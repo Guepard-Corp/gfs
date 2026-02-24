@@ -7,7 +7,6 @@
 //! PID file: .gfs/mcp.pid, log file: .gfs/mcp.log.
 
 use std::fs;
-use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Stdio;

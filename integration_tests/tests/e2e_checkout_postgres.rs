@@ -105,7 +105,7 @@ fn gfs_init_with_db(path: &Path) -> bool {
         .args([
             "run",
             "--package",
-            "guepard-data-plane-cli",
+            "gfs-cli",
             "--bin",
             "gfs",
             "init",
@@ -126,7 +126,7 @@ fn gfs_config(path: &Path, key: &str, value: &str) -> (bool, String, String) {
         .args([
             "run",
             "--package",
-            "guepard-data-plane-cli",
+            "gfs-cli",
             "--bin",
             "gfs",
             "config",
@@ -152,7 +152,7 @@ fn gfs_commit(
     let mut args = vec![
         "run",
         "--package",
-        "guepard-data-plane-cli",
+        "gfs-cli",
         "--bin",
         "gfs",
         "commit",
@@ -183,7 +183,7 @@ fn gfs_log(repo_path: &Path, max_count: Option<usize>) -> (bool, String, String)
     let mut args: Vec<String> = vec![
         "run".to_string(),
         "--package".to_string(),
-        "guepard-data-plane-cli".to_string(),
+        "gfs-cli".to_string(),
         "--bin".to_string(),
         "gfs".to_string(),
         "log".to_string(),
@@ -209,7 +209,7 @@ fn gfs_checkout(repo_path: &Path, revision: &str) -> (bool, String, String) {
         .args([
             "run",
             "--package",
-            "guepard-data-plane-cli",
+            "gfs-cli",
             "--bin",
             "gfs",
             "checkout",
@@ -234,7 +234,7 @@ fn gfs_checkout_b(
     let mut args = vec![
         "run",
         "--package",
-        "guepard-data-plane-cli",
+        "gfs-cli",
         "--bin",
         "gfs",
         "checkout",
@@ -261,7 +261,7 @@ fn gfs_compute_status(path: &Path) -> (bool, String, String) {
         .args([
             "run",
             "--package",
-            "guepard-data-plane-cli",
+            "gfs-cli",
             "--bin",
             "gfs",
             "compute",
@@ -282,7 +282,7 @@ fn gfs_compute_stop(path: &Path) -> (bool, String, String) {
         .args([
             "run",
             "--package",
-            "guepard-data-plane-cli",
+            "gfs-cli",
             "--bin",
             "gfs",
             "compute",
@@ -298,53 +298,10 @@ fn gfs_compute_stop(path: &Path) -> (bool, String, String) {
     (out.status.success(), stdout, stderr)
 }
 
-fn gfs_compute_start(path: &Path) -> (bool, String, String) {
-    let out = Command::new("cargo")
-        .args([
-            "run",
-            "--package",
-            "guepard-data-plane-cli",
-            "--bin",
-            "gfs",
-            "compute",
-            "--path",
-            path.to_str().unwrap(),
-            "start",
-        ])
-        .current_dir(workspace_root())
-        .output()
-        .expect("run gfs compute start");
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    (out.status.success(), stdout, stderr)
-}
-
 fn get_container_id(repo_path: &Path) -> Option<String> {
     repo_layout::get_runtime_config(repo_path)
         .ok()
         .and_then(|opt| opt.map(|r| r.container_name))
-}
-
-/// Return the host path of the container's bind mount for `/var/lib/postgresql/data`, if present.
-fn get_container_data_mount_host_path(container_id: &str) -> Option<PathBuf> {
-    let out = Command::new("docker")
-        .args([
-            "inspect",
-            "--format",
-            r#"{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Source}}{{end}}{{end}}"#,
-            container_id,
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() {
-        return None;
-    }
-    let p = PathBuf::from(s);
-    p.canonicalize().ok().or(Some(p))
 }
 
 fn wait_for_postgres(container_id: &str) -> bool {

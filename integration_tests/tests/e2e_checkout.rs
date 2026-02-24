@@ -1,7 +1,7 @@
 //! End-to-end tests for `gfs checkout`.
 //!
 //! Invoke the **CLI binary** via `std::process::Command`. Same pattern as
-//! `e2e_commit.rs`: we run `cargo run --package guepard-data-plane-cli --bin gfs checkout ...`
+//! `e2e_commit.rs`: we run `cargo run --package gfs --bin gfs checkout ...`
 //! and assert on the resulting filesystem (HEAD, WORKSPACE, workspace dir content).
 //!
 //! macOS-only: commit uses the APFS storage backend.
@@ -23,7 +23,7 @@ fn gfs_init(path: &Path) -> bool {
         .args([
             "run",
             "--package",
-            "guepard-data-plane-cli",
+            "gfs-cli",
             "--bin",
             "gfs",
             "init",
@@ -44,7 +44,7 @@ fn gfs_commit(
     let mut args = vec![
         "run",
         "--package",
-        "guepard-data-plane-cli",
+        "gfs-cli",
         "--bin",
         "gfs",
         "commit",
@@ -78,7 +78,7 @@ fn gfs_checkout(repo_path: &Path, revision: &str) -> (bool, String, String) {
         .args([
             "run",
             "--package",
-            "guepard-data-plane-cli",
+            "gfs-cli",
             "--bin",
             "gfs",
             "checkout",
@@ -187,8 +187,6 @@ fn checkout_branch_main_updates_workspace_to_tip_content() {
     let (ok2, _, _) = gfs_commit(repo_path, "second", None, None);
     assert!(ok2);
 
-    let hash2 = read_ref(repo_path, "main");
-
     let (checkout_ok, _stdout, stderr) = gfs_checkout(repo_path, "main");
     assert!(checkout_ok, "gfs checkout main should succeed; stderr: {stderr}");
 
@@ -196,10 +194,9 @@ fn checkout_branch_main_updates_workspace_to_tip_content() {
     assert_eq!(head, "ref: refs/heads/main", "HEAD should point at main");
 
     let workspace_path = read_workspace_path(repo_path);
-    let short_hash2 = &hash2[..12.min(hash2.len())];
     assert!(
-        workspace_path.to_string_lossy().contains("main") && workspace_path.to_string_lossy().contains(short_hash2),
-        "WORKSPACE should point at workspaces/main/<short_hash>/data; got: {}",
+        workspace_path.to_string_lossy().contains("main/0/data"),
+        "WORKSPACE should point at workspaces/main/0/data (branch workspace); got: {}",
         workspace_path.display()
     );
     assert_eq!(

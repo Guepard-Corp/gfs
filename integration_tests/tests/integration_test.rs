@@ -24,7 +24,7 @@ fn gfs_init_creates_valid_repo_layout() {
         .args([
             "run",
             "--package",
-            "guepard-data-plane-cli",
+            "gfs-cli",
             "--bin",
             "gfs",
             "init",

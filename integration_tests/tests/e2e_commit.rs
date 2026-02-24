@@ -2,7 +2,7 @@
 //!
 //! Invoke the **CLI binary** via `std::process::Command` (same pattern as
 //! `integration_test.rs`). We do not import the CLI crate; we only run
-//! `cargo run --package guepard-data-plane-cli --bin gfs init/commit ...`
+//! `cargo run --package gfs --bin gfs init/commit ...`
 //! and assert on the resulting filesystem.
 //!
 //! macOS-only: commit uses the APFS storage backend. Docker must be running.
@@ -31,7 +31,7 @@ fn gfs_init(path: &Path) -> bool {
         .args([
             "run",
             "--package",
-            "guepard-data-plane-cli",
+            "gfs-cli",
             "--bin",
             "gfs",
             "init",
@@ -50,7 +50,7 @@ fn gfs_init_with_db(path: &Path) -> bool {
         .args([
             "run",
             "--package",
-            "guepard-data-plane-cli",
+            "gfs-cli",
             "--bin",
             "gfs",
             "init",
@@ -118,7 +118,7 @@ fn gfs_log(repo_path: &Path, max_count: Option<usize>) -> (bool, String, String)
     let mut args = vec![
         "run".to_string(),
         "--package".to_string(),
-        "guepard-data-plane-cli".to_string(),
+        "gfs-cli".to_string(),
         "--bin".to_string(),
         "gfs".to_string(),
         "log".to_string(),
@@ -150,7 +150,7 @@ fn gfs_commit(
     let mut args = vec![
         "run",
         "--package",
-        "guepard-data-plane-cli",
+        "gfs-cli",
         "--bin",
         "gfs",
         "commit",

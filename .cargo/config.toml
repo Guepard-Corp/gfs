@@ -1,0 +1,4 @@
+[alias]
+gfs = ["run", "--bin", "guepard-data-plane-cli"]
+gfs-mcp = ["run", "--bin", "guepard-data-plane-mcp"]
+gfs-mcp2 = ["run", "--bin", "guepard-data-plane-mcp2"]
