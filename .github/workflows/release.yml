@@ -30,19 +30,19 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache cargo index
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache cargo build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: target
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
@@ -148,19 +148,19 @@ jobs:
         run: rustup target add ${{ matrix.target }}
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache cargo index
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/git
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache cargo build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: target
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
