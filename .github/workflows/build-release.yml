@@ -134,7 +134,7 @@ jobs:
         run: ls -lh release_assets/
 
       - name: Create GitHub Release with assets
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: release_assets/*
           body: |
