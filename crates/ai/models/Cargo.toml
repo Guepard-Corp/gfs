@@ -1,0 +1,11 @@
+[package]
+name = "gfs-ai-models"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+byteorder = "1"
+
+[dev-dependencies]
