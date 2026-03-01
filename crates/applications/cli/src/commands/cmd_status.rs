@@ -137,10 +137,10 @@ fn status_indicator(status: &str) -> &'static str {
 fn status_indicator_colored(status: &str) -> String {
     let dot = status_indicator(status);
     match status {
-        "running" => format!("{}", green(dot)),
-        "starting" | "restarting" => format!("{}", yellow(dot)),
-        "stopped" | "stopping" | "not_provisioned" | "paused" => format!("{}", dimmed(dot)),
-        "failed" | "unknown" => format!("{}", red(dot)),
+        "running" => green(dot).to_string(),
+        "starting" | "restarting" => yellow(dot).to_string(),
+        "stopped" | "stopping" | "not_provisioned" | "paused" => dimmed(dot).to_string(),
+        "failed" | "unknown" => red(dot).to_string(),
         _ => dot.to_string(),
     }
 }

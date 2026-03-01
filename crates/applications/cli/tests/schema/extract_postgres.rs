@@ -20,17 +20,17 @@ fn schema_extract_postgres() {
     with_fresh_repo(|repo_path| {
         // 1. Create table via docker exec
         let container_id = get_container_id(repo_path);
-        run_psql_select(&container_id, "CREATE TABLE IF NOT EXISTS schema_test (id int, name text);");
+        run_psql_select(
+            &container_id,
+            "CREATE TABLE IF NOT EXISTS schema_test (id int, name text);",
+        );
 
         // 2. Run gfs schema extract --output <path> (in-process for coverage)
         let output_path = repo_path.join("schema.json");
         let (ok, _, stderr) =
             common::cli_runner::gfs_schema_extract(repo_path, Some(&output_path), false);
 
-        assert!(
-            ok,
-            "gfs schema extract should succeed; stderr: {stderr}"
-        );
+        assert!(ok, "gfs schema extract should succeed; stderr: {stderr}");
 
         // 3. Parse JSON and verify schema
         let json = fs::read_to_string(&output_path).expect("read schema.json");
@@ -74,8 +74,7 @@ fn schema_extract_postgres() {
 #[test]
 fn schema_extract_error_not_initialized() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let (ok, _, stderr) =
-        common::cli_runner::gfs_schema_extract(temp.path(), None, false);
+    let (ok, _, stderr) = common::cli_runner::gfs_schema_extract(temp.path(), None, false);
 
     assert!(!ok, "schema extract on non-repo should fail");
     assert!(

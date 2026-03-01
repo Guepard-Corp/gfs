@@ -70,9 +70,8 @@ impl PrettyFormatter {
     /// Create a new pretty formatter.
     pub fn new(use_color: bool) -> Self {
         // Auto-detection: disable if NO_COLOR env var or stdout is not a TTY
-        let use_color = use_color
-            && std::env::var("NO_COLOR").is_err()
-            && std::io::stdout().is_terminal();
+        let use_color =
+            use_color && std::env::var("NO_COLOR").is_err() && std::io::stdout().is_terminal();
 
         Self { use_color }
     }
@@ -107,7 +106,10 @@ impl PrettyFormatter {
         output
     }
 
-    fn group_by_table<'a>(&self, mutations: &'a [SchemaMutation]) -> Vec<(String, Vec<&'a SchemaMutation>)> {
+    fn group_by_table<'a>(
+        &self,
+        mutations: &'a [SchemaMutation],
+    ) -> Vec<(String, Vec<&'a SchemaMutation>)> {
         let mut groups: HashMap<String, Vec<&SchemaMutation>> = HashMap::new();
 
         for mutation in mutations {
@@ -155,7 +157,8 @@ impl PrettyFormatter {
         if !other_mutations.is_empty() {
             if table_mutations.is_empty() {
                 // No table-level change, show table name
-                output.push_str(&format!("  {}    {}\n",
+                output.push_str(&format!(
+                    "  {}    {}\n",
                     self.colorize("MODIFIED", Color::Bold),
                     self.colorize(table_name, Color::Bold)
                 ));
@@ -197,7 +200,11 @@ impl PrettyFormatter {
 
         // Extract just the column/entity name (not the full path)
         let target = if mutation.entity == DiffEntity::Column {
-            mutation.target.split('.').last().unwrap_or(&mutation.target)
+            mutation
+                .target
+                .split('.')
+                .next_back()
+                .unwrap_or(&mutation.target)
         } else {
             &mutation.target
         };
@@ -207,10 +214,10 @@ impl PrettyFormatter {
         if let Some(type_info) = mutation.metadata.get("type") {
             metadata_parts.push(self.colorize(type_info, Color::Dim));
         }
-        if let Some(nullable) = mutation.metadata.get("nullable") {
-            if nullable == "true" {
-                metadata_parts.push(self.colorize("nullable", Color::Dim));
-            }
+        if let Some(nullable) = mutation.metadata.get("nullable")
+            && nullable == "true"
+        {
+            metadata_parts.push(self.colorize("nullable", Color::Dim));
         }
 
         let metadata_str = if metadata_parts.is_empty() {
@@ -227,12 +234,7 @@ impl PrettyFormatter {
 
         format!(
             "{}{} {:9} {:20}{}{}",
-            indent,
-            symbol_colored,
-            entity_str,
-            target,
-            metadata_str,
-            breaking_tag
+            indent, symbol_colored, entity_str, target, metadata_str, breaking_tag
         )
         .trim_end()
         .to_string()
@@ -243,9 +245,21 @@ impl PrettyFormatter {
         let mut output = String::new();
 
         // Count changes by type
-        let added = diff.mutations.iter().filter(|m| m.operation == DiffOperation::Add).count();
-        let dropped = diff.mutations.iter().filter(|m| m.operation == DiffOperation::Drop).count();
-        let modified = diff.mutations.iter().filter(|m| m.operation == DiffOperation::Modify).count();
+        let added = diff
+            .mutations
+            .iter()
+            .filter(|m| m.operation == DiffOperation::Add)
+            .count();
+        let dropped = diff
+            .mutations
+            .iter()
+            .filter(|m| m.operation == DiffOperation::Drop)
+            .count();
+        let modified = diff
+            .mutations
+            .iter()
+            .filter(|m| m.operation == DiffOperation::Modify)
+            .count();
 
         let mut summary_parts = Vec::new();
         if added > 0 {
@@ -264,20 +278,23 @@ impl PrettyFormatter {
             summary_parts.join(" · ")
         };
 
-        output.push_str(&format!("  {}   {}\n",
+        output.push_str(&format!(
+            "  {}   {}\n",
             self.colorize("Summary", Color::Bold),
             summary
         ));
 
         // Risk line
         if diff.has_breaking_changes {
-            output.push_str(&format!("  {}      {} {}\n",
+            output.push_str(&format!(
+                "  {}      {} {}\n",
                 self.colorize("Risk", Color::Bold),
                 self.colorize("⚠", Color::Yellow),
                 self.colorize("BREAKING CHANGES", Color::Red)
             ));
         } else if !diff.mutations.is_empty() {
-            output.push_str(&format!("  {}      {} {}\n",
+            output.push_str(&format!(
+                "  {}      {} {}\n",
                 self.colorize("Risk", Color::Bold),
                 self.colorize("✓", Color::Green),
                 self.colorize("Safe changes", Color::Green)
@@ -510,23 +527,21 @@ mod tests {
         let formatter = PrettyFormatter::new(false);
         let output = formatter.format(&diff);
 
-        assert!(output.contains("✕"));  // DROP symbol
-        assert!(output.contains("+"));  // ADD symbol
-        assert!(output.contains("│"));  // Tree connector for column under table
+        assert!(output.contains("✕")); // DROP symbol
+        assert!(output.contains("+")); // ADD symbol
+        assert!(output.contains("│")); // Tree connector for column under table
     }
 
     #[test]
     fn test_pretty_format_summary() {
         let mut diff = create_test_diff();
-        diff.mutations = vec![
-            SchemaMutation {
-                entity: DiffEntity::Column,
-                operation: DiffOperation::Add,
-                target: "users.email".to_string(),
-                metadata: HashMap::new(),
-                is_breaking: false,
-            },
-        ];
+        diff.mutations = vec![SchemaMutation {
+            entity: DiffEntity::Column,
+            operation: DiffOperation::Add,
+            target: "users.email".to_string(),
+            metadata: HashMap::new(),
+            is_breaking: false,
+        }];
 
         let formatter = PrettyFormatter::new(false);
         let output = formatter.format(&diff);
@@ -622,15 +637,13 @@ mod tests {
     #[test]
     fn test_json_format_safe_changes() {
         let mut diff = create_test_diff();
-        diff.mutations = vec![
-            SchemaMutation {
-                entity: DiffEntity::Column,
-                operation: DiffOperation::Add,
-                target: "users.email".to_string(),
-                metadata: HashMap::new(),
-                is_breaking: false,
-            },
-        ];
+        diff.mutations = vec![SchemaMutation {
+            entity: DiffEntity::Column,
+            operation: DiffOperation::Add,
+            target: "users.email".to_string(),
+            metadata: HashMap::new(),
+            is_breaking: false,
+        }];
 
         let json = JsonFormatter::format(&diff).expect("JSON serialization failed");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("JSON parsing failed");
@@ -645,15 +658,13 @@ mod tests {
         let mut metadata = HashMap::new();
         metadata.insert("type".to_string(), "int".to_string());
 
-        diff.mutations = vec![
-            SchemaMutation {
-                entity: DiffEntity::Column,
-                operation: DiffOperation::Modify,
-                target: "users.age".to_string(),
-                metadata,
-                is_breaking: false,
-            },
-        ];
+        diff.mutations = vec![SchemaMutation {
+            entity: DiffEntity::Column,
+            operation: DiffOperation::Modify,
+            target: "users.age".to_string(),
+            metadata,
+            is_breaking: false,
+        }];
 
         // Serialize to JSON
         let json = JsonFormatter::format(&diff).expect("JSON serialization failed");

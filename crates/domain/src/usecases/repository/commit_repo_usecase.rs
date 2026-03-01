@@ -227,7 +227,8 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
         tracing::debug!("Extracting schema for commit");
 
         // 1. Extract schema metadata using ExtractSchemaUseCase.
-        let extract_use_case = ExtractSchemaUseCase::new(self.compute.clone(), self.registry.clone());
+        let extract_use_case =
+            ExtractSchemaUseCase::new(self.compute.clone(), self.registry.clone());
         let schema_output = extract_use_case.run(repo_path).await.map_err(|e| {
             tracing::warn!("Schema extraction failed: {}", e);
             e
@@ -254,11 +255,12 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
         })?;
 
         // 3. Store schema object in repo.
-        let schema_hash = repo_layout::write_schema_object(repo_path, &schema_output.metadata, &schema_sql)
-            .map_err(|e| {
-                tracing::warn!("Failed to write schema object: {}", e);
-                e
-            })?;
+        let schema_hash =
+            repo_layout::write_schema_object(repo_path, &schema_output.metadata, &schema_sql)
+                .map_err(|e| {
+                    tracing::warn!("Failed to write schema object: {}", e);
+                    e
+                })?;
 
         // 4. Cleanup temp directory.
         let _ = std::fs::remove_dir_all(temp_dir);

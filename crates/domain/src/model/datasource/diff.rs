@@ -105,7 +105,7 @@ fn diff_tables(
         .collect();
 
     // Find dropped tables
-    for (table_name, _) in &old_tables {
+    for table_name in old_tables.keys() {
         if !new_tables.contains_key(table_name) {
             mutations.push(SchemaMutation {
                 entity: DiffEntity::Table,
@@ -235,7 +235,10 @@ fn diff_columns(
                     .as_ref()
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "NULL".to_string());
-                changes.insert("default".to_string(), format!("{}->{}", old_default, new_default));
+                changes.insert(
+                    "default".to_string(),
+                    format!("{}->{}", old_default, new_default),
+                );
             }
 
             // If there are changes, add a mutation
@@ -255,7 +258,10 @@ fn diff_columns(
 /// Check if a type change is narrowing (breaking).
 fn is_type_narrowing(old_type: &str, new_type: &str) -> bool {
     // Parse varchar lengths
-    if let (Some(old_len), Some(new_len)) = (extract_varchar_length(old_type), extract_varchar_length(new_type)) {
+    if let (Some(old_len), Some(new_len)) = (
+        extract_varchar_length(old_type),
+        extract_varchar_length(new_type),
+    ) {
         return new_len < old_len; // varchar(255) -> varchar(100) is narrowing
     }
 

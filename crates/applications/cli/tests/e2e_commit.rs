@@ -111,7 +111,10 @@ fn commit_creates_snapshot_folder_with_copied_files() {
     assert!(cli_runner::gfs_init(repo_path), "gfs init should succeed");
 
     let data_dir = workspace_data_dir(repo_path);
-    assert!(data_dir.exists(), "workspace data dir must exist after init");
+    assert!(
+        data_dir.exists(),
+        "workspace data dir must exist after init"
+    );
     fs::write(data_dir.join("pg_version"), "16\n").unwrap();
     fs::write(data_dir.join("schema.sql"), "CREATE TABLE test (id INT);\n").unwrap();
 
@@ -129,8 +132,7 @@ fn commit_creates_snapshot_folder_with_copied_files() {
     assert!(commit_hash.chars().all(|c| c.is_ascii_hexdigit()));
 
     let (obj_dir, obj_file) = commit_hash.split_at(2);
-    let obj_bytes =
-        fs::read(repo_path.join(".gfs/objects").join(obj_dir).join(obj_file)).unwrap();
+    let obj_bytes = fs::read(repo_path.join(".gfs/objects").join(obj_dir).join(obj_file)).unwrap();
     let commit: Commit = serde_json::from_slice(&obj_bytes).expect("valid JSON commit object");
 
     assert_eq!(commit.message, "first commit");
@@ -287,8 +289,7 @@ fn two_commits_produce_distinct_snapshot_folders_with_files() {
     let ref_content = fs::read_to_string(repo_path.join(".gfs/refs/heads/main")).unwrap();
     let hash2 = ref_content.trim().to_string();
     let (d2, f2) = hash2.split_at(2);
-    let obj2_bytes =
-        fs::read(repo_path.join(".gfs/objects").join(d2).join(f2)).unwrap();
+    let obj2_bytes = fs::read(repo_path.join(".gfs/objects").join(d2).join(f2)).unwrap();
     let commit2: Commit = serde_json::from_slice(&obj2_bytes).unwrap();
     let hash1 = commit2
         .parents
@@ -376,8 +377,7 @@ fn commit_with_real_database_snapshots_workspace() {
     assert_eq!(commit_hash.len(), 64);
 
     let (obj_dir, obj_file) = commit_hash.split_at(2);
-    let obj_bytes =
-        fs::read(repo_path.join(".gfs/objects").join(obj_dir).join(obj_file)).unwrap();
+    let obj_bytes = fs::read(repo_path.join(".gfs/objects").join(obj_dir).join(obj_file)).unwrap();
     let commit: Commit = serde_json::from_slice(&obj_bytes).expect("valid JSON commit object");
     let snapshot_path = snapshot_dir(repo_path, &commit.snapshot_hash);
     assert!(

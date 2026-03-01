@@ -970,30 +970,6 @@ fn paths_differ(a: &str, b: &str) -> bool {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn handler_get_info_returns_expected_server_name() {
-        let handler = GfsMcpHandler::new();
-        let info = handler.get_info();
-        assert_eq!(info.server_info.name, "gfs-mcp");
-        assert!(info.capabilities.tools.is_some());
-    }
-
-    #[test]
-    fn handler_get_info_instructions_mention_list_providers() {
-        let handler = GfsMcpHandler::new();
-        let info = handler.get_info();
-        let instructions = info.instructions.as_deref().unwrap_or("");
-        assert!(
-            instructions.contains("list_providers"),
-            "instructions should mention list_providers"
-        );
-    }
-}
-
 async fn do_export(args: &serde_json::Value) -> Result<CallToolResult, McpError> {
     let args = if args.is_object() { args } else { &json!({}) };
     let repo_path = repo_path_from_value(args);
@@ -1353,4 +1329,28 @@ async fn do_diff_schema(args: &serde_json::Value) -> Result<CallToolResult, McpE
         .map_err(|e| to_error_data(format!("failed to parse JSON output: {}", e)))?;
 
     json_ok(json_value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handler_get_info_returns_expected_server_name() {
+        let handler = GfsMcpHandler::new();
+        let info = handler.get_info();
+        assert_eq!(info.server_info.name, "gfs-mcp");
+        assert!(info.capabilities.tools.is_some());
+    }
+
+    #[test]
+    fn handler_get_info_instructions_mention_list_providers() {
+        let handler = GfsMcpHandler::new();
+        let info = handler.get_info();
+        let instructions = info.instructions.as_deref().unwrap_or("");
+        assert!(
+            instructions.contains("list_providers"),
+            "instructions should mention list_providers"
+        );
+    }
 }

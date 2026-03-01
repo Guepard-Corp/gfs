@@ -241,9 +241,7 @@ mod tests {
 
     #[tokio::test]
     async fn log_with_options() {
-        let repo = MockRepository {
-            commits: vec![],
-        };
+        let repo = MockRepository { commits: vec![] };
         let usecase = LogRepoUseCase::new(Arc::new(repo));
         let dir = tempfile::tempdir().unwrap();
         let result = usecase

@@ -145,11 +145,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let working_dir = temp_dir.path().to_path_buf();
         fs::create_dir_all(working_dir.join(GFS_DIR)).unwrap();
-        fs::write(
-            working_dir.join(GFS_DIR).join(HEAD_FILE),
-            "ref: refs/heads",
-        )
-        .unwrap();
+        fs::write(working_dir.join(GFS_DIR).join(HEAD_FILE), "ref: refs/heads").unwrap();
         let result = get_head(&working_dir).unwrap();
         assert_eq!(result, "ref: refs/heads");
     }
@@ -166,7 +162,11 @@ mod tests {
         .unwrap();
         fs::create_dir_all(working_dir.join(GFS_DIR).join(REFS_DIR).join(HEADS_DIR)).unwrap();
         fs::write(
-            working_dir.join(GFS_DIR).join(REFS_DIR).join(HEADS_DIR).join("main"),
+            working_dir
+                .join(GFS_DIR)
+                .join(REFS_DIR)
+                .join(HEADS_DIR)
+                .join("main"),
             "0",
         )
         .unwrap();

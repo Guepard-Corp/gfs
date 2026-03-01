@@ -416,7 +416,10 @@ fn test_01_init_config_validate_commit_log() {
         // gag may not capture stdout in test harness; verify commit state via filesystem
         let ref_content =
             fs::read_to_string(repo_path.join(".gfs/refs/heads/main")).expect("main ref exists");
-        assert!(!ref_content.trim().is_empty(), "main should point to a commit");
+        assert!(
+            !ref_content.trim().is_empty(),
+            "main should point to a commit"
+        );
     }
 }
 
@@ -454,7 +457,8 @@ fn test_02_pgbench_commit_compute_status() {
         );
     } else {
         assert_eq!(
-            count_commits_from_main(repo_path), 2,
+            count_commits_from_main(repo_path),
+            2,
             "repo should have 2 commits (gag may not capture stdout)"
         );
     }

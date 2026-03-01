@@ -39,7 +39,10 @@ INSERT INTO sql_import (id, label) VALUES (10, 'ten'), (20, 'twenty');
         }
 
         let container_id = get_container_id(repo_path);
-        let result = run_psql_select(&container_id, "SELECT id, label FROM sql_import ORDER BY id");
+        let result = run_psql_select(
+            &container_id,
+            "SELECT id, label FROM sql_import ORDER BY id",
+        );
         assert!(
             result.contains("10|ten"),
             "sql_import should contain (10,ten); got: {result}"

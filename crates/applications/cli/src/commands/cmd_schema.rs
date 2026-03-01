@@ -3,10 +3,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use gfs_compute_docker::DockerCompute;
 use gfs_domain::model::datasource::diff::compute_schema_diff;
-use gfs_domain::model::datasource::diff_formatter::{AgenticFormatter, JsonFormatter, PrettyFormatter};
+use gfs_domain::model::datasource::diff_formatter::{
+    AgenticFormatter, JsonFormatter, PrettyFormatter,
+};
 use gfs_domain::ports::database_provider::InMemoryDatabaseProviderRegistry;
 use gfs_domain::repo_utils::repo_layout;
 use gfs_domain::usecases::repository::extract_schema_usecase::ExtractSchemaUseCase;
@@ -79,9 +81,12 @@ pub async fn run_show(
         .with_context(|| format!("failed to load commit {}", commit_hash))?;
 
     // Get schema hash
-    let schema_hash = commit_obj
-        .schema_hash
-        .ok_or_else(|| anyhow!("commit {} has no schema (schema versioning was not enabled)", commit_hash))?;
+    let schema_hash = commit_obj.schema_hash.ok_or_else(|| {
+        anyhow!(
+            "commit {} has no schema (schema versioning was not enabled)",
+            commit_hash
+        )
+    })?;
 
     // Load schema object
     let (metadata, ddl) = repo_layout::get_schema_by_hash(&repo_path, &schema_hash)
@@ -96,11 +101,7 @@ pub async fn run_show(
         println!("{}", json);
     } else {
         // Show both metadata and DDL with colors
-        println!(
-            "{} {}",
-            dimmed("Schema Hash:"),
-            cyan(schema_hash)
-        );
+        println!("{} {}", dimmed("Schema Hash:"), cyan(schema_hash));
         println!(
             "{} {} {}",
             dimmed("Driver:"),

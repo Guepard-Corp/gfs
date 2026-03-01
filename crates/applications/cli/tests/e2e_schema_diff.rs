@@ -221,7 +221,12 @@ fn schema_diff_no_changes_exit_code() {
     assert!(ok);
 
     let (ok, _, _) = cli_runner::run_gfs([
-        "gfs", "commit", "--path", repo_path.to_str().unwrap(), "-m", "test",
+        "gfs",
+        "commit",
+        "--path",
+        repo_path.to_str().unwrap(),
+        "-m",
+        "test",
     ]);
     assert!(ok);
 
@@ -239,7 +244,11 @@ fn schema_diff_no_changes_exit_code() {
     ]);
 
     // Exit code 0 means ok=true in our test runner
-    assert!(ok, "Expected exit code 0 for no changes, got stdout: {}", stdout);
+    assert!(
+        ok,
+        "Expected exit code 0 for no changes, got stdout: {}",
+        stdout
+    );
 }
 
 #[test]
@@ -272,7 +281,12 @@ fn schema_diff_no_color_flag() {
     assert!(ok);
 
     let (ok, _, _) = cli_runner::run_gfs([
-        "gfs", "commit", "--path", repo_path.to_str().unwrap(), "-m", "v1",
+        "gfs",
+        "commit",
+        "--path",
+        repo_path.to_str().unwrap(),
+        "-m",
+        "v1",
     ]);
     assert!(ok);
     let hash1 = repo_layout::get_current_commit_id(repo_path).unwrap();
@@ -288,7 +302,12 @@ fn schema_diff_no_color_flag() {
     assert!(ok);
 
     let (ok, _, _) = cli_runner::run_gfs([
-        "gfs", "commit", "--path", repo_path.to_str().unwrap(), "-m", "v2",
+        "gfs",
+        "commit",
+        "--path",
+        repo_path.to_str().unwrap(),
+        "-m",
+        "v2",
     ]);
     assert!(ok);
     let hash2 = repo_layout::get_current_commit_id(repo_path).unwrap();
@@ -397,23 +416,32 @@ fn schema_diff_json_format() {
 
     // Parse JSON output
     let json: serde_json::Value = serde_json::from_str(&stdout)
-        .expect(&format!("Failed to parse JSON output: {}", stdout));
+        .unwrap_or_else(|_| panic!("Failed to parse JSON output: {}", stdout));
 
     // Verify JSON structure
     assert_eq!(json["version"], "1", "Expected version field");
     assert_eq!(json["from_commit"], hash1, "Expected from_commit field");
     assert_eq!(json["to_commit"], hash2, "Expected to_commit field");
-    assert_eq!(json["has_breaking_changes"], false, "Expected no breaking changes");
-    assert_eq!(json["exit_code"], 1, "Expected exit code 1 for safe changes");
+    assert_eq!(
+        json["has_breaking_changes"], false,
+        "Expected no breaking changes"
+    );
+    assert_eq!(
+        json["exit_code"], 1,
+        "Expected exit code 1 for safe changes"
+    );
 
     // Verify mutations array exists and has content
-    let mutations = json["mutations"].as_array().expect("mutations should be an array");
+    let mutations = json["mutations"]
+        .as_array()
+        .expect("mutations should be an array");
     assert!(!mutations.is_empty(), "Expected at least one mutation");
 
     // Find the TABLE ADD mutation
-    let table_add = mutations.iter().find(|m| {
-        m["entity"] == "Table" && m["operation"] == "Add"
-    }).expect("Expected TABLE ADD mutation");
+    let table_add = mutations
+        .iter()
+        .find(|m| m["entity"] == "Table" && m["operation"] == "Add")
+        .expect("Expected TABLE ADD mutation");
 
     assert!(
         table_add["target"].as_str().unwrap().contains("orders"),
@@ -422,9 +450,18 @@ fn schema_diff_json_format() {
     assert_eq!(table_add["is_breaking"], false);
 
     // Verify summary
-    assert!(json["summary"]["total"].as_u64().unwrap() > 0, "Expected non-zero total mutations");
-    assert!(json["summary"]["by_operation"].is_object(), "Expected by_operation object");
-    assert!(json["summary"]["by_entity"].is_object(), "Expected by_entity object");
+    assert!(
+        json["summary"]["total"].as_u64().unwrap() > 0,
+        "Expected non-zero total mutations"
+    );
+    assert!(
+        json["summary"]["by_operation"].is_object(),
+        "Expected by_operation object"
+    );
+    assert!(
+        json["summary"]["by_entity"].is_object(),
+        "Expected by_entity object"
+    );
 }
 
 #[test]
@@ -457,7 +494,12 @@ fn schema_diff_json_no_changes() {
     assert!(ok);
 
     let (ok, _, _) = cli_runner::run_gfs([
-        "gfs", "commit", "--path", repo_path.to_str().unwrap(), "-m", "test",
+        "gfs",
+        "commit",
+        "--path",
+        repo_path.to_str().unwrap(),
+        "-m",
+        "test",
     ]);
     assert!(ok);
 
@@ -479,12 +521,16 @@ fn schema_diff_json_no_changes() {
 
     // Parse JSON
     let json: serde_json::Value = serde_json::from_str(&stdout)
-        .expect(&format!("Failed to parse JSON: {}", stdout));
+        .unwrap_or_else(|_| panic!("Failed to parse JSON: {}", stdout));
 
     assert_eq!(json["version"], "1");
     assert_eq!(json["exit_code"], 0);
     assert_eq!(json["has_breaking_changes"], false);
-    assert_eq!(json["mutations"].as_array().unwrap().len(), 0, "Expected empty mutations array");
+    assert_eq!(
+        json["mutations"].as_array().unwrap().len(),
+        0,
+        "Expected empty mutations array"
+    );
     assert_eq!(json["summary"]["total"], 0, "Expected zero total mutations");
 }
 
@@ -518,7 +564,12 @@ fn schema_diff_json_pretty_mutually_exclusive() {
     assert!(ok);
 
     let (ok, _, _) = cli_runner::run_gfs([
-        "gfs", "commit", "--path", repo_path.to_str().unwrap(), "-m", "v1",
+        "gfs",
+        "commit",
+        "--path",
+        repo_path.to_str().unwrap(),
+        "-m",
+        "v1",
     ]);
     assert!(ok);
     let hash1 = repo_layout::get_current_commit_id(repo_path).unwrap();
@@ -534,7 +585,12 @@ fn schema_diff_json_pretty_mutually_exclusive() {
     assert!(ok);
 
     let (ok, _, _) = cli_runner::run_gfs([
-        "gfs", "commit", "--path", repo_path.to_str().unwrap(), "-m", "v2",
+        "gfs",
+        "commit",
+        "--path",
+        repo_path.to_str().unwrap(),
+        "-m",
+        "v2",
     ]);
     assert!(ok);
     let hash2 = repo_layout::get_current_commit_id(repo_path).unwrap();
@@ -552,10 +608,13 @@ fn schema_diff_json_pretty_mutually_exclusive() {
         repo_path.to_str().unwrap(),
     ]);
 
-    assert!(!ok, "Expected command to fail with both --json and --pretty");
     assert!(
-        stderr.contains("--pretty and --json cannot be used together") ||
-        stderr.contains("mutually exclusive"),
+        !ok,
+        "Expected command to fail with both --json and --pretty"
+    );
+    assert!(
+        stderr.contains("--pretty and --json cannot be used together")
+            || stderr.contains("mutually exclusive"),
         "Expected error about mutual exclusivity, got: {}",
         stderr
     );

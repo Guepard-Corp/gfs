@@ -1,11 +1,17 @@
+use crate::components::{CodeBlock, SchemaDiffTabs};
 use leptos::*;
 use leptos_router::*;
-use crate::components::{CodeBlock, SchemaDiffTabs};
 
 #[component]
 pub fn Docs() -> impl IntoView {
     let params = use_params_map();
-    let page = move || params.with(|p| p.get("page").cloned().unwrap_or_else(|| "getting-started".to_string()));
+    let page = move || {
+        params.with(|p| {
+            p.get("page")
+                .cloned()
+                .unwrap_or_else(|| "getting-started".to_string())
+        })
+    };
 
     view! {
         <div class="docs-page">
@@ -186,7 +192,7 @@ fn QuickStart() -> impl IntoView {
 
             <h2>"2. Create a New Project"</h2>
             <CodeBlock code="mkdir my_project
-cd my_project"/>
+    cd my_project"/>
 
             <h2>"3. Initialize the Repository"</h2>
             <CodeBlock code="gfs init --database-provider postgres --database-version 17"/>
@@ -198,7 +204,7 @@ cd my_project"/>
             <h2>"5. Query Your Database"</h2>
             <p>"Execute SQL directly or open an interactive terminal:"</p>
             <CodeBlock code="gfs query \"SELECT 1\"
-# Or: gfs query (interactive)"/>
+    # Or: gfs query (interactive)"/>
 
             <h2>"6. Make Changes and Commit"</h2>
             <p>"After modifying your database schema or data:"</p>
@@ -313,7 +319,7 @@ fn CommandInit() -> impl IntoView {
             <h2>"Query Your Database"</h2>
             <p>"Use "<code>"gfs query"</code>" to run SQL or open an interactive session. No separate database client needed:"</p>
             <CodeBlock code="gfs query \"SELECT 1\"
-gfs query  # interactive terminal"/>
+    gfs query  # interactive terminal"/>
 
             <h2>"Requirements"</h2>
             <ul>
@@ -831,7 +837,7 @@ gfs config user.name \"John Doe\""/>
             <h2>"Examples"</h2>
             <h3>"Set author for commits"</h3>
             <CodeBlock code="gfs config user.name \"Jane Smith\"
-gfs config user.email \"jane@example.com\""/>
+    gfs config user.email \"jane@example.com\""/>
 
             <h3>"Read current config"</h3>
             <CodeBlock code="gfs config user.name"/>
@@ -957,7 +963,8 @@ const CLAUDE_CONFIG_WITH_PATH: &str = r#"{
   }
 }"#;
 
-const CLAUDE_CONFIG_PATH_MACOS: &str = "~/Library/Application Support/Claude/claude_desktop_config.json";
+const CLAUDE_CONFIG_PATH_MACOS: &str =
+    "~/Library/Application Support/Claude/claude_desktop_config.json";
 const CLAUDE_CONFIG_PATH_WIN: &str = "%APPDATA%/Claude/claude_desktop_config.json";
 const CLAUDE_CONFIG_PATH_LINUX: &str = "~/.config/Claude/claude_desktop_config.json";
 
@@ -1152,7 +1159,7 @@ gfs mcp web --port 8080"/>
 
             <h2>"With Repository Path"</h2>
             <CodeBlock code="gfs mcp --path /path/to/repo start
-gfs mcp --path /path/to/repo web --port 8080"/>
+    gfs mcp --path /path/to/repo web --port 8080"/>
 
             <h2>"Endpoint"</h2>
             <p>"Clients send JSON-RPC requests to "<code>"POST http://127.0.0.1:PORT/mcp"</code>". The server uses the streamable HTTP transport. No authentication is required by default."</p>

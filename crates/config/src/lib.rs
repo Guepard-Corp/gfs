@@ -127,7 +127,10 @@ mod tests {
     fn config_load_none_returns_defaults() {
         let config = Config::load(None).unwrap();
         assert!(!config.node.id.is_empty() || config.node.id == "unknown");
-        assert_eq!(config.control_plane.otel_logs_endpoint, "http://localhost:7281");
+        assert_eq!(
+            config.control_plane.otel_logs_endpoint,
+            "http://localhost:7281"
+        );
         assert!(config.control_plane.otel_metrics_endpoint.contains("7280"));
         assert_eq!(config.metrics.interval_secs, 5);
     }

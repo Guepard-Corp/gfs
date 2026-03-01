@@ -109,7 +109,7 @@ jobs:
           fi
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact_name }}
           path: |
@@ -128,7 +128,7 @@ jobs:
           sha256sum gfs-ai-tools-${VERSION}.tar.gz > gfs-ai-tools-${VERSION}.tar.gz.sha256
 
       - name: Upload AI tools artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: gfs-ai-tools
           path: |
@@ -142,7 +142,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
 
       - name: Prepare artifacts
         run: |

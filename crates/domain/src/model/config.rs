@@ -104,7 +104,10 @@ mod tests {
         let loaded = GfsConfig::load(dir.path()).unwrap();
         assert_eq!(loaded.mount_point, config.mount_point);
         assert_eq!(loaded.version, config.version);
-        assert_eq!(loaded.environment.as_ref().unwrap().database_provider, "postgres");
+        assert_eq!(
+            loaded.environment.as_ref().unwrap().database_provider,
+            "postgres"
+        );
         assert_eq!(loaded.runtime.as_ref().unwrap().container_name, "c1");
     }
 

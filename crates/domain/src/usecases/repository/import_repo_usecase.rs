@@ -126,8 +126,7 @@ impl<R: DatabaseProviderRegistry> ImportRepoUseCase<R> {
         };
 
         // 1. Load repo config.
-        let config = GfsConfig::load(path)
-            .map_err(|e| ImportRepoError::Config(e.to_string()))?;
+        let config = GfsConfig::load(path).map_err(|e| ImportRepoError::Config(e.to_string()))?;
 
         let provider_name = config
             .environment
@@ -228,6 +227,7 @@ mod tests {
     use async_trait::async_trait;
 
     use crate::model::config::{EnvironmentConfig, RuntimeConfig};
+    use crate::model::layout::GFS_DIR;
     use crate::ports::compute::{
         Compute, ComputeDefinition, InstanceId, InstanceState, InstanceStatus, StartOptions,
     };
@@ -235,7 +235,6 @@ mod tests {
         ConnectionParams, DatabaseProvider, DatabaseProviderArg, DatabaseProviderRegistry,
         ImportSpec, ProviderError, Result as RegistryResult, SIGTERM, SupportedFeature,
     };
-    use crate::model::layout::GFS_DIR;
 
     #[test]
     fn format_from_extension_sql() {
@@ -244,7 +243,10 @@ mod tests {
 
     #[test]
     fn format_from_extension_dump() {
-        assert_eq!(format_from_extension(Path::new("backup.dump")), Some("custom"));
+        assert_eq!(
+            format_from_extension(Path::new("backup.dump")),
+            Some("custom")
+        );
     }
 
     #[test]
@@ -524,9 +526,7 @@ mod tests {
             Arc::new(MockCompute { exit_code: 0 }),
             Arc::new(MockRegistry),
         );
-        let result = usecase
-            .run(dir.path(), input_file.clone(), "sql")
-            .await;
+        let result = usecase.run(dir.path(), input_file.clone(), "sql").await;
         assert!(result.is_ok());
         let output = result.unwrap();
         assert_eq!(output.format, "sql");

@@ -83,8 +83,7 @@ impl<R: DatabaseProviderRegistry> ExportRepoUseCase<R> {
         format: &str,
     ) -> Result<ExportOutput, ExportRepoError> {
         // 1. Load repo config.
-        let config = GfsConfig::load(path)
-            .map_err(|e| ExportRepoError::Config(e.to_string()))?;
+        let config = GfsConfig::load(path).map_err(|e| ExportRepoError::Config(e.to_string()))?;
 
         let provider_name = config
             .environment
@@ -178,6 +177,7 @@ mod tests {
     use async_trait::async_trait;
 
     use crate::model::config::{EnvironmentConfig, RuntimeConfig};
+    use crate::model::layout::GFS_DIR;
     use crate::ports::compute::{
         Compute, ComputeDefinition, InstanceId, InstanceState, InstanceStatus, StartOptions,
     };
@@ -185,7 +185,6 @@ mod tests {
         ConnectionParams, DatabaseProvider, DatabaseProviderArg, DatabaseProviderRegistry,
         ExportSpec, ProviderError, Result as RegistryResult, SIGTERM, SupportedFeature,
     };
-    use crate::model::layout::GFS_DIR;
 
     struct MockCompute {
         exit_code: i32,
@@ -413,7 +412,11 @@ mod tests {
         }
     }
 
-    fn create_repo_with_config(dir: &std::path::Path, env: &EnvironmentConfig, runtime: &RuntimeConfig) {
+    fn create_repo_with_config(
+        dir: &std::path::Path,
+        env: &EnvironmentConfig,
+        runtime: &RuntimeConfig,
+    ) {
         let gfs_dir = dir.join(GFS_DIR);
         std::fs::create_dir_all(&gfs_dir).unwrap();
         let config = GfsConfig {
@@ -446,9 +449,7 @@ mod tests {
             Arc::new(MockRegistry),
         );
         let output_dir = dir.path().join("export_out");
-        let result = usecase
-            .run(dir.path(), output_dir.clone(), "sql")
-            .await;
+        let result = usecase.run(dir.path(), output_dir.clone(), "sql").await;
         assert!(result.is_ok());
         let output = result.unwrap();
         assert_eq!(output.format, "sql");
@@ -500,7 +501,9 @@ mod tests {
             Arc::new(MockCompute { exit_code: 0 }),
             Arc::new(MockRegistry),
         );
-        let result = usecase.run(dir.path(), dir.path().to_path_buf(), "sql").await;
+        let result = usecase
+            .run(dir.path(), dir.path().to_path_buf(), "sql")
+            .await;
         assert!(matches!(result, Err(ExportRepoError::NotConfigured(_))));
     }
 
@@ -529,7 +532,9 @@ mod tests {
             Arc::new(MockCompute { exit_code: 0 }),
             Arc::new(MockRegistry),
         );
-        let result = usecase.run(dir.path(), dir.path().to_path_buf(), "sql").await;
+        let result = usecase
+            .run(dir.path(), dir.path().to_path_buf(), "sql")
+            .await;
         assert!(matches!(result, Err(ExportRepoError::NotConfigured(_))));
     }
 
@@ -551,7 +556,9 @@ mod tests {
             Arc::new(MockCompute { exit_code: 0 }),
             Arc::new(MockRegistry),
         );
-        let result = usecase.run(dir.path(), dir.path().to_path_buf(), "sql").await;
+        let result = usecase
+            .run(dir.path(), dir.path().to_path_buf(), "sql")
+            .await;
         assert!(matches!(result, Err(ExportRepoError::ProviderNotFound(_))));
     }
 
@@ -573,7 +580,9 @@ mod tests {
             Arc::new(MockCompute { exit_code: 0 }),
             Arc::new(MockRegistry),
         );
-        let result = usecase.run(dir.path(), dir.path().to_path_buf(), "custom").await;
+        let result = usecase
+            .run(dir.path(), dir.path().to_path_buf(), "custom")
+            .await;
         assert!(matches!(result, Err(ExportRepoError::UnsupportedFormat(_))));
     }
 }

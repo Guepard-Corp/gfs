@@ -6,7 +6,7 @@ use std::sync::Arc;
 use gfs_domain::ports::compute::{ComputeDefinition, EnvVar, PortMapping};
 use gfs_domain::ports::database_provider::{
     ConnectionParams, DataFormat, DatabaseProvider, DatabaseProviderArg, DatabaseProviderRegistry,
-    ExportSpec, ImportSpec, ProviderError, Result, SchemaExtractionSpec, SIGTERM, SupportedFeature,
+    ExportSpec, ImportSpec, ProviderError, Result, SIGTERM, SchemaExtractionSpec, SupportedFeature,
 };
 
 const NAME: &str = "mysql";
@@ -393,7 +393,8 @@ impl DatabaseProvider for MysqlProvider {
             ) as result
             FROM information_schema.SCHEMATA
             WHERE SCHEMA_NAME NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
-            ORDER BY SCHEMA_NAME;".to_string(),
+            ORDER BY SCHEMA_NAME;"
+                .to_string(),
         );
 
         // Tables query - returns JSON array of tables with metadata
@@ -421,7 +422,8 @@ impl DatabaseProvider for MysqlProvider {
             FROM information_schema.TABLES
             WHERE TABLE_SCHEMA NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
                 AND TABLE_TYPE = 'BASE TABLE'
-            ORDER BY TABLE_SCHEMA, TABLE_NAME;".to_string(),
+            ORDER BY TABLE_SCHEMA, TABLE_NAME;"
+                .to_string(),
         );
 
         // Columns query - returns JSON array of columns with full metadata
@@ -454,7 +456,8 @@ impl DatabaseProvider for MysqlProvider {
             ) as result
             FROM information_schema.COLUMNS
             WHERE TABLE_SCHEMA NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
-            ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION;".to_string(),
+            ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION;"
+                .to_string(),
         );
 
         queries

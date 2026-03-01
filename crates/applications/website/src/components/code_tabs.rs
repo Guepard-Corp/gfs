@@ -1,5 +1,5 @@
-use leptos::*;
 use crate::components::CodeBlock;
+use leptos::*;
 
 #[component]
 pub fn CodeTabs() -> impl IntoView {

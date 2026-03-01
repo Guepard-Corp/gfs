@@ -153,6 +153,50 @@ fn paths_differ(a: &str, b: &str) -> bool {
     }
 }
 
+async fn get_data_bind_host_path<R: DatabaseProviderRegistry>(
+    compute: &dyn Compute,
+    registry: &R,
+    instance_id: &InstanceId,
+    provider_name: &str,
+) -> Option<String> {
+    let provider = registry.get(provider_name)?;
+    let compute_data_path = provider
+        .definition()
+        .data_dir
+        .to_string_lossy()
+        .into_owned();
+    compute
+        .get_instance_data_mount_host_path(instance_id, &compute_data_path)
+        .await
+        .ok()
+        .flatten()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Build connection string using DatabaseProvider from the registry and connection info from Compute.
+async fn build_connection_string<R: DatabaseProviderRegistry>(
+    compute: &dyn Compute,
+    registry: &R,
+    instance_id: &InstanceId,
+    provider_name: &str,
+) -> String {
+    let provider = match registry.get(provider_name) {
+        Some(p) => p,
+        None => return String::new(),
+    };
+    let compute_port = provider.default_port();
+    let info = match compute.get_connection_info(instance_id, compute_port).await {
+        Ok(i) => i,
+        Err(_) => return String::new(),
+    };
+    let params = ConnectionParams {
+        host: info.host,
+        port: info.port,
+        env: info.env,
+    };
+    provider.connection_string(&params).unwrap_or_default()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -582,48 +626,4 @@ mod tests {
         assert_eq!(compute.container_id, "container-1");
         assert_eq!(compute.container_status, "running");
     }
-}
-
-async fn get_data_bind_host_path<R: DatabaseProviderRegistry>(
-    compute: &dyn Compute,
-    registry: &R,
-    instance_id: &InstanceId,
-    provider_name: &str,
-) -> Option<String> {
-    let provider = registry.get(provider_name)?;
-    let compute_data_path = provider
-        .definition()
-        .data_dir
-        .to_string_lossy()
-        .into_owned();
-    compute
-        .get_instance_data_mount_host_path(instance_id, &compute_data_path)
-        .await
-        .ok()
-        .flatten()
-        .map(|p| p.to_string_lossy().into_owned())
-}
-
-/// Build connection string using DatabaseProvider from the registry and connection info from Compute.
-async fn build_connection_string<R: DatabaseProviderRegistry>(
-    compute: &dyn Compute,
-    registry: &R,
-    instance_id: &InstanceId,
-    provider_name: &str,
-) -> String {
-    let provider = match registry.get(provider_name) {
-        Some(p) => p,
-        None => return String::new(),
-    };
-    let compute_port = provider.default_port();
-    let info = match compute.get_connection_info(instance_id, compute_port).await {
-        Ok(i) => i,
-        Err(_) => return String::new(),
-    };
-    let params = ConnectionParams {
-        host: info.host,
-        port: info.port,
-        env: info.env,
-    };
-    provider.connection_string(&params).unwrap_or_default()
 }

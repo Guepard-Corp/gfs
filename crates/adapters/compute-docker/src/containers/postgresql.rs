@@ -6,7 +6,7 @@ use std::sync::Arc;
 use gfs_domain::ports::compute::{ComputeDefinition, EnvVar, PortMapping};
 use gfs_domain::ports::database_provider::{
     ConnectionParams, DataFormat, DatabaseProvider, DatabaseProviderArg, DatabaseProviderRegistry,
-    ExportSpec, ImportSpec, ProviderError, Result, SchemaExtractionSpec, SIGTERM, SupportedFeature,
+    ExportSpec, ImportSpec, ProviderError, Result, SIGTERM, SchemaExtractionSpec, SupportedFeature,
 };
 
 const NAME: &str = "postgres";
@@ -435,7 +435,8 @@ impl DatabaseProvider for PostgresqlProvider {
                     AND nspname NOT LIKE 'pg_temp_%'
                     AND nspname NOT LIKE 'pg_toast_temp_%'
                 ORDER BY nspname
-            ) t;".to_string(),
+            ) t;"
+                .to_string(),
         );
 
         // Tables query - returns JSON array of tables with metadata
@@ -461,7 +462,8 @@ impl DatabaseProvider for PostgresqlProvider {
                 WHERE c.relkind = 'r'
                     AND n.nspname NOT IN ('pg_catalog', 'information_schema')
                 ORDER BY n.nspname, c.relname
-            ) t;".to_string(),
+            ) t;"
+                .to_string(),
         );
 
         // Columns query - returns JSON array of columns with full metadata
@@ -498,7 +500,8 @@ impl DatabaseProvider for PostgresqlProvider {
                 FROM information_schema.columns cols
                 WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
                 ORDER BY table_schema, table_name, ordinal_position
-            ) t;".to_string(),
+            ) t;"
+                .to_string(),
         );
 
         queries
@@ -761,7 +764,9 @@ mod tests {
             port: 5432,
             env: vec![],
         };
-        let spec = provider.import_spec(&params, "custom", "import.dump").unwrap();
+        let spec = provider
+            .import_spec(&params, "custom", "import.dump")
+            .unwrap();
         assert!(spec.command.contains("pg_restore"));
         assert!(spec.command.contains("/data/import.dump"));
         assert_eq!(spec.input_filename, "import.dump");
@@ -817,7 +822,10 @@ mod tests {
             ],
         };
         let spec = provider.import_spec(&params, "csv", "import.csv").unwrap();
-        assert!(spec.command.contains("CREATE TABLE IF NOT EXISTS csv_import"));
+        assert!(
+            spec.command
+                .contains("CREATE TABLE IF NOT EXISTS csv_import")
+        );
         assert!(spec.command.contains("/data/import.csv"));
         assert!(spec.command.contains("FORMAT csv"));
         assert!(spec.command.contains("HEADER true"));

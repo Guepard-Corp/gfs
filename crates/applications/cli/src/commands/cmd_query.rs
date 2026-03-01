@@ -66,7 +66,9 @@ pub async fn run(
     let conn_info = compute
         .get_connection_info(&instance_id, default_port)
         .await
-        .context("failed to get connection info (is the database running? try 'gfs compute start')")?;
+        .context(
+            "failed to get connection info (is the database running? try 'gfs compute start')",
+        )?;
 
     // Override database name if --database flag is provided
     let mut env = conn_info.env;

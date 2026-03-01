@@ -188,11 +188,12 @@ impl<R: DatabaseProviderRegistry> ExtractSchemaUseCase<R> {
     }
 }
 
+/// Parsed schema output from the extraction sidecar.
+type ParseSchemaOutput = (String, Vec<Schema>, Vec<Table>, Vec<Column>);
+
 /// Parse the stdout from the schema extraction sidecar.
 /// Expected format: delimiter lines followed by content until the next delimiter.
-fn parse_schema_output(
-    stdout: &str,
-) -> Result<(String, Vec<Schema>, Vec<Table>, Vec<Column>), String> {
+fn parse_schema_output(stdout: &str) -> Result<ParseSchemaOutput, String> {
     let mut version = String::new();
     let mut schemas = Vec::new();
     let mut tables = Vec::new();
@@ -205,22 +206,50 @@ fn parse_schema_output(
         let trimmed = line.trim();
         match trimmed {
             DELIM_VERSION => {
-                flush_section(current_section, &current_lines, &mut version, &mut schemas, &mut tables, &mut columns)?;
+                flush_section(
+                    current_section,
+                    &current_lines,
+                    &mut version,
+                    &mut schemas,
+                    &mut tables,
+                    &mut columns,
+                )?;
                 current_section = Some("version");
                 current_lines.clear();
             }
             DELIM_SCHEMAS => {
-                flush_section(current_section, &current_lines, &mut version, &mut schemas, &mut tables, &mut columns)?;
+                flush_section(
+                    current_section,
+                    &current_lines,
+                    &mut version,
+                    &mut schemas,
+                    &mut tables,
+                    &mut columns,
+                )?;
                 current_section = Some("schemas");
                 current_lines.clear();
             }
             DELIM_TABLES => {
-                flush_section(current_section, &current_lines, &mut version, &mut schemas, &mut tables, &mut columns)?;
+                flush_section(
+                    current_section,
+                    &current_lines,
+                    &mut version,
+                    &mut schemas,
+                    &mut tables,
+                    &mut columns,
+                )?;
                 current_section = Some("tables");
                 current_lines.clear();
             }
             DELIM_COLUMNS => {
-                flush_section(current_section, &current_lines, &mut version, &mut schemas, &mut tables, &mut columns)?;
+                flush_section(
+                    current_section,
+                    &current_lines,
+                    &mut version,
+                    &mut schemas,
+                    &mut tables,
+                    &mut columns,
+                )?;
                 current_section = Some("columns");
                 current_lines.clear();
             }
@@ -231,7 +260,14 @@ fn parse_schema_output(
             }
         }
     }
-    flush_section(current_section, &current_lines, &mut version, &mut schemas, &mut tables, &mut columns)?;
+    flush_section(
+        current_section,
+        &current_lines,
+        &mut version,
+        &mut schemas,
+        &mut tables,
+        &mut columns,
+    )?;
 
     Ok((version, schemas, tables, columns))
 }
@@ -305,12 +341,12 @@ mod tests {
 
     use crate::model::config::{EnvironmentConfig, GfsConfig, RuntimeConfig};
     use crate::ports::compute::{
-        Compute, ComputeDefinition, ExecOutput, InstanceId, InstanceStatus, InstanceState,
+        Compute, ComputeDefinition, ExecOutput, InstanceId, InstanceState, InstanceStatus,
         PortMapping, StartOptions,
     };
     use crate::ports::database_provider::{
         ConnectionParams, DatabaseProvider, DatabaseProviderArg, DatabaseProviderRegistry,
-        ProviderError, Result as RegistryResult, SchemaExtractionSpec, SIGTERM, SupportedFeature,
+        ProviderError, Result as RegistryResult, SIGTERM, SchemaExtractionSpec, SupportedFeature,
     };
 
     fn existing_repo_path() -> (TempDir, std::path::PathBuf) {
@@ -320,7 +356,11 @@ mod tests {
         (temp, path)
     }
 
-    fn write_config(path: &std::path::Path, env: Option<EnvironmentConfig>, runtime: Option<RuntimeConfig>) {
+    fn write_config(
+        path: &std::path::Path,
+        env: Option<EnvironmentConfig>,
+        runtime: Option<RuntimeConfig>,
+    ) {
         let config = GfsConfig {
             mount_point: None,
             version: String::new(),
@@ -387,7 +427,10 @@ GFS_SCHEMA_TABLES
 
         let result = parse_schema_output(stdout);
         let err = result.unwrap_err();
-        assert!(err.contains("no JSON found") || err.contains("parse schemas"), "expected parse error, got: {err}");
+        assert!(
+            err.contains("no JSON found") || err.contains("parse schemas"),
+            "expected parse error, got: {err}"
+        );
     }
 
     #[test]
@@ -408,18 +451,10 @@ GFS_SCHEMA_TABLES
     // Mock Compute for ExtractSchemaUseCase
     // -----------------------------------------------------------------------
 
+    #[derive(Default)]
     struct SchemaExtractMockCompute {
         run_task_stdout: String,
         run_task_exit_code: i32,
-    }
-
-    impl Default for SchemaExtractMockCompute {
-        fn default() -> Self {
-            Self {
-                run_task_stdout: String::new(),
-                run_task_exit_code: 0,
-            }
-        }
     }
 
     #[async_trait]
@@ -631,7 +666,9 @@ GFS_SCHEMA_TABLES
         }
         fn get(&self, name: &str) -> Option<Arc<dyn DatabaseProvider>> {
             if name == "mock-schema" {
-                self.provider.as_ref().map(|p| Arc::clone(p) as Arc<dyn DatabaseProvider>)
+                self.provider
+                    .as_ref()
+                    .map(|p| Arc::clone(p) as Arc<dyn DatabaseProvider>)
             } else {
                 None
             }
@@ -725,7 +762,10 @@ GFS_SCHEMA_COLUMNS
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.to_string().contains("unknown-provider") || err.to_string().contains("ProviderNotFound"));
+        assert!(
+            err.to_string().contains("unknown-provider")
+                || err.to_string().contains("ProviderNotFound")
+        );
     }
 
     #[tokio::test]
@@ -761,7 +801,8 @@ GFS_SCHEMA_COLUMNS
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            err.to_string().contains("does not support schema extraction"),
+            err.to_string()
+                .contains("does not support schema extraction"),
             "expected ExtractionFailed, got: {err}"
         );
     }

@@ -1,9 +1,7 @@
 use leptos::*;
 
 #[component]
-pub fn CodeBlock(
-    #[prop(into)] code: String,
-) -> impl IntoView {
+pub fn CodeBlock(#[prop(into)] code: String) -> impl IntoView {
     view! {
         <div class="code-block-wrapper">
             <pre>

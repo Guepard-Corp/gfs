@@ -10,9 +10,9 @@ use gfs_domain::ports::database_provider::{
 };
 use gfs_domain::repo_utils::repo_layout;
 
+use crate::ComputeAction;
 use crate::cli_utils::{get_repo_dir, relativize_to_repo};
 use crate::output::{dimmed, green, red, yellow};
-use crate::ComputeAction;
 
 // ---------------------------------------------------------------------------
 // Entry point called from main
@@ -203,12 +203,12 @@ fn format_state(state: &InstanceState) -> &'static str {
 fn format_state_colored(state: &InstanceState) -> String {
     let s = format_state(state);
     match state {
-        InstanceState::Running => format!("{}", green(s)),
-        InstanceState::Starting | InstanceState::Restarting => format!("{}", yellow(s)),
+        InstanceState::Running => green(s).to_string(),
+        InstanceState::Starting | InstanceState::Restarting => yellow(s).to_string(),
         InstanceState::Stopped | InstanceState::Stopping | InstanceState::Paused => {
-            format!("{}", dimmed(s))
+            dimmed(s).to_string()
         }
-        InstanceState::Failed | InstanceState::Unknown => format!("{}", red(s)),
+        InstanceState::Failed | InstanceState::Unknown => red(s).to_string(),
     }
 }
 

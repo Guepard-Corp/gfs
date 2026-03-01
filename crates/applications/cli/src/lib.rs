@@ -68,12 +68,30 @@ pub enum SchemaAction {
 
 #[derive(Subcommand)]
 pub enum ComputeAction {
-    Status { #[arg(long)] id: Option<String> },
-    Start { #[arg(long)] id: Option<String> },
-    Stop { #[arg(long)] id: Option<String> },
-    Restart { #[arg(long)] id: Option<String> },
-    Pause { #[arg(long)] id: Option<String> },
-    Unpause { #[arg(long)] id: Option<String> },
+    Status {
+        #[arg(long)]
+        id: Option<String>,
+    },
+    Start {
+        #[arg(long)]
+        id: Option<String>,
+    },
+    Stop {
+        #[arg(long)]
+        id: Option<String>,
+    },
+    Restart {
+        #[arg(long)]
+        id: Option<String>,
+    },
+    Pause {
+        #[arg(long)]
+        id: Option<String>,
+    },
+    Unpause {
+        #[arg(long)]
+        id: Option<String>,
+    },
     Logs {
         #[arg(long)]
         id: Option<String>,
@@ -330,7 +348,10 @@ enum StorageAction {
         #[arg(long)]
         mount_point: PathBuf,
     },
-    Unmount { #[arg(long)] id: String },
+    Unmount {
+        #[arg(long)]
+        id: String,
+    },
     Snapshot {
         #[arg(long)]
         id: String,
@@ -345,8 +366,14 @@ enum StorageAction {
         #[arg(long)]
         from_snapshot: Option<String>,
     },
-    Status { #[arg(long)] id: String },
-    Quota { #[arg(long)] id: String },
+    Status {
+        #[arg(long)]
+        id: String,
+    },
+    Quota {
+        #[arg(long)]
+        id: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -443,7 +470,8 @@ where
                 no_color,
             } => {
                 let no_color = no_color || cli.color == ColorMode::Never;
-                commands::cmd_schema::run_diff(commit1, commit2, path, pretty, json, no_color).await?
+                commands::cmd_schema::run_diff(commit1, commit2, path, pretty, json, no_color)
+                    .await?
             }
         },
         TopLevel::Storage { action } => run_storage(action).await?,
@@ -569,13 +597,21 @@ mod tests {
     #[tokio::test]
     async fn run_version_succeeds() {
         let result = run(["gfs", "version"]).await;
-        assert!(result.is_ok(), "gfs version should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "gfs version should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[tokio::test]
     async fn run_providers_succeeds() {
         let result = run(["gfs", "providers"]).await;
-        assert!(result.is_ok(), "gfs providers should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "gfs providers should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[tokio::test]

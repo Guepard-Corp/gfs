@@ -23,14 +23,12 @@ where
         let stdout_path = stdout_file.path().to_path_buf();
         let stderr_path = stderr_file.path().to_path_buf();
 
-        let _stdout_redirect = gag::Redirect::stdout(
-            std::fs::File::create(&stdout_path).expect("create stdout file"),
-        )
-        .expect("redirect stdout");
-        let _stderr_redirect = gag::Redirect::stderr(
-            std::fs::File::create(&stderr_path).expect("create stderr file"),
-        )
-        .expect("redirect stderr");
+        let _stdout_redirect =
+            gag::Redirect::stdout(std::fs::File::create(&stdout_path).expect("create stdout file"))
+                .expect("redirect stdout");
+        let _stderr_redirect =
+            gag::Redirect::stderr(std::fs::File::create(&stderr_path).expect("create stderr file"))
+                .expect("redirect stderr");
 
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let result = rt.block_on(gfs_cli::run(args.iter().map(|s| s.as_str())));
@@ -45,7 +43,7 @@ where
             Ok(_) => (true, stderr),
             Err(e) => (false, format!("{stderr}{e:#}")),
         };
-        return (ok, stdout, stderr);
+        (ok, stdout, stderr)
     }
 
     #[cfg(not(unix))]
@@ -161,24 +159,12 @@ pub fn gfs_log(path: &Path, max_count: Option<usize>) -> (bool, String, String) 
 
 /// Convenience: gfs compute --path <path> status
 pub fn gfs_compute_status(path: &Path) -> (bool, String, String) {
-    run_gfs([
-        "gfs",
-        "compute",
-        "--path",
-        path.to_str().unwrap(),
-        "status",
-    ])
+    run_gfs(["gfs", "compute", "--path", path.to_str().unwrap(), "status"])
 }
 
 /// Convenience: gfs compute --path <path> stop
 pub fn gfs_compute_stop(path: &Path) -> (bool, String, String) {
-    run_gfs([
-        "gfs",
-        "compute",
-        "--path",
-        path.to_str().unwrap(),
-        "stop",
-    ])
+    run_gfs(["gfs", "compute", "--path", path.to_str().unwrap(), "stop"])
 }
 
 /// Convenience: gfs import --path <path> --file <file> [--format fmt]

@@ -55,7 +55,8 @@ fn print_commit_block(cwr: &gfs_domain::model::commit::CommitWithRefs, full_hash
         .unwrap_or("0000000000000000000000000000000000000000000000000000000000000000");
 
     // Display short or full hash based on flag
-    let hash_display = gfs_domain::repo_utils::repo_layout::format_commit_hash(hash_full, full_hash);
+    let hash_display =
+        gfs_domain::repo_utils::repo_layout::format_commit_hash(hash_full, full_hash);
 
     let refs_str = if cwr.refs.is_empty() {
         String::new()
@@ -74,7 +75,12 @@ fn print_commit_block(cwr: &gfs_domain::model::commit::CommitWithRefs, full_hash
     let author_line = if author_email.is_empty() {
         format!("{} {}", dimmed("Author:"), author)
     } else {
-        format!("{} {} <{}>", dimmed("Author:"), author, dimmed(author_email))
+        format!(
+            "{} {} <{}>",
+            dimmed("Author:"),
+            author,
+            dimmed(author_email)
+        )
     };
     println!("{}", author_line);
 

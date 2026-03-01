@@ -650,17 +650,17 @@ impl DockerCompute {
             .condition("not-running")
             .build();
         let mut stream = self.docker.wait_container(&id.0, Some(wait_opts));
-        if let Some(item) = stream.next().await {
-            if let Err(e) = item {
-                use bollard::errors::Error as BollardError;
-                // DockerContainerWaitError means the container exited (possibly with non-zero code).
-                // Treat as success so run_task can capture logs and exit code for the caller.
-                if matches!(e, BollardError::DockerContainerWaitError { .. }) {
-                    return Ok(());
-                }
-                let msg = format!("Docker container wait error: {e:?}");
-                return Err(ComputeError::Internal(msg));
+        if let Some(item) = stream.next().await
+            && let Err(e) = item
+        {
+            use bollard::errors::Error as BollardError;
+            // DockerContainerWaitError means the container exited (possibly with non-zero code).
+            // Treat as success so run_task can capture logs and exit code for the caller.
+            if matches!(e, BollardError::DockerContainerWaitError { .. }) {
+                return Ok(());
             }
+            let msg = format!("Docker container wait error: {e:?}");
+            return Err(ComputeError::Internal(msg));
         }
         Ok(())
     }

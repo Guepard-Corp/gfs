@@ -550,9 +550,17 @@ mod tests {
         );
         let dir = tempfile::tempdir().unwrap();
         let result = usecase
-            .run(dir.path().to_path_buf(), None, Some("postgres".into()), None)
+            .run(
+                dir.path().to_path_buf(),
+                None,
+                Some("postgres".into()),
+                None,
+            )
             .await;
-        assert!(matches!(result, Err(InitRepoError::DatabaseVersionRequired)));
+        assert!(matches!(
+            result,
+            Err(InitRepoError::DatabaseVersionRequired)
+        ));
     }
 
     #[tokio::test]
