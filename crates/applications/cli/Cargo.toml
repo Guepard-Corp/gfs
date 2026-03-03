@@ -56,3 +56,8 @@ tokio              = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 gfs-storage-apfs = { workspace = true }
+
+[features]
+default = []
+# Enable GPU acceleration on macOS
+metal = ["gfs-ai-models/metal"]

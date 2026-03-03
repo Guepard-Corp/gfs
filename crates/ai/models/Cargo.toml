@@ -12,6 +12,16 @@ gfs-domain = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
+anyhow = { workspace = true }
+
+# GPU acceleration (optional, enabled by feature flag)
+candle-core = { version = "0.8", optional = true, features = ["metal"] }
+accelerate-src = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[features]
+default = []
+# Enable GPU acceleration on macOS
+metal = ["candle-core", "accelerate-src"]

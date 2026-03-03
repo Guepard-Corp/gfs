@@ -76,6 +76,11 @@ impl DataGraph {
     pub fn neighbours(&self, idx: usize) -> &[usize] {
         &self.adjacency[idx]
     }
+
+    /// Get a reference to all nodes in the graph.
+    pub fn nodes(&self) -> &[DataNode] {
+        &self.nodes
+    }
 }
 
 // ── Builder ───────────────────────────────────────────────────────────────────

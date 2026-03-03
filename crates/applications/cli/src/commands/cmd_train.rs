@@ -52,6 +52,14 @@ pub enum TrainAction {
         /// Skip evaluation metrics (faster training)
         #[arg(long)]
         skip_metrics: bool,
+
+        /// Disable GPU acceleration (force CPU training)
+        #[arg(long)]
+        no_gpu: bool,
+
+        /// GPU batch size for Metal operations
+        #[arg(long)]
+        gpu_batch_size: Option<usize>,
     },
 
     /// Resume training from checkpoint
@@ -96,7 +104,9 @@ pub async fn run(action: TrainAction) -> Result<()> {
             tables,
             row_limit,
             skip_metrics,
-        } => run_start(path, output, config, database, tables, row_limit, skip_metrics).await,
+            no_gpu,
+            gpu_batch_size,
+        } => run_start(path, output, config, database, tables, row_limit, skip_metrics, no_gpu, gpu_batch_size).await,
 
         TrainAction::Resume {
             path,
@@ -125,6 +135,8 @@ async fn run_start(
     tables: Option<Vec<String>>,
     row_limit: Option<usize>,
     skip_metrics: bool,
+    no_gpu: bool,
+    gpu_batch_size: Option<usize>,
 ) -> Result<()> {
     // 1. Load GFS config
     let repo_path = path.unwrap_or_else(get_repo_dir);
@@ -160,6 +172,14 @@ async fn run_start(
     }
     if skip_metrics {
         train_config.training.compute_metrics = false;
+    }
+    // GPU configuration
+    if no_gpu {
+        train_config.model.w2v.force_cpu = true;
+        train_config.model.w2v.use_gpu = false;
+    }
+    if let Some(batch_size) = gpu_batch_size {
+        train_config.model.w2v.gpu_batch_size = batch_size;
     }
 
     // 4. Set up infrastructure

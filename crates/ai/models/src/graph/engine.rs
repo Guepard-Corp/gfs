@@ -321,6 +321,12 @@ impl GraphSemanticEngine {
         if self.hnsw.is_none() {
             return Err(GraphError::NotTrained);
         }
+
+        // Create parent directory if it doesn't exist
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
         self.w2v.save(&format!("{path}.w2v"))?;
         self.hnsw.as_ref().unwrap().save(&format!("{path}.hnsw"))?;
         Self::write_nodes(&self.nodes, &format!("{path}.gnodes"))?;

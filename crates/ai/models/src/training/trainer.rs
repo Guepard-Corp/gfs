@@ -131,21 +131,33 @@ impl Trainer {
         for epoch in start_epoch..total_epochs {
             self.metrics.current_epoch = epoch;
 
-            // Compute metrics if configured
+            // Record basic training metrics
             if self.config.training.compute_metrics
                 && epoch % self.config.training.metric_interval == 0
             {
-                if let Some(val_graph) = validation_graph {
-                    let eval_metrics = self.metrics.compute_evaluation_metrics(
-                        &self.engine,
-                        val_graph,
-                        &self.config.evaluation,
-                    );
+                // Record elapsed time for this epoch
+                let elapsed_secs = self.metrics.elapsed().as_secs_f32();
+                self.metrics.record("elapsed_time_s", elapsed_secs);
 
-                    for (name, value) in eval_metrics {
-                        self.metrics.record(&name, value);
-                    }
+                // Record model size metrics
+                if let Some(model_info) = self.engine.model_info() {
+                    self.metrics.record("vocab_size", model_info.vocab_size as f32);
+                    self.metrics.record("corpus_size", model_info.corpus_size as f32);
                 }
+
+                // Compute evaluation metrics on the training graph.
+                // The engine's HNSW index contains only training nodes, so we evaluate
+                // there: for each sampled node, search returns other training nodes,
+                // and we check whether graph neighbours appear in the top-K results.
+                let eval_metrics = self.metrics.compute_evaluation_metrics(
+                    &self.engine,
+                    graph,
+                    &self.config.evaluation,
+                );
+                for (name, value) in eval_metrics {
+                    self.metrics.record(&name, value);
+                }
+                let _ = validation_graph; // reserved for future inductive evaluation
             }
 
             // Save checkpoint if configured

@@ -8,6 +8,7 @@
 //===----------------------------------------------------------------------===//
 
 use super::vocab::Vocabulary;
+use super::backend::{BackendConfig, ComputeBackend, create_backend};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,6 +49,23 @@ pub struct Word2VecConfig {
     pub subsample_threshold: f64,
     /// Architecture (Skip-gram or CBOW)
     pub arch: W2VArchitecture,
+    /// Enable GPU acceleration (Metal on macOS)
+    #[serde(default = "default_use_gpu")]
+    pub use_gpu: bool,
+    /// Force CPU backend even if GPU available
+    #[serde(default)]
+    pub force_cpu: bool,
+    /// Batch size for GPU operations (Metal only)
+    #[serde(default = "default_gpu_batch_size")]
+    pub gpu_batch_size: usize,
+}
+
+fn default_use_gpu() -> bool {
+    true // Default to GPU if available
+}
+
+fn default_gpu_batch_size() -> usize {
+    1024
 }
 
 impl Default for Word2VecConfig {
@@ -63,6 +81,9 @@ impl Default for Word2VecConfig {
             min_learning_rate: 0.0001,
             subsample_threshold: 1e-5,
             arch: W2VArchitecture::SkipGram,
+            use_gpu: true,
+            force_cpu: false,
+            gpu_batch_size: 1024,
         }
     }
 }
@@ -121,6 +142,8 @@ pub struct Word2Vec {
     w_out: Vec<f32>,
     /// Atomic counter for words processed (for learning rate decay)
     words_processed: Arc<AtomicU64>,
+    /// Compute backend (CPU or Metal GPU)
+    backend: Arc<Box<dyn ComputeBackend>>,
 }
 
 impl Word2Vec {
@@ -131,12 +154,37 @@ impl Word2Vec {
 
     /// Create a new Word2Vec model with custom configuration
     pub fn with_config(cfg: Word2VecConfig) -> Self {
+        // Multi-threaded Word2Vec training is incompatible with GPU acceleration
+        // due to Metal command buffer synchronization issues.
+        // Force CPU backend if num_threads > 1.
+        let force_cpu_for_threading = cfg.num_threads > 1 && cfg.use_gpu;
+
+        if force_cpu_for_threading {
+            println!("ℹ️  Note: GPU acceleration is disabled for multi-threaded training");
+            println!("   Using CPU backend with {} threads for optimal performance", cfg.num_threads);
+            println!("   (GPU works best with single-threaded training: set num_threads=1)");
+        }
+
+        // Initialize backend based on configuration
+        let backend_config = BackendConfig {
+            prefer_gpu: cfg.use_gpu && !force_cpu_for_threading,
+            force_cpu: cfg.force_cpu || force_cpu_for_threading,
+            batch_size: cfg.gpu_batch_size,
+        };
+
+        let backend = create_backend(&backend_config)
+            .unwrap_or_else(|e| {
+                eprintln!("⚠ Failed to create backend: {}, falling back to CPU", e);
+                Box::new(super::backend::cpu::CpuBackend::new())
+            });
+
         Self {
             cfg,
             vocab: Vocabulary::new(),
             w_in: Vec::new(),
             w_out: Vec::new(),
             words_processed: Arc::new(AtomicU64::new(0)),
+            backend: Arc::new(backend),
         }
     }
 
@@ -190,6 +238,7 @@ impl Word2Vec {
                 let cfg = &self.cfg;
                 let vocab = &self.vocab;
                 let words_processed = &self.words_processed;
+                let backend = Arc::clone(&self.backend);
                 let w_in = w_in_ptr;
                 let w_out = w_out_ptr;
 
@@ -203,6 +252,7 @@ impl Word2Vec {
                         w_in,
                         w_out,
                         words_processed,
+                        backend,
                     );
                 });
             }
@@ -224,6 +274,7 @@ impl Word2Vec {
         w_in_ptr: SendPtr<f32>,
         w_out_ptr: SendPtr<f32>,
         words_processed: &AtomicU64,
+        backend: Arc<Box<dyn ComputeBackend>>,
     ) {
         // Extract raw pointers from SendPtr
         let w_in_ptr = w_in_ptr.0;
@@ -290,6 +341,7 @@ impl Word2Vec {
                                     vocab,
                                     w_in_ptr,
                                     w_out_ptr,
+                                    &backend,
                                 );
                             }
                         } else {
@@ -315,6 +367,7 @@ impl Word2Vec {
                                 vocab,
                                 w_in_ptr,
                                 w_out_ptr,
+                                &backend,
                             );
                         }
                     }
@@ -323,17 +376,6 @@ impl Word2Vec {
         }
     }
 
-    /// Fast sigmoid approximation
-    #[inline]
-    fn sigmoid(x: f32) -> f32 {
-        if x > 6.0 {
-            return 1.0;
-        }
-        if x < -6.0 {
-            return 0.0;
-        }
-        1.0 / (1.0 + (-x).exp())
-    }
 
     /// Train a single skip-gram pair (center word, context word)
     #[allow(clippy::too_many_arguments)]
@@ -347,6 +389,7 @@ impl Word2Vec {
         vocab: &Vocabulary,
         w_in_ptr: *mut f32,
         w_out_ptr: *mut f32,
+        backend: &Box<dyn ComputeBackend>,
     ) {
         let dim = cfg.dimension;
         let v_in = std::slice::from_raw_parts_mut(
@@ -363,8 +406,9 @@ impl Word2Vec {
                 dim,
             );
 
-            let dot: f32 = (0..dim).map(|d| v_in[d] * v_out[d]).sum();
-            let g = (1.0 - Self::sigmoid(dot)) * lr;
+            // Use backend for dot product
+            let dot = backend.dot_product(v_in, v_out);
+            let g = (1.0 - backend.sigmoid(dot)) * lr;
 
             for d in 0..dim {
                 grad_buf[d] += g * v_out[d];
@@ -384,8 +428,9 @@ impl Word2Vec {
                 dim,
             );
 
-            let dot: f32 = (0..dim).map(|d| v_in[d] * v_out[d]).sum();
-            let g = -Self::sigmoid(dot) * lr;
+            // Use backend for dot product
+            let dot = backend.dot_product(v_in, v_out);
+            let g = -backend.sigmoid(dot) * lr;
 
             for d in 0..dim {
                 grad_buf[d] += g * v_out[d];
@@ -412,6 +457,7 @@ impl Word2Vec {
         vocab: &Vocabulary,
         w_in_ptr: *mut f32,
         w_out_ptr: *mut f32,
+        backend: &Box<dyn ComputeBackend>,
     ) {
         let dim = cfg.dimension;
 
@@ -445,8 +491,9 @@ impl Word2Vec {
                 dim,
             );
 
-            let dot: f32 = (0..dim).map(|d| hidden[d] * v_out[d]).sum();
-            let g = (1.0 - Self::sigmoid(dot)) * lr;
+            // Use backend for dot product
+            let dot = backend.dot_product(hidden, v_out);
+            let g = (1.0 - backend.sigmoid(dot)) * lr;
 
             for d in 0..dim {
                 grad_buf[d] += g * v_out[d];
@@ -466,8 +513,9 @@ impl Word2Vec {
                 dim,
             );
 
-            let dot: f32 = (0..dim).map(|d| hidden[d] * v_out[d]).sum();
-            let g = -Self::sigmoid(dot) * lr;
+            // Use backend for dot product
+            let dot = backend.dot_product(hidden, v_out);
+            let g = -backend.sigmoid(dot) * lr;
 
             for d in 0..dim {
                 grad_buf[d] += g * v_out[d];
@@ -672,9 +720,14 @@ mod tests {
 
     #[test]
     fn test_sigmoid() {
-        assert_eq!(Word2Vec::sigmoid(100.0), 1.0);
-        assert_eq!(Word2Vec::sigmoid(-100.0), 0.0);
-        assert!((Word2Vec::sigmoid(0.0) - 0.5).abs() < 0.01);
+        // Test sigmoid via backend
+        use crate::core::backend::cpu::CpuBackend;
+        use crate::core::backend::ComputeBackend;
+
+        let backend = CpuBackend::new();
+        assert_eq!(backend.sigmoid(100.0), 1.0);
+        assert_eq!(backend.sigmoid(-100.0), 0.0);
+        assert!((backend.sigmoid(0.0) - 0.5).abs() < 0.01);
     }
 
     #[test]
