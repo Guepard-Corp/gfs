@@ -60,6 +60,7 @@ pub struct SchemaOutput {
 // ---------------------------------------------------------------------------
 
 const DELIM_VERSION: &str = "GFS_SCHEMA_VERSION";
+const DELIM_DATABASE: &str = "GFS_SCHEMA_DATABASE:";  // Format: GFS_SCHEMA_DATABASE:<dbname>
 const DELIM_SCHEMAS: &str = "GFS_SCHEMA_SCHEMAS";
 const DELIM_TABLES: &str = "GFS_SCHEMA_TABLES";
 const DELIM_COLUMNS: &str = "GFS_SCHEMA_COLUMNS";
@@ -157,17 +158,19 @@ impl<R: DatabaseProviderRegistry> ExtractSchemaUseCase<R> {
             )));
         }
 
-        // 6. Parse stdout into version, schemas, tables, columns.
-        let (version, schemas, tables, columns) =
-            parse_schema_output(&output.stdout).map_err(ExtractSchemaError::ExtractionFailed)?;
+        // 6. Parse stdout into version and databases.
+        let (version, databases) =
+            parse_multi_database_output(&output.stdout).map_err(ExtractSchemaError::ExtractionFailed)?;
 
-        // 7. Build metadata.
+        // 7. Build metadata using new multi-database format.
         let metadata = DatasourceMetadata {
             version,
             driver: provider_name,
-            schemas,
-            tables,
-            columns,
+            databases: Some(databases),
+            // Legacy fields set to None (using new format)
+            schemas: None,
+            tables: None,
+            columns: None,
             views: None,
             functions: None,
             indexes: None,
@@ -188,67 +191,130 @@ impl<R: DatabaseProviderRegistry> ExtractSchemaUseCase<R> {
     }
 }
 
-/// Parsed schema output from the extraction sidecar.
-type ParseSchemaOutput = (String, Vec<Schema>, Vec<Table>, Vec<Column>);
+/// Parsed multi-database schema output from the extraction sidecar.
+type ParseMultiDatabaseOutput = (String, Vec<crate::model::datasource::DatabaseMetadata>);
 
-/// Parse the stdout from the schema extraction sidecar.
-/// Expected format: delimiter lines followed by content until the next delimiter.
-fn parse_schema_output(stdout: &str) -> Result<ParseSchemaOutput, String> {
+/// Parse the stdout from the multi-database schema extraction sidecar.
+///
+/// Expected format:
+/// ```
+/// GFS_SCHEMA_VERSION
+/// <version string>
+/// GFS_SCHEMA_DATABASE:<dbname>
+/// GFS_SCHEMA_SCHEMAS
+/// <schemas JSON lines>
+/// GFS_SCHEMA_TABLES
+/// <tables JSON lines>
+/// GFS_SCHEMA_COLUMNS
+/// <columns JSON lines>
+/// GFS_SCHEMA_DATABASE:<dbname2>
+/// ...
+/// ```
+fn parse_multi_database_output(stdout: &str) -> Result<ParseMultiDatabaseOutput, String> {
     let mut version = String::new();
-    let mut schemas = Vec::new();
-    let mut tables = Vec::new();
-    let mut columns = Vec::new();
+    let mut databases: Vec<crate::model::datasource::DatabaseMetadata> = Vec::new();
+
+    let mut current_database_name: Option<String> = None;
+    let mut current_schemas: Vec<Schema> = Vec::new();
+    let mut current_tables: Vec<Table> = Vec::new();
+    let mut current_columns: Vec<Column> = Vec::new();
 
     let mut current_section: Option<&str> = None;
     let mut current_lines: Vec<&str> = Vec::new();
 
     for line in stdout.lines() {
         let trimmed = line.trim();
-        match trimmed {
-            DELIM_VERSION => {
-                flush_section(
+
+        // Check for database delimiter
+        if trimmed.starts_with(DELIM_DATABASE) {
+            // Flush previous database if any
+            if let Some(db_name) = current_database_name.take() {
+                // IMPORTANT: Flush current section first before flushing database
+                // Otherwise we lose the last section's data (often columns)
+                flush_section_multi_db(
                     current_section,
                     &current_lines,
                     &mut version,
-                    &mut schemas,
-                    &mut tables,
-                    &mut columns,
+                    &mut current_schemas,
+                    &mut current_tables,
+                    &mut current_columns,
+                )?;
+
+                databases.push(crate::model::datasource::DatabaseMetadata {
+                    name: db_name,
+                    schemas: std::mem::take(&mut current_schemas),
+                    tables: std::mem::take(&mut current_tables),
+                    columns: std::mem::take(&mut current_columns),
+                    views: None,
+                    functions: None,
+                    indexes: None,
+                    triggers: None,
+                    materialized_views: None,
+                    types: None,
+                    foreign_tables: None,
+                    policies: None,
+                    table_privileges: None,
+                    column_privileges: None,
+                    config: None,
+                    publications: None,
+                    roles: None,
+                    extensions: None,
+                });
+            }
+
+            // Start new database
+            let db_name = trimmed[DELIM_DATABASE.len()..].trim().to_string();
+            current_database_name = Some(db_name);
+            current_section = None;
+            current_lines.clear();
+            continue;
+        }
+
+        match trimmed {
+            DELIM_VERSION => {
+                flush_section_multi_db(
+                    current_section,
+                    &current_lines,
+                    &mut version,
+                    &mut current_schemas,
+                    &mut current_tables,
+                    &mut current_columns,
                 )?;
                 current_section = Some("version");
                 current_lines.clear();
             }
             DELIM_SCHEMAS => {
-                flush_section(
+                flush_section_multi_db(
                     current_section,
                     &current_lines,
                     &mut version,
-                    &mut schemas,
-                    &mut tables,
-                    &mut columns,
+                    &mut current_schemas,
+                    &mut current_tables,
+                    &mut current_columns,
                 )?;
                 current_section = Some("schemas");
                 current_lines.clear();
             }
             DELIM_TABLES => {
-                flush_section(
+                flush_section_multi_db(
                     current_section,
                     &current_lines,
                     &mut version,
-                    &mut schemas,
-                    &mut tables,
-                    &mut columns,
+                    &mut current_schemas,
+                    &mut current_tables,
+                    &mut current_columns,
                 )?;
                 current_section = Some("tables");
                 current_lines.clear();
             }
             DELIM_COLUMNS => {
-                flush_section(
+                flush_section_multi_db(
                     current_section,
                     &current_lines,
                     &mut version,
-                    &mut schemas,
-                    &mut tables,
-                    &mut columns,
+                    &mut current_schemas,
+                    &mut current_tables,
+                    &mut current_columns,
                 )?;
                 current_section = Some("columns");
                 current_lines.clear();
@@ -260,19 +326,45 @@ fn parse_schema_output(stdout: &str) -> Result<ParseSchemaOutput, String> {
             }
         }
     }
-    flush_section(
+
+    // Flush final section
+    flush_section_multi_db(
         current_section,
         &current_lines,
         &mut version,
-        &mut schemas,
-        &mut tables,
-        &mut columns,
+        &mut current_schemas,
+        &mut current_tables,
+        &mut current_columns,
     )?;
 
-    Ok((version, schemas, tables, columns))
+    // Flush final database
+    if let Some(db_name) = current_database_name {
+        databases.push(crate::model::datasource::DatabaseMetadata {
+            name: db_name,
+            schemas: current_schemas,
+            tables: current_tables,
+            columns: current_columns,
+            views: None,
+            functions: None,
+            indexes: None,
+            triggers: None,
+            materialized_views: None,
+            types: None,
+            foreign_tables: None,
+            policies: None,
+            table_privileges: None,
+            column_privileges: None,
+            config: None,
+            publications: None,
+            roles: None,
+            extensions: None,
+        });
+    }
+
+    Ok((version, databases))
 }
 
-fn flush_section(
+fn flush_section_multi_db(
     section: Option<&str>,
     lines: &[&str],
     version: &mut String,
@@ -287,44 +379,42 @@ fn flush_section(
     if content.is_empty() {
         return Ok(());
     }
+
     match section {
         "version" => {
-            *version = content.lines().last().unwrap_or("").trim().to_string();
+            *version = content;
         }
         "schemas" => {
-            let json_str = extract_json(&content)?;
-            *schemas = serde_json::from_str(&json_str)
-                .map_err(|e| format!("failed to parse schemas: {e}"))?;
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                let parsed: Vec<Schema> = serde_json::from_str(trimmed)
+                    .map_err(|e| format!("failed to parse schemas JSON: {e}: {trimmed}"))?;
+                schemas.extend(parsed);
+            }
         }
         "tables" => {
-            let json_str = extract_json(&content)?;
-            *tables = serde_json::from_str(&json_str)
-                .map_err(|e| format!("failed to parse tables: {e}"))?;
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                let parsed: Vec<Table> = serde_json::from_str(trimmed)
+                    .map_err(|e| format!("failed to parse tables JSON: {e}: {trimmed}"))?;
+                tables.extend(parsed);
+            }
         }
         "columns" => {
-            let json_str = extract_json(&content)?;
-            *columns = serde_json::from_str(&json_str)
-                .map_err(|e| format!("failed to parse columns: {e}"))?;
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                let parsed: Vec<Column> = serde_json::from_str(trimmed)
+                    .map_err(|e| format!("failed to parse columns JSON: {e}: {trimmed}"))?;
+                columns.extend(parsed);
+            }
         }
         _ => {}
     }
+
     Ok(())
 }
 
-fn extract_json(content: &str) -> Result<String, String> {
-    let json_str = content
-        .lines()
-        .skip_while(|line| !line.trim().starts_with('[') && !line.trim().starts_with('{'))
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim()
-        .to_string();
-    if json_str.is_empty() {
-        return Err("no JSON found in section".to_string());
-    }
-    Ok(json_str)
-}
-
+/// Parsed schema output from the extraction sidecar (legacy).
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

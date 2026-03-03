@@ -36,7 +36,7 @@ pub use foreign_tables::ForeignTable;
 pub use functions::{Function, FunctionArg, FunctionArgMode};
 pub use indexes::{Index, IndexAttribute};
 pub use materialized_views::MaterializedView;
-pub use metadata::DatasourceMetadata;
+pub use metadata::{DatabaseMetadata, DatasourceMetadata};
 pub use policies::{Policy, PolicyAction, PolicyCommand};
 pub use publications::{Publication, PublicationTable};
 pub use resultset::{

@@ -18,6 +18,8 @@ bincode     = { workspace = true, features = ["serde"] }
 anyhow      = { workspace = true }
 tracing     = { workspace = true }
 sha2        = { workspace = true }
+hostname    = { workspace = true }
+rand        = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

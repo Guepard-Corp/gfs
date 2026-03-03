@@ -15,7 +15,8 @@
 use super::data_graph::DataGraph;
 
 /// Configuration for the random walker.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct WalkerConfig {
     /// Number of random walks to start from each node. Default: 10.
     pub num_walks: usize,

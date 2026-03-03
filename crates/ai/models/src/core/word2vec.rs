@@ -16,7 +16,7 @@ use std::thread;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 /// Word2Vec architecture type
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum W2VArchitecture {
     /// Skip-gram: predict context from center word
     SkipGram,
@@ -25,7 +25,8 @@ pub enum W2VArchitecture {
 }
 
 /// Configuration for Word2Vec training
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Word2VecConfig {
     /// Embedding vector dimension
     pub dimension: usize,

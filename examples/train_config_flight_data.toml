@@ -1,0 +1,121 @@
+# Flight Data Benchmark Training Configuration
+#
+# Optimized configuration for training on the flight data benchmark:
+# benchmarks/flight-data-300MB/demo-small-en-20170815.sql
+#
+# This configuration is tuned for:
+# - Flight, airport, and airline data
+# - Relational structure between entities
+# - Text-heavy fields (airport names, airline codes, etc.)
+# - Medium-sized dataset
+#
+# Expected training time: ~1-2 minutes for 10k rows
+#
+# Usage:
+#   gfs init --database-provider postgres --database-version 17
+#   gfs import --file benchmarks/flight-data-300MB/demo-small-en-20170815.sql
+#   gfs commit -m "Initial flight data import"
+#   gfs train start --output models/flight_model_v1 --config examples/train_config_flight_data.toml
+
+[model.w2v]
+dimension = 128              # Good balance for this dataset size
+epochs = 15                  # Sufficient for convergence
+learning_rate = 0.025
+window = 6                   # Slightly larger for text fields
+negative_samples = 15
+min_count = 1                # Keep all words (some codes are rare)
+num_threads = 8
+
+[model.hnsw]
+m = 16                       # Good recall for semantic search
+ef_construction = 200
+ef = 200
+
+[model.walker]
+num_walks = 12               # Good coverage of flight network
+walk_length = 25             # Capture multi-hop relationships
+seed = 42                    # Reproducible results
+
+# Data configuration
+[data]
+# Uncomment to train on specific tables:
+# table_filter = ["flights", "airports", "airlines", "routes"]
+
+# Remove or adjust row_limit based on your needs:
+# - For quick testing: row_limit = 1000
+# - For development: row_limit = 5000
+# - For production: remove row_limit entirely
+row_limit = 10000
+
+include_relationships = true # Essential for flight network structure
+split_ratios = [0.8, 0.1, 0.1]
+split_seed = 42
+
+# Training parameters
+[training]
+show_progress = true
+compute_metrics = true
+metric_interval = 2          # Compute every 2 epochs
+
+# Checkpointing
+[checkpoint]
+checkpoint_dir = ".gfs/checkpoints"
+checkpoint_interval = 3      # Save every 3 epochs
+max_checkpoints = 5
+
+# Evaluation metrics
+[evaluation]
+metrics = ["Precision", "Recall", "MRR", "NDCG"]
+top_k_values = [1, 5, 10]    # Typical values for semantic search
+
+# =============================================================================
+# USAGE EXAMPLES
+# =============================================================================
+
+# Quick development iteration:
+#   gfs train start --output models/flight_dev --config examples/train_config_flight_data.toml \
+#     --row-limit 2000 --skip-metrics
+
+# Train on specific tables:
+#   gfs train start --output models/flight_airports --config examples/train_config_flight_data.toml \
+#     --tables flights,airports,airlines
+
+# Full training on all data:
+#   # Remove row_limit from this file, then:
+#   gfs train start --output models/flight_production --config examples/train_config_flight_data.toml
+
+# =============================================================================
+# EXPECTED RESULTS
+# =============================================================================
+#
+# With row_limit = 10000, you should see:
+# - Vocabulary size: ~8,000-15,000 words
+# - Training time: ~45-90 seconds
+# - Precision@5: 0.75-0.85
+# - Recall@10: 0.80-0.90
+# - MRR: 0.70-0.80
+#
+# Model will learn semantic relationships like:
+# - "JFK" → "New York airports", "international flights"
+# - "Boeing 737" → "domestic flights", "short-haul"
+# - "LAX" → "Los Angeles", "west coast"
+#
+# =============================================================================
+# TROUBLESHOOTING
+# =============================================================================
+#
+# Out of memory?
+#   - Reduce dimension to 64
+#   - Reduce row_limit to 5000
+#   - Reduce num_walks to 8 and walk_length to 15
+#
+# Training too slow?
+#   - Increase num_threads to match your CPU cores
+#   - Set compute_metrics = false
+#   - Reduce epochs to 10
+#
+# Poor quality results?
+#   - Increase dimension to 256
+#   - Increase epochs to 20
+#   - Increase num_walks to 20 and walk_length to 40
+#   - Remove row_limit to use all data

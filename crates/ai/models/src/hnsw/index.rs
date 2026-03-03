@@ -20,7 +20,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use rand::distributions::Distribution;
 
 /// Distance metric for similarity search
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DistanceMetric {
     /// Cosine distance (1 - cosine similarity)
     Cosine,
@@ -31,7 +31,8 @@ pub enum DistanceMetric {
 }
 
 /// HNSW index configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct HNSWConfig {
     /// Number of bidirectional links for each node (except layer 0)
     pub m: usize,

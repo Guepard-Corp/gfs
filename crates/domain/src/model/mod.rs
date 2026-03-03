@@ -4,5 +4,6 @@ pub mod config;
 pub mod datasource;
 pub mod errors;
 pub mod layout;
+pub mod model_artifact;
 pub mod ref_info;
 pub mod status;

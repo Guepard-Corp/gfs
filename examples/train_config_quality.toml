@@ -1,0 +1,60 @@
+# High-Quality Training Configuration
+#
+# Use this configuration for:
+# - Production models
+# - Final training runs
+# - When semantic search quality is critical
+# - When you have time for thorough training
+#
+# Training time: ~2-4 minutes per 10k rows
+#
+# Usage:
+#   gfs train start --output models/production_model --config examples/train_config_quality.toml
+
+[model.w2v]
+dimension = 256              # Larger dimension = more expressive
+epochs = 20                  # More epochs = better convergence
+learning_rate = 0.015        # Lower learning rate = more stable
+window = 8                   # Larger context = more global understanding
+negative_samples = 20        # More samples = better quality
+min_count = 2                # Filter rare words
+num_threads = 8              # Adjust to your CPU cores
+
+[model.hnsw]
+m = 32                       # More connections = better recall
+ef_construction = 400        # Higher precision = better index quality
+ef = 400                     # Higher precision = better search quality
+
+[model.walker]
+num_walks = 20               # More walks = better graph coverage
+walk_length = 40             # Longer walks = more global structure
+seed = 42
+
+# Data configuration
+[data]
+# Leave empty to include all tables, or specify specific ones:
+# table_filter = ["products", "categories", "orders"]
+
+# Remove or increase row_limit for production (use all data)
+# row_limit = 50000
+
+include_relationships = true # Include FK relationships for graph structure
+split_ratios = [0.8, 0.1, 0.1]  # Train/validation/test split
+split_seed = 42
+
+# Training parameters
+[training]
+show_progress = true         # Show progress bar
+compute_metrics = true       # Compute evaluation metrics
+metric_interval = 2          # Compute every 2 epochs (balance speed vs. granularity)
+
+# Checkpointing
+[checkpoint]
+checkpoint_dir = ".gfs/checkpoints"
+checkpoint_interval = 5      # Save every 5 epochs
+max_checkpoints = 3          # Keep last 3 checkpoints (saves disk space)
+
+# Evaluation metrics
+[evaluation]
+metrics = ["Precision", "Recall", "MRR", "NDCG"]
+top_k_values = [1, 3, 5, 10, 20]  # Multiple K values for comprehensive evaluation

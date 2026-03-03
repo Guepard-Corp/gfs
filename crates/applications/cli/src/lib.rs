@@ -331,6 +331,15 @@ enum TopLevel {
         action: SchemaAction,
     },
 
+    /// Train GNN models on database data
+    Train {
+        #[command(subcommand)]
+        action: commands::cmd_train::TrainAction,
+    },
+
+    /// Semantic search using trained GNN models
+    Search(commands::cmd_search::SearchArgs),
+
     /// Print the CLI version
     Version,
 }
@@ -480,6 +489,8 @@ where
             let action = action.unwrap_or(McpAction::Stdio);
             commands::cmd_mcp::run(path, action).await?;
         }
+        TopLevel::Train { action } => commands::cmd_train::run(action).await?,
+        TopLevel::Search(args) => commands::cmd_search::run(args).await?,
         TopLevel::Version => commands::cmd_version::run(),
     }
 

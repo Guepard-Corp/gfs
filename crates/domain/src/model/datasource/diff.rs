@@ -93,14 +93,14 @@ fn diff_tables(
     mutations: &mut Vec<SchemaMutation>,
 ) {
     let old_tables: HashMap<String, &Table> = old_metadata
-        .tables
-        .iter()
+        .get_all_tables()
+        .into_iter()
         .map(|t| (format!("{}.{}", t.schema, t.name), t))
         .collect();
 
     let new_tables: HashMap<String, &Table> = new_metadata
-        .tables
-        .iter()
+        .get_all_tables()
+        .into_iter()
         .map(|t| (format!("{}.{}", t.schema, t.name), t))
         .collect();
 
@@ -144,14 +144,14 @@ fn diff_columns(
 ) {
     // Build column maps using schema.table.column as key
     let old_columns: HashMap<String, &Column> = old_metadata
-        .columns
-        .iter()
+        .get_all_columns()
+        .into_iter()
         .map(|c| (format!("{}.{}.{}", c.schema, c.table, c.name), c))
         .collect();
 
     let new_columns: HashMap<String, &Column> = new_metadata
-        .columns
-        .iter()
+        .get_all_columns()
+        .into_iter()
         .map(|c| (format!("{}.{}.{}", c.schema, c.table, c.name), c))
         .collect();
 

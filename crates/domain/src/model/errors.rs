@@ -3,6 +3,28 @@ use serde_json;
 use std::io;
 use std::path::PathBuf;
 
+/// General domain error type for operations not specific to commits or repositories.
+#[derive(Debug, thiserror::Error)]
+pub enum DomainError {
+    #[error("Resource not found: {0}")]
+    NotFound(String),
+
+    #[error("Resource already exists: {0}")]
+    AlreadyExists(String),
+
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
+
+    #[error("Internal error: {0}")]
+    Internal(String),
+
+    #[error("IO error: {0}")]
+    IoError(#[from] std::io::Error),
+
+    #[error("Serialization error: {0}")]
+    SerializationError(#[from] serde_json::Error),
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CommitError {
     #[error("Failed to create commit: {0}")]

@@ -458,7 +458,26 @@ impl DatabaseProvider for PostgresqlProvider {
                     COALESCE(s.n_dead_tup, 0)::bigint as dead_rows_estimate,
                     obj_description(c.oid, 'pg_class') as comment,
                     '[]'::json as primary_keys,
-                    '[]'::json as relationships
+                    COALESCE(
+                        (SELECT json_agg(json_build_object(
+                            'id', con.oid::bigint,
+                            'constraint_name', con.conname,
+                            'source_schema', n.nspname,
+                            'source_table_name', c.relname,
+                            'source_column_name', a.attname,
+                            'target_table_schema', nf.nspname,
+                            'target_table_name', cf.relname,
+                            'target_column_name', af.attname
+                        ))
+                        FROM pg_constraint con
+                        JOIN pg_attribute a ON a.attnum = con.conkey[1] AND a.attrelid = con.conrelid
+                        JOIN pg_class cf ON cf.oid = con.confrelid
+                        JOIN pg_namespace nf ON nf.oid = cf.relnamespace
+                        JOIN pg_attribute af ON af.attnum = con.confkey[1] AND af.attrelid = con.confrelid
+                        WHERE con.conrelid = c.oid
+                            AND con.contype = 'f'),
+                        '[]'::json
+                    ) as relationships
                 FROM pg_class c
                 JOIN pg_namespace n ON n.oid = c.relnamespace
                 LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
@@ -516,7 +535,7 @@ impl DatabaseProvider for PostgresqlProvider {
     ) -> std::result::Result<Option<SchemaExtractionSpec>, ProviderError> {
         let user = params.get_env(ENV_USER).unwrap_or(DEFAULT_USER);
         let password = params.get_env(ENV_PASSWORD).unwrap_or(DEFAULT_PASSWORD);
-        let db = params.get_env(ENV_DB).unwrap_or(DEFAULT_DB);
+        let default_db = params.get_env(ENV_DB).unwrap_or(DEFAULT_DB);
         let queries = self.schema_extraction_queries();
         let schemas_q = queries
             .get("schemas")
@@ -529,30 +548,50 @@ impl DatabaseProvider for PostgresqlProvider {
             .ok_or_else(|| ProviderError::InvalidParams("missing columns query".into()))?;
 
         // Run schema extraction inside a container (no psql on host required).
-        // Output uses delimiters for parsing.
+        // NEW: Extract schema from ALL databases, not just the default one.
+        // Output uses delimiters for parsing, with GFS_SCHEMA_DATABASE to separate databases.
         let command = format!(
-            r#"echo "GFS_SCHEMA_VERSION"
-PGPASSWORD="{password}" psql -h {host} -p {port} -U {user} -d {db} -t -A -c "SELECT version();"
-echo "GFS_SCHEMA_SCHEMAS"
-PGPASSWORD="{password}" psql -h {host} -p {port} -U {user} -d {db} -t -A -c "$(cat <<'SCHEMAS_EOF'
+            r#"#!/bin/bash
+set -e
+
+# Output PostgreSQL version (global, not per-database)
+echo "GFS_SCHEMA_VERSION"
+PGPASSWORD="{password}" psql -h {host} -p {port} -U {user} -d {default_db} -t -A -c "SELECT version();"
+
+# Get list of all databases (exclude templates)
+DATABASES=$(PGPASSWORD="{password}" psql -h {host} -p {port} -U {user} -d {default_db} -t -A -c "
+SELECT datname FROM pg_database
+WHERE datistemplate = false
+ORDER BY datname;
+")
+
+# For each database, extract schema/tables/columns
+for db in $DATABASES; do
+  echo "GFS_SCHEMA_DATABASE:$db"
+
+  echo "GFS_SCHEMA_SCHEMAS"
+  PGPASSWORD="{password}" psql -h {host} -p {port} -U {user} -d "$db" -t -A -c "$(cat <<'SCHEMAS_EOF'
 {schemas_query}
 SCHEMAS_EOF
 )"
-echo "GFS_SCHEMA_TABLES"
-PGPASSWORD="{password}" psql -h {host} -p {port} -U {user} -d {db} -t -A -c "$(cat <<'TABLES_EOF'
+
+  echo "GFS_SCHEMA_TABLES"
+  PGPASSWORD="{password}" psql -h {host} -p {port} -U {user} -d "$db" -t -A -c "$(cat <<'TABLES_EOF'
 {tables_query}
 TABLES_EOF
 )"
-echo "GFS_SCHEMA_COLUMNS"
-PGPASSWORD="{password}" psql -h {host} -p {port} -U {user} -d {db} -t -A -c "$(cat <<'COLUMNS_EOF'
+
+  echo "GFS_SCHEMA_COLUMNS"
+  PGPASSWORD="{password}" psql -h {host} -p {port} -U {user} -d "$db" -t -A -c "$(cat <<'COLUMNS_EOF'
 {columns_query}
 COLUMNS_EOF
-)""#,
+)"
+done"#,
             password = password,
             host = params.host,
             port = params.port,
             user = user,
-            db = db,
+            default_db = default_db,
             schemas_query = schemas_q,
             tables_query = tables_q,
             columns_query = columns_q,

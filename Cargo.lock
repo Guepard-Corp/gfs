@@ -829,8 +829,28 @@ name = "gfs-ai-models"
 version = "0.1.0"
 dependencies = [
  "byteorder",
+ "chrono",
+ "gfs-domain",
  "rand 0.8.5",
  "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
+]
+
+[[package]]
+name = "gfs-ai-postgres"
+version = "0.1.9"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "gfs-ai-models",
+ "gfs-domain",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -842,7 +862,10 @@ dependencies = [
  "chrono",
  "clap",
  "gag",
+ "gfs-ai-models",
+ "gfs-ai-postgres",
  "gfs-compute-docker",
+ "gfs-config",
  "gfs-domain",
  "gfs-mcp",
  "gfs-storage-apfs",
@@ -891,6 +914,8 @@ dependencies = [
  "async-trait",
  "bincode",
  "chrono",
+ "hostname",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "sha2",
@@ -920,6 +945,20 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "gfs-model-registry-file"
+version = "0.1.9"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "gfs-domain",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -1059,6 +1098,17 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hostname"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "617aaa3557aef3810a6369d0a99fac8a080891b68bd9f9812a1eeda0c0730cbd"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "windows-link",
+]
 
 [[package]]
 name = "html-escape"
@@ -1359,7 +1409,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi 0.5.2",
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

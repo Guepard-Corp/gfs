@@ -1,0 +1,95 @@
+# GFS GNN Training Configuration
+# This file configures all aspects of training a Graph Neural Network model
+# on database data using the GraphSemanticEngine (TextDeepWalk).
+
+# ============================================================================
+# Model Configuration
+# ============================================================================
+
+[model.w2v]
+# Word2Vec embedding configuration
+dimension = 128              # Embedding vector dimension
+epochs = 10                  # Number of training epochs
+learning_rate = 0.025        # Initial learning rate
+window = 5                   # Context window size (words on each side)
+negative_samples = 15        # Number of negative samples per positive
+min_count = 1                # Minimum word frequency threshold
+num_threads = 8              # Number of parallel training threads
+min_learning_rate = 0.0001   # Minimum learning rate (decays during training)
+subsample_threshold = 1e-5   # Subsampling threshold for frequent words
+
+[model.hnsw]
+# HNSW index configuration for fast similarity search
+m = 16                       # Number of bidirectional links per node
+ef_construction = 200        # Size of dynamic candidate list during construction
+ef_search = 50               # Size of dynamic candidate list during search
+m_l = 0.0                    # Level multiplier (0.0 = auto-calculate)
+seed = 42                    # Random seed for reproducibility
+
+[model.walker]
+# DeepWalk random walk configuration
+num_walks = 10               # Number of random walks to start from each node
+walk_length = 20             # Number of steps (hops) per walk
+seed = 42                    # Random seed for reproducibility
+
+[model]
+text_repeat = 3              # How many times to repeat text corpus vs walks
+
+# ============================================================================
+# Data Configuration
+# ============================================================================
+
+[data]
+# Which tables to include (comment out to include all tables)
+table_filter = ["products", "categories", "components"]
+
+# Maximum rows per table (comment out for no limit)
+row_limit = 10000
+
+# Include foreign key relationships as edges in the graph
+include_relationships = true
+
+# Train/validation/test split ratios (must sum to 1.0)
+split_ratios = [0.8, 0.1, 0.1]
+
+# Random seed for data splitting (reproducibility)
+split_seed = 42
+
+# ============================================================================
+# Training Parameters
+# ============================================================================
+
+[training]
+# Show progress bar during training
+show_progress = true
+
+# Compute evaluation metrics during training
+compute_metrics = true
+
+# Metric computation interval (every N epochs)
+metric_interval = 1
+
+# ============================================================================
+# Checkpointing
+# ============================================================================
+
+[checkpoint]
+# Directory to save checkpoints (relative to current directory)
+checkpoint_dir = ".gfs/checkpoints"
+
+# Checkpoint every N epochs (0 = disabled)
+checkpoint_interval = 2
+
+# Maximum number of checkpoints to keep (older ones deleted)
+max_checkpoints = 5
+
+# ============================================================================
+# Evaluation
+# ============================================================================
+
+[evaluation]
+# Metrics to compute: "Precision", "Recall", "MRR", "NDCG"
+metrics = ["Precision", "Recall", "MRR"]
+
+# K values for top-K metrics (e.g., precision@5, recall@10)
+top_k_values = [1, 5, 10]

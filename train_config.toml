@@ -1,0 +1,45 @@
+# Model configuration
+[model.w2v]
+dimension = 128              # Embedding dimension (128 or 256 recommended)
+epochs = 10                  # Training epochs
+learning_rate = 0.025        # Learning rate
+window = 5                   # Context window size
+negative_samples = 15        # Negative sampling count
+min_count = 1                # Minimum word frequency
+num_threads = 8              # Parallel threads
+
+[model.hnsw]
+m = 16                       # HNSW construction parameter
+ef_construction = 200        # Build-time search depth
+ef = 200                     # Query-time search depth
+
+[model.walker]
+num_walks = 10               # Random walks per node
+walk_length = 20             # Steps per walk
+seed = 42                    # Random seed for reproducibility
+
+# Data configuration
+[data]
+# Leave empty to include all tables, or specify:
+# table_filter = ["flights", "airports", "airlines"]
+row_limit = 10000            # Limit rows per table (remove for all data)
+include_relationships = true # Include foreign key relationships as edges
+split_ratios = [0.8, 0.1, 0.1]  # Train/validation/test split
+split_seed = 42              # Seed for data splitting
+
+# Training parameters
+[training]
+show_progress = true         # Show progress bar
+compute_metrics = true       # Compute evaluation metrics
+metric_interval = 1          # Compute metrics every N epochs
+
+# Checkpointing
+[checkpoint]
+checkpoint_dir = ".gfs/checkpoints"
+checkpoint_interval = 2      # Save checkpoint every N epochs (0 = disabled)
+max_checkpoints = 5          # Keep only last N checkpoints
+
+# Evaluation metrics
+[evaluation]
+metrics = ["Precision", "Recall", "MRR", "NDCG"]
+top_k_values = [1, 5, 10]    # Compute metrics for top-K results

@@ -10,5 +10,7 @@ pub mod cmd_mcp;
 pub mod cmd_providers;
 pub mod cmd_query;
 pub mod cmd_schema;
+pub mod cmd_search;
 pub mod cmd_status;
+pub mod cmd_train;
 pub mod cmd_version;

@@ -6,6 +6,12 @@ edition = "2021"
 [dependencies]
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
 byteorder = "1"
+gfs-domain = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }

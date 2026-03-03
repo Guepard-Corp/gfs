@@ -70,7 +70,8 @@ pub type Result<T> = std::result::Result<T, GraphError>;
 // ── Config ────────────────────────────────────────────────────────────────────
 
 /// Full configuration for [`GraphSemanticEngine`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct GraphEngineConfig {
     /// Word2Vec training configuration.
     pub w2v: Word2VecConfig,

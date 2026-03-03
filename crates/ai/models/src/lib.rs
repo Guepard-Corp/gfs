@@ -7,10 +7,12 @@
 //===----------------------------------------------------------------------===//
 
 pub mod core;
+pub mod features;
 pub mod hnsw;
 pub mod similarity;
 pub mod semantic_search_engine;
 pub mod graph;
+pub mod training;
 
 // Re-export commonly used items from core
 pub use core::{

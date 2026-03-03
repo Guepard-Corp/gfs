@@ -32,6 +32,9 @@ gfs-domain = { workspace = true }
 gfs-compute-docker        = { workspace = true }
 gfs-storage-file   = { workspace = true }
 gfs-mcp            = { workspace = true }
+gfs-config         = { workspace = true }
+gfs-ai-models      = { workspace = true }
+gfs-ai-postgres    = { workspace = true }
 chrono             = { workspace = true }
 clap               = { workspace = true }
 tokio              = { workspace = true }

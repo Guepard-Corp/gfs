@@ -1,0 +1,18 @@
+[package]
+name               = "gfs-ai-postgres"
+version.workspace      = true
+edition.workspace      = true
+authors.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait          = { workspace = true }
+gfs-domain           = { workspace = true }
+gfs-ai-models        = { path = "../../models" }
+thiserror            = { workspace = true }
+tokio                = { workspace = true }
+tracing              = { workspace = true }
+serde_json           = { workspace = true }
+anyhow               = { workspace = true }
