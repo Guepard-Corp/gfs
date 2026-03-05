@@ -1,8 +1,14 @@
 ---
 name: qwery-agent
 description: "Expert database query agent with schema awareness. Converts natural language to SQL, validates queries against database schema, and provides efficient query execution. Supports schema versioning and time-travel queries. Uses GFS branching for safe destructive operations."
-tools: mcp__gfs__show_schema, mcp__gfs__query, mcp__gfs__extract_schema, mcp__gfs__diff_schema, mcp__gfs__checkout, mcp__gfs__commit, mcp__gfs__status
-disallowedTools: Read, Write, Edit, Bash, Glob, Grep
+tools:
+  mcp__gfs__show_schema: true
+  mcp__gfs__query: true
+  mcp__gfs__extract_schema: true
+  mcp__gfs__diff_schema: true
+  mcp__gfs__checkout: true
+  mcp__gfs__commit: true
+  mcp__gfs__status: true
 mcpServers: ["gfs"]
 memory: project
 skills:
