@@ -122,6 +122,18 @@ impl DockerCompute {
             .iter()
             .any(|component| component.name.to_ascii_lowercase().contains("podman"))
     }
+
+    fn is_container_running(info: &bollard::models::ContainerInspectResponse) -> bool {
+        if info.state.as_ref().and_then(|s| s.running).unwrap_or(false) {
+            return true;
+        }
+
+        info.state
+            .as_ref()
+            .and_then(|s| s.status.as_ref())
+            .map(|s| format!("{s:?}").to_ascii_lowercase().contains("running"))
+            .unwrap_or(false)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -506,6 +518,10 @@ impl Compute for DockerCompute {
             .await
             .map_err(|e| classify(&id.0, e))?;
 
+        if !Self::is_container_running(&info) {
+            return Err(ComputeError::NotRunning(id.0.clone()));
+        }
+
         // Get the container IP on its first available network.
         let ip = info
             .network_settings
@@ -515,7 +531,12 @@ impl Compute for DockerCompute {
             .and_then(|net| net.ip_address.as_ref())
             .filter(|ip| !ip.is_empty())
             .cloned()
-            .unwrap_or_else(|| id.0.clone());
+            .ok_or_else(|| {
+                ComputeError::Internal(format!(
+                    "instance has no task-reachable network IP: '{}'",
+                    id.0
+                ))
+            })?;
 
         // Reuse the env extraction logic from get_connection_info.
         let env = info
@@ -563,10 +584,23 @@ impl Compute for DockerCompute {
                 .inspect_container(&target.0, None)
                 .await
                 .map_err(|e| classify(&target.0, e))?;
-            info.network_settings
+            if !Self::is_container_running(&info) {
+                return Err(ComputeError::NotRunning(target.0.clone()));
+            }
+
+            let network = info
+                .network_settings
                 .as_ref()
                 .and_then(|n| n.networks.as_ref())
                 .and_then(|nets| nets.keys().next().cloned())
+                .ok_or_else(|| {
+                    ComputeError::Internal(format!(
+                        "instance has no network for task linking: '{}'",
+                        target.0
+                    ))
+                })?;
+
+            Some(network)
         } else {
             None
         };
