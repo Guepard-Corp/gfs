@@ -48,15 +48,15 @@ gfs config --global user.name \"John Doe\""/>
             <h2>"Examples"</h2>
             <h3>"Set global identity (all repos)"</h3>
             <CodeBlock code="gfs config --global user.name \"Alice\"
-gfs config --global user.email \"alice@example.com\""/>
+    gfs config --global user.email \"alice@example.com\""/>
 
             <h3>"Override identity for one repo"</h3>
             <CodeBlock code="gfs config user.name \"Alice\"
-gfs config user.email \"alice@example.com\""/>
+    gfs config user.email \"alice@example.com\""/>
 
             <h3>"Read back"</h3>
             <CodeBlock code="gfs config user.name          # repo-local
-gfs config --global user.name  # global"/>
+    gfs config --global user.name  # global"/>
 
             <h2>"Storage"</h2>
             <ul>

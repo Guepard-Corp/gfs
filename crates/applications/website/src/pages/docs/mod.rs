@@ -2,8 +2,8 @@ use leptos::*;
 use leptos_router::*;
 
 mod ai_agents;
-mod commands;
 mod coming_soon;
+mod commands;
 mod getting_started;
 mod installation;
 mod mcp;
@@ -11,11 +11,11 @@ mod quick_start;
 mod telemetry;
 
 use ai_agents::{AiAgentsSkills, AiAgentsSubagents};
+use coming_soon::ComingSoon;
 use commands::{
     CommandCheckout, CommandCommit, CommandCompute, CommandConfig, CommandExport, CommandImport,
     CommandInit, CommandLog, CommandProviders, CommandQuery, CommandSchema, CommandStatus,
 };
-use coming_soon::ComingSoon;
 use getting_started::GettingStarted;
 use installation::Installation;
 use mcp::{McpClaudeCode, McpClaudeDesktop, McpCursor, McpHttpMode, McpOverview};

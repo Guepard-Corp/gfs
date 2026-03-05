@@ -88,10 +88,7 @@ fn get(repo_path: &std::path::Path, key: &str) -> Result<()> {
 
 fn set(repo_path: &std::path::Path, key: &str, value: &str) -> Result<()> {
     if key == KEY_TELEMETRY_ENABLED {
-        anyhow::bail!(
-            "'{}' is a global-only setting; use --global to set it",
-            key
-        );
+        anyhow::bail!("'{}' is a global-only setting; use --global to set it", key);
     }
     if key != KEY_USER_NAME && key != KEY_USER_EMAIL {
         anyhow::bail!(

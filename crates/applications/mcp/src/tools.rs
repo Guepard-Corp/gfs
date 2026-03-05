@@ -3,7 +3,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gfs_telemetry::TelemetryClient;
 use gfs_compute_docker::DockerCompute;
 use gfs_compute_docker::containers;
 use gfs_domain::adapters::gfs_repository::GfsRepository;
@@ -22,6 +21,7 @@ use gfs_domain::usecases::repository::{
     import_repo_usecase::ImportRepoUseCase, init_repo_usecase::InitRepositoryUseCase,
     log_repo_usecase::LogRepoUseCase, status_repo_usecase::StatusRepoUseCase,
 };
+use gfs_telemetry::TelemetryClient;
 use rmcp::{
     ErrorData as McpError, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},

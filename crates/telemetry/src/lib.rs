@@ -243,7 +243,9 @@ impl TelemetryClient {
             tracing::debug!(target: "gfs_telemetry", "send_event({event_name}): sending to PostHog");
             match send_event(event_name, &distinct_id, props) {
                 Ok(()) => tracing::debug!(target: "gfs_telemetry", "send_event({event_name}): ok"),
-                Err(e) => tracing::debug!(target: "gfs_telemetry", "send_event({event_name}): failed — {e}"),
+                Err(e) => {
+                    tracing::debug!(target: "gfs_telemetry", "send_event({event_name}): failed — {e}")
+                }
             }
         });
 

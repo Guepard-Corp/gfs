@@ -228,10 +228,7 @@ mod tests {
         settings.save().unwrap();
 
         let loaded = GlobalSettings::load().unwrap();
-        assert_eq!(
-            loaded.user.as_ref().unwrap().name.as_deref(),
-            Some("Bob")
-        );
+        assert_eq!(loaded.user.as_ref().unwrap().name.as_deref(), Some("Bob"));
         assert_eq!(
             loaded.user.as_ref().unwrap().email.as_deref(),
             Some("bob@example.com")
