@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model::config::GfsConfig;
 use crate::ports::compute::{Compute, ComputeError, InstanceId};
@@ -86,6 +87,24 @@ pub struct ImportRepoUseCase<R: DatabaseProviderRegistry> {
 impl<R: DatabaseProviderRegistry> ImportRepoUseCase<R> {
     pub fn new(compute: Arc<dyn Compute>, registry: Arc<R>) -> Self {
         Self { compute, registry }
+    }
+
+    fn create_import_staging_dir(repo_path: &Path) -> std::io::Result<PathBuf> {
+        let base = repo_path.join(".gfs").join("tmp").join("import");
+        std::fs::create_dir_all(&base)?;
+
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+
+        let dir = base.join(unique);
+        std::fs::create_dir(&dir)?;
+        Ok(dir)
     }
 
     /// Import data into the database instance associated with the repo at `path`.
@@ -183,18 +202,33 @@ impl<R: DatabaseProviderRegistry> ImportRepoUseCase<R> {
             .import_spec(&params, &resolved_format, input_filename)
             .map_err(|e| ImportRepoError::UnsupportedFormat(e.to_string()))?;
 
-        // 5. Mount the directory containing the import file into the sidecar.
-        let host_data_dir = input_file
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
-        spec.definition.host_data_dir = Some(host_data_dir);
+        // 5. Stage the input file into an isolated directory under .gfs/tmp/import.
+        //    On Podman, bind mounts with :U can recursively chown the source path.
+        //    Staging avoids mutating ownership/permissions of user directories.
+        let staging_dir = Self::create_import_staging_dir(path).map_err(|e| {
+            ImportRepoError::Config(format!("cannot create import staging dir: {e}"))
+        })?;
+
+        let staged_file = staging_dir.join(input_filename);
+        if let Err(copy_err) = std::fs::copy(&input_file, &staged_file) {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            return Err(ImportRepoError::Config(format!(
+                "cannot stage import file '{}': {copy_err}",
+                input_file.display()
+            )));
+        }
+
+        spec.definition.host_data_dir = Some(staging_dir.clone());
 
         // 6. Run the import sidecar linked to the database instance.
         let output = self
             .compute
             .run_task(&spec.definition, &spec.command, Some(&instance_id))
-            .await?;
+            .await;
+
+        let _ = std::fs::remove_dir_all(&staging_dir);
+
+        let output = output?;
 
         // 7. Check exit code.
         if output.exit_code != 0 {

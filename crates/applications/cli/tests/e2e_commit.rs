@@ -1,7 +1,7 @@
 //! End-to-end tests for `gfs commit`.
 //!
 //! Runs CLI in-process via gfs_cli::run() for coverage capture.
-//! macOS-only: commit uses the APFS storage backend. Docker required for DB tests.
+//! macOS-only: commit uses the APFS storage backend. Docker or Podman required for DB tests.
 
 #![cfg(target_os = "macos")]
 
@@ -27,7 +27,7 @@ fn get_container_id(repo_path: &Path) -> Option<String> {
 /// Wait for Postgres in the container to accept connections. Retries up to 30 times with 1s delay.
 fn wait_for_postgres(container_id: &str) -> bool {
     for _ in 0..30 {
-        let ok = std::process::Command::new("docker")
+        let ok = std::process::Command::new(common::container_runtime::runtime_binary())
             .args([
                 "exec",
                 container_id,
@@ -53,10 +53,10 @@ struct ContainerCleanupGuard(String);
 
 impl Drop for ContainerCleanupGuard {
     fn drop(&mut self) {
-        let _ = std::process::Command::new("docker")
+        let _ = std::process::Command::new(common::container_runtime::runtime_binary())
             .args(["stop", &self.0])
             .output();
-        let _ = std::process::Command::new("docker")
+        let _ = std::process::Command::new(common::container_runtime::runtime_binary())
             .args(["rm", "-f", &self.0])
             .output();
     }
@@ -355,7 +355,7 @@ fn commit_with_real_database_snapshots_workspace() {
 
     assert!(
         cli_runner::gfs_init_with_db(repo_path),
-        "gfs init --database-provider postgres should succeed (Docker must be running)"
+        "gfs init --database-provider postgres should succeed (Docker or Podman must be running)"
     );
 
     let container_id = get_container_id(repo_path)

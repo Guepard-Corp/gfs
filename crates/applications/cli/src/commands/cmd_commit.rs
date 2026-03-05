@@ -54,7 +54,8 @@ async fn run(
 
     let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
     let compute: Arc<dyn Compute> = Arc::new(
-        DockerCompute::new().map_err(|e| anyhow::anyhow!("failed to connect to Docker: {e}"))?,
+        DockerCompute::new()
+            .map_err(|e| anyhow::anyhow!("failed to connect to Docker/Podman: {e}"))?,
     );
 
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());

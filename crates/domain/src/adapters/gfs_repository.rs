@@ -58,19 +58,49 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Set directory and all contents (files and dirs) recursively to 0o700 so the container
-/// (e.g. postgres) can chown files inside without "Permission denied". No-op on non-Unix.
+/// Best-effort permission normalization for workspace directories.
+///
+/// On some runtimes (notably rootless Podman with user namespace remapping),
+/// repository files can be owned by subordinate UIDs that are not chmod-able
+/// from the host user. In that case, we continue checkout and let the runtime
+/// handle access through its own namespace mapping.
 fn set_workspace_dir_permissions(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        let status = Command::new("chmod")
+        let output = Command::new("chmod")
             .arg("-R")
             .arg("0700")
             .arg(path)
-            .status()
+            .output()
             .map_err(std::io::Error::other)?;
-        if !status.success() {
-            return Err(std::io::Error::other("chmod -R 0700 failed"));
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let first_line = stderr
+                .lines()
+                .next()
+                .unwrap_or("chmod -R 0700 failed")
+                .to_string();
+
+            let is_permission_error = {
+                let lower = stderr.to_ascii_lowercase();
+                lower.contains("operation not permitted")
+                    || lower.contains("permission denied")
+                    || lower.contains("not permitted")
+            };
+
+            if is_permission_error {
+                tracing::warn!(
+                    workspace_path = %path.display(),
+                    error = %first_line,
+                    "Checkout: failed to normalize workspace permissions; continuing"
+                );
+            } else {
+                return Err(std::io::Error::other(format!(
+                    "chmod -R 0700 failed for '{}': {first_line}",
+                    path.display()
+                )));
+            }
         }
     }
     Ok(())

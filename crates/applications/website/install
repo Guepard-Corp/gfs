@@ -108,11 +108,21 @@ check_and_install_docker() {
         return 0
     fi
 
+    if command -v podman >/dev/null 2>&1; then
+        podman_version=$(podman --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        if [[ -n "$podman_version" ]]; then
+            echo -e "✅ ${MUTED}Podman detected (version $podman_version).${NC}"
+        else
+            echo -e "✅ ${MUTED}Podman detected.${NC}"
+        fi
+        return 0
+    fi
+
     local platform
     platform=$(detect_platform_for_docker)
 
     echo -e ""
-    echo -e "⚠️  ${ORANGE}Docker is not installed. GFS requires Docker to manage database containers.${NC}"
+    echo -e "⚠️  ${ORANGE}No container runtime detected. GFS requires Docker or Podman to manage database containers.${NC}"
     echo -e ""
     case "$platform" in
         macos)
@@ -685,7 +695,7 @@ echo -e "${MUTED}▙▌▌▐▖  ▌ ▙▌▌   ▙▌█▌▐▖█▌▙▌
 echo -e "${MUTED}                                   ▄▌           "
 echo -e ""
 echo -e ""
-echo -e "${MUTED}GFS uses Docker:${NC}"
+echo -e "${MUTED}GFS uses Docker or Podman:${NC}"
 echo -e ""
 echo -e "cd <project>  ${MUTED}# Open directory${NC}"
 echo -e "gfs      ${MUTED}# Run command${NC}"

@@ -10,7 +10,7 @@
 //! (validate workspace structure), create branch from main (validate pgbench data on branch),
 //! checkout back to main, then a final test stops and removes the main container so none remain.
 //!
-//! macOS-only: commit uses the APFS storage backend. Docker must be running.
+//! macOS-only: commit uses the APFS storage backend. Docker or Podman must be running.
 
 #![cfg(target_os = "macos")]
 
@@ -46,7 +46,9 @@ struct OneOffContainerGuard(String);
 
 impl Drop for OneOffContainerGuard {
     fn drop(&mut self) {
-        let _ = Command::new("docker").args(["rm", "-f", &self.0]).output();
+        let _ = Command::new(common::container_runtime::runtime_binary())
+            .args(["rm", "-f", &self.0])
+            .output();
     }
 }
 
@@ -69,10 +71,10 @@ impl Drop for MainContainerCleanup {
         if let Ok(mut id) = self.0.lock()
             && let Some(container_id) = id.take()
         {
-            let _ = Command::new("docker")
+            let _ = Command::new(common::container_runtime::runtime_binary())
                 .args(["stop", &container_id])
                 .output();
-            let _ = Command::new("docker")
+            let _ = Command::new(common::container_runtime::runtime_binary())
                 .args(["rm", "-f", &container_id])
                 .output();
         }
@@ -108,8 +110,12 @@ fn cleanup_main_container(repo_path: &Path) {
         .take_container_id()
         .or_else(|| get_container_id(repo_path));
     if let Some(id) = container_id {
-        let _ = Command::new("docker").args(["stop", &id]).output();
-        let _ = Command::new("docker").args(["rm", "-f", &id]).output();
+        let _ = Command::new(common::container_runtime::runtime_binary())
+            .args(["stop", &id])
+            .output();
+        let _ = Command::new(common::container_runtime::runtime_binary())
+            .args(["rm", "-f", &id])
+            .output();
     }
 }
 
@@ -121,7 +127,7 @@ fn get_container_id(repo_path: &Path) -> Option<String> {
 
 fn wait_for_postgres(container_id: &str) -> bool {
     for _ in 0..30 {
-        let ok = Command::new("docker")
+        let ok = Command::new(common::container_runtime::runtime_binary())
             .args([
                 "exec",
                 container_id,
@@ -144,7 +150,7 @@ fn wait_for_postgres(container_id: &str) -> bool {
 
 fn run_pgbench_init(container_id: &str) -> (Duration, String) {
     let start = Instant::now();
-    let out = Command::new("docker")
+    let out = Command::new(common::container_runtime::runtime_binary())
         .args([
             "exec",
             container_id,
@@ -169,7 +175,7 @@ fn run_pgbench_init(container_id: &str) -> (Duration, String) {
 
 #[allow(dead_code)]
 fn run_psql_list_tables(container_id: &str) -> String {
-    let out = Command::new("docker")
+    let out = Command::new(common::container_runtime::runtime_binary())
         .args([
             "exec",
             container_id,
@@ -197,7 +203,7 @@ fn has_pgbench_tables(output: &str) -> bool {
         || output.contains("pgbench_tellers")
 }
 
-/// Return current Unix uid and gid as "(uid):(gid)" for `docker run --user`. Fails if id cannot be determined.
+/// Return current Unix uid and gid as "(uid):(gid)" for `run --user`. Fails if id cannot be determined.
 fn host_user_uid_gid() -> String {
     let uid = Command::new("id")
         .args(["-u"])
@@ -262,18 +268,20 @@ fn run_one_off_postgres_list_tables_inner(
         args.push("--user");
         args.push(u);
     }
-    let create = Command::new("docker")
+    let create = Command::new(common::container_runtime::runtime_binary())
         .args(args)
         .output()
-        .expect("docker run one-off postgres");
+        .expect("run one-off postgres");
     if !create.status.success() {
         let stderr = String::from_utf8_lossy(&create.stderr);
-        let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+        let _ = Command::new(common::container_runtime::runtime_binary())
+            .args(["rm", "-f", &name])
+            .output();
         panic!("failed to create one-off container: {}", stderr);
     }
     let _guard = OneOffContainerGuard(name.clone());
     for _ in 0..30 {
-        let ok = Command::new("docker")
+        let ok = Command::new(common::container_runtime::runtime_binary())
             .args([
                 "exec", &name, "psql", "-U", "postgres", "-d", "postgres", "-c", "SELECT 1",
             ])
@@ -286,7 +294,7 @@ fn run_one_off_postgres_list_tables_inner(
         thread::sleep(Duration::from_secs(1));
     }
     thread::sleep(Duration::from_secs(2));
-    let out = Command::new("docker")
+    let out = Command::new(common::container_runtime::runtime_binary())
         .args([
             "exec", &name, "psql", "-U", "postgres", "-d", "postgres", "-c", "\\dt",
         ])
@@ -371,7 +379,7 @@ fn test_01_init_config_validate_commit_log() {
 
     assert!(
         cli_runner::gfs_init_with_db(repo_path),
-        "gfs init --database-provider postgres should succeed (Docker must be running)"
+        "gfs init --database-provider postgres should succeed (Docker or Podman must be running)"
     );
 
     let (ok, _, stderr) = cli_runner::gfs_config(repo_path, "user.name", Some("Test User"));

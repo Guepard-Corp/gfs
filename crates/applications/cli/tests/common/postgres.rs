@@ -23,8 +23,9 @@ struct ContainerCleanupGuard(String);
 
 impl Drop for ContainerCleanupGuard {
     fn drop(&mut self) {
-        let _ = Command::new("docker").args(["stop", &self.0]).output();
-        let _ = Command::new("docker").args(["rm", "-f", &self.0]).output();
+        let runtime = super::container_runtime::runtime_binary();
+        let _ = Command::new(runtime).args(["stop", &self.0]).output();
+        let _ = Command::new(runtime).args(["rm", "-f", &self.0]).output();
     }
 }
 
@@ -59,7 +60,7 @@ where
 
     // 4. Wait for Postgres before commit (commit runs CHECKPOINT)
     for _ in 0..30 {
-        let ok = Command::new("docker")
+        let ok = Command::new(super::container_runtime::runtime_binary())
             .args([
                 "exec",
                 &container_id,
@@ -96,7 +97,7 @@ pub fn gfs_import(repo_path: &Path, file: &Path, format: Option<&str>) -> (bool,
 }
 
 pub fn run_psql_select(container_id: &str, query: &str) -> String {
-    let out = Command::new("docker")
+    let out = Command::new(super::container_runtime::runtime_binary())
         .args([
             "exec",
             container_id,
