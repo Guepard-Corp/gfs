@@ -19,9 +19,9 @@ pub async fn run(
 ) -> Result<()> {
     let repo_path = path.unwrap_or_else(get_repo_dir);
 
-    let compute = Arc::new(
-        DockerCompute::new().context("failed to connect to Docker/Podman daemon (is your container runtime running?)")?,
-    );
+    let compute = Arc::new(DockerCompute::new().context(
+        "failed to connect to Docker/Podman daemon (is your container runtime running?)",
+    )?);
 
     // If --id is given, we need to override the container name in the config.
     // The use case loads it from config; for --id override we create a temporary wrapper.

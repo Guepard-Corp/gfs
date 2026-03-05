@@ -22,9 +22,9 @@ pub async fn run(path: Option<PathBuf>, output: String) -> Result<()> {
     let repo_path = path.unwrap_or_else(get_repo_dir);
 
     let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
-    let compute = Arc::new(
-        DockerCompute::new().context("failed to connect to Docker/Podman daemon (is your container runtime running?)")?,
-    );
+    let compute = Arc::new(DockerCompute::new().context(
+        "failed to connect to Docker/Podman daemon (is your container runtime running?)",
+    )?);
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
     gfs_compute_docker::containers::register_all(registry.as_ref())
         .context("failed to register database providers")?;
