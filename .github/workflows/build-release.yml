@@ -122,7 +122,7 @@ jobs:
           "$hash  ${{ matrix.archive_name }}" | Out-File -Encoding ascii ${{ matrix.archive_name }}.sha256
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.0
         with:
           name: ${{ matrix.artifact_name }}
           path: |
@@ -141,7 +141,7 @@ jobs:
           sha256sum gfs-ai-tools-${VERSION}.tar.gz > gfs-ai-tools-${VERSION}.tar.gz.sha256
 
       - name: Upload AI tools artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.0
         with:
           name: gfs-ai-tools
           path: |
