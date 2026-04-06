@@ -55,13 +55,15 @@ pub async fn checkout(
     let short_hash = &commit_hash[..7.min(commit_hash.len())];
     if let Some(ref name) = create_branch {
         println!(
-            "Switched to new branch '{}' ({})",
+            "{} Switched to new branch '{}' ({})",
+            green("✓"),
             green(name.trim()),
             dimmed(short_hash)
         );
     } else {
         println!(
-            "Switched to {} ({})",
+            "{} Switched to {} ({})",
+            green("✓"),
             cyan(revision.trim()),
             dimmed(short_hash)
         );
