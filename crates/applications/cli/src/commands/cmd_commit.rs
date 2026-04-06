@@ -10,6 +10,7 @@ use gfs_domain::ports::database_provider::InMemoryDatabaseProviderRegistry;
 use gfs_domain::ports::repository::Repository;
 use gfs_domain::ports::storage::StoragePort;
 use gfs_domain::usecases::repository::commit_repo_usecase::CommitRepoUseCase;
+use serde_json::json;
 
 use crate::cli_utils::get_repo_dir;
 use crate::output::{cyan, dimmed, green};
@@ -23,19 +24,20 @@ pub async fn commit(
     message: String,
     author: Option<String>,
     author_email: Option<String>,
+    json_output: bool,
 ) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         use gfs_storage_apfs::ApfsStorage;
         let storage: Arc<dyn StoragePort> = Arc::new(ApfsStorage::new());
-        run(path, message, author, author_email, storage).await
+        run(path, message, author, author_email, storage, json_output).await
     }
 
     #[cfg(not(target_os = "macos"))]
     {
         use gfs_storage_file::FileStorage;
         let storage: Arc<dyn StoragePort> = Arc::new(FileStorage::new());
-        run(path, message, author, author_email, storage).await
+        run(path, message, author, author_email, storage, json_output).await
     }
 }
 
@@ -49,6 +51,7 @@ async fn run(
     author: Option<String>,
     author_email: Option<String>,
     storage: Arc<dyn StoragePort>,
+    json_output: bool,
 ) -> Result<()> {
     let repo_path = path.unwrap_or_else(get_repo_dir);
 
@@ -75,15 +78,18 @@ async fn run(
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    print_commit_result(&branch, &commit_hash, &message);
+    if json_output {
+        println!(
+            "{}",
+            json!({
+                "hash": commit_hash,
+                "branch": branch,
+                "message": message,
+            })
+        );
+    } else {
+        let short = &commit_hash[..7.min(commit_hash.len())];
+        println!("{} [{}] {}  {}", green("✓"), cyan(&branch), dimmed(short), message);
+    }
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Display
-// ---------------------------------------------------------------------------
-
-fn print_commit_result(branch: &str, hash: &str, message: &str) {
-    let short = &hash[..7.min(hash.len())];
-    println!("{} [{}] {}  {}", green("✓"), cyan(branch), dimmed(short), message);
 }

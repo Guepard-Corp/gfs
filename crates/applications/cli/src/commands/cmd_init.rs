@@ -8,6 +8,7 @@ use gfs_domain::ports::compute::Compute;
 use gfs_domain::ports::database_provider::InMemoryDatabaseProviderRegistry;
 use gfs_domain::ports::repository::Repository;
 use gfs_domain::usecases::repository::init_repo_usecase::InitRepositoryUseCase;
+use serde_json::json;
 
 use crate::cli_utils::get_repo_dir;
 use crate::output::{cyan, dimmed, green};
@@ -17,6 +18,7 @@ pub async fn init(
     database_provider: Option<String>,
     database_version: Option<String>,
     database_port: Option<u16>,
+    json_output: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::trace!("Initializing Guepard environment at: {:?}", path);
 
@@ -40,29 +42,28 @@ pub async fn init(
         )
         .await?;
 
-    // Success feedback
-    println!(
-        "  {} Initialized GFS repository at {}",
-        green("✓"),
-        cyan(target_path.display().to_string())
-    );
-    println!();
-    println!(
-        "    {:<16} {}",
-        dimmed("Branch"),
-        cyan("main")
-    );
-    println!(
-        "    {:<16} {}",
-        dimmed("Config"),
-        ".gfs/config.toml"
-    );
-    if let Some(ref provider) = provider_display {
+    if json_output {
         println!(
-            "    {:<16} {}",
-            dimmed("Provider"),
-            cyan(provider)
+            "{}",
+            json!({
+                "path": target_path.display().to_string(),
+                "branch": "main",
+                "config": ".gfs/config.toml",
+                "provider": provider_display,
+            })
         );
+    } else {
+        println!(
+            "  {} Initialized GFS repository at {}",
+            green("✓"),
+            cyan(target_path.display().to_string())
+        );
+        println!();
+        println!("    {:<16} {}", dimmed("Branch"), cyan("main"));
+        println!("    {:<16} {}", dimmed("Config"), ".gfs/config.toml");
+        if let Some(ref provider) = provider_display {
+            println!("    {:<16} {}", dimmed("Provider"), cyan(provider));
+        }
     }
 
     Ok(())
