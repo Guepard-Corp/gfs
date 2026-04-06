@@ -223,6 +223,27 @@ enum TopLevel {
         revision: Option<String>,
     },
 
+    /// List, create, or delete branches
+    Branch {
+        /// Name of the branch to create (omit to list all branches)
+        name: Option<String>,
+
+        /// Commit or branch to start the new branch from (default: HEAD)
+        start_point: Option<String>,
+
+        /// Delete the named branch
+        #[arg(short = 'd', long)]
+        delete: Option<String>,
+
+        /// Switch to the new branch after creating it (like checkout -b)
+        #[arg(short = 'c', long)]
+        checkout: bool,
+
+        /// Path to the GFS repository root (default: current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+
     /// Export data from the running database instance to a file
     Export {
         /// Path to the GFS repository root (default: current directory)
@@ -404,6 +425,7 @@ fn command_name(cmd: &TopLevel) -> &'static str {
         TopLevel::Commit { .. } => "commit",
         TopLevel::Config { .. } => "config",
         TopLevel::Checkout { .. } => "checkout",
+        TopLevel::Branch { .. } => "branch",
         TopLevel::Export { .. } => "export",
         TopLevel::Import { .. } => "import",
         TopLevel::Providers { .. } => "providers",
@@ -492,6 +514,16 @@ where
                 revision,
             } => {
                 commands::cmd_checkout::checkout(path, revision, create_branch).await?;
+                Ok(0)
+            }
+            TopLevel::Branch {
+                name,
+                start_point,
+                delete,
+                checkout,
+                path,
+            } => {
+                commands::cmd_branch::run(path, name, start_point, delete, checkout).await?;
                 Ok(0)
             }
             TopLevel::Export {

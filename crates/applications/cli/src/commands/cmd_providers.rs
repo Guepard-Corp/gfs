@@ -7,7 +7,10 @@ use gfs_domain::ports::database_provider::{
     DatabaseProviderRegistry, InMemoryDatabaseProviderRegistry, SupportedFeature,
 };
 
-use crate::output::{bold, cyan};
+use crate::output::{
+    bold, cyan, tbl_rule, TBL_BL, TBL_BR, TBL_T_DOWN, TBL_T_LEFT, TBL_T_RIGHT, TBL_T_UP,
+    TBL_TL, TBL_TR, TBL_V,
+};
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -70,84 +73,109 @@ fn print_provider_detail(registry: &impl DatabaseProviderRegistry, name: &str) -
 }
 
 // ---------------------------------------------------------------------------
-// Output
+// Output — Unicode box tables
 // ---------------------------------------------------------------------------
 
-/// Print providers table. Columns: database_provider | version | features
+const COL_PROVIDER: usize = 20;
+const COL_VERSION: usize = 30;
+const COL_FEATURES: usize = 30;
+
 fn print_providers_table(rows: &[(String, String, String)]) {
-    const COL_PROVIDER: usize = 20;
-    const COL_VERSION: usize = 30;
-    const COL_FEATURES: usize = 50;
+    let cols = [COL_PROVIDER, COL_VERSION, COL_FEATURES];
 
+    // Top border: ┌──────┬──────┬──────┐
+    println!("{}", tbl_rule(&cols, TBL_TL, TBL_T_DOWN, TBL_TR));
+
+    // Header row
+    let h_provider = format!("{:<w$}", "database_provider", w = COL_PROVIDER);
+    let h_version = format!("{:<w$}", "version", w = COL_VERSION);
+    let h_features = format!("{:<w$}", "features", w = COL_FEATURES);
     println!(
-        "  {:<provider$} | {:<version$} | {:<features$}",
-        bold("database_provider"),
-        bold("version"),
-        bold("features"),
-        provider = COL_PROVIDER,
-        version = COL_VERSION,
-        features = COL_FEATURES
-    );
-    println!(
-        "  {:<provider$}-+-{:<version$}-+-{:<features$}",
-        "-".repeat(COL_PROVIDER),
-        "-".repeat(COL_VERSION),
-        "-".repeat(COL_FEATURES),
-        provider = COL_PROVIDER,
-        version = COL_VERSION,
-        features = COL_FEATURES
+        "  {} {} {} {} {} {} {}",
+        TBL_V,
+        bold(&h_provider),
+        TBL_V,
+        bold(&h_version),
+        TBL_V,
+        bold(&h_features),
+        TBL_V
     );
 
+    // Separator: ├──────┼──────┼──────┤
+    println!(
+        "{}",
+        tbl_rule(&cols, TBL_T_RIGHT, "┼", TBL_T_LEFT)
+    );
+
+    // Data rows
     for (name, versions, features) in rows {
-        let version_trunc = truncate(versions, COL_VERSION);
-        let features_trunc = truncate(features, COL_FEATURES);
+        let p = format!("{:<w$}", name, w = COL_PROVIDER);
+        let v = format!("{:<w$}", truncate(versions, COL_VERSION), w = COL_VERSION);
+        let f = format!("{:<w$}", truncate(features, COL_FEATURES), w = COL_FEATURES);
         println!(
-            "  {:<provider$} | {:<version$} | {:<features$}",
-            cyan(name),
-            version_trunc,
-            features_trunc,
-            provider = COL_PROVIDER,
-            version = COL_VERSION,
-            features = COL_FEATURES
+            "  {} {} {} {} {} {} {}",
+            TBL_V,
+            cyan(&p),
+            TBL_V,
+            v,
+            TBL_V,
+            f,
+            TBL_V
         );
     }
+
+    // Bottom border: └──────┴──────┴──────┘
+    println!("{}", tbl_rule(&cols, TBL_BL, TBL_T_UP, TBL_BR));
 
     println!();
     println!("  Images are pulled from Docker Hub by default.");
 }
 
-/// Print features table. Columns: feature | description
+const COL_FEATURE: usize = 25;
+const COL_DESC: usize = 45;
+
 fn print_features_table(features: &[SupportedFeature]) {
-    const COL_FEATURE: usize = 25;
-    const COL_DESC: usize = 55;
+    let cols = [COL_FEATURE, COL_DESC];
 
     println!("  {}", bold("Features"));
-    println!("  {}", "─".repeat(COL_FEATURE + COL_DESC + 5));
+
+    // Top border
+    println!("{}", tbl_rule(&cols, TBL_TL, TBL_T_DOWN, TBL_TR));
+
+    // Header
+    let h_feat = format!("{:<w$}", "feature", w = COL_FEATURE);
+    let h_desc = format!("{:<w$}", "description", w = COL_DESC);
     println!(
-        "  {:<feature$} | {:<desc$}",
-        bold("feature"),
-        bold("description"),
-        feature = COL_FEATURE,
-        desc = COL_DESC
-    );
-    println!(
-        "  {:<feature$}-+-{:<desc$}",
-        "-".repeat(COL_FEATURE),
-        "-".repeat(COL_DESC),
-        feature = COL_FEATURE,
-        desc = COL_DESC
+        "  {} {} {} {} {}",
+        TBL_V,
+        bold(&h_feat),
+        TBL_V,
+        bold(&h_desc),
+        TBL_V
     );
 
+    // Separator
+    println!(
+        "{}",
+        tbl_rule(&cols, TBL_T_RIGHT, "┼", TBL_T_LEFT)
+    );
+
+    // Rows
     for f in features {
-        let desc_trunc = truncate(&f.description, COL_DESC);
+        let feat = format!("{:<w$}", f.id, w = COL_FEATURE);
+        let desc = format!(
+            "{:<w$}",
+            truncate(&f.description, COL_DESC),
+            w = COL_DESC
+        );
         println!(
-            "  {:<feature$} | {:<desc$}",
-            f.id,
-            desc_trunc,
-            feature = COL_FEATURE,
-            desc = COL_DESC
+            "  {} {} {} {} {}",
+            TBL_V, feat, TBL_V, desc, TBL_V
         );
     }
+
+    // Bottom
+    println!("{}", tbl_rule(&cols, TBL_BL, TBL_T_UP, TBL_BR));
 }
 
 fn truncate(s: impl AsRef<str>, max_len: usize) -> String {
@@ -155,6 +183,6 @@ fn truncate(s: impl AsRef<str>, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_len.saturating_sub(3)])
+        format!("{}…", &s[..max_len.saturating_sub(1)])
     }
 }

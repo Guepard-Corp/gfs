@@ -40,8 +40,8 @@ pub async fn run(
         .context("export failed")?;
 
     println!(
-        "{} {}",
-        green("Exported to"),
+        "{} Exported to {}",
+        green("✓"),
         cyan(output.file_path.display().to_string())
     );
     if !output.stderr.is_empty() {
