@@ -163,6 +163,18 @@ Parameters:
 
 Returns: Success status and checked out revision.
 
+**Tip**: For branch listing and creation without switching, use the CLI with `--json`:
+```shell
+# List branches programmatically
+gfs branch
+
+# Create branch from checkpoint without switching
+gfs branch release/v1.0 <commit_hash>
+
+# Delete a branch
+gfs branch -d old-feature
+```
+
 ### 7. Database Container Management
 
 Tool: `compute`
@@ -376,6 +388,30 @@ If `show_schema` returns error about missing schema, the commit was created befo
 
 Check that GFS CLI is installed on MCP server host. Verify Docker is running for database operations. Review error messages in tool response for specific issues.
 
+## CLI Fallback with `--json`
+
+When MCP tools are unavailable or you need operations not yet exposed as MCP tools (e.g., branch management, graph log), use the GFS CLI with `--json` for structured output:
+
+```shell
+# Structured commit output
+gfs --json commit -m "checkpoint before migration"
+# → {"hash":"b57732d8...","branch":"main","message":"checkpoint before migration"}
+
+# Structured checkout output
+gfs --json checkout -b feature/migration
+# → {"hash":"b57732d8...","branch":"feature/migration","new_branch":true}
+
+# Branch listing
+gfs branch
+
+# Branch topology graph
+gfs log --graph --all
+```
+
+**Exit codes** for conditional logic:
+- `gfs status` → 0 (compute running) or 1 (compute down)
+- `gfs schema diff` → 0 (no changes), 1 (changes), 2 (breaking)
+
 ## Key Reminders
 
 1. **Always commit before mutations** - Create safety checkpoints with automatic schema capture
@@ -387,6 +423,7 @@ Check that GFS CLI is installed on MCP server host. Verify Docker is running for
 7. **Show_schema for documentation** - Use to document database structure at any point
 8. **Extract_schema for current state** - Capture current schema without commit
 9. **Tool responses are structured** - Parse JSON responses for programmatic access
+10. **Use `--json` for CLI fallback** - When MCP tools aren't available, CLI with `--json` gives structured output
 
 ## Environment Variables
 
