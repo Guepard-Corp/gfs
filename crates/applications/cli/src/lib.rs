@@ -527,8 +527,8 @@ where
                 Ok(0)
             }
             TopLevel::Status { path, output } => {
-                commands::cmd_status::run(path, output).await?;
-                Ok(0)
+                let exit_code = commands::cmd_status::run(path, output).await?;
+                Ok(exit_code)
             }
             TopLevel::Query {
                 path,

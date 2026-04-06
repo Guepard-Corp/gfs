@@ -38,8 +38,8 @@ pub async fn run(
         .context("import failed")?;
 
     println!(
-        "{} {}",
-        green("Imported from"),
+        "{} Imported from {}",
+        green("✓"),
         cyan(output.imported_from.display().to_string())
     );
     if !output.stderr.is_empty() {
