@@ -14,7 +14,7 @@ use gfs_domain::repo_utils::repo_layout;
 use gfs_domain::usecases::repository::extract_schema_usecase::ExtractSchemaUseCase;
 
 use crate::cli_utils::get_repo_dir;
-use crate::output::{bold, cyan, dimmed, green};
+use crate::output::{cyan, dimmed, green, header};
 
 /// Extract schema from the running database instance.
 pub async fn run_extract(
@@ -52,8 +52,8 @@ pub async fn run_extract(
         std::fs::write(&output_path, &json)
             .with_context(|| format!("failed to write schema to {}", output_path.display()))?;
         println!(
-            "{} {}",
-            green("Schema extracted to"),
+            "{} Schema extracted to {}",
+            green("✓"),
             cyan(output_path.display().to_string())
         );
     } else {
@@ -101,18 +101,22 @@ pub async fn run_show(
         println!("{}", json);
     } else {
         // Show both metadata and DDL with colors
-        println!("{} {}", dimmed("Schema Hash:"), cyan(schema_hash));
+        println!("  {} {}", dimmed("Schema Hash:"), cyan(schema_hash));
         println!(
-            "{} {} {}",
+            "  {} {} {}",
             dimmed("Driver:"),
             metadata.driver,
             metadata.version
         );
-        println!("\n{}", bold("=== Metadata (JSON) ==="));
+        println!();
+        println!("  {}", header("Metadata (JSON)"));
+        println!();
         let json = serde_json::to_string_pretty(&metadata)
             .context("failed to serialize schema metadata")?;
         println!("{}", json);
-        println!("\n{}", bold("=== DDL (SQL) ==="));
+        println!();
+        println!("  {}", header("DDL (SQL)"));
+        println!();
         println!("{}", ddl);
     }
 
