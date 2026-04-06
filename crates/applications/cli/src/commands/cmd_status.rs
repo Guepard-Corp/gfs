@@ -20,7 +20,8 @@ use crate::output::{
 // Entry point
 // ---------------------------------------------------------------------------
 
-pub async fn run(path: Option<PathBuf>, output: String) -> Result<()> {
+/// Returns exit code: 0 = compute running (or no compute configured), 1 = compute not running.
+pub async fn run(path: Option<PathBuf>, output: String) -> Result<i32> {
     let repo_path = path.unwrap_or_else(get_repo_dir);
 
     let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
@@ -42,7 +43,13 @@ pub async fn run(path: Option<PathBuf>, output: String) -> Result<()> {
         _ => print_table(&status, &repo_path),
     }
 
-    Ok(())
+    // Exit code: 0 if no compute or compute is running, 1 otherwise.
+    let exit_code = match &status.compute {
+        Some(c) if c.container_status != "running" => 1,
+        _ => 0,
+    };
+
+    Ok(exit_code)
 }
 
 // ---------------------------------------------------------------------------
