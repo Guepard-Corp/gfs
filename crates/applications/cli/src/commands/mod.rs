@@ -1,3 +1,4 @@
+pub mod cmd_branch;
 pub mod cmd_checkout;
 pub mod cmd_commit;
 pub mod cmd_compute;
