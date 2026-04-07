@@ -783,7 +783,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -977,9 +977,10 @@ dependencies = [
 
 [[package]]
 name = "gfs-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "chrono",
  "clap",
@@ -1004,7 +1005,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-compute-docker"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "bollard",
@@ -1018,7 +1019,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-config"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -1028,7 +1029,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-domain"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1046,7 +1047,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-mcp"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "atty",
@@ -1068,7 +1069,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-storage-apfs"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1080,7 +1081,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-storage-file"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1092,7 +1093,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-telemetry"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "gfs-domain",
@@ -1105,7 +1106,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-website"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "console_error_panic_hook",
  "leptos",
@@ -1393,7 +1394,7 @@ dependencies = [
  "hyper 1.8.1",
  "libc",
  "pin-project-lite",
- "socket2 0.6.2",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -1593,7 +1594,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi 0.5.2",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2465,7 +2466,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3032,7 +3033,7 @@ dependencies = [
  "getrandom 0.4.1",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3096,9 +3097,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.49.0"
+version = "1.50.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72a2903cd7736441aac9df9d7688bd0ce48edccaadf181c3b90be801e81d3d86"
+checksum = "27ad5e34374e03cfffefc301becb44e9dc3c17584f414349ebe29ed26661822d"
 dependencies = [
  "bytes",
  "libc",
@@ -3609,7 +3610,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
