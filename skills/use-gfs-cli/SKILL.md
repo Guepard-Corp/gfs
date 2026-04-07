@@ -31,6 +31,59 @@ Validate the installation:
 gfs version
 ```
 
+## Global Flags
+
+### `--json` — Machine-Readable Output
+
+Add `--json` before any subcommand for structured JSON output instead of styled text. This is the recommended approach for scripts and AI agents:
+
+```shell
+# Commit and get the hash programmatically
+gfs --json commit -m "add users table"
+# → {"hash":"b57732d8...","branch":"main","message":"add users table"}
+
+# Init and get the connection string
+gfs --json init --database-provider postgres --database-version 17
+# → {"path":"/my/project","branch":"main","config":".gfs/config.toml","provider":"postgres"}
+
+# Checkout and confirm
+gfs --json checkout -b feature/auth
+# → {"hash":"b57732d8...","branch":"feature/auth","new_branch":true}
+
+# Export and get the file path
+gfs --json export --format sql
+# → {"file_path":".gfs/exports/dump.sql","format":"sql"}
+```
+
+**Supported commands**: `init`, `commit`, `checkout`, `export`, `import`
+`gfs status --output json` also works (predates the global flag).
+
+### `--color` — Color Control
+
+```shell
+gfs --color never status   # No ANSI colors (for piping)
+gfs --color always log     # Force colors even when piped
+```
+
+### Exit Codes
+
+| Command | Code | Meaning |
+|---------|------|---------|
+| `gfs status` | 0 | Compute running or not configured |
+| `gfs status` | 1 | Compute configured but not running |
+| `gfs schema diff` | 0 | No schema changes |
+| `gfs schema diff` | 1 | Schema changes detected |
+| `gfs schema diff` | 2 | Breaking changes detected |
+
+Use exit codes for conditional logic:
+```shell
+if gfs status > /dev/null 2>&1; then
+    gfs query "SELECT 1"
+else
+    gfs compute start
+fi
+```
+
 ## Quick Start
 
 ### 1. Check available database providers
@@ -138,18 +191,33 @@ gfs log --max-count 10
 
 # View commits in a range
 gfs log --from main --until feature-branch
+
+# Show branch topology graph (all branches)
+gfs log --graph --all
+
+# Show graph for current branch only
+gfs log --graph
 ```
 
-### 3. Create Branches
-
-Experiment with database changes in isolated branches:
+### 3. Manage Branches
 
 ```shell
+# List all branches (* marks current)
+gfs branch
+
+# Create branch at HEAD (without switching)
+gfs branch feature-branch
+
+# Create branch from specific commit/checkpoint
+gfs branch release/v1.0 <commit_id>
+
 # Create and switch to new branch
+gfs branch -c feature-branch
+# or the classic shorthand:
 gfs checkout -b feature-branch
 
-# List available branches (shown in gfs log output)
-gfs log
+# Delete a branch
+gfs branch -d feature-branch
 ```
 
 ### 4. Switch Branches
@@ -363,11 +431,10 @@ gfs schema show HEAD~5
 # Compare schema changes over time
 gfs schema diff HEAD~10 HEAD
 
-# Export schema history
-for commit in $(gfs log --max-count 10 | grep "commit" | awk '{print $2}'); do
-  echo "=== Commit $commit ==="
-  gfs schema show $commit --ddl-only
-done
+# View schema across recent commits using rev~n notation
+gfs schema show HEAD~1 --ddl-only
+gfs schema show HEAD~2 --ddl-only
+gfs schema show HEAD~3 --ddl-only
 ```
 
 ### Rollback to Previous State
@@ -394,14 +461,17 @@ gfs commit -m "rolled back to working state"
 ### Audit Schema Changes
 
 ```shell
-# Find when a specific table was added
-gfs log | grep -A2 "users table"
+# View full commit history to find a specific change
+gfs log
 
 # Show schema at that commit
 gfs schema show <commit_id>
 
 # Compare with current schema
 gfs schema diff <commit_id> HEAD
+
+# Compare with pretty visual output
+gfs schema diff <commit_id> HEAD --pretty
 
 # Extract DDL for code review
 gfs schema show <commit_id> --ddl-only > schema-then.sql

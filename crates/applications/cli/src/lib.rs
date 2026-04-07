@@ -149,6 +149,10 @@ struct Cli {
     #[arg(long, global = true, default_value_t = ColorMode::Auto, value_enum)]
     color: ColorMode,
 
+    /// Output machine-readable JSON instead of styled text (for agent/script consumption)
+    #[arg(long, global = true)]
+    json: bool,
+
     #[command(subcommand)]
     command: TopLevel,
 }
@@ -451,8 +455,9 @@ where
     let version = env!("CARGO_PKG_VERSION");
     let os = std::env::consts::OS;
 
-    // Capture color before moving cli.command (ColorMode is Copy)
+    // Capture flags before moving cli.command
     let color = cli.color;
+    let json_output = cli.json;
 
     let result: Result<i32> = async move {
         match cli.command {
@@ -462,7 +467,7 @@ where
                 database_version,
                 port,
             } => {
-                commands::cmd_init::init(path, database_provider, database_version, port)
+                commands::cmd_init::init(path, database_provider, database_version, port, json_output)
                     .await
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
                 Ok(0)
@@ -473,7 +478,7 @@ where
                 author,
                 author_email,
             } => {
-                commands::cmd_commit::commit(path, message, author, author_email).await?;
+                commands::cmd_commit::commit(path, message, author, author_email, json_output).await?;
                 Ok(0)
             }
             TopLevel::Config {
@@ -491,7 +496,7 @@ where
                 create_branch,
                 revision,
             } => {
-                commands::cmd_checkout::checkout(path, revision, create_branch).await?;
+                commands::cmd_checkout::checkout(path, revision, create_branch, json_output).await?;
                 Ok(0)
             }
             TopLevel::Export {
@@ -500,7 +505,7 @@ where
                 format,
                 id,
             } => {
-                commands::cmd_export::run(path, output_dir, format, id).await?;
+                commands::cmd_export::run(path, output_dir, format, id, json_output).await?;
                 Ok(0)
             }
             TopLevel::Import {
@@ -509,7 +514,7 @@ where
                 format,
                 id,
             } => {
-                commands::cmd_import::run(path, file, format, id).await?;
+                commands::cmd_import::run(path, file, format, id, json_output).await?;
                 Ok(0)
             }
             TopLevel::Providers { provider } => {

@@ -15,7 +15,7 @@ use gfs_domain::utils::data_dir;
 
 use crate::ComputeAction;
 use crate::cli_utils::{get_repo_dir, relativize_to_repo};
-use crate::output::{dimmed, green, red, yellow};
+use crate::output::{bold, box_bottom, box_row, box_top, dimmed, green, red, yellow};
 
 // ---------------------------------------------------------------------------
 // Entry point called from main
@@ -76,7 +76,11 @@ fn handle_config(path: Option<PathBuf>, key: &str, value: &str) -> Result<()> {
                 );
             }
             config.save(&repo_path).context("failed to save config")?;
-            println!("database_port updated to {port}. Run 'gfs compute restart' to apply.");
+            println!(
+                "{} database_port updated to {}. Run 'gfs compute restart' to apply.",
+                green("✓"),
+                port
+            );
             Ok(())
         }
         _ => anyhow::bail!("unknown config key '{}'; supported keys: db.port", key),
@@ -101,23 +105,16 @@ async fn dispatch(
                 .status(&instance_id)
                 .await
                 .map_err(anyhow::Error::from)?;
-            print_status(&status);
-            if let Some(ref dir) = container_data_dir(compute, &instance_id, path.clone()).await {
-                let repo_path = path.clone().unwrap_or_else(get_repo_dir);
-                let rel = relativize_to_repo(&repo_path, dir);
-                println!("Container data dir : {rel}");
-            }
+            let data_dir = container_data_dir(compute, &instance_id, path.clone()).await;
+            print_status(&status, data_dir.as_deref(), path.as_ref());
         }
 
         ComputeAction::Start { .. } => {
             let repo_path = path.clone().unwrap_or_else(get_repo_dir);
             let (instance_id, status) =
                 start_restart_or_recreate(compute, &instance_id, &repo_path, false).await?;
-            print_status(&status);
-            if let Some(ref dir) = container_data_dir(compute, &instance_id, path).await {
-                let rel = relativize_to_repo(&repo_path, dir);
-                println!("Container data dir : {rel}");
-            }
+            let data_dir = container_data_dir(compute, &instance_id, path.clone()).await;
+            print_status(&status, data_dir.as_deref(), path.as_ref());
         }
 
         ComputeAction::Stop { .. } => {
@@ -125,18 +122,15 @@ async fn dispatch(
                 .stop(&instance_id)
                 .await
                 .map_err(anyhow::Error::from)?;
-            print_status(&status);
+            print_status(&status, None, path.as_ref());
         }
 
         ComputeAction::Restart { .. } => {
             let repo_path = path.clone().unwrap_or_else(get_repo_dir);
             let (instance_id, status) =
                 start_restart_or_recreate(compute, &instance_id, &repo_path, true).await?;
-            print_status(&status);
-            if let Some(ref dir) = container_data_dir(compute, &instance_id, path).await {
-                let rel = relativize_to_repo(&repo_path, dir);
-                println!("Container data dir : {rel}");
-            }
+            let data_dir = container_data_dir(compute, &instance_id, path.clone()).await;
+            print_status(&status, data_dir.as_deref(), path.as_ref());
         }
 
         ComputeAction::Pause { .. } => {
@@ -144,7 +138,7 @@ async fn dispatch(
                 .pause(&instance_id)
                 .await
                 .map_err(anyhow::Error::from)?;
-            print_status(&status);
+            print_status(&status, None, path.as_ref());
         }
 
         ComputeAction::Unpause { .. } => {
@@ -152,7 +146,7 @@ async fn dispatch(
                 .unpause(&instance_id)
                 .await
                 .map_err(anyhow::Error::from)?;
-            print_status(&status);
+            print_status(&status, None, path.as_ref());
         }
 
         ComputeAction::Config { .. } => unreachable!("Config is handled before dispatch"),
@@ -203,21 +197,77 @@ async fn dispatch(
 }
 
 // ---------------------------------------------------------------------------
-// Display helper
+// Display helper — boxed status
 // ---------------------------------------------------------------------------
 
-fn print_status(s: &InstanceStatus) {
-    println!("id          : {}", dimmed(&s.id.0));
-    println!("state       : {}", format_state_colored(&s.state));
+const BOX_W: usize = 40;
+const LABEL_W: usize = 18;
+
+fn fmt_row(label: &str, value: &str) -> String {
+    let value_w = BOX_W - LABEL_W - 1;
+    let padded_label = format!("{:<w$}", label, w = LABEL_W);
+    let padded_value = format!("{:<w$}", value, w = value_w);
+    format!("{} {}", dimmed(&padded_label), padded_value)
+}
+
+fn fmt_row_colored(label: &str, colored_value: &str, raw_value: &str) -> String {
+    let value_w = BOX_W - LABEL_W - 1;
+    let padded_label = format!("{:<w$}", label, w = LABEL_W);
+    let remaining = value_w.saturating_sub(raw_value.chars().count());
+    format!(
+        "{} {}{}",
+        dimmed(&padded_label),
+        colored_value,
+        " ".repeat(remaining)
+    )
+}
+
+fn print_status(s: &InstanceStatus, data_dir: Option<&str>, path: Option<&PathBuf>) {
+    println!("{}", box_top(&bold("Compute"), BOX_W));
+
+    // ID
+    let truncated_id = truncate_id(&s.id.0);
+    let row = fmt_row_colored("id", &dimmed(&truncated_id), &truncated_id);
+    println!("{}", box_row(&row, BOX_W));
+
+    // State with dot indicator
+    let state_str = format_state(&s.state);
+    let dot = status_indicator_colored(&s.state);
+    let colored_state = format!("{} {}", dot, format_state_colored_text(&s.state));
+    let raw_state = format!("{} {}", status_indicator_raw(&s.state), state_str);
+    let row = fmt_row_colored("state", &colored_state, &raw_state);
+    println!("{}", box_row(&row, BOX_W));
+
+    // PID
     if let Some(pid) = s.pid {
-        println!("pid         : {pid}");
+        let pid_str = pid.to_string();
+        let row = fmt_row("pid", &pid_str);
+        println!("{}", box_row(&row, BOX_W));
     }
+
+    // Started at
     if let Some(started_at) = s.started_at {
-        println!("started_at  : {}", started_at.format("%Y-%m-%dT%H:%M:%SZ"));
+        let ts = started_at.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let row = fmt_row("started_at", &ts);
+        println!("{}", box_row(&row, BOX_W));
     }
+
+    // Exit code
     if let Some(code) = s.exit_code {
-        println!("exit_code   : {code}");
+        let code_str = code.to_string();
+        let row = fmt_row("exit_code", &code_str);
+        println!("{}", box_row(&row, BOX_W));
     }
+
+    // Container data dir
+    if let Some(dir) = data_dir {
+        let repo_path = path.cloned().unwrap_or_else(get_repo_dir);
+        let rel = relativize_to_repo(&repo_path, dir);
+        let row = fmt_row("data dir", &rel);
+        println!("{}", box_row(&row, BOX_W));
+    }
+
+    println!("{}", box_bottom(BOX_W));
 }
 
 fn format_state(state: &InstanceState) -> &'static str {
@@ -233,15 +283,40 @@ fn format_state(state: &InstanceState) -> &'static str {
     }
 }
 
-fn format_state_colored(state: &InstanceState) -> String {
+fn status_indicator_raw(state: &InstanceState) -> &'static str {
+    match state {
+        InstanceState::Running => "●",
+        InstanceState::Starting | InstanceState::Restarting => "◐",
+        InstanceState::Stopped | InstanceState::Stopping | InstanceState::Paused => "○",
+        InstanceState::Failed | InstanceState::Unknown => "✕",
+    }
+}
+
+fn status_indicator_colored(state: &InstanceState) -> String {
+    let dot = status_indicator_raw(state);
+    match state {
+        InstanceState::Running => green(dot),
+        InstanceState::Starting | InstanceState::Restarting => yellow(dot),
+        InstanceState::Stopped | InstanceState::Stopping | InstanceState::Paused => dimmed(dot),
+        InstanceState::Failed | InstanceState::Unknown => red(dot),
+    }
+}
+
+fn format_state_colored_text(state: &InstanceState) -> String {
     let s = format_state(state);
     match state {
-        InstanceState::Running => green(s).to_string(),
-        InstanceState::Starting | InstanceState::Restarting => yellow(s).to_string(),
-        InstanceState::Stopped | InstanceState::Stopping | InstanceState::Paused => {
-            dimmed(s).to_string()
-        }
-        InstanceState::Failed | InstanceState::Unknown => red(s).to_string(),
+        InstanceState::Running => green(s),
+        InstanceState::Starting | InstanceState::Restarting => yellow(s),
+        InstanceState::Stopped | InstanceState::Stopping | InstanceState::Paused => dimmed(s),
+        InstanceState::Failed | InstanceState::Unknown => red(s),
+    }
+}
+
+fn truncate_id(id: &str) -> String {
+    if id.len() <= 16 {
+        id.to_string()
+    } else {
+        format!("{}…", &id[..12])
     }
 }
 
