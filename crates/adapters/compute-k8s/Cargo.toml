@@ -1,0 +1,21 @@
+[package]
+name               = "gfs-compute-k8s"
+version.workspace      = true
+edition.workspace      = true
+authors.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait   = { workspace = true }
+chrono        = { workspace = true }
+futures-util  = { version = "0.3" }
+gfs-domain    = { workspace = true }
+k8s-openapi   = { workspace = true }
+kube          = { workspace = true }
+serde_json    = { workspace = true }
+tar           = { workspace = true }
+thiserror     = { workspace = true }
+tokio         = { workspace = true }
+tracing       = { workspace = true }

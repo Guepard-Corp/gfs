@@ -35,6 +35,7 @@ path = "tests/schema/extract_clickhouse.rs"
 gfs-domain     = { workspace = true }
 gfs-telemetry  = { workspace = true }
 gfs-compute-docker        = { workspace = true }
+gfs-compute-k8s           = { workspace = true }
 gfs-storage-file   = { workspace = true }
 gfs-mcp            = { workspace = true }
 chrono             = { workspace = true }

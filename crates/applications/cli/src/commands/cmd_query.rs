@@ -4,14 +4,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use gfs_compute_docker::DockerCompute;
 use gfs_domain::model::config::GfsConfig;
-use gfs_domain::ports::compute::{Compute, InstanceId};
+use gfs_domain::ports::compute::InstanceId;
 use gfs_domain::ports::database_provider::{
     ConnectionParams, DatabaseProviderRegistry, InMemoryDatabaseProviderRegistry,
 };
 
 use crate::cli_utils::get_repo_dir;
+use crate::commands::compute_support::compute_for_path;
 
 /// Execute a SQL query against the running database instance.
 ///
@@ -44,8 +44,7 @@ pub async fn run(
     let provider_name = &environment.database_provider;
     let container_name = &runtime.container_name;
 
-    // Set up compute and registry
-    let compute = Arc::new(DockerCompute::new().map_err(|e| anyhow::anyhow!("{e}"))?);
+    let compute = compute_for_path(&repo_path).await?;
 
     let registry_impl = InMemoryDatabaseProviderRegistry::new();
     gfs_compute_docker::containers::register_all(&registry_impl)

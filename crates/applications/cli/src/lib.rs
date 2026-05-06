@@ -187,6 +187,10 @@ enum TopLevel {
         /// Database name (if provider is set)
         #[arg(long)]
         database_name: Option<String>,
+
+        /// Compute runtime to use: "docker" (default) or "k8s".
+        #[arg(long, default_value = "docker")]
+        runtime_provider: String,
     },
 
     /// Record a commit of the current repository state
@@ -523,6 +527,7 @@ where
                 database_user,
                 database_password,
                 database_name,
+                runtime_provider,
             } => {
                 let credentials =
                     gfs_domain::usecases::repository::init_repo_usecase::DatabaseCredentials {
@@ -536,6 +541,9 @@ where
                     database_version,
                     port,
                     credentials,
+                    runtime_provider,
+                    credentials,
+                    runtime_provider,
                     json_output,
                 )
                 .await
