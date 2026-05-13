@@ -542,8 +542,6 @@ where
                     port,
                     credentials,
                     runtime_provider,
-                    credentials,
-                    runtime_provider,
                     json_output,
                 )
                 .await

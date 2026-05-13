@@ -47,6 +47,9 @@ const MANAGER: &str = "gfs";
 const DEFAULT_PVC_SIZE: &str = "10Gi";
 const SCALE_TIMEOUT: Duration = Duration::from_secs(180);
 const POLL_INTERVAL_MS: u64 = 500;
+const TASK_CONTAINER_NAME: &str = "task";
+const SIDECAR_CONTAINER_NAME: &str = "sidecar";
+const BUSYBOX_SIDECAR_IMAGE: &str = "busybox:1.36";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -139,7 +142,7 @@ pub struct K8sCompute {
 impl K8sCompute {
     /// Connect to the cluster using default kubeconfig resolution and default config.
     pub async fn new() -> std::result::Result<Self, ComputeError> {
-        Self::with_config(K8sComputeConfig::default()).await
+        Self::with_config(K8sComputeConfig::from_env()).await
     }
 
     /// Connect to the cluster with explicit configuration.
@@ -287,16 +290,25 @@ impl K8sCompute {
     // -----------------------------------------------------------------------
 
     async fn exec_in_pod(&self, pod_name: &str, command: &[&str]) -> Result<ExecOutput> {
+        self.exec_in_pod_container(pod_name, None, command).await
+    }
+
+    async fn exec_in_pod_container(
+        &self,
+        pod_name: &str,
+        container: Option<&str>,
+        command: &[&str],
+    ) -> Result<ExecOutput> {
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
+        let mut attach = AttachParams::default()
+            .stdout(true)
+            .stderr(true)
+            .stdin(false);
+        if let Some(c) = container {
+            attach = attach.container(c);
+        }
         let mut attached = pods
-            .exec(
-                pod_name,
-                command.iter().copied(),
-                &AttachParams::default()
-                    .stdout(true)
-                    .stderr(true)
-                    .stdin(false),
-            )
+            .exec(pod_name, command.iter().copied(), &attach)
             .await
             .map_err(|e| ComputeError::Internal(format!("exec failed: {e}")))?;
 
@@ -543,6 +555,245 @@ impl K8sCompute {
         }
 
         Ok(files)
+    }
+
+    fn bare_pod_phase(pod: &Pod) -> Option<&str> {
+        pod.status.as_ref()?.phase.as_deref()
+    }
+
+    fn init_container_exit_code(pod: &Pod, name: &str) -> Option<i32> {
+        let statuses = pod.status.as_ref()?.init_container_statuses.as_ref()?;
+        let st = statuses.iter().find(|s| s.name == name)?;
+        let term = st.state.as_ref()?.terminated.as_ref()?;
+        Some(term.exit_code)
+    }
+
+    fn main_container_exit_code(pod: &Pod, name: &str) -> Option<i32> {
+        let statuses = pod.status.as_ref()?.container_statuses.as_ref()?;
+        let st = statuses.iter().find(|s| s.name == name)?;
+        let term = st.state.as_ref()?.terminated.as_ref()?;
+        Some(term.exit_code)
+    }
+
+    /// Stream `tar -cf - -C parent basename` from a pod (optionally a non-default container) into `dest`.
+    async fn stream_tar_from_pod_path(
+        &self,
+        pod_name: &str,
+        exec_container: Option<&str>,
+        pack_src: &Path,
+        dest: &Path,
+    ) -> Result<()> {
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
+        let parent = pack_src
+            .parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or("/");
+        let basename = pack_src
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(".");
+        let tar_cmd = format!("tar -cf - -C {parent} {basename}");
+        let tar_args = ["sh", "-c", tar_cmd.as_str()];
+        let mut attach = AttachParams::default()
+            .stdout(true)
+            .stderr(false)
+            .stdin(false);
+        if let Some(c) = exec_container {
+            attach = attach.container(c);
+        }
+        let mut attached = pods
+            .exec(pod_name, tar_args.iter().copied(), &attach)
+            .await
+            .map_err(|e| ComputeError::Internal(format!("exec tar failed: {e}")))?;
+
+        let mut stdout = attached
+            .stdout()
+            .ok_or_else(|| ComputeError::Internal("no stdout from tar exec".to_string()))?;
+
+        let dest_path = dest.to_path_buf();
+        let (pipe_reader, mut pipe_writer) = std::io::pipe().map_err(ComputeError::Io)?;
+
+        let unpack =
+            tokio::task::spawn_blocking(move || Self::unpack_tar(pipe_reader, &dest_path));
+
+        let copy_result: Result<()> = async {
+            let mut buf = vec![0u8; 65536];
+            loop {
+                let n = stdout.read(&mut buf).await.map_err(ComputeError::Io)?;
+                if n == 0 {
+                    break;
+                }
+                use std::io::Write;
+                pipe_writer.write_all(&buf[..n]).map_err(ComputeError::Io)?;
+            }
+            Ok(())
+        }
+        .await;
+
+        drop(pipe_writer);
+        drop(attached);
+
+        let files = unpack
+            .await
+            .map_err(|e| ComputeError::Internal(format!("tar unpack task panicked: {e}")))?
+            .map_err(ComputeError::Io)?;
+
+        if files == 0 {
+            return Err(ComputeError::Internal(format!(
+                "tar stream from pod '{pod_name}' produced an empty archive"
+            )));
+        }
+
+        if let Err(e) = copy_result {
+            match &e {
+                ComputeError::Io(ioe) if ioe.kind() == std::io::ErrorKind::BrokenPipe => {}
+                _ => return Err(e),
+            }
+        }
+
+        Ok(())
+    }
+
+    fn host_data_tree_has_files(dir: &Path) -> std::io::Result<bool> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let ft = entry.file_type()?;
+            if ft.is_file() {
+                return Ok(true);
+            }
+            if ft.is_dir() && Self::host_data_tree_has_files(&entry.path())? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// `true` when there are no files under `host_data_dir` (directories only or missing → created).
+    /// Used to pick the export capture path (init + sidecar + tar out). Any file uses the import path.
+    fn host_dir_is_empty_for_export_capture(dir: &Path) -> Result<bool> {
+        if !dir.exists() {
+            std::fs::create_dir_all(dir).map_err(ComputeError::Io)?;
+            return Ok(true);
+        }
+        if !dir.is_dir() {
+            return Err(ComputeError::Internal(format!(
+                "host_data_dir {} is not a directory",
+                dir.display()
+            )));
+        }
+        let has_files = Self::host_data_tree_has_files(dir).map_err(ComputeError::Io)?;
+        Ok(!has_files)
+    }
+
+    /// Stream a tar archive of `host_dir` from the gfs host into the pod via exec stdin (`tar xf`).
+    async fn stream_host_dir_tar_into_pod(
+        &self,
+        pod_name: &str,
+        container: &str,
+        host_dir: &Path,
+        dest_in_container: &Path,
+    ) -> Result<()> {
+        use std::process::Stdio;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::process::Command;
+
+        let dest = dest_in_container.to_string_lossy();
+        let extract_cmd = format!("mkdir -p {dest} && tar xf - -C {dest}");
+
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
+        let attach = AttachParams::default()
+            .stdin(true)
+            .stdout(false)
+            .stderr(false)
+            .container(container);
+
+        let mut attached = pods
+            .exec(
+                pod_name,
+                ["sh", "-c", extract_cmd.as_str()].iter().copied(),
+                &attach,
+            )
+            .await
+            .map_err(|e| ComputeError::Internal(format!("exec tar-in failed: {e}")))?;
+
+        let mut stdin = attached
+            .stdin()
+            .ok_or_else(|| ComputeError::Internal("tar-in: no stdin on attach".to_string()))?;
+        let status_rx = attached.take_status();
+
+        let host = host_dir
+            .to_str()
+            .ok_or_else(|| ComputeError::Internal("host_data_dir is not valid UTF-8".into()))?
+            .to_string();
+
+        let mut child = Command::new("tar")
+            .args(["cf", "-", "-C", host.as_str(), "."])
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|e| ComputeError::Internal(format!("host tar spawn failed: {e}")))?;
+
+        let mut tar_out = child
+            .stdout
+            .take()
+            .ok_or_else(|| ComputeError::Internal("host tar: no stdout".to_string()))?;
+
+        let copy_res: std::result::Result<(), ComputeError> = async {
+            let mut buf = vec![0u8; 65536];
+            loop {
+                let n = tar_out.read(&mut buf).await.map_err(ComputeError::Io)?;
+                if n == 0 {
+                    break;
+                }
+                stdin.write_all(&buf[..n]).await.map_err(ComputeError::Io)?;
+            }
+            stdin.shutdown().await.map_err(ComputeError::Io)?;
+            Ok(())
+        }
+        .await;
+
+        drop(stdin);
+        drop(tar_out);
+
+        if let Err(e) = copy_res {
+            drop(attached);
+            return Err(e);
+        }
+
+        let exit_code: i32 = if let Some(rx) = status_rx {
+            match rx.await {
+                Some(status) if status.status.as_deref() == Some("Success") => 0,
+                Some(status) => status.code.unwrap_or(1),
+                None => 0,
+            }
+        } else {
+            0
+        };
+
+        let host_tar_status = child.wait().await.map_err(ComputeError::Io)?;
+        if !host_tar_status.success() {
+            drop(attached);
+            return Err(ComputeError::Internal(format!(
+                "host tar cf failed (status {host_tar_status})"
+            )));
+        }
+
+        drop(attached);
+
+        if exit_code != 0 {
+            return Err(ComputeError::Internal(format!(
+                "pod tar extract failed with exit {exit_code}"
+            )));
+        }
+
+        Ok(())
+    }
+
+    async fn task_pod_logs(pods: &Api<Pod>, name: &str, container: &str) -> String {
+        let lp = LogParams {
+            container: Some(container.to_string()),
+            ..Default::default()
+        };
+        pods.logs(name, &lp).await.unwrap_or_default()
     }
 }
 
@@ -1050,78 +1301,9 @@ impl Compute for K8sCompute {
         dest: &Path,
     ) -> Result<()> {
         let pod_name = Self::pod_name(id);
-        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
-
-        let parent = Path::new(container_path)
-            .parent()
-            .and_then(|p| p.to_str())
-            .unwrap_or("/");
-        let basename = Path::new(container_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(".");
-        let tar_cmd = format!("tar -cf - -C {parent} {basename}");
-
-        let tar_args = ["sh", "-c", tar_cmd.as_str()];
-        let mut attached = pods
-            .exec(
-                &pod_name,
-                tar_args.iter().copied(),
-                &AttachParams::default()
-                    .stdout(true)
-                    .stderr(false)
-                    .stdin(false),
-            )
-            .await
-            .map_err(|e| ComputeError::Internal(format!("exec tar failed: {e}")))?;
-
-        let mut stdout = attached
-            .stdout()
-            .ok_or_else(|| ComputeError::Internal("no stdout from tar exec".to_string()))?;
-
-        let dest_path = dest.to_path_buf();
-        let (pipe_reader, mut pipe_writer) = std::io::pipe().map_err(ComputeError::Io)?;
-
-        let unpack =
-            tokio::task::spawn_blocking(move || Self::unpack_tar(pipe_reader, &dest_path));
-
-        let copy_result: Result<()> = async {
-            let mut buf = vec![0u8; 65536];
-            loop {
-                let n = stdout.read(&mut buf).await.map_err(ComputeError::Io)?;
-                if n == 0 {
-                    break;
-                }
-                use std::io::Write;
-                pipe_writer.write_all(&buf[..n]).map_err(ComputeError::Io)?;
-            }
-            Ok(())
-        }
-        .await;
-
-        drop(pipe_writer);
-        drop(attached);
-
-        let files = unpack
-            .await
-            .map_err(|e| ComputeError::Internal(format!("tar unpack task panicked: {e}")))?
-            .map_err(ComputeError::Io)?;
-
-        if files == 0 {
-            return Err(ComputeError::Internal(format!(
-                "stream_snapshot: '{container_path}' produced an empty archive"
-            )));
-        }
-
-        // BrokenPipe is harmless — tar may have exited before the stream ended.
-        if let Err(e) = copy_result {
-            match &e {
-                ComputeError::Io(ioe) if ioe.kind() == std::io::ErrorKind::BrokenPipe => {}
-                _ => return Err(e),
-            }
-        }
-
-        tracing::info!(pod = pod_name, container_path, files, "stream_snapshot complete");
+        self.stream_tar_from_pod_path(&pod_name, None, Path::new(container_path), dest)
+            .await?;
+        tracing::info!(pod = pod_name, container_path, "stream_snapshot complete");
         Ok(())
     }
 
@@ -1144,6 +1326,14 @@ impl Compute for K8sCompute {
                 .as_millis()
         );
 
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
+
+        let mut meta_labels = BTreeMap::from([
+            ("managed-by".to_string(), MANAGER.to_string()),
+            ("app".to_string(), task_name.clone()),
+        ]);
+        meta_labels.extend(self.extra_labels.clone());
+
         let k8s_env: Vec<K8sEnvVar> = definition
             .env
             .iter()
@@ -1155,18 +1345,247 @@ impl Compute for K8sCompute {
             .collect();
 
         let data_dir = definition.data_dir.to_string_lossy().into_owned();
+        let data_mount = VolumeMount {
+            name: "data".to_string(),
+            mount_path: data_dir.clone(),
+            ..Default::default()
+        };
 
+        let empty_vol = Volume {
+            name: "data".to_string(),
+            empty_dir: Some(k8s_openapi::api::core::v1::EmptyDirVolumeSource {
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let host_capture_export = match definition.host_data_dir.as_ref() {
+            None => false,
+            Some(dir) => Self::host_dir_is_empty_for_export_capture(dir)?,
+        };
+
+        if host_capture_export {
+            // Export-style: init runs the tool; busybox sidecar keeps the pod alive so we can
+            // `tar` the shared EmptyDir out to the host (bind mounts are not available on k8s).
+            let init_task = Container {
+                name: TASK_CONTAINER_NAME.to_string(),
+                image: Some(definition.image.clone()),
+                env: Some(k8s_env.clone()),
+                command: Some(vec!["sh".to_string(), "-c".to_string()]),
+                args: Some(vec![command.to_string()]),
+                volume_mounts: Some(vec![data_mount.clone()]),
+                ..Default::default()
+            };
+
+            let sidecar = Container {
+                name: SIDECAR_CONTAINER_NAME.to_string(),
+                image: Some(BUSYBOX_SIDECAR_IMAGE.to_string()),
+                command: Some(vec!["sleep".to_string(), "infinity".to_string()]),
+                volume_mounts: Some(vec![data_mount]),
+                ..Default::default()
+            };
+
+            let task_pod = Pod {
+                metadata: ObjectMeta {
+                    name: Some(task_name.clone()),
+                    namespace: Some(self.namespace.clone()),
+                    labels: Some(meta_labels),
+                    ..Default::default()
+                },
+                spec: Some(PodSpec {
+                    restart_policy: Some("Never".to_string()),
+                    init_containers: Some(vec![init_task]),
+                    containers: vec![sidecar],
+                    volumes: Some(vec![empty_vol]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+
+            pods.create(&PostParams::default(), &task_pod)
+                .await
+                .map_err(|e| ComputeError::Internal(format!("failed to create task pod: {e}")))?;
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(600);
+            loop {
+                let pod = pods
+                    .get(&task_name)
+                    .await
+                    .map_err(|e| ComputeError::Internal(format!("task pod get failed: {e}")))?;
+
+                if let Some(code) = Self::init_container_exit_code(&pod, TASK_CONTAINER_NAME) {
+                    let raw =
+                        Self::task_pod_logs(&pods, &task_name, TASK_CONTAINER_NAME).await;
+                    if code != 0 {
+                        let _ = pods.delete(&task_name, &DeleteParams::default()).await;
+                        return Ok(ExecOutput {
+                            exit_code: code,
+                            stdout: raw,
+                            stderr: String::new(),
+                        });
+                    }
+                    break;
+                }
+
+                if Self::bare_pod_phase(&pod) == Some("Failed") {
+                    let raw =
+                        Self::task_pod_logs(&pods, &task_name, TASK_CONTAINER_NAME).await;
+                    let code = Self::init_container_exit_code(&pod, TASK_CONTAINER_NAME).unwrap_or(1);
+                    let _ = pods.delete(&task_name, &DeleteParams::default()).await;
+                    return Ok(ExecOutput {
+                        exit_code: code,
+                        stdout: raw,
+                        stderr: String::new(),
+                    });
+                }
+
+                if std::time::Instant::now() > deadline {
+                    let _ = pods.delete(&task_name, &DeleteParams::default()).await;
+                    return Err(ComputeError::Internal(format!(
+                        "task pod '{task_name}' timed out waiting for init container"
+                    )));
+                }
+                tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+            }
+
+            // Sidecar must be exec-ready before we stream from it.
+            let sidecar_deadline = std::time::Instant::now() + Duration::from_secs(120);
+            loop {
+                if self
+                    .exec_in_pod_container(
+                        &task_name,
+                        Some(SIDECAR_CONTAINER_NAME),
+                        &["true"],
+                    )
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+                if std::time::Instant::now() > sidecar_deadline {
+                    let _ = pods.delete(&task_name, &DeleteParams::default()).await;
+                    return Err(ComputeError::Internal(
+                        "task pod sidecar did not become executable".to_string(),
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+            }
+
+            let host_dir = definition.host_data_dir.as_ref().unwrap();
+            if let Err(e) = self
+                .stream_tar_from_pod_path(
+                    &task_name,
+                    Some(SIDECAR_CONTAINER_NAME),
+                    &definition.data_dir,
+                    host_dir,
+                )
+                .await
+            {
+                let _ = pods.delete(&task_name, &DeleteParams::default()).await;
+                return Err(e);
+            }
+
+            let raw = Self::task_pod_logs(&pods, &task_name, TASK_CONTAINER_NAME).await;
+            let _ = pods.delete(&task_name, &DeleteParams::default()).await;
+            return Ok(ExecOutput {
+                exit_code: 0,
+                stdout: raw,
+                stderr: String::new(),
+            });
+        }
+
+        if let Some(host_dir) = definition.host_data_dir.as_ref() {
+            // Import-style: staged files on the host must be copied into the EmptyDir before the
+            // tool runs. We use a long-running main container, inject a tar stream, then exec.
+            let main = Container {
+                name: TASK_CONTAINER_NAME.to_string(),
+                image: Some(definition.image.clone()),
+                env: Some(k8s_env),
+                command: Some(vec!["sleep".to_string(), "infinity".to_string()]),
+                volume_mounts: Some(vec![data_mount]),
+                ..Default::default()
+            };
+
+            let task_pod = Pod {
+                metadata: ObjectMeta {
+                    name: Some(task_name.clone()),
+                    namespace: Some(self.namespace.clone()),
+                    labels: Some(meta_labels),
+                    ..Default::default()
+                },
+                spec: Some(PodSpec {
+                    restart_policy: Some("Never".to_string()),
+                    containers: vec![main],
+                    volumes: Some(vec![empty_vol]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+
+            pods.create(&PostParams::default(), &task_pod)
+                .await
+                .map_err(|e| ComputeError::Internal(format!("failed to create task pod: {e}")))?;
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(600);
+            loop {
+                let pod = pods
+                    .get(&task_name)
+                    .await
+                    .map_err(|e| ComputeError::Internal(format!("task pod get failed: {e}")))?;
+                if Self::bare_pod_phase(&pod) == Some("Running") {
+                    let ready = pod
+                        .status
+                        .as_ref()
+                        .and_then(|s| s.container_statuses.as_ref())
+                        .and_then(|cs| cs.iter().find(|c| c.name == TASK_CONTAINER_NAME))
+                        .map(|c| c.ready)
+                        .unwrap_or(false);
+                    if ready {
+                        break;
+                    }
+                }
+                if Self::bare_pod_phase(&pod) == Some("Failed") {
+                    let raw =
+                        Self::task_pod_logs(&pods, &task_name, TASK_CONTAINER_NAME).await;
+                    let _ = pods.delete(&task_name, &DeleteParams::default()).await;
+                    return Ok(ExecOutput {
+                        exit_code: 1,
+                        stdout: raw,
+                        stderr: String::new(),
+                    });
+                }
+                if std::time::Instant::now() > deadline {
+                    let _ = pods.delete(&task_name, &DeleteParams::default()).await;
+                    return Err(ComputeError::Internal(format!(
+                        "task pod '{task_name}' timed out waiting for main container"
+                    )));
+                }
+                tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+            }
+
+            self.stream_host_dir_tar_into_pod(&task_name, TASK_CONTAINER_NAME, host_dir, &definition.data_dir)
+                .await?;
+
+            let out = self
+                .exec_in_pod_container(
+                    &task_name,
+                    Some(TASK_CONTAINER_NAME),
+                    &["sh", "-c", command],
+                )
+                .await?;
+
+            let _ = pods.delete(&task_name, &DeleteParams::default()).await;
+            return Ok(out);
+        }
+
+        // No host_data_dir: single short-lived container.
         let container = Container {
-            name: "task".to_string(),
+            name: TASK_CONTAINER_NAME.to_string(),
             image: Some(definition.image.clone()),
             env: Some(k8s_env),
             command: Some(vec!["sh".to_string(), "-c".to_string()]),
             args: Some(vec![command.to_string()]),
-            volume_mounts: Some(vec![VolumeMount {
-                name: "data".to_string(),
-                mount_path: data_dir,
-                ..Default::default()
-            }]),
+            volume_mounts: Some(vec![data_mount]),
             ..Default::default()
         };
 
@@ -1174,36 +1593,55 @@ impl Compute for K8sCompute {
             metadata: ObjectMeta {
                 name: Some(task_name.clone()),
                 namespace: Some(self.namespace.clone()),
+                labels: Some(meta_labels),
                 ..Default::default()
             },
             spec: Some(PodSpec {
                 restart_policy: Some("Never".to_string()),
                 containers: vec![container],
-                volumes: Some(vec![Volume {
-                    name: "data".to_string(),
-                    empty_dir: Some(k8s_openapi::api::core::v1::EmptyDirVolumeSource {
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }]),
+                volumes: Some(vec![empty_vol]),
                 ..Default::default()
             }),
             ..Default::default()
         };
 
-        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
         pods.create(&PostParams::default(), &task_pod)
             .await
             .map_err(|e| ComputeError::Internal(format!("failed to create task pod: {e}")))?;
 
-        // Wait for the pod to complete (max 10 min).
-        let task_id = InstanceId(task_name.clone());
         let deadline = std::time::Instant::now() + Duration::from_secs(600);
         loop {
-            let s = self.status(&task_id).await?;
-            if matches!(s.state, InstanceState::Stopped | InstanceState::Failed) {
-                break;
+            let pod = pods
+                .get(&task_name)
+                .await
+                .map_err(|e| ComputeError::Internal(format!("task pod get failed: {e}")))?;
+
+            match Self::bare_pod_phase(&pod) {
+                Some("Succeeded") => {
+                    let code = Self::main_container_exit_code(&pod, TASK_CONTAINER_NAME).unwrap_or(0);
+                    let raw =
+                        Self::task_pod_logs(&pods, &task_name, TASK_CONTAINER_NAME).await;
+                    let _ = pods.delete(&task_name, &DeleteParams::default()).await;
+                    return Ok(ExecOutput {
+                        exit_code: code,
+                        stdout: raw,
+                        stderr: String::new(),
+                    });
+                }
+                Some("Failed") => {
+                    let code = Self::main_container_exit_code(&pod, TASK_CONTAINER_NAME).unwrap_or(1);
+                    let raw =
+                        Self::task_pod_logs(&pods, &task_name, TASK_CONTAINER_NAME).await;
+                    let _ = pods.delete(&task_name, &DeleteParams::default()).await;
+                    return Ok(ExecOutput {
+                        exit_code: code,
+                        stdout: raw,
+                        stderr: String::new(),
+                    });
+                }
+                _ => {}
             }
+
             if std::time::Instant::now() > deadline {
                 let _ = pods.delete(&task_name, &DeleteParams::default()).await;
                 return Err(ComputeError::Internal(format!(
@@ -1212,25 +1650,6 @@ impl Compute for K8sCompute {
             }
             tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
         }
-
-        let raw = pods
-            .logs(&task_name, &LogParams::default())
-            .await
-            .unwrap_or_default();
-
-        let exit_code = self
-            .status(&task_id)
-            .await
-            .map(|s| if matches!(s.state, InstanceState::Failed) { 1 } else { 0 })
-            .unwrap_or(-1);
-
-        let _ = pods.delete(&task_name, &DeleteParams::default()).await;
-
-        Ok(ExecOutput {
-            exit_code,
-            stdout: raw,
-            stderr: String::new(),
-        })
     }
 }
 

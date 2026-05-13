@@ -4,12 +4,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use gfs_compute_docker::DockerCompute;
 use gfs_domain::ports::database_provider::InMemoryDatabaseProviderRegistry;
 use gfs_domain::usecases::repository::export_repo_usecase::ExportRepoUseCase;
 use serde_json::json;
 
 use crate::cli_utils::get_repo_dir;
+use crate::commands::compute_support::compute_for_path;
 use crate::output::{cyan, green};
 
 pub async fn run(
@@ -21,7 +21,7 @@ pub async fn run(
 ) -> Result<()> {
     let repo_path = path.unwrap_or_else(get_repo_dir);
 
-    let compute = Arc::new(DockerCompute::new().map_err(|e| anyhow::anyhow!("{e}"))?);
+    let compute = compute_for_path(&repo_path).await?;
 
     let _ = id; // container name override is reserved for future use; use case reads from config.
 
