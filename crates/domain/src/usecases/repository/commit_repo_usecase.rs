@@ -51,6 +51,15 @@ fn storage_error_looks_like_permission_denied(err: &StorageError) -> bool {
     }
 }
 
+/// this will return true when checkpoint preparation failed because PostgreSQL had no
+/// available client slots left
+fn compute_error_looks_like_connection_limit(err: &ComputeError) -> bool {
+    let message = err.to_string().to_ascii_lowercase();
+    message.contains("too many clients already")
+        || message.contains("remaining connection slots are reserved")
+        || message.contains("sorry, too many clients already")
+}
+
 // ---------------------------------------------------------------------------
 // RAII unpause guard
 // ---------------------------------------------------------------------------
@@ -409,14 +418,26 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
             let commands = provider.prepare_for_snapshot(&params).map_err(|e| {
                 CommitRepoError::Repository(RepositoryError::Internal(e.to_string()))
             })?;
-            self.compute
+            if let Err(e) = self
+                .compute
                 .prepare_for_snapshot(&instance_id, &commands)
-                .await?;
+                .await
+            {
+                if compute_error_looks_like_connection_limit(&e) {
+                    tracing::warn!(
+                        error = %e,
+                        instance = %instance_id,
+                        "checkpoint preparation failed because PostgreSQL is at its connection limit; proceeding with snapshot without an explicit CHECKPOINT"
+                    );
+                } else {
+                    return Err(CommitRepoError::Compute(e));
+                }
+            }
 
             // Pause the container so no writes land during the snapshot.
             // On rootless Podman with cgroup v1 the runtime cannot freeze
             // container processes; treat that as a soft failure and proceed
-            // with a crash-consistent snapshot (CHECKPOINT already applied).
+            // with a best-effort snapshot.
             let status = self.compute.status(&instance_id).await?;
             if status.state == InstanceState::Running {
                 match self.compute.pause(&instance_id).await {
@@ -946,6 +967,8 @@ mod tests {
         unpaused: Mutex<bool>,
         /// When set, `stream_snapshot` creates `dest` then fails with this message.
         stream_snapshot_fail_message: Mutex<Option<String>>,
+        /// when set, `prepare_for_snapshot` returns this error instead of succeeding
+        prepare_snapshot_fail_message: Mutex<Option<String>>,
         stream_snapshot_calls: AtomicUsize,
         /// When set, `pause()` returns `ComputeError::Internal` with this message
         /// instead of succeeding (simulates cgroup v1 / rootless Podman).
@@ -960,6 +983,7 @@ mod tests {
                 paused: Mutex::new(false),
                 unpaused: Mutex::new(false),
                 stream_snapshot_fail_message: Mutex::new(None),
+                prepare_snapshot_fail_message: Mutex::new(None),
                 stream_snapshot_calls: AtomicUsize::new(0),
                 pause_fails_with: None,
             }
@@ -1019,6 +1043,9 @@ mod tests {
             _: &InstanceId,
             _commands: &[String],
         ) -> crate::ports::compute::Result<()> {
+            if let Some(msg) = self.prepare_snapshot_fail_message.lock().unwrap().clone() {
+                return Err(crate::ports::compute::ComputeError::Internal(msg));
+            }
             *self.prepared.lock().unwrap() = true;
             Ok(())
         }
@@ -1444,6 +1471,54 @@ mod tests {
             storage.finalized.lock().unwrap().is_none(),
             "finalize_snapshot is only for stream_snapshot fallback"
         );
+    }
+
+    #[tokio::test]
+    async fn commit_continues_when_checkpoint_hits_connection_limit() {
+        let compute = Arc::new(MockCompute {
+            state: InstanceState::Running,
+            prepare_snapshot_fail_message: Mutex::new(Some(
+                "prepare_for_snapshot command failed (exit 2): psql -c CHECKPOINT;\nstderr: psql: error: connection to server failed: FATAL:  sorry, too many clients already".into(),
+            )),
+            ..Default::default()
+        });
+        let repo = MockRepository {
+            commit_hash: "limit123".into(),
+            current_commit: "previous-hash".into(),
+            mount_point: Some("/vol/main".into()),
+            runtime_config: Some(RuntimeConfig {
+                runtime_provider: "docker".into(),
+                runtime_version: "24".into(),
+                container_name: "limit-pg".into(),
+            }),
+            environment: Some(EnvironmentConfig {
+                database_provider: "mock-db".into(),
+                database_version: "16".into(),
+                database_port: None,
+            }),
+            ..Default::default()
+        };
+        let storage = Arc::new(MockStorage::new("snap-limit"));
+        let registry = Arc::new(MockRegistry);
+
+        let uc = CommitRepoUseCase::new(Arc::new(repo), compute.clone(), storage, registry);
+
+        let hash = uc
+            .run(
+                existing_repo_path(),
+                "connection limit fallback".into(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("commit should continue without an explicit checkpoint");
+
+        assert_eq!(hash, "limit123");
+        assert!(!*compute.prepared.lock().unwrap(), "checkpoint was skipped");
+        assert!(*compute.paused.lock().unwrap(), "pause should still happen");
+        assert!(*compute.unpaused.lock().unwrap(), "unpause should still happen");
     }
 
     #[tokio::test]
