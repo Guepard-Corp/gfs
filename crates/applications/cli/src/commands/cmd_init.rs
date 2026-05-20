@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use gfs_compute_docker::DockerCompute;
 use gfs_compute_docker::containers;
+use gfs_compute_kubernetes::KubernetesCompute;
 use gfs_domain::adapters::gfs_repository::GfsRepository;
+use gfs_domain::model::config::GfsConfig;
 use gfs_domain::ports::compute::Compute;
 use gfs_domain::ports::database_provider::InMemoryDatabaseProviderRegistry;
 use gfs_domain::ports::repository::Repository;
@@ -35,12 +37,22 @@ pub async fn init(
     let provider_display = database_provider.clone();
 
     let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
+    let runtime_provider = std::env::var("GFS_RUNTIME_PROVIDER")
+        .unwrap_or_else(|_| "docker".to_string())
+        .trim()
+        .to_ascii_lowercase();
+
     let compute: Option<Arc<dyn Compute>> = if database_provider.is_some() {
-        Some(Arc::new(
-            DockerCompute::new()
-                .map_err(|e| std::io::Error::other(e.to_string()))?
-                .with_platform(platform),
-        ))
+        match runtime_provider.as_str() {
+            "kubernetes" | "k8s" | "k3s" => Some(Arc::new(
+                KubernetesCompute::new(None)
+                    .await
+                    .map_err(|e| std::io::Error::other(e.to_string()))?,
+            )),
+            _ => Some(Arc::new(
+                DockerCompute::new().map_err(|e| std::io::Error::other(e.to_string()))?,
+            )),
+        }
     } else {
         None
     };
@@ -62,6 +74,19 @@ pub async fn init(
             labels,
         )
         .await?;
+
+    // Kubernetes runtime: ensure mount_point is set to PVC name so commits snapshot PVCs
+    // instead of trying to snapshot a host filesystem path.
+    if has_provider && matches!(runtime_provider.as_str(), "kubernetes" | "k8s" | "k3s") {
+        if let Ok(mut cfg) = GfsConfig::load(&target_path) {
+            if cfg.mount_point.as_deref().unwrap_or("").trim().is_empty() {
+                if let Some(rt) = cfg.runtime.as_ref() {
+                    cfg.mount_point = Some(format!("{}-data", rt.container_name.trim()));
+                    let _ = cfg.save(&target_path);
+                }
+            }
+        }
+    }
 
     let mut connection_string: Option<String> = None;
     if has_provider && let Some(compute) = compute.clone() {

@@ -23,6 +23,8 @@ use crate::output::{
     yellow,
 };
 
+use super::compute_support::compute_for_repo;
+
 // ---------------------------------------------------------------------------
 // Entry point called from main
 // ---------------------------------------------------------------------------
@@ -59,9 +61,12 @@ pub async fn run(path: Option<PathBuf>, action: ComputeAction, json_output: bool
     if let ComputeAction::Config { ref key, ref value } = action {
         return handle_config(path, key, value, json_output);
     }
-    let compute = DockerCompute::new().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let id = resolve_id(path.clone(), &action)?;
-    dispatch(&compute, &id, action, path, json_output).await
+    let repo_path = path.clone().unwrap_or_else(get_repo_dir);
+    let repository: Arc<dyn gfs_domain::ports::repository::Repository> =
+        Arc::new(gfs_domain::adapters::gfs_repository::GfsRepository::new());
+    let compute = compute_for_repo(&repository, &repo_path).await?;
+    let id = resolve_id(Some(repo_path), &action)?;
+    dispatch_dyn(compute.as_ref(), &id, action, path, json_output).await
 }
 
 fn handle_config(path: Option<PathBuf>, key: &str, value: &str, json_output: bool) -> Result<()> {
@@ -107,8 +112,8 @@ fn handle_config(path: Option<PathBuf>, key: &str, value: &str, json_output: boo
 // Dispatch
 // ---------------------------------------------------------------------------
 
-async fn dispatch(
-    compute: &DockerCompute,
+async fn dispatch_dyn(
+    compute: &dyn Compute,
     id: &str,
     action: ComputeAction,
     path: Option<PathBuf>,
@@ -118,11 +123,9 @@ async fn dispatch(
 
     match action {
         ComputeAction::Status { .. } => {
-            let status = compute
-                .status(&instance_id)
-                .await
-                .map_err(anyhow::Error::from)?;
-            let data_dir = container_data_dir(compute, &instance_id, path.clone()).await;
+            let status = compute.status(&instance_id).await.map_err(anyhow::Error::from)?;
+            // Only Docker compute can report bind-mount host paths; k8s returns None.
+            let data_dir: Option<&str> = None;
             if json_output {
                 print_status_json(&status, data_dir.as_deref(), path.as_ref(), None)?;
             } else {
@@ -132,9 +135,8 @@ async fn dispatch(
 
         ComputeAction::Start { .. } => {
             let repo_path = path.clone().unwrap_or_else(get_repo_dir);
-            let (instance_id, status) =
-                start_restart_or_recreate(compute, &instance_id, &repo_path, false).await?;
-            let data_dir = container_data_dir(compute, &instance_id, path.clone()).await;
+            let status = compute.start(&instance_id, Default::default()).await?;
+            let data_dir: Option<&str> = None;
             if json_output {
                 print_status_json(&status, data_dir.as_deref(), path.as_ref(), Some("start"))?;
             } else {
@@ -157,10 +159,8 @@ async fn dispatch(
         }
 
         ComputeAction::Restart { .. } => {
-            let repo_path = path.clone().unwrap_or_else(get_repo_dir);
-            let (instance_id, status) =
-                start_restart_or_recreate(compute, &instance_id, &repo_path, true).await?;
-            let data_dir = container_data_dir(compute, &instance_id, path.clone()).await;
+            let status = compute.restart(&instance_id).await?;
+            let data_dir: Option<&str> = None;
             if json_output {
                 print_status_json(&status, data_dir.as_deref(), path.as_ref(), Some("restart"))?;
             } else {

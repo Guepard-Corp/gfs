@@ -38,7 +38,7 @@ pub async fn commit(
     #[cfg(target_os = "linux")]
     {
         let repo_path = path.unwrap_or_else(get_repo_dir);
-        let storage = storage_for_repo(&repo_path);
+        let storage = storage_for_repo(&repo_path).await;
         run(
             Some(repo_path),
             message,
@@ -59,7 +59,20 @@ pub async fn commit(
 }
 
 #[cfg(target_os = "linux")]
-fn storage_for_repo(repo_path: &std::path::Path) -> Arc<dyn StoragePort> {
+async fn storage_for_repo(repo_path: &std::path::Path) -> Arc<dyn StoragePort> {
+    if let Ok(cfg) = gfs_domain::model::config::GfsConfig::load(repo_path)
+        && cfg
+            .runtime
+            .as_ref()
+            .map(|r| r.runtime_provider.trim().eq_ignore_ascii_case("kubernetes"))
+            .unwrap_or(false)
+    {
+        let s = gfs_storage_kubernetes::KubernetesStorage::new(None)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .expect("kubernetes storage init");
+        return Arc::new(s);
+    }
     if gfs_storage_btrfs::is_btrfs(&repo_path.join(GFS_DIR)) {
         Arc::new(gfs_storage_btrfs::BtrfsStorage::from_repo(repo_path))
     } else {

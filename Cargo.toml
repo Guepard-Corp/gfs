@@ -2,9 +2,11 @@
 resolver = "2"
 members = [
     "crates/adapters/compute-docker",
+    "crates/adapters/compute-kubernetes",
     "crates/adapters/storage-apfs",
     "crates/adapters/storage-btrfs",
     "crates/adapters/storage-file",
+    "crates/adapters/storage-kubernetes",
     "crates/applications/cli",
     "crates/applications/console",
     "crates/applications/mcp",
@@ -52,7 +54,7 @@ tracing              = { version = "0.1" }
 tracing-subscriber   = { version = "0.3", features = ["env-filter", "json"] }
 utoipa               = { version = "5.4.0", features = ["rocket_extras"] }
 utoipa-swagger-ui    = { version = "8", features = ["rocket"] }
-kube                 = { version = "3.0.1", features = ["runtime", "derive"] }
+kube                 = { version = "3.0.1", features = ["runtime", "derive", "ws"] }
 k8s-openapi          = { version = "0.27.0", features = ["latest"] }
 bollard              = { version = "0.20" }
 sha2                 = { version = "0.10" }
@@ -70,8 +72,9 @@ gfs-config                 = { path = "crates/config" }
 gfs-storage-apfs           = { path = "crates/adapters/storage-apfs" }
 gfs-storage-btrfs          = { path = "crates/adapters/storage-btrfs" }
 gfs-storage-file           = { path = "crates/adapters/storage-file" }
+gfs-storage-kubernetes     = { path = "crates/adapters/storage-kubernetes" }
 gfs-compute-docker         = { path = "crates/adapters/compute-docker" }
-gfs-cli                    = { path = "crates/applications/cli" }
+gfs-compute-kubernetes     = { path = "crates/adapters/compute-kubernetes" }
 gfs-mcp                    = { path = "crates/applications/mcp" }
 
 [profile.release]

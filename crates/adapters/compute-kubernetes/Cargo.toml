@@ -1,0 +1,21 @@
+[package]
+name = "gfs-compute-kubernetes"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+gfs-domain = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
