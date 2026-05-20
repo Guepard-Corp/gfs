@@ -3,7 +3,7 @@
 //! This runtime manages a single Postgres workspace as Kubernetes resources:
 //! - PVC for data
 //! - StatefulSet (1 replica) mounting the PVC
-//! - ClusterIP Service for connectivity
+//! - Service for connectivity (NodePort when `GFS_K8S_EXPOSE_NODEPORT` is enabled)
 //!
 //! Notes:
 //! - `pause`/`unpause` are not supported (no cgroup freezer equivalent).
@@ -45,6 +45,64 @@ fn k8s_pvc_size_gi() -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| DEFAULT_PVC_SIZE_GI.to_string())
+}
+
+/// When true (default), Postgres Services are NodePort so `get_connection_info`
+/// can return a host:port reachable from outside the VPC (worker public IP/EIP).
+fn k8s_expose_nodeport() -> bool {
+    match std::env::var("GFS_K8S_EXPOSE_NODEPORT")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("0" | "false" | "no") => false,
+        Some(_) => true,
+        None => true,
+    }
+}
+
+fn k8s_service_type() -> &'static str {
+    if k8s_expose_nodeport() {
+        "NodePort"
+    } else {
+        "ClusterIP"
+    }
+}
+
+/// Per-instance port from Supabase `deployment_request.port` (via `GFS_INSTANCE_NODE_PORT`).
+fn instance_expose_port(compute_port: u16) -> Option<i32> {
+    std::env::var("GFS_INSTANCE_NODE_PORT")
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .filter(|p| *p > 0)
+}
+
+/// Kubernetes NodePort must be in 30000–32767; hostPort on the pod may use any assigned port.
+fn is_valid_k8s_node_port(port: i32) -> bool {
+    (30000..=32767).contains(&port)
+}
+
+/// hostPort on the StatefulSet container (reachable via worker public IP/EIP).
+fn instance_host_port(compute_port: u16) -> Option<i32> {
+    instance_expose_port(compute_port).or_else(|| {
+        std::env::var("GFS_K8S_NODE_PORT")
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .or_else(|| {
+                if compute_port == 5432 {
+                    std::env::var("GFS_K8S_POSTGRES_NODE_PORT")
+                        .ok()
+                        .and_then(|s| s.trim().parse::<i32>().ok())
+                } else {
+                    None
+                }
+            })
+    })
+}
+
+/// Fixed NodePort on the Service only when the port is in the k8s-valid range.
+fn k8s_service_node_port(compute_port: u16) -> Option<i32> {
+    instance_host_port(compute_port).filter(|p| is_valid_k8s_node_port(*p))
 }
 const APP_LABEL_KEY: &str = "app.kubernetes.io/name";
 const APP_LABEL_VALUE: &str = "gfs";
@@ -161,10 +219,16 @@ impl KubernetesCompute {
         let container_ports: Vec<k8s_openapi::api::core::v1::ContainerPort> = def
             .ports
             .iter()
-            .map(|p| k8s_openapi::api::core::v1::ContainerPort {
-                container_port: i32::from(p.compute_port),
-                name: Some(format!("p{}", p.compute_port)),
-                ..Default::default()
+            .map(|p| {
+                let mut cp = k8s_openapi::api::core::v1::ContainerPort {
+                    container_port: i32::from(p.compute_port),
+                    name: Some(format!("p{}", p.compute_port)),
+                    ..Default::default()
+                };
+                if k8s_expose_nodeport() {
+                    cp.host_port = instance_host_port(p.compute_port);
+                }
+                cp
             })
             .collect();
 
@@ -240,13 +304,21 @@ impl KubernetesCompute {
         let svc_name = Self::svc_name(instance);
         let service_ports: Vec<ServicePort> = ports
             .iter()
-            .map(|p| ServicePort {
-                port: i32::from(p.compute_port),
-                target_port: Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
-                    i32::from(p.compute_port),
-                )),
-                name: Some(format!("p{}", p.compute_port)),
-                ..Default::default()
+            .map(|p| {
+                let mut sp = ServicePort {
+                    port: i32::from(p.compute_port),
+                    target_port: Some(
+                        k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
+                            i32::from(p.compute_port),
+                        ),
+                    ),
+                    name: Some(format!("p{}", p.compute_port)),
+                    ..Default::default()
+                };
+                if k8s_expose_nodeport() {
+                    sp.node_port = k8s_service_node_port(p.compute_port);
+                }
+                sp
             })
             .collect();
 
@@ -258,13 +330,33 @@ impl KubernetesCompute {
                 ..Default::default()
             },
             spec: Some(ServiceSpec {
-                type_: Some("ClusterIP".to_string()),
+                type_: Some(k8s_service_type().to_string()),
                 selector: Some(labels),
                 ports: Some(service_ports),
                 ..Default::default()
             }),
             ..Default::default()
         }
+    }
+
+    async fn get_service(&self, instance: &str) -> Result<Service> {
+        let api = self.api_services();
+        let name = Self::svc_name(instance);
+        api.get(&name)
+            .await
+            .map_err(|e| ComputeError::Internal(format!("k8s service get failed: {e}")))
+    }
+
+    fn node_port_from_service(svc: &Service, compute_port: u16) -> Option<u16> {
+        let ports = svc.spec.as_ref()?.ports.as_ref()?;
+        for p in ports {
+            if p.port == i32::from(compute_port) {
+                if let Some(np) = p.node_port.filter(|n| *n > 0) {
+                    return Some(np as u16);
+                }
+            }
+        }
+        None
     }
 
     fn pvc_manifest(&self, instance: &str) -> PersistentVolumeClaim {
@@ -453,10 +545,34 @@ impl Compute for KubernetesCompute {
         id: &InstanceId,
         compute_port: u16,
     ) -> Result<InstanceConnectionInfo> {
-        let svc = Self::svc_name(&id.0);
-        let host = format!("{svc}.{}.svc.cluster.local", self.namespace);
+        let svc_name = Self::svc_name(&id.0);
+        let cluster_host = format!("{svc_name}.{}.svc.cluster.local", self.namespace);
+
+        if k8s_expose_nodeport() {
+            let host = std::env::var("GUEPARD_EXTERNAL_HOST")
+                .or_else(|_| std::env::var("GFS_K8S_EXTERNAL_HOST"))
+                .ok()
+                .filter(|h| !h.is_empty())
+                .unwrap_or(cluster_host);
+            let port = if let Some(hp) = instance_host_port(compute_port) {
+                hp as u16
+            } else {
+                let svc = self.get_service(&id.0).await?;
+                Self::node_port_from_service(&svc, compute_port).ok_or_else(|| {
+                    ComputeError::Internal(format!(
+                        "NodePort not allocated yet for service {svc_name} port {compute_port}"
+                    ))
+                })?
+            };
+            return Ok(InstanceConnectionInfo {
+                host,
+                port,
+                env: vec![],
+            });
+        }
+
         Ok(InstanceConnectionInfo {
-            host,
+            host: cluster_host,
             port: compute_port,
             env: vec![],
         })
