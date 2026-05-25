@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use gfs_compute_docker::DockerCompute;
 use gfs_compute_kubernetes::KubernetesCompute;
+use gfs_console_remote::block_direct_kubernetes_env;
 use gfs_domain::ports::compute::{
     Compute, ComputeDefinition, ComputeError, ExecOutput, InstanceConnectionInfo, InstanceId,
     InstanceStatus, LogEntry, LogsOptions, StartOptions,
@@ -131,6 +132,12 @@ pub async fn compute_for_repo(
             .unwrap_or_else(|| "docker".to_string());
 
         match provider.as_str() {
+            "guepard" | "console" | "remote" => {
+                block_direct_kubernetes_env()?;
+                anyhow::bail!(
+                    "guepard remote repository: VCS runs via console API (gfs commit/log/checkout), not local compute"
+                );
+            }
             "kubernetes" | "k8s" | "k3s" => Ok(Arc::new(
                 KubernetesCompute::new(None)
                     .await

@@ -31,6 +31,13 @@ pub async fn checkout(
     create_branch: Option<String>,
     json_output: bool,
 ) -> Result<()> {
+    let repo_path = path.clone().unwrap_or_else(get_repo_dir);
+
+    if super::remote_support::is_remote_repo(&repo_path)? {
+        return super::cmd_remote_checkout::checkout(path, revision, create_branch, json_output)
+            .await;
+    }
+
     let (revision, create_branch) = match (&revision, &create_branch) {
         (Some(r), None) => (r.clone(), None),
         (None, Some(b)) => (String::new(), Some(b.clone())),
@@ -39,8 +46,6 @@ pub async fn checkout(
             anyhow::bail!("revision required or use -b <branch_name>");
         }
     };
-
-    let repo_path = path.unwrap_or_else(get_repo_dir);
 
     let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
     let compute: Arc<dyn Compute> = compute_for_repo(&repository, &repo_path).await?;

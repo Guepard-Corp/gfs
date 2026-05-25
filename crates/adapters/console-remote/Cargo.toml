@@ -1,0 +1,17 @@
+[package]
+name               = "gfs-console-remote"
+version.workspace      = true
+edition.workspace      = true
+authors.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+description            = "HTTP client for GFS operations via guepard-console apps/server"
+
+[dependencies]
+anyhow       = { workspace = true }
+reqwest      = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+toml         = { workspace = true }
+gfs-domain   = { workspace = true }

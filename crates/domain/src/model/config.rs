@@ -29,10 +29,24 @@ pub struct EnvironmentConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeConfig {
-    /// Runtime backend (e.g. `"docker"`, `"firecracker"`).
+    /// Runtime backend (e.g. `"docker"`, `"kubernetes"`, `"guepard"`).
     pub runtime_provider: String,
     pub runtime_version: String,
     pub container_name: String,
+}
+
+/// Console-mediated remote target (no local k3s API).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteConfig {
+    pub console_url: String,
+    pub node_id: String,
+    pub database_id: String,
+    #[serde(default = "default_remote_project")]
+    pub project: String,
+}
+
+fn default_remote_project() -> String {
+    "default".to_string()
 }
 
 impl fmt::Display for RuntimeConfig {
@@ -95,10 +109,20 @@ pub struct GfsConfig {
     #[serde(default)]
     pub storage: Option<StorageConfig>,
     #[serde(default)]
-    pub compute: Option<ComputeConfig>,
+    pub remote: Option<RemoteConfig>,
 }
 
 impl GfsConfig {
+    pub fn is_guepard_remote(&self) -> bool {
+        let provider = self
+            .runtime
+            .as_ref()
+            .map(|r| r.runtime_provider.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        matches!(provider.as_str(), "guepard" | "console" | "remote")
+            && self.remote.is_some()
+    }
+
     pub fn load(repo_path: &Path) -> Result<Self, RepoError> {
         let config_path = repo_path.join(GFS_DIR).join(CONFIG_FILE);
         let content = std::fs::read_to_string(config_path)?;
@@ -226,7 +250,7 @@ mod tests {
                 compression: Some("zstd".into()),
                 enable_reflink: true,
             }),
-            compute: None,
+            remote: None,
         };
         config.save(dir.path()).unwrap();
 
@@ -327,7 +351,7 @@ mod tests {
             environment: None,
             runtime: None,
             storage: None,
-            compute: None,
+            remote: None,
         };
         // Pass path where .gfs does not exist; save writes to repo_path/.gfs/config.toml
         let result = config.save(dir.path());

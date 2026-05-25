@@ -580,7 +580,7 @@ mod tests {
             environment: Some(env.clone()),
             runtime: Some(runtime.clone()),
             storage: None,
-            compute: None,
+            remote: None,
         };
         config.save(dir).unwrap();
     }

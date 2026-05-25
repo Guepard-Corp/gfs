@@ -38,6 +38,7 @@ gfs-compute-docker        = { workspace = true }
 gfs-compute-kubernetes    = { workspace = true }
 gfs-storage-file   = { workspace = true }
 gfs-storage-kubernetes = { workspace = true }
+gfs-console-remote     = { workspace = true }
 gfs-mcp            = { workspace = true }
 chrono             = { workspace = true }
 clap               = { workspace = true }

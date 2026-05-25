@@ -26,9 +26,8 @@ pub async fn init(
     database_port: Option<u16>,
     credentials: DatabaseCredentials,
     json_output: bool,
-    image: Option<String>,
-    platform: Option<String>,
-    labels: std::collections::BTreeMap<String, String>,
+    remote: bool,
+    remote_node: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::trace!("Initializing Guepard environment at: {:?}", path);
 
@@ -41,6 +40,24 @@ pub async fn init(
         .unwrap_or_else(|_| "docker".to_string())
         .trim()
         .to_ascii_lowercase();
+
+    if remote
+        || matches!(
+            runtime_provider.as_str(),
+            "guepard" | "console" | "remote"
+        )
+    {
+        return super::cmd_init_remote::init_remote(
+            Some(target_path),
+            database_provider,
+            database_version,
+            remote_node,
+            None,
+            credentials,
+            json_output,
+        )
+        .await;
+    }
 
     let compute: Option<Arc<dyn Compute>> = if database_provider.is_some() {
         match runtime_provider.as_str() {
