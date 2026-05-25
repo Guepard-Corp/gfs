@@ -65,9 +65,38 @@ pub async fn checkout(
                 .await;
         }
 
-        // 2) perform repo checkout (updates HEAD)
+        // 2) repo checkout (create branch ref first when -b, then switch HEAD)
+        let checkout_rev = if let Some(ref branch_name) = create_branch {
+            let branch_name = branch_name.trim();
+            if branch_name.is_empty() {
+                anyhow::bail!("empty branch name");
+            }
+            let start_rev = if revision.trim().is_empty() {
+                "HEAD"
+            } else {
+                revision.trim()
+            };
+            let tip = repository
+                .rev_parse(&repo_path, start_rev)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if tip == "0" {
+                anyhow::bail!("cannot create branch: start revision has no commits");
+            }
+            repository
+                .create_branch(&repo_path, branch_name, &tip)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            branch_name.to_string()
+        } else {
+            if revision.trim().is_empty() {
+                anyhow::bail!("revision required or use -b <branch_name>");
+            }
+            revision.clone()
+        };
+
         repository
-            .checkout(&repo_path, &revision)
+            .checkout(&repo_path, &checkout_rev)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let commit_hash = repository.get_current_commit_id(&repo_path).await?;

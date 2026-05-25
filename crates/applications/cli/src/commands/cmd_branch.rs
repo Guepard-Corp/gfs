@@ -9,16 +9,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use gfs_compute_docker::DockerCompute;
 use gfs_domain::adapters::gfs_repository::GfsRepository;
 use gfs_domain::model::layout::{GFS_DIR, HEADS_DIR, REFS_DIR};
-use gfs_domain::ports::compute::Compute;
-use gfs_domain::ports::database_provider::InMemoryDatabaseProviderRegistry;
 use gfs_domain::ports::repository::Repository;
 use gfs_domain::repo_utils::repo_layout;
-use gfs_domain::usecases::repository::checkout_repo_usecase::CheckoutRepoUseCase;
 use serde_json::json;
 
+use super::cmd_checkout;
 use crate::cli_utils::{get_repo_dir, list_branch_tips};
 use crate::output::{cyan, dimmed, gold, green};
 
@@ -153,42 +150,13 @@ async fn create_branch(
     json_output: bool,
 ) -> Result<()> {
     if switch {
-        // Use the full checkout flow (stops/starts compute, creates workspace).
-        let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
-        let compute: Arc<dyn Compute> = Arc::new(DockerCompute::new().context(
-            "failed to connect to Docker/Podman daemon (is your container runtime running?)",
-        )?);
-        let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
-        gfs_compute_docker::containers::register_all(registry.as_ref())
-            .context("failed to register database providers")?;
-
-        let use_case = CheckoutRepoUseCase::new(repository, compute, registry);
-        let revision = start_point.unwrap_or("").to_string();
-        let commit_hash = use_case
-            .run(repo_path.to_path_buf(), revision, Some(name.to_string()))
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-        if json_output {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "action": "create_and_checkout",
-                    "branch": name,
-                    "hash": commit_hash,
-                    "start_point": start_point.unwrap_or("HEAD"),
-                }))?
-            );
-            return Ok(());
-        }
-
-        let short_hash = &commit_hash[..7.min(commit_hash.len())];
-        println!(
-            "{} Switched to new branch '{}' ({})",
-            green("✓"),
-            green(name),
-            dimmed(short_hash)
-        );
+        return cmd_checkout::checkout(
+            Some(repo_path.to_path_buf()),
+            start_point.map(|s| s.to_string()),
+            Some(name.to_string()),
+            json_output,
+        )
+        .await;
     } else {
         // Just create the ref — don't switch.
         let commit_hash = if let Some(rev) = start_point {
