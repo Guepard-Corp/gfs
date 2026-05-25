@@ -73,4 +73,4 @@ Never commit Supabase keys, service role keys, or passwords.
 | `instance not found: gfs-pg-...` | Commit against old `database_id`; run `gfs init --remote` again |
 | `volume not found: .../.gfs/workspaces/main/0/data` | DP repo not initialized for that id — track in data-platform-v3 |
 
-See [k3s-architecture.md](./k3s-architecture.md) and guepard-console `docs/runbooks/aws-dev-environment-inventory.md`.
+See local `docs/k3s-architecture.md` (untracked in git) and guepard-console `docs/runbooks/aws-dev-environment-inventory.md`.
