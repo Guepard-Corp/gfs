@@ -50,4 +50,27 @@ Credentials file: `~/.config/guepard/credentials.toml` (from `gfs login`).
 - `KUBECONFIG` + cluster mutations when `runtime_provider` is `guepard` / `console` / `remote`
 - Direct k3s API from developer machine (use SSM on DP for ops/debug)
 
+## Auth smoke (dev CP)
+
+```bash
+export GUEPARD_CONSOLE_URL=http://44.245.9.188:32298
+export GUEPARD_SUPABASE_URL=https://eapqlfgxmtjehkdmqrvi.supabase.co
+export GUEPARD_SUPABASE_ANON_KEY=<from-apps-server-env-not-git>
+
+gfs login --email <user> --password '<password>'
+# or export GUEPARD_ACCESS_TOKEN=<user-api-token>
+
+gfs init --remote --provider postgres --version 17 \
+  --remote-node ip-10-0-1-57-0d5dce3039d44177a4544b28cd424e83
+```
+
+Never commit Supabase keys, service role keys, or passwords.
+
+## Known issues (2026-05-25)
+
+| Error | Meaning |
+|-------|---------|
+| `instance not found: gfs-pg-...` | Commit against old `database_id`; run `gfs init --remote` again |
+| `volume not found: .../.gfs/workspaces/main/0/data` | DP repo not initialized for that id — track in data-platform-v3 |
+
 See [k3s-architecture.md](./k3s-architecture.md) and guepard-console `docs/runbooks/aws-dev-environment-inventory.md`.
