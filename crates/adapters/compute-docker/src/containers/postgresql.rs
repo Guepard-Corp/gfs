@@ -1099,6 +1099,23 @@ mod tests {
         assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.writable_cols(p_relid regclass)"));
         assert!(sql.contains("AND attgenerated = ''"));
         assert!(!sql.contains("_local SELECT * FROM"));
+        // CHECK rebuild is decoupled from hydration into a periodic refresher
+        // (lock_timeout-bounded) instead of running on every warm.
+        assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.refresh_exclusions()"));
+        assert!(sql.contains("SET LOCAL lock_timeout"));
+        assert!(sql.contains("GRANT EXECUTE ON FUNCTION gfs_sync.refresh_exclusions"));
+        // warm_range no longer rebuilds the CHECK itself.
+        assert!(!sql.contains("PERFORM gfs_sync.rebuild_exclusion(p_nsp, p_tab)"));
+        // Ranges are coalesced before each rebuild so the CHECK stays compact.
+        assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.coalesce_ranges(p_nsp text, p_tab text)"));
+        assert!(sql.contains("PERFORM gfs_sync.coalesce_ranges(rec.schema_name, rec.table_name)"));
+        // whole_table strategy for non-range-able keys (uuid/text/composite):
+        // hydrate everything + CHECK (false) so the foreign scan is always pruned.
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS gfs_sync.fully_cached"));
+        assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.warm_whole_table(p_nsp text, p_tab text)"));
+        // Fully-cached tables drop the foreign branch from the view entirely.
+        assert!(sql.contains("CREATE OR REPLACE VIEW %I.%I AS SELECT * FROM %I.%I"));
+        assert!(sql.contains("GRANT EXECUTE ON FUNCTION gfs_sync.warm_whole_table"));
     }
 
     #[test]

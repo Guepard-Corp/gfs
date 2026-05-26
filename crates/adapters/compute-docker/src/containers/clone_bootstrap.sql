@@ -32,6 +32,15 @@ CREATE TABLE IF NOT EXISTS gfs_sync.cached_range (
   PRIMARY KEY (schema_name, table_name, lo, hi)
 );
 
+-- Tables hydrated in full (whole_table strategy, for non-range-able keys like
+-- random uuids). Their foreign table gets a CHECK (false) so every read is
+-- served locally with zero remote contact.
+CREATE TABLE IF NOT EXISTS gfs_sync.fully_cached (
+  schema_name text NOT NULL,
+  table_name  text NOT NULL,
+  PRIMARY KEY (schema_name, table_name)
+);
+
 -- Enable constraint exclusion so the planner can refute a query predicate that
 -- falls within a cached range against the foreign table's exclusion CHECK and
 -- prune the foreign scan entirely (zero remote contact). Applies to new sessions
@@ -519,6 +528,19 @@ DECLARE
 BEGIN
   IF to_regclass(fq) IS NULL THEN RETURN; END IF;
 
+  -- Whole-table cache (any key, incl. composite/uuid): serve entirely from the
+  -- local store by dropping the foreign branch from the view. This guarantees no
+  -- foreign scan is ever planned, even for unconstrained queries — more robust
+  -- than CHECK-based pruning (which only refutes query predicates). The INSTEAD
+  -- OF triggers (writes) live on the view and are preserved by CREATE OR REPLACE.
+  IF EXISTS (SELECT 1 FROM gfs_sync.fully_cached
+               WHERE schema_name = p_nsp AND table_name = p_tab) THEN
+    EXECUTE format('ALTER FOREIGN TABLE %s DROP CONSTRAINT IF EXISTS gfs_excl', fq);
+    EXECUTE format('CREATE OR REPLACE VIEW %I.%I AS SELECT * FROM %I.%I',
+                   p_nsp, p_tab, p_nsp, p_tab || '_local');
+    RETURN;
+  END IF;
+
   SELECT key_cols INTO keycol FROM gfs_sync.table_meta
     WHERE schema_name = p_nsp AND table_name = p_tab;
   -- Single-column key only (stored conflict key has no comma); it is quoted.
@@ -545,9 +567,14 @@ BEGIN
 END
 $fn$;
 
--- Hydrate [p_lo, p_hi] of the key into the local store, record the range, and
--- rebuild the exclusion CHECK. Returns the number of rows hydrated. No-op for
--- composite or missing keys (the overlay stays correct, just not elided).
+-- Hydrate [p_lo, p_hi] of the key into the local store and record the range.
+-- Returns the number of rows hydrated. No-op for composite or missing keys (the
+-- overlay stays correct, just not elided).
+--
+-- It does NOT rebuild the exclusion CHECK: that is decoupled into
+-- gfs_sync.refresh_exclusions() so the AccessExclusive ALTER runs periodically
+-- (coalesced) instead of on every warm, avoiding read-blocking lock contention.
+-- A hydrated range is served correctly meanwhile (live), just not yet elided.
 CREATE OR REPLACE FUNCTION gfs_sync.warm_range(p_nsp text, p_tab text, p_lo text, p_hi text)
 RETURNS bigint
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fn$
@@ -588,12 +615,138 @@ BEGIN
     VALUES (p_nsp, p_tab, p_lo, p_hi)
     ON CONFLICT (schema_name, table_name, lo, hi) DO NOTHING;
 
-  PERFORM gfs_sync.rebuild_exclusion(p_nsp, p_tab);
-  RETURN rc;
+  RETURN rc;  -- exclusion CHECK is (re)built later by refresh_exclusions()
 END
 $fn$;
 
 GRANT EXECUTE ON FUNCTION gfs_sync.warm_range(text, text, text, text) TO PUBLIC;
+
+-- Hydrate an ENTIRE table into the local store and mark it fully cached, for
+-- keys that can't be range-chunked (random uuid, text, composite). The exclusion
+-- CHECK (false) is applied later by refresh_exclusions(). Returns rows hydrated.
+-- Caller is responsible for only doing this on tables small enough to copy.
+CREATE OR REPLACE FUNCTION gfs_sync.warm_whole_table(p_nsp text, p_tab text)
+RETURNS bigint
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fn$
+DECLARE
+  fq      text := format('%I.%I', 'gfs_remote_' || p_nsp, p_tab);
+  collist text;
+  rc      bigint := 0;
+BEGIN
+  IF to_regclass(fq) IS NULL THEN
+    RAISE NOTICE 'gfs: warm_whole_table: no overlay for %.%', p_nsp, p_tab;
+    RETURN 0;
+  END IF;
+  collist := gfs_sync.writable_cols(fq::regclass);
+  EXECUTE format('INSERT INTO %I.%I (%s) SELECT %s FROM %s ON CONFLICT DO NOTHING',
+                 p_nsp, p_tab || '_local', collist, collist, fq);
+  GET DIAGNOSTICS rc = ROW_COUNT;
+  INSERT INTO gfs_sync.fully_cached(schema_name, table_name)
+    VALUES (p_nsp, p_tab) ON CONFLICT DO NOTHING;
+  RETURN rc;  -- exclusion CHECK (false) applied by refresh_exclusions()
+END
+$fn$;
+
+GRANT EXECUTE ON FUNCTION gfs_sync.warm_whole_table(text, text) TO PUBLIC;
+
+-- Rebuild the exclusion CHECK for every table with cached ranges. Decoupled from
+-- warm_range so the read-blocking AccessExclusive ALTER runs periodically and
+-- coalesced (called by the proxy / a job on a timer), not on every warm.
+-- `lock_timeout` bounds any read stall: a table it can't lock now is retried on
+-- the next call. Safe because cached_range is written in the same transaction as
+-- the hydration, so a rebuild only ever sees already-hydrated ranges.
+CREATE OR REPLACE FUNCTION gfs_sync.refresh_exclusions()
+RETURNS integer
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fn$
+DECLARE
+  rec record;
+  n   integer := 0;
+BEGIN
+  SET LOCAL lock_timeout = '200ms';
+  FOR rec IN
+    SELECT schema_name, table_name FROM gfs_sync.cached_range
+    UNION
+    SELECT schema_name, table_name FROM gfs_sync.fully_cached
+  LOOP
+    BEGIN
+      -- Coalescing is an optimization; isolate it so a failure never blocks the
+      -- rebuild (which is what actually applies elision).
+      BEGIN
+        PERFORM gfs_sync.coalesce_ranges(rec.schema_name, rec.table_name);
+      EXCEPTION WHEN others THEN NULL;
+      END;
+      PERFORM gfs_sync.rebuild_exclusion(rec.schema_name, rec.table_name);
+      n := n + 1;
+    EXCEPTION
+      WHEN lock_not_available THEN NULL;  -- table busy; retried next call
+      WHEN others THEN NULL;              -- best-effort
+    END;
+  END LOOP;
+  RETURN n;
+END
+$fn$;
+
+GRANT EXECUTE ON FUNCTION gfs_sync.refresh_exclusions() TO PUBLIC;
+
+-- Merge overlapping/adjacent cached ranges for a table into the minimal set, so
+-- the exclusion CHECK stays compact (and planning fast) as ranges accumulate.
+-- Sorts/merges in the key's type; integer keys also merge adjacency
+-- ([0,999] ∪ [1000,1999] = [0,1999]). Called by refresh_exclusions().
+CREATE OR REPLACE FUNCTION gfs_sync.coalesce_ranges(p_nsp text, p_tab text)
+RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fn$
+DECLARE
+  fq      text := format('%I.%I', 'gfs_remote_' || p_nsp, p_tab);
+  keycol  text;
+  keytype text;
+  adj     text;
+BEGIN
+  IF to_regclass(fq) IS NULL THEN RETURN; END IF;
+  SELECT key_cols INTO keycol FROM gfs_sync.table_meta
+    WHERE schema_name = p_nsp AND table_name = p_tab;
+  IF keycol IS NULL OR position(',' in keycol) > 0 THEN RETURN; END IF;
+  keycol := btrim(keycol, '"');
+  SELECT format_type(a.atttypid, a.atttypmod) INTO keytype
+    FROM pg_attribute a WHERE a.attrelid = fq::regclass AND a.attname = keycol;
+  IF keytype IS NULL THEN RETURN; END IF;
+  -- Coalescing only applies to integer keys (the only ones we range-chunk); it
+  -- also needs min()/max() on the key type, which non-integer types may lack.
+  IF keytype NOT IN ('smallint', 'integer', 'bigint') THEN RETURN; END IF;
+  adj := ' + 1';  -- integer keys merge adjacency ([0,999] ∪ [1000,1999])
+
+  -- Gaps-and-islands merge into a temp table, then replace the table's ranges in
+  -- separate statements. (A single DELETE+INSERT would let an unchanged merged
+  -- range collide with the row being deleted under ON CONFLICT, emptying it.)
+  DROP TABLE IF EXISTS _gfs_coalesce;
+  EXECUTE format($q$
+    CREATE TEMP TABLE _gfs_coalesce ON COMMIT DROP AS
+      WITH r AS (
+        SELECT (lo)::%1$s AS klo, (hi)::%1$s AS khi
+        FROM gfs_sync.cached_range WHERE schema_name = %2$L AND table_name = %3$L
+      ),
+      ord AS (
+        SELECT klo, khi,
+               max(khi) OVER (ORDER BY klo, khi
+                              ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prev_max
+        FROM r
+      ),
+      grp AS (
+        SELECT klo, khi,
+               count(*) FILTER (WHERE prev_max IS NULL OR klo > prev_max%4$s)
+                 OVER (ORDER BY klo, khi) AS g
+        FROM ord
+      )
+      SELECT min(klo)::text AS lo, max(khi)::text AS hi FROM grp GROUP BY g
+  $q$, keytype, p_nsp, p_tab, adj);
+
+  DELETE FROM gfs_sync.cached_range WHERE schema_name = p_nsp AND table_name = p_tab;
+  INSERT INTO gfs_sync.cached_range(schema_name, table_name, lo, hi)
+    SELECT p_nsp, p_tab, lo, hi FROM _gfs_coalesce;
+  DROP TABLE _gfs_coalesce;
+END
+$fn$;
+
+GRANT EXECUTE ON FUNCTION gfs_sync.coalesce_ranges(text, text) TO PUBLIC;
 
 -- Query-driven warming entry point (what a proxy/cron calls with the read SQL).
 -- EXPLAINs the query, and for each foreign scan with a pushed predicate:
@@ -611,14 +764,15 @@ GRANT EXECUTE ON FUNCTION gfs_sync.warm_range(text, text, text, text) TO PUBLIC;
 -- in warm_range (SECURITY DEFINER), so this function needs only SELECT (to
 -- EXPLAIN) + EXECUTE on warm_range.
 CREATE OR REPLACE FUNCTION gfs_sync.warm_query_chunks(
-  p_sql text, p_chunk bigint DEFAULT 100000, p_maxchunks int DEFAULT 64)
+  p_sql text, p_chunk bigint DEFAULT 100000, p_maxchunks int DEFAULT 64,
+  p_whole_max bigint DEFAULT 50000)
 RETURNS integer
 LANGUAGE plpgsql AS $fn$
 DECLARE
   line text; m text[];
   cur_shadow text := NULL; cur_tab text := NULL;
   sch text; whereclause text; keycols text; keycol text; keytype text; collist text;
-  kmin bigint; kmax bigint; c bigint; rc integer; n integer := 0;
+  kmin bigint; kmax bigint; c bigint; cnt bigint; rc integer; n integer := 0;
 BEGIN
   FOR line IN EXECUTE 'EXPLAIN (VERBOSE) ' || p_sql LOOP
     m := regexp_match(line, 'Foreign Scan on (gfs_remote_[A-Za-z0-9_]+)\.([A-Za-z0-9_]+)');
@@ -656,14 +810,26 @@ BEGIN
               c := c + p_chunk;
             END LOOP;
           END IF;
-        ELSIF keycols IS NOT NULL THEN
-          -- Ownership only (no elision): copy the predicate's rows.
-          collist := gfs_sync.writable_cols(format('%I.%I', cur_shadow, cur_tab)::regclass);
-          EXECUTE format(
-            'INSERT INTO %I.%I (%s) SELECT %s FROM %I.%I WHERE %s ON CONFLICT (%s) DO NOTHING',
-            sch, cur_tab || '_local', collist, collist, cur_shadow, cur_tab, whereclause, keycols);
-          GET DIAGNOSTICS rc = ROW_COUNT;
-          n := n + rc;
+        ELSIF keycols IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM gfs_sync.fully_cached
+                                WHERE schema_name = sch AND table_name = cur_tab) THEN
+          -- Non-range-able key (uuid/text/composite). If the table is small
+          -- enough, cache it whole (enables elision via CHECK (false)); else
+          -- copy just the predicate's rows (ownership only). The size probe is
+          -- bounded by LIMIT so it never scans a huge table.
+          EXECUTE format('SELECT count(*) FROM (SELECT 1 FROM %I.%I LIMIT %s) s',
+                         cur_shadow, cur_tab, p_whole_max + 1) INTO cnt;
+          IF cnt <= p_whole_max THEN
+            PERFORM gfs_sync.warm_whole_table(sch, cur_tab);
+            n := n + 1;
+          ELSE
+            collist := gfs_sync.writable_cols(format('%I.%I', cur_shadow, cur_tab)::regclass);
+            EXECUTE format(
+              'INSERT INTO %I.%I (%s) SELECT %s FROM %I.%I WHERE %s ON CONFLICT (%s) DO NOTHING',
+              sch, cur_tab || '_local', collist, collist, cur_shadow, cur_tab, whereclause, keycols);
+            GET DIAGNOSTICS rc = ROW_COUNT;
+            n := n + rc;
+          END IF;
         END IF;
       EXCEPTION WHEN others THEN
         NULL;  -- never let warming break anything
@@ -675,7 +841,7 @@ BEGIN
 END
 $fn$;
 
-GRANT EXECUTE ON FUNCTION gfs_sync.warm_query_chunks(text, bigint, int) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION gfs_sync.warm_query_chunks(text, bigint, int, bigint) TO PUBLIC;
 
 -- Orchestrator: resolve the schemas to mirror (all non-system schemas when
 -- p_schemas IS NULL), mirror extensions and types, import each schema's tables

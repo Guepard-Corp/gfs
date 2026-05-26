@@ -1196,9 +1196,10 @@ fn clone_warm_range_elides_remote_reads() {
     let gfs = common::postgres::get_container_id(&repo_path);
     cleanup.add(gfs.clone());
 
-    // Warm ids [1,1000] into the local store (records the range + rebuilds the
-    // foreign table's exclusion CHECK).
+    // Warm ids [1,1000] into the local store, then rebuild the exclusion CHECK
+    // (decoupled: warm_range only hydrates; refresh_exclusions applies elision).
     psql(&gfs, "postgres", "SELECT gfs_sync.warm_range('public','orders','1','1000')");
+    psql(&gfs, "postgres", "SELECT gfs_sync.refresh_exclusions()");
 
     // A cached-range read: the planner prunes the foreign branch entirely.
     let plan_cached = psql(&gfs, "postgres", "EXPLAIN (VERBOSE) SELECT * FROM orders WHERE id = 42");
@@ -1248,9 +1249,11 @@ fn clone_warm_query_chunks_drives_elision() {
     cleanup.add(gfs.clone());
 
     // Drive warming from a single point-read SQL, chunk size 1000 → warms the
-    // chunk [4000,4999] that contains id=4242.
+    // chunk [4000,4999] that contains id=4242. Then apply the exclusion CHECK
+    // (decoupled rebuild).
     psql(&gfs, "postgres",
         "SELECT gfs_sync.warm_query_chunks('SELECT * FROM orders WHERE id = 4242', 1000)");
+    psql(&gfs, "postgres", "SELECT gfs_sync.refresh_exclusions()");
 
     // The queried key is elided...
     let p_hit = psql(&gfs, "postgres", "EXPLAIN (VERBOSE) SELECT * FROM orders WHERE id = 4242");
@@ -1266,6 +1269,152 @@ fn clone_warm_query_chunks_drives_elision() {
     assert_eq!(psql(&gfs, "postgres", "SELECT name FROM orders WHERE id = 4900"), "n4900");
     assert_eq!(psql(&gfs, "postgres", "SELECT name FROM orders WHERE id = 8000"), "n8000");
     assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM orders"), "10000");
+}
+
+/// The CHECK rebuild is decoupled from hydration: `warm_range` alone hydrates
+/// (correct, but not yet elided — no read-blocking ALTER), and elision only
+/// kicks in after `refresh_exclusions()`. Proves both the deferral and that a
+/// hydrated-but-not-yet-refreshed range is still read correctly.
+#[test]
+#[serial]
+fn clone_exclusion_refresh_is_decoupled() {
+    let repo = TempDir::new().unwrap();
+    let repo_path = repo.path().to_path_buf();
+    let mut cleanup = Cleanup::new(repo);
+
+    let remote = "gfs-e2e-decouple-remote";
+    cleanup.add(remote);
+    let port = start_remote(remote, "postgres:16");
+    seed_remote(remote, &format!(
+        "{READER} CREATE TABLE orders (id bigint PRIMARY KEY, name text NOT NULL); \
+         INSERT INTO orders SELECT g,'n'||g FROM generate_series(1,10000) g; {}", grant_reader()));
+
+    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
+    let out = run_clone(&url, &repo_path, Some("16"));
+    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
+    let gfs = common::postgres::get_container_id(&repo_path);
+    cleanup.add(gfs.clone());
+
+    // Hydrate only — no rebuild yet.
+    psql(&gfs, "postgres", "SELECT gfs_sync.warm_range('public','orders','1','1000')");
+
+    // Still federated (CHECK not rebuilt), but read correctly.
+    let before = psql(&gfs, "postgres", "EXPLAIN (VERBOSE) SELECT * FROM orders WHERE id = 42");
+    assert!(
+        before.contains("Foreign Scan"),
+        "before refresh, the range must not be elided yet:\n{before}"
+    );
+    assert_eq!(psql(&gfs, "postgres", "SELECT name FROM orders WHERE id = 42"), "n42");
+
+    // Apply the exclusion CHECK; now the range is elided.
+    psql(&gfs, "postgres", "SELECT gfs_sync.refresh_exclusions()");
+    let after = psql(&gfs, "postgres", "EXPLAIN (VERBOSE) SELECT * FROM orders WHERE id = 42");
+    assert!(
+        !after.contains("Foreign Scan"),
+        "after refresh, the cached range must be elided:\n{after}"
+    );
+    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM orders"), "10000");
+}
+
+/// `refresh_exclusions()` coalesces adjacent/overlapping cached ranges so the
+/// exclusion CHECK stays compact: three adjacent integer chunks collapse to one
+/// `cached_range` row, and the whole merged span is elided.
+#[test]
+#[serial]
+fn clone_refresh_coalesces_ranges() {
+    let repo = TempDir::new().unwrap();
+    let repo_path = repo.path().to_path_buf();
+    let mut cleanup = Cleanup::new(repo);
+
+    let remote = "gfs-e2e-coalesce-remote";
+    cleanup.add(remote);
+    let port = start_remote(remote, "postgres:16");
+    seed_remote(remote, &format!(
+        "{READER} CREATE TABLE orders (id bigint PRIMARY KEY, name text NOT NULL); \
+         INSERT INTO orders SELECT g,'n'||g FROM generate_series(1,10000) g; {}", grant_reader()));
+
+    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
+    let out = run_clone(&url, &repo_path, Some("16"));
+    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
+    let gfs = common::postgres::get_container_id(&repo_path);
+    cleanup.add(gfs.clone());
+
+    // Three adjacent chunks → three cached_range rows before coalescing.
+    psql(&gfs, "postgres", "SELECT gfs_sync.warm_range('public','orders','0','999')");
+    psql(&gfs, "postgres", "SELECT gfs_sync.warm_range('public','orders','1000','1999')");
+    psql(&gfs, "postgres", "SELECT gfs_sync.warm_range('public','orders','2000','2999')");
+    assert_eq!(
+        psql(&gfs, "postgres", "SELECT count(*) FROM gfs_sync.cached_range WHERE table_name='orders'"),
+        "3"
+    );
+
+    // refresh_exclusions coalesces them into a single [0,2999] range...
+    psql(&gfs, "postgres", "SELECT gfs_sync.refresh_exclusions()");
+    assert_eq!(
+        psql(&gfs, "postgres", "SELECT count(*) FROM gfs_sync.cached_range WHERE table_name='orders'"),
+        "1",
+        "three adjacent ranges must coalesce into one"
+    );
+    assert_eq!(
+        psql(&gfs, "postgres", "SELECT lo||'-'||hi FROM gfs_sync.cached_range WHERE table_name='orders'"),
+        "0-2999"
+    );
+
+    // ...and the whole merged span is elided, a key beyond it still federates.
+    for id in ["42", "1500", "2999"] {
+        let p = psql(&gfs, "postgres", &format!("EXPLAIN (VERBOSE) SELECT * FROM orders WHERE id = {id}"));
+        assert!(!p.contains("Foreign Scan"), "id={id} (in merged range) must be elided:\n{p}");
+    }
+    let p_out = psql(&gfs, "postgres", "EXPLAIN (VERBOSE) SELECT * FROM orders WHERE id = 5000");
+    assert!(p_out.contains("Foreign Scan"), "id=5000 (outside) should federate:\n{p_out}");
+
+    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM orders"), "10000");
+}
+
+/// whole_table strategy: a uuid-keyed table can't be range-chunked, so warming
+/// caches it in full and `refresh_exclusions()` applies `CHECK (false)` — every
+/// read (even unconstrained) is then served locally with no remote contact.
+/// Exercises the automatic path through `warm_query_chunks`.
+#[test]
+#[serial]
+fn clone_whole_table_elides_non_integer_key() {
+    let repo = TempDir::new().unwrap();
+    let repo_path = repo.path().to_path_buf();
+    let mut cleanup = Cleanup::new(repo);
+
+    let remote = "gfs-e2e-whole-remote";
+    cleanup.add(remote);
+    let port = start_remote(remote, "postgres:16");
+    seed_remote(remote, &format!(
+        "{READER} CREATE TABLE docs (id uuid PRIMARY KEY, body text NOT NULL); \
+         INSERT INTO docs SELECT gen_random_uuid(), 'b'||g FROM generate_series(1,100) g; {}",
+        grant_reader()));
+
+    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
+    let out = run_clone(&url, &repo_path, Some("16"));
+    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
+    let gfs = common::postgres::get_container_id(&repo_path);
+    cleanup.add(gfs.clone());
+
+    // Drive warming via the proxy entry point with a non-key predicate. The uuid
+    // key isn't range-able and the table is small → whole_table.
+    psql(&gfs, "postgres",
+        "SELECT gfs_sync.warm_query_chunks('SELECT * FROM docs WHERE body = ''b5''')");
+    psql(&gfs, "postgres", "SELECT gfs_sync.refresh_exclusions()");
+
+    assert_eq!(
+        psql(&gfs, "postgres", "SELECT count(*) FROM gfs_sync.fully_cached WHERE table_name='docs'"),
+        "1",
+        "small uuid-keyed table should be marked fully cached"
+    );
+    // Even an unconstrained scan is elided (CHECK (false) makes the foreign
+    // relation provably empty).
+    let p_scan = psql(&gfs, "postgres", "EXPLAIN (VERBOSE) SELECT * FROM docs");
+    assert!(!p_scan.contains("Foreign Scan"), "whole-cached table must not federate:\n{p_scan}");
+    let p_pred = psql(&gfs, "postgres", "EXPLAIN (VERBOSE) SELECT * FROM docs WHERE body = 'b9'");
+    assert!(!p_pred.contains("Foreign Scan"), "predicate read must be elided too:\n{p_pred}");
+
+    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM docs"), "100");
 }
 
 /// Intersection of the two concurrent features: network elision (`warm_range`)
