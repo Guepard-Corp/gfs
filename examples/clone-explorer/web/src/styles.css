@@ -1,0 +1,101 @@
+:root {
+  --bg: #0f1115;
+  --panel: #171a21;
+  --line: #2a2f3a;
+  --text: #e6e9ef;
+  --muted: #9aa3b2;
+  --accent: #6ea8fe;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.app { max-width: 1400px; margin: 0 auto; padding: 24px; }
+
+header h1 { margin: 0 0 4px; font-size: 22px; }
+header .sub { margin: 0 0 16px; color: var(--muted); max-width: 900px; line-height: 1.5; }
+
+.toolbar {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 12px; background: var(--panel);
+  border: 1px solid var(--line); border-radius: 10px; margin-bottom: 16px;
+}
+.toolbar .grow { flex: 1; }
+.toolbar .pageinfo { color: var(--muted); font-variant-numeric: tabular-nums; min-width: 320px; text-align: center; }
+.toolbar .total { color: var(--muted); }
+.toolbar label { color: var(--muted); display: inline-flex; gap: 6px; align-items: center; }
+.search { flex: 0 1 280px; }
+
+input, select, button {
+  background: #0d0f14; color: var(--text);
+  border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; font-size: 14px;
+}
+button { cursor: pointer; }
+button:disabled { opacity: 0.4; cursor: default; }
+button:hover:not(:disabled) { border-color: var(--accent); }
+
+.panes { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
+.panel-clone { border-color: #2f4a7a; }
+/* Fixed-height head so both panels' tables start at the same vertical position. */
+.panel-head { display: flex; align-items: center; justify-content: space-between; min-height: 34px; }
+.panel-head h2 { margin: 0; font-size: 15px; letter-spacing: 0.04em; }
+.head-right { display: flex; align-items: center; gap: 10px; }
+
+.badge { font-size: 12px; padding: 3px 9px; border-radius: 999px; font-weight: 600; white-space: nowrap; }
+.badge-source { background: #2a2f3a; color: var(--muted); }
+.badge-remote { background: #4a2f2f; color: #ffb3b3; }
+.badge-local { background: #1f4a2f; color: #8ef0a8; }
+
+button.warm { padding: 4px 10px; font-size: 12px; white-space: nowrap; }
+
+.badge-cloned { background: #1f3a4a; color: #8ed8f0; }
+
+/* Clone call-to-action (shown until the user clones the source). */
+.clone-cta { display: flex; flex-direction: column; align-items: center; gap: 18px; padding: 48px 24px; text-align: center; }
+.clone-cta p { color: var(--muted); max-width: 460px; line-height: 1.6; margin: 0; }
+.clone-cta code { color: var(--text); }
+.clone-btn { font-size: 16px; padding: 12px 22px; border-radius: 10px; border-color: #2f4a7a; background: #16263f; color: #cfe0ff; }
+.clone-btn:hover { border-color: var(--accent); }
+.timer { font-variant-numeric: tabular-nums; font-size: 16px; color: #8ed8f0; }
+
+/* nowrap + fixed height keeps the two panels' stat lines the same height even
+   though the clone shows extra counters. */
+.stats { display: flex; gap: 14px; flex-wrap: nowrap; color: var(--muted); font-size: 13px; margin: 10px 0; min-height: 20px; }
+.stats span { white-space: nowrap; }
+.stats b { color: var(--text); }
+.stats .size b { color: var(--accent); font-variant-numeric: tabular-nums; }
+
+.err { color: #ffb3b3; font-size: 13px; margin: 8px 0; white-space: pre-wrap; }
+
+/* Table loader: overlay a spinner while React Query fetches a page. The old
+   page stays visible underneath (placeholderData: keepPreviousData). */
+.table-wrap { position: relative; min-height: 80px; }
+.loading-overlay {
+  position: absolute; inset: 0; z-index: 2;
+  display: flex; align-items: flex-start; justify-content: center; padding-top: 28px;
+  background: rgba(15, 17, 21, 0.55); backdrop-filter: blur(1px);
+}
+.spinner {
+  width: 26px; height: 26px; border-radius: 50%;
+  border: 3px solid var(--line); border-top-color: var(--accent);
+  animation: spin 0.7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+th { color: var(--muted); font-weight: 600; }
+.num { text-align: right; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.empty { color: var(--muted); text-align: center; padding: 18px; }
+
+button.link { background: none; border: none; color: var(--accent); padding: 0; font-family: inherit; }
+button.mini { padding: 2px 8px; font-size: 12px; }

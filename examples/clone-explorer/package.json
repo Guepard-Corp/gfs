@@ -1,0 +1,16 @@
+{
+  "name": "gfs-clone-explorer",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.14.0",
+  "description": "Side-by-side SOURCE vs GFS CLONE explorer: paginate millions of rows, watch the clone read-through, warm a page into the clone and see the foreign scan disappear, and diverge the clone with local writes while the source stays untouched.",
+  "scripts": {
+    "demo": "bash scripts/run.sh",
+    "build:web": "pnpm --filter clone-explorer-web run build",
+    "server": "pnpm --filter clone-explorer-server run start"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild"]
+  }
+}

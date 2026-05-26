@@ -1,0 +1,17 @@
+# Source PostgreSQL the clone reads from. Plain upstream database: no GFS objects,
+# no replication slots, nothing installed on it.
+services:
+  source:
+    image: postgres:16
+    container_name: gfs-explorer-source
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: appdb
+    ports:
+      - "${SOURCE_PORT:-55442}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d appdb"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
