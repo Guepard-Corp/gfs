@@ -1,4 +1,5 @@
 pub mod checkout_repo_usecase;
+pub mod clone_repo_usecase;
 pub mod commit_repo_usecase;
 pub mod export_repo_usecase;
 pub mod extract_schema_usecase;

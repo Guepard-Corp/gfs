@@ -55,29 +55,29 @@ This project is under active development. Expect changes, incomplete features, a
 
 GFS (Git For database Systems) brings Git-like version control to your databases. It enables you to:
 
-- **Safe for AI agents** — automatic snapshots protect against agent mistakes and data loss
-- **Rollback instantly** — undo any database change in seconds
+- **Safe for AI agents**: automatic snapshots protect against agent mistakes and data loss
+- **Rollback instantly**: undo any database change in seconds
 - **Branch** to let agents and developers experiment without risking data
 - **Time travel** through your database history
 - **Commit** database states with meaningful messages
-- **Collaborate** — agents and humans working on the same database with confidence
+- **Collaborate**: agents and humans working on the same database with confidence
 
 GFS uses Docker to manage isolated database environments, making it easy to work with different versions of your database without conflicts.
 
 ## Built for AI Agents
 
-AI coding agents are powerful but dangerous around databases. A single bad migration, a dropped table, or corrupted data can be costly to recover from — if recovery is even possible.
+AI coding agents are powerful but dangerous around databases. A single bad migration, a dropped table, or corrupted data can be costly to recover from, if recovery is even possible.
 
 GFS makes agent-driven database work safe by default:
 
 - **Every change is a commit.** If an agent makes a mistake, roll back in one command.
-- **Branches are free.** Let agents experiment on an isolated branch — merge only what works.
+- **Branches are free.** Let agents experiment on an isolated branch, then merge only what works.
 - **MCP integration.** Agents interact with GFS natively through the Model Context Protocol, no shell wrappers needed.
 - **Less token waste.** Import, export, and query operations run through GFS instead of the agent generating boilerplate SQL.
 
-**Without GFS:** an agent drops a table or runs a bad migration — you're left manually restoring from backups (if they exist).
+**Without GFS:** an agent drops a table or runs a bad migration, and you're left manually restoring from backups (if they exist).
 
-**With GFS:** `gfs checkout HEAD~1` — done. Your database is back to the previous state in seconds.
+**With GFS:** `gfs checkout HEAD~1`. Done. Your database is back to the previous state in seconds.
 
 ## Supported Databases
 
@@ -97,6 +97,7 @@ Run `gfs providers` to see all available providers and their supported versions.
 - Query database directly from CLI (SQL execution and interactive mode)
 - Schema extraction, show, and diff between commits
 - Export and import data (SQL, custom, CSV)
+- Lazily clone a remote PostgreSQL database (copy-on-read, experimental)
 - Compute container management (start, stop, logs)
 - Repository config (user.name, user.email)
 
@@ -221,7 +222,7 @@ Configure your editor's MCP settings to point to this command. Refer to your edi
 
 Once connected, your AI agent can:
 
-- **Commit** before and after making changes — creating safe checkpoints
+- **Commit** before and after making changes, creating safe checkpoints
 - **Branch** to try risky migrations without affecting the main database
 - **Roll back** if something goes wrong
 - **Query** the database to inspect data
@@ -303,6 +304,23 @@ Initialize a new GFS repository.
 ```bash
 gfs init --database-provider <provider> --database-version <version>
 ```
+
+### `gfs clone` (experimental)
+
+Lazily clone a remote PostgreSQL database (copy-on-read). Only the schema is
+mirrored up front; reads are served live from the remote until rows are written
+locally, and writes stay local so the clone diverges. The remote is read-only.
+
+```bash
+gfs clone --from 'postgres://user:password@host:5432/dbname' [PATH]
+```
+
+Options: `--database-version` (else matched to the remote), `--image` (e.g.
+`pgvector/pgvector:pg16` when the source uses an extension), `--platform` (e.g.
+`linux/amd64`), `--port`. Add `?schema=a,b` to the URL to mirror specific
+schemas. Cloned tables are views: plain CRUD works unchanged, but DDL and
+`SELECT … FOR UPDATE` are not supported on them. Quote the URL if the password
+contains shell metacharacters.
 
 ### `gfs status`
 

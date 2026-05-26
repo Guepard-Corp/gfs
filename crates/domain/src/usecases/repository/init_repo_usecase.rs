@@ -68,7 +68,9 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
 
     /// Initialise the repository and optionally provision a database.
     ///
-    /// When `database_provider` is set, `database_version` must also be set and non-empty.
+    /// When `database_provider` is set, either `database_version` must be set and
+    /// non-empty, or `image` must override the full container image (which pins
+    /// its own version, e.g. `pgvector/pgvector:pg16`).
     pub async fn run(
         &self,
         path: PathBuf,
@@ -77,15 +79,20 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         database_version: Option<String>,
         database_port: Option<u16>,
         credentials: DatabaseCredentials,
+        image: Option<String>,
     ) -> std::result::Result<(), InitRepoError> {
         self.repository.init(&path, mount_point).await?;
 
         if let Some(provider) = database_provider {
-            let version = database_version
-                .filter(|v| !v.is_empty())
-                .ok_or(InitRepoError::DatabaseVersionRequired)?;
-            self.deploy_database(&path, provider, version, database_port, credentials)
-                .await?;
+            self.deploy_database(
+                &path,
+                provider,
+                database_version,
+                database_port,
+                credentials,
+                image,
+            )
+            .await?;
         }
 
         Ok(())
@@ -95,9 +102,10 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         &self,
         repo_path: &std::path::Path,
         provider_name: String,
-        database_version: String,
+        database_version: Option<String>,
         database_port: Option<u16>,
         credentials: DatabaseCredentials,
+        image: Option<String>,
     ) -> std::result::Result<(), InitRepoError> {
         let compute = self.compute.as_ref().ok_or_else(|| {
             InitRepoError::Compute(ComputeError::Internal(
@@ -122,12 +130,22 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
             })?;
 
         let mut definition = provider.definition();
-        let base = definition
-            .image
-            .split(':')
-            .next()
-            .unwrap_or(&definition.image);
-        definition.image = format!("{}:{}", base, database_version);
+        match image {
+            // Explicit image override pins its own version (e.g. an image that
+            // bundles an extension the default image lacks, like pgvector).
+            Some(img) => definition.image = img,
+            None => {
+                let version = database_version
+                    .filter(|v| !v.is_empty())
+                    .ok_or(InitRepoError::DatabaseVersionRequired)?;
+                let base = definition
+                    .image
+                    .split(':')
+                    .next()
+                    .unwrap_or(&definition.image);
+                definition.image = format!("{}:{}", base, version);
+            }
+        }
 
         if let Some(port) = database_port {
             for mapping in &mut definition.ports {
@@ -604,6 +622,7 @@ mod tests {
                 None,
                 None,
                 DatabaseCredentials::default(),
+                None,
             )
             .await;
         assert!(result.is_ok());
@@ -625,6 +644,7 @@ mod tests {
                 Some("17".into()),
                 None,
                 DatabaseCredentials::default(),
+                None,
             )
             .await;
         assert!(result.is_ok());
@@ -646,6 +666,7 @@ mod tests {
                 None,
                 None,
                 DatabaseCredentials::default(),
+                None,
             )
             .await;
         assert!(matches!(
@@ -670,6 +691,7 @@ mod tests {
                 Some("8".into()),
                 None,
                 DatabaseCredentials::default(),
+                None,
             )
             .await;
         assert!(matches!(
@@ -697,13 +719,14 @@ mod tests {
                 None,
                 None,
                 DatabaseCredentials::default(),
+                None,
             )
             .await;
         assert!(first.is_ok(), "first init should succeed: {:?}", first);
 
         // Second init fails with AlreadyInitialized
         let second = usecase
-            .run(path, None, None, None, None, DatabaseCredentials::default())
+            .run(path, None, None, None, None, DatabaseCredentials::default(), None)
             .await;
         assert!(
             matches!(

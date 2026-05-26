@@ -1,4 +1,5 @@
 mod checkout;
+mod clone;
 mod commit;
 mod compute;
 mod config;
@@ -12,6 +13,7 @@ mod schema;
 mod status;
 
 pub use checkout::CommandCheckout;
+pub use clone::CommandClone;
 pub use commit::CommandCommit;
 pub use compute::CommandCompute;
 pub use config::CommandConfig;

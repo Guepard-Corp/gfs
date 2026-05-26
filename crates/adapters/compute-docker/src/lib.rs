@@ -97,9 +97,19 @@ fn resolve_host_bind_path(path: &Path) -> Result<std::path::PathBuf> {
 #[derive(Debug, Clone)]
 pub struct DockerCompute {
     docker: bollard::Docker,
+    /// Optional platform override (e.g. `"linux/amd64"`) for pulling/creating
+    /// containers — lets an amd64-only image run on arm64 under emulation.
+    platform: Option<String>,
 }
 
 impl DockerCompute {
+    /// Set a platform override (e.g. `"linux/amd64"`) applied when pulling and
+    /// creating containers. Useful for images lacking a native-arch manifest.
+    pub fn with_platform(mut self, platform: Option<String>) -> Self {
+        self.platform = platform;
+        self
+    }
+
     /// Connect to the local Docker daemon using platform defaults
     /// (`/var/run/docker.sock` on Unix, named pipe on Windows).
     ///
@@ -107,7 +117,7 @@ impl DockerCompute {
     /// running or the socket path has wrong permissions).
     pub fn new() -> std::result::Result<Self, ComputeError> {
         match bollard::Docker::connect_with_local_defaults() {
-            Ok(docker) => Ok(Self { docker }),
+            Ok(docker) => Ok(Self { docker, platform: None }),
             Err(default_err) => {
                 #[cfg(unix)]
                 if let Some(socket_path) = Self::podman_socket_path() {
@@ -118,7 +128,7 @@ impl DockerCompute {
                         120,
                         bollard::API_DEFAULT_VERSION,
                     ) {
-                        return Ok(Self { docker });
+                        return Ok(Self { docker, platform: None });
                     }
 
                     let socket_uri = format!("unix://{}", socket);
@@ -127,7 +137,7 @@ impl DockerCompute {
                         120,
                         bollard::API_DEFAULT_VERSION,
                     ) {
-                        return Ok(Self { docker });
+                        return Ok(Self { docker, platform: None });
                     }
                 }
 
@@ -389,14 +399,29 @@ impl Compute for DockerCompute {
         use std::collections::HashMap;
 
         // Ensure the image exists locally by pulling it if necessary.
-        let pull_opts = bollard::query_parameters::CreateImageOptionsBuilder::default()
-            .from_image(definition.image.as_str())
-            .build();
+        let mut pull_builder = bollard::query_parameters::CreateImageOptionsBuilder::default()
+            .from_image(definition.image.as_str());
+        if let Some(p) = self.platform.as_deref() {
+            pull_builder = pull_builder.platform(p);
+        }
+        let pull_opts = pull_builder.build();
         self.docker
             .create_image(Some(pull_opts), None, None)
             .try_collect::<Vec<_>>()
             .await
-            .map_err(|e| classify(definition.image.as_str(), e))?;
+            // A pull failure (missing tag, no manifest for this arch, auth) is
+            // not "instance not found" — surface it as what it is.
+            .map_err(|e| {
+                ComputeError::Internal(format!(
+                    "failed to pull image '{}': {e}{}",
+                    definition.image,
+                    if self.platform.is_none() {
+                        " (if the image lacks a manifest for your architecture, retry with --platform linux/amd64)"
+                    } else {
+                        ""
+                    }
+                ))
+            })?;
 
         let image_name = definition.image.to_ascii_lowercase();
         let prefix = if image_name.contains("mysql") {
@@ -470,9 +495,12 @@ impl Compute for DockerCompute {
             ..Default::default()
         };
 
-        let options = bollard::query_parameters::CreateContainerOptionsBuilder::default()
-            .name(&name)
-            .build();
+        let mut create_builder =
+            bollard::query_parameters::CreateContainerOptionsBuilder::default().name(&name);
+        if let Some(p) = self.platform.as_deref() {
+            create_builder = create_builder.platform(p);
+        }
+        let options = create_builder.build();
 
         let mount_path = definition.host_data_dir.clone();
         let _create = self

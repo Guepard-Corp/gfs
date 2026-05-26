@@ -1,0 +1,23 @@
+# PoC for RFC 008: overlay approach (correct copy-on-read).
+# remote = read-only source; gfs = local clone with the UNION ALL overlay view.
+services:
+  remote:
+    image: postgres:17
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: shop
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d shop"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  gfs:
+    image: postgres:17
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: gfs
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d gfs"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

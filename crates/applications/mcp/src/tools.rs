@@ -815,6 +815,7 @@ async fn do_init(args: &serde_json::Value) -> Result<CallToolResult, McpError> {
             database_version.clone(),
             None,
             DatabaseCredentials::default(),
+            None,
         )
         .await
         .map_err(|e| to_error_data(e.to_string()))?;

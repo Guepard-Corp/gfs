@@ -16,6 +16,7 @@ use serde_json::json;
 use crate::cli_utils::get_repo_dir;
 use crate::output::{cyan, dimmed, green};
 
+#[allow(clippy::too_many_arguments)]
 pub async fn init(
     path: Option<PathBuf>,
     database_provider: Option<String>,
@@ -23,6 +24,8 @@ pub async fn init(
     database_port: Option<u16>,
     credentials: DatabaseCredentials,
     json_output: bool,
+    image: Option<String>,
+    platform: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::trace!("Initializing Guepard environment at: {:?}", path);
 
@@ -33,7 +36,9 @@ pub async fn init(
     let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
     let compute: Option<Arc<dyn Compute>> = if database_provider.is_some() {
         Some(Arc::new(
-            DockerCompute::new().map_err(|e| std::io::Error::other(e.to_string()))?,
+            DockerCompute::new()
+                .map_err(|e| std::io::Error::other(e.to_string()))?
+                .with_platform(platform),
         ))
     } else {
         None
@@ -52,6 +57,7 @@ pub async fn init(
             database_version,
             database_port,
             credentials,
+            image,
         )
         .await?;
 

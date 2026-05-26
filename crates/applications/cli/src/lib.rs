@@ -189,6 +189,35 @@ enum TopLevel {
         database_name: Option<String>,
     },
 
+    /// Lazily clone a read-only remote database (copy-on-read; data fetched on first read)
+    Clone {
+        /// Remote source URL, e.g. postgres://user:password@host:5432/dbname
+        #[arg(long = "from")]
+        from: String,
+
+        /// Path where to initialize the clone (default: current directory)
+        path: Option<PathBuf>,
+
+        /// Version for the local database container (e.g. 17). Omit to match the remote's version.
+        #[arg(long)]
+        database_version: Option<String>,
+
+        /// Override the local container image (e.g. pgvector/pgvector:pg16). Use
+        /// when the source relies on an extension the default image lacks; pins
+        /// its own version (overrides --database-version).
+        #[arg(long)]
+        image: Option<String>,
+
+        /// Platform for the local container (e.g. linux/amd64). Use to run an
+        /// image that lacks a manifest for your architecture (via emulation).
+        #[arg(long)]
+        platform: Option<String>,
+
+        /// Host port to bind for the local database container
+        #[arg(long)]
+        port: Option<u16>,
+    },
+
     /// Record a commit of the current repository state
     Commit {
         /// Commit message (required)
@@ -458,6 +487,7 @@ fn resolve_output_format(cmd_output: Option<String>, json_output: bool) -> Strin
 fn command_name(cmd: &TopLevel) -> &'static str {
     match cmd {
         TopLevel::Init { .. } => "init",
+        TopLevel::Clone { .. } => "clone",
         TopLevel::Commit { .. } => "commit",
         TopLevel::Config { .. } => "config",
         TopLevel::Checkout { .. } => "checkout",
@@ -536,6 +566,29 @@ where
                     database_version,
                     port,
                     credentials,
+                    json_output,
+                    None,
+                    None,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+                Ok(0)
+            }
+            TopLevel::Clone {
+                from,
+                path,
+                database_version,
+                image,
+                platform,
+                port,
+            } => {
+                commands::cmd_clone::clone(
+                    from,
+                    path,
+                    database_version,
+                    image,
+                    platform,
+                    port,
                     json_output,
                 )
                 .await

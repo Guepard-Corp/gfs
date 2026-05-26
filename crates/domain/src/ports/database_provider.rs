@@ -153,6 +153,41 @@ pub struct SchemaExtractionSpec {
     pub command: String,
 }
 
+// ---------------------------------------------------------------------------
+// Lazy clone (RFC 008)
+// ---------------------------------------------------------------------------
+
+/// A read-only remote database to lazily clone from (copy-on-read).
+///
+/// Only `SELECT` access is assumed; nothing is created on the remote. See
+/// `docs/rfcs/008-remote-clone.md`.
+#[derive(Debug, Clone)]
+pub struct RemoteSource {
+    pub host: String,
+    pub port: u16,
+    pub dbname: String,
+    pub user: String,
+    pub password: String,
+    /// Remote schemas to mirror (e.g. `["public"]`). Empty means "all
+    /// non-system schemas", discovered at bootstrap time.
+    pub schemas: Vec<String>,
+}
+
+/// Sidecar spec that bootstraps a lazy clone inside the local GFS database.
+///
+/// The provider returns a [`ComputeDefinition`] for an ephemeral tool instance
+/// (a database image shipping the client, e.g. `psql`) and a shell command that
+/// connects to the **local** GFS database and sets up the foreign-data-wrapper
+/// link, the mixed-partition tables, and the sync catalog. No data is copied at
+/// bootstrap time — data is hydrated on first read.
+#[derive(Debug, Clone)]
+pub struct CloneSpec {
+    /// Compute definition for the tool sidecar.
+    pub definition: ComputeDefinition,
+    /// Shell command to execute in the sidecar (against the local database).
+    pub command: String,
+}
+
 /// Signal number for graceful shutdown. On Unix, 15 = SIGTERM.
 pub const SIGTERM: u32 = 15;
 
@@ -360,6 +395,26 @@ pub trait DatabaseProvider: Send + Sync {
         _params: &ConnectionParams,
     ) -> std::result::Result<Option<SchemaExtractionSpec>, ProviderError> {
         Ok(None)
+    }
+
+    // -----------------------------------------------------------------------
+    // Lazy clone (RFC 008)
+    // -----------------------------------------------------------------------
+
+    /// Build a sidecar spec that bootstraps a lazy (copy-on-read) clone of a
+    /// read-only `remote` database inside the local GFS database.
+    ///
+    /// `local` carries the connection info the sidecar uses to reach the local
+    /// GFS database. The default implementation reports the feature as
+    /// unsupported.
+    fn clone_bootstrap_spec(
+        &self,
+        _local: &ConnectionParams,
+        _remote: &RemoteSource,
+    ) -> std::result::Result<CloneSpec, ProviderError> {
+        Err(ProviderError::UnsupportedFormat(
+            "lazy clone not supported by this provider".into(),
+        ))
     }
 }
 

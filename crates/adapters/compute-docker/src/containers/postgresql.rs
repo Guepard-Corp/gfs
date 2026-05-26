@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use gfs_domain::ports::compute::{ComputeDefinition, EnvVar, PortMapping};
 use gfs_domain::ports::database_provider::{
-    ConnectionParams, DataFormat, DatabaseProvider, DatabaseProviderArg, DatabaseProviderRegistry,
-    ExportSpec, ImportSpec, ProviderError, Result, SIGTERM, SchemaExtractionSpec, SupportedFeature,
+    CloneSpec, ConnectionParams, DataFormat, DatabaseProvider, DatabaseProviderArg,
+    DatabaseProviderRegistry, ExportSpec, ImportSpec, ProviderError, RemoteSource, Result, SIGTERM,
+    SchemaExtractionSpec, SupportedFeature,
 };
 
 const NAME: &str = "postgres";
@@ -142,6 +143,36 @@ impl Default for PostgresqlProvider {
     }
 }
 
+/// Resolve `(user, password, db)` from connection params, falling back to the
+/// provider defaults. Shared by every spec that builds a psql/pg_* command.
+fn conn_creds(params: &ConnectionParams) -> (&str, &str, &str) {
+    (
+        params.get_env(ENV_USER).unwrap_or(DEFAULT_USER),
+        params.get_env(ENV_PASSWORD).unwrap_or(DEFAULT_PASSWORD),
+        params.get_env(ENV_DB).unwrap_or(DEFAULT_DB),
+    )
+}
+
+/// Build the ephemeral tool-sidecar `ComputeDefinition` shared by export,
+/// import, schema-extraction, and clone: the database image with `PGPASSWORD`
+/// set and the data exchange directory mounted at `data_dir`.
+fn sidecar_definition(image: String, password: &str, data_dir: &str) -> ComputeDefinition {
+    ComputeDefinition {
+        image,
+        env: vec![EnvVar {
+            name: "PGPASSWORD".into(),
+            default: Some(password.to_string()),
+        }],
+        ports: vec![],
+        data_dir: PathBuf::from(data_dir),
+        host_data_dir: None, // set by the orchestrator when needed
+        user: None,
+        logs_dir: None,
+        conf_dir: None,
+        args: vec![],
+    }
+}
+
 impl DatabaseProvider for PostgresqlProvider {
     fn name(&self) -> &str {
         NAME
@@ -173,9 +204,7 @@ impl DatabaseProvider for PostgresqlProvider {
         &self,
         params: &ConnectionParams,
     ) -> std::result::Result<String, ProviderError> {
-        let user = params.get_env(ENV_USER).unwrap_or(DEFAULT_USER);
-        let password = params.get_env(ENV_PASSWORD).unwrap_or(DEFAULT_PASSWORD);
-        let db = params.get_env(ENV_DB).unwrap_or(DEFAULT_DB);
+        let (user, password, db) = conn_creds(params);
         Ok(format!(
             "postgresql://{}:{}@{}:{}/{}",
             user, password, params.host, params.port, db
@@ -303,9 +332,7 @@ impl DatabaseProvider for PostgresqlProvider {
         params: &ConnectionParams,
         format: &str,
     ) -> std::result::Result<ExportSpec, ProviderError> {
-        let user = params.get_env(ENV_USER).unwrap_or(DEFAULT_USER);
-        let password = params.get_env(ENV_PASSWORD).unwrap_or(DEFAULT_PASSWORD);
-        let db = params.get_env(ENV_DB).unwrap_or(DEFAULT_DB);
+        let (user, password, db) = conn_creds(params);
 
         let (pg_format, filename, schema_only) = match format {
             "sql" => ("plain", "export.sql", false),
@@ -317,20 +344,7 @@ impl DatabaseProvider for PostgresqlProvider {
         let schema_flag = if schema_only { " --schema-only" } else { "" };
 
         Ok(ExportSpec {
-            definition: ComputeDefinition {
-                image: self.definition().image,
-                env: vec![EnvVar {
-                    name: "PGPASSWORD".into(),
-                    default: Some(password.to_string()),
-                }],
-                ports: vec![],
-                data_dir: PathBuf::from("/data"),
-                host_data_dir: None, // set by orchestrator
-                user: None,
-                logs_dir: None,
-                conf_dir: None,
-                args: vec![],
-            },
+            definition: sidecar_definition(self.definition().image, password, "/data"),
             command: format!(
                 "pg_dump -h {host} -p {port} -U {user} -d {db} --format={fmt}{schema_flag} -f /data/{file}",
                 host = params.host,
@@ -351,9 +365,7 @@ impl DatabaseProvider for PostgresqlProvider {
         format: &str,
         input_filename: &str,
     ) -> std::result::Result<ImportSpec, ProviderError> {
-        let user = params.get_env(ENV_USER).unwrap_or(DEFAULT_USER);
-        let password = params.get_env(ENV_PASSWORD).unwrap_or(DEFAULT_PASSWORD);
-        let db = params.get_env(ENV_DB).unwrap_or(DEFAULT_DB);
+        let (user, password, db) = conn_creds(params);
 
         let command = match format {
             "sql" => format!(
@@ -384,22 +396,39 @@ impl DatabaseProvider for PostgresqlProvider {
         };
 
         Ok(ImportSpec {
-            definition: ComputeDefinition {
-                image: self.definition().image,
-                env: vec![EnvVar {
-                    name: "PGPASSWORD".into(),
-                    default: Some(password.to_string()),
-                }],
-                ports: vec![],
-                data_dir: PathBuf::from("/data"),
-                host_data_dir: None, // set by orchestrator
-                user: None,
-                logs_dir: None,
-                conf_dir: None,
-                args: vec![],
-            },
+            definition: sidecar_definition(self.definition().image, password, "/data"),
             command,
             input_filename: input_filename.to_string(),
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Lazy clone (RFC 008)
+    // -----------------------------------------------------------------------
+
+    fn clone_bootstrap_spec(
+        &self,
+        local: &ConnectionParams,
+        remote: &RemoteSource,
+    ) -> std::result::Result<CloneSpec, ProviderError> {
+        let (user, password, db) = conn_creds(local);
+
+        let bootstrap_sql = build_clone_bootstrap_sql(remote);
+
+        // The sidecar runs psql against the LOCAL GFS database and feeds the
+        // bootstrap script via a quoted heredoc (no shell expansion inside).
+        let command = format!(
+            "psql -h {host} -p {port} -U {user} -d {db} -v ON_ERROR_STOP=1 <<'GFS_CLONE_BOOTSTRAP'\n{sql}\nGFS_CLONE_BOOTSTRAP\n",
+            host = local.host,
+            port = local.port,
+            user = user,
+            db = db,
+            sql = bootstrap_sql,
+        );
+
+        Ok(CloneSpec {
+            definition: sidecar_definition(self.definition().image, password, "/data"),
+            command,
         })
     }
 
@@ -412,9 +441,7 @@ impl DatabaseProvider for PostgresqlProvider {
         params: &ConnectionParams,
         query: Option<&str>,
     ) -> std::result::Result<std::process::Command, ProviderError> {
-        let user = params.get_env(ENV_USER).unwrap_or(DEFAULT_USER);
-        let password = params.get_env(ENV_PASSWORD).unwrap_or(DEFAULT_PASSWORD);
-        let db = params.get_env(ENV_DB).unwrap_or(DEFAULT_DB);
+        let (user, password, db) = conn_creds(params);
 
         // Build psql command with connection parameters
         let mut cmd = std::process::Command::new("psql");
@@ -530,9 +557,7 @@ impl DatabaseProvider for PostgresqlProvider {
         &self,
         params: &ConnectionParams,
     ) -> std::result::Result<Option<SchemaExtractionSpec>, ProviderError> {
-        let user = params.get_env(ENV_USER).unwrap_or(DEFAULT_USER);
-        let password = params.get_env(ENV_PASSWORD).unwrap_or(DEFAULT_PASSWORD);
-        let db = params.get_env(ENV_DB).unwrap_or(DEFAULT_DB);
+        let (user, password, db) = conn_creds(params);
         let queries = self.schema_extraction_queries();
         let schemas_q = queries
             .get("schemas")
@@ -575,20 +600,7 @@ COLUMNS_EOF
         );
 
         Ok(Some(SchemaExtractionSpec {
-            definition: ComputeDefinition {
-                image: self.definition().image,
-                env: vec![EnvVar {
-                    name: "PGPASSWORD".into(),
-                    default: Some(password.to_string()),
-                }],
-                ports: vec![],
-                data_dir: PathBuf::from("/tmp"),
-                host_data_dir: None,
-                user: None,
-                logs_dir: None,
-                conf_dir: None,
-                args: vec![],
-            },
+            definition: sidecar_definition(self.definition().image, password, "/tmp"),
             command,
         }))
     }
@@ -597,6 +609,64 @@ COLUMNS_EOF
 /// Registers the PostgreSQL provider in `registry` under the name `"postgres"`.
 pub fn register(registry: &impl DatabaseProviderRegistry) -> Result<()> {
     registry.register(Arc::new(PostgresqlProvider::new()))
+}
+
+// ---------------------------------------------------------------------------
+// Lazy-clone bootstrap SQL generation (RFC 008)
+// ---------------------------------------------------------------------------
+
+/// The overlay bootstrap template, kept as a real `.sql` file (proper syntax
+/// highlighting / linting). `__PLACEHOLDER__` sentinels are substituted by
+/// `build_clone_bootstrap_sql`.
+const CLONE_BOOTSTRAP_TMPL: &str = include_str!("clone_bootstrap.sql");
+
+/// Escape a value for use inside a single-quoted SQL string literal.
+fn sql_lit(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+/// Build the bootstrap SQL run inside the local GFS database to set up a lazy
+/// (copy-on-read) clone of `remote`, using the **overlay** mechanic.
+///
+/// Installs `postgres_fdw` + `dblink`, imports the remote schema as foreign
+/// tables, and — for each remote table with a single-column primary key —
+/// creates a local store, a delete-tombstone table, an updatable overlay view
+/// (local wins; remote rows only if neither local nor tombstoned), and
+/// `INSTEAD OF` triggers for copy-on-write. No data is copied.
+///
+/// Correctness is guaranteed by the view (disjoint row sets), independent of
+/// hydration. The mechanic is the one validated by
+/// `docs/rfcs/008-remote-clone/poc-overlay`.
+fn build_clone_bootstrap_sql(remote: &RemoteSource) -> String {
+    // dblink connection string, used only for read-only introspection of the
+    // remote (schema/table/key discovery).
+    let conn = format!(
+        "host={} port={} dbname={} user={} password={}",
+        remote.host, remote.port, remote.dbname, remote.user, remote.password,
+    );
+
+    // SQL array literal of schemas to mirror, or NULL meaning "all user schemas".
+    let schemas_array = if remote.schemas.is_empty() {
+        "NULL::text[]".to_string()
+    } else {
+        let items: Vec<String> = remote
+            .schemas
+            .iter()
+            .map(|s| format!("'{}'", sql_lit(s)))
+            .collect();
+        format!("ARRAY[{}]::text[]", items.join(", "))
+    };
+
+    let template = CLONE_BOOTSTRAP_TMPL;
+
+    template
+        .replace("__RHOST__", &sql_lit(&remote.host))
+        .replace("__RPORT__", &remote.port.to_string())
+        .replace("__RDB__", &sql_lit(&remote.dbname))
+        .replace("__RUSER__", &sql_lit(&remote.user))
+        .replace("__RPASS__", &sql_lit(&remote.password))
+        .replace("__CONN__", &sql_lit(&conn))
+        .replace("__SCHEMAS_ARRAY__", &schemas_array)
 }
 
 #[cfg(test)]
@@ -904,6 +974,202 @@ mod tests {
             env: vec![],
         };
         let spec = provider.export_spec(&params, "sql").unwrap();
+        assert_eq!(spec.definition.image, provider.definition().image);
+    }
+
+    // -- lazy clone (RFC 008) ------------------------------------------------
+
+    fn sample_remote() -> RemoteSource {
+        RemoteSource {
+            host: "rds.example.com".into(),
+            port: 5432,
+            dbname: "shop".into(),
+            user: "reader".into(),
+            password: "p@ss".into(),
+            schemas: vec!["public".into()],
+        }
+    }
+
+    fn local_params() -> ConnectionParams {
+        ConnectionParams {
+            host: "172.17.0.2".into(),
+            port: 5432,
+            env: vec![
+                ("POSTGRES_USER".into(), "postgres".into()),
+                ("POSTGRES_PASSWORD".into(), "localpw".into()),
+                ("POSTGRES_DB".into(), "gfs".into()),
+            ],
+        }
+    }
+
+    #[test]
+    fn clone_bootstrap_sql_substitutes_remote() {
+        let sql = build_clone_bootstrap_sql(&sample_remote());
+        // FDW server + mapping carry the remote connection params.
+        assert!(sql.contains("OPTIONS (host 'rds.example.com', port '5432', dbname 'shop')"));
+        assert!(sql.contains("OPTIONS (user 'reader', password 'p@ss')"));
+        // Requested schemas become an array literal driving the per-schema import.
+        assert!(sql.contains("ARRAY['public']::text[]"));
+        // Per-table import (LIMIT TO) so one bad table cannot abort the clone.
+        assert!(sql.contains("IMPORT FOREIGN SCHEMA %I LIMIT TO (%I) FROM SERVER gfs_remote_srv INTO %I"));
+        // Resilience hooks: skip un-importable tables / overlays.
+        assert!(sql.contains("CREATE EXTENSION IF NOT EXISTS %I"));
+        assert!(sql.contains("to_regclass(fq_remote) IS NULL"));
+        // dblink introspection connection string is present.
+        assert!(sql.contains("host=rds.example.com port=5432 dbname=shop user=reader password=p@ss"));
+        // No leftover placeholders.
+        assert!(!sql.contains("__"));
+    }
+
+    #[test]
+    fn clone_bootstrap_sql_all_schemas_when_none_requested() {
+        let mut remote = sample_remote();
+        remote.schemas = vec![];
+        let sql = build_clone_bootstrap_sql(&remote);
+        // Empty list → NULL sentinel → gfs_sync.clone discovers all user schemas.
+        assert!(sql.contains("gfs_sync.clone('"));
+        assert!(sql.contains("NULL::text[]"));
+        assert!(sql.contains("array_agg(nspname)"));
+    }
+
+    #[test]
+    fn clone_bootstrap_sql_builds_overlay() {
+        let sql = build_clone_bootstrap_sql(&sample_remote());
+        assert!(sql.contains("CREATE EXTENSION IF NOT EXISTS postgres_fdw;"));
+        assert!(sql.contains("CREATE EXTENSION IF NOT EXISTS dblink;"));
+        // Overlay objects: local store, tombstones, view, copy-on-write triggers
+        // (schema-qualified, %I.%I).
+        assert!(sql.contains("CREATE TABLE %I.%I (LIKE %s INCLUDING DEFAULTS INCLUDING GENERATED)"));
+        // Generated columns are excluded from the writable column list (recomputed).
+        assert!(sql.contains("AND attgenerated = ''"));
+        assert!(sql.contains("CREATE VIEW %I.%I AS"));
+        assert!(sql.contains("UNION ALL"));
+        assert!(sql.contains("NOT EXISTS"));
+        assert!(sql.contains("INSTEAD OF INSERT ON %I.%I"));
+        assert!(sql.contains("INSTEAD OF UPDATE ON %I.%I"));
+        assert!(sql.contains("INSTEAD OF DELETE ON %I.%I"));
+        assert!(sql.contains("ON CONFLICT (%s)"));
+        assert!(sql.contains("gfs_sync.table_meta"));
+        // Composite-key support: discovery returns (schema, table, key columns).
+        assert!(sql.contains("AS r(nsp text, tab text, keycols text[])"));
+        // Per-schema shadow import.
+        assert!(sql.contains("'gfs_remote_' || p_sch"));
+        // Tier 3: logic lives in reusable gfs_sync.* functions orchestrated by clone().
+        assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.build_overlay("));
+        assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.clone(p_conn text, p_schemas text[])"));
+        assert!(sql.contains("PERFORM gfs_sync.build_overlay(p_conn, rec.nsp, rec.tab, rec.keycols)"));
+        // Remediations: any-role FDW access, local sequences, overlay comment.
+        assert!(sql.contains("CREATE USER MAPPING FOR PUBLIC"));
+        assert!(sql.contains("CREATE SEQUENCE %I.%I START WITH %s"));
+        assert!(sql.contains("SET DEFAULT nextval(%L)"));
+        // Non-sequence defaults (now(), uuid_generate_v4(), ...) are mirrored
+        // onto both the view and the local store.
+        assert!(sql.contains("ALTER VIEW %I.%I ALTER COLUMN %I SET DEFAULT %s"));
+        assert!(sql.contains("ALTER TABLE %I.%I ALTER COLUMN %I SET DEFAULT %s"));
+        assert!(sql.contains("a.attidentity NOT IN ('a','d')"));
+        assert!(sql.contains("COMMENT ON VIEW %I.%I IS %L"));
+        // Copy-on-read warming function is installed.
+        assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.warm_for_query(p_sql text)"));
+        assert!(sql.contains("EXPLAIN (VERBOSE) "));
+        // The flawed partition mechanic must be gone.
+        assert!(!sql.contains("PARTITION BY RANGE"));
+        assert!(!sql.contains("ATTACH PARTITION"));
+        assert!(!sql.contains("hydrate_for_query"));
+    }
+
+    #[test]
+    fn clone_bootstrap_sql_has_range_elision() {
+        let sql = build_clone_bootstrap_sql(&sample_remote());
+        // Cached-range metadata + constraint exclusion + the warm_range primitive
+        // that hydrates a range and rebuilds the foreign table's exclusion CHECK.
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS gfs_sync.cached_range"));
+        assert!(sql.contains("SET constraint_exclusion = on"));
+        assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.rebuild_exclusion(p_nsp text, p_tab text)"));
+        assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.warm_range(p_nsp text, p_tab text, p_lo text, p_hi text)"));
+        assert!(sql.contains("ADD CONSTRAINT gfs_excl CHECK"));
+        // Driveable by a low-privilege role (proxy/cron).
+        assert!(sql.contains("SECURITY DEFINER"));
+        assert!(sql.contains("GRANT EXECUTE ON FUNCTION gfs_sync.warm_range"));
+        // Query-driven entry point: expands a query's key span to chunks.
+        assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.warm_query_chunks("));
+        assert!(sql.contains("PERFORM gfs_sync.warm_range(sch, cur_tab"));
+        assert!(sql.contains("GRANT EXECUTE ON FUNCTION gfs_sync.warm_query_chunks"));
+        // Hydration writes an explicit non-generated column list (never SELECT *),
+        // so warming tolerates STORED generated columns in the local store.
+        assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.writable_cols(p_relid regclass)"));
+        assert!(sql.contains("AND attgenerated = ''"));
+        assert!(!sql.contains("_local SELECT * FROM"));
+    }
+
+    #[test]
+    fn clone_bootstrap_sql_builds_composite_key_fragments() {
+        let sql = build_clone_bootstrap_sql(&sample_remote());
+        // Key-column fragments are built per key ordinal, so composite PKs work.
+        assert!(sql.contains("unnest(p_keycols) WITH ORDINALITY AS u(kc, ord)"));
+        // Key-change detection in the UPDATE trigger uses IS DISTINCT FROM per col.
+        assert!(sql.contains("IS DISTINCT FROM OLD."));
+        // Tombstone table preserves each key column's type (composite-aware).
+        assert!(sql.contains("format_type(a.atttypid, a.atttypmod)"));
+        // Non-key columns drive the upsert SET list.
+        assert!(sql.contains("FILTER (WHERE NOT (attname = ANY(p_keycols)))"));
+    }
+
+    #[test]
+    fn clone_bootstrap_sql_mirrors_only_non_sequence_defaults() {
+        let sql = build_clone_bootstrap_sql(&sample_remote());
+        // The default-mirroring loop selects column defaults that are NOT
+        // identity and NOT a nextval(...) — those are handled by the sequence
+        // loop above and must not be double-applied here.
+        assert!(sql.contains("a.attidentity NOT IN ('a','d')"));
+        assert!(sql.contains("NOT LIKE 'nextval(%"));
+        assert!(sql.contains("pg_get_expr(ad.adbin, ad.adrelid)"));
+    }
+
+    #[test]
+    fn clone_bootstrap_sql_mirrors_enum_types() {
+        let sql = build_clone_bootstrap_sql(&sample_remote());
+        // User-defined ENUMs are discovered (typtype 'e') and recreated locally
+        // before import, preserving label order.
+        assert!(sql.contains("t.typtype = 'e'"));
+        assert!(sql.contains("array_agg(e.enumlabel ORDER BY e.enumsortorder)"));
+        assert!(sql.contains("CREATE TYPE %I.%I AS ENUM (%s)"));
+    }
+
+    #[test]
+    fn clone_bootstrap_sql_mirrors_domain_and_composite_types() {
+        let sql = build_clone_bootstrap_sql(&sample_remote());
+        // DOMAINs: base type + constraints recreated.
+        assert!(sql.contains("t.typtype = 'd'"));
+        assert!(sql.contains("CREATE DOMAIN %I.%I AS %s%s%s %s"));
+        assert!(sql.contains("pg_get_constraintdef(c.oid)"));
+        // COMPOSITEs: attribute list recreated, multi-pass for dependencies.
+        assert!(sql.contains("t.typtype = 'c' AND c.relkind = 'c'"));
+        assert!(sql.contains("CREATE TYPE %I.%I AS (%s)"));
+        assert!(sql.contains("FOR pass IN 1..10 LOOP"));
+        assert!(sql.contains("to_regtype(format('%I.%I', comptyp.nsp, comptyp.typ)) IS NOT NULL"));
+    }
+
+    #[test]
+    fn clone_bootstrap_sql_escapes_single_quotes() {
+        let mut remote = sample_remote();
+        remote.password = "a'b".into();
+        let sql = build_clone_bootstrap_sql(&remote);
+        // Single quote is doubled inside the SQL string literal.
+        assert!(sql.contains("password 'a''b'"));
+    }
+
+    #[test]
+    fn clone_bootstrap_spec_wraps_sql_in_local_psql_heredoc() {
+        let provider = PostgresqlProvider::new();
+        let spec = provider
+            .clone_bootstrap_spec(&local_params(), &sample_remote())
+            .unwrap();
+        // Connects to the LOCAL database.
+        assert!(spec.command.contains("psql -h 172.17.0.2 -p 5432 -U postgres -d gfs"));
+        assert!(spec.command.contains("<<'GFS_CLONE_BOOTSTRAP'"));
+        // Local password is supplied via PGPASSWORD on the sidecar.
+        assert!(spec.definition.env.iter().any(|e| e.name == "PGPASSWORD"
+            && e.default.as_deref() == Some("localpw")));
         assert_eq!(spec.definition.image, provider.definition().image);
     }
 }

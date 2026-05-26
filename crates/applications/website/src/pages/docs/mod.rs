@@ -13,8 +13,9 @@ mod telemetry;
 use ai_agents::{AiAgentsSkills, AiAgentsSubagents};
 use coming_soon::ComingSoon;
 use commands::{
-    CommandCheckout, CommandCommit, CommandCompute, CommandConfig, CommandExport, CommandImport,
-    CommandInit, CommandLog, CommandProviders, CommandQuery, CommandSchema, CommandStatus,
+    CommandCheckout, CommandClone, CommandCommit, CommandCompute, CommandConfig, CommandExport,
+    CommandImport, CommandInit, CommandLog, CommandProviders, CommandQuery, CommandSchema,
+    CommandStatus,
 };
 use getting_started::GettingStarted;
 use installation::Installation;
@@ -51,6 +52,7 @@ pub fn Docs() -> impl IntoView {
                                 <h3>"Commands"</h3>
                                 <ul>
                                     <li><A href="/docs/commands/init" class="nav-item">"gfs init"</A></li>
+                                    <li><A href="/docs/commands/clone" class="nav-item">"gfs clone"</A></li>
                                     <li><A href="/docs/commands/status" class="nav-item">"gfs status"</A></li>
                                     <li><A href="/docs/commands/commit" class="nav-item">"gfs commit"</A></li>
                                     <li><A href="/docs/commands/log" class="nav-item">"gfs log"</A></li>
@@ -98,6 +100,7 @@ pub fn Docs() -> impl IntoView {
                             "installation" => view! { <Installation/> }.into_view(),
                             "quick-start" => view! { <QuickStart/> }.into_view(),
                             "commands/init" => view! { <CommandInit/> }.into_view(),
+                            "commands/clone" => view! { <CommandClone/> }.into_view(),
                             "commands/status" => view! { <CommandStatus/> }.into_view(),
                             "commands/commit" => view! { <CommandCommit/> }.into_view(),
                             "commands/log" => view! { <CommandLog/> }.into_view(),
