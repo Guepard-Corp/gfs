@@ -16,6 +16,8 @@ export function App() {
   const [q, setQ] = useState("");
 
   const metaQ = useQuery({ queryKey: ["meta"], queryFn: api.meta });
+  const modeQ = useQuery({ queryKey: ["mode"], queryFn: api.mode });
+  const proxyMode = modeQ.data?.proxy ?? false;
   const cloneQ = useQuery({ queryKey: ["clone"], queryFn: api.cloneStatus });
   const cloneM = useMutation({
     mutationFn: api.doClone,
@@ -38,7 +40,7 @@ export function App() {
   return (
     <div className="app">
       <header>
-        <h1>GFS Clone Explorer</h1>
+        <h1>GFS Clone Explorer{proxyMode && <span className="badge badge-proxy" title="The clone is fronted by the guepard proxy, which auto-warms reads"> ⚡ proxy mode</span>}</h1>
         <p className="sub">
           Same app, same tables, two databases. Clone the <b>source</b> from the
           panel on the right and watch how long it takes. The <b>clone</b> copies
@@ -80,7 +82,7 @@ export function App() {
 
       <div className="panes">
         <Panel db="source" page={page} size={size} q={q} />
-        <Panel db="clone" page={page} size={size} q={q} clone={clone} onClone={() => cloneM.mutate()} />
+        <Panel db="clone" page={page} size={size} q={q} clone={clone} onClone={() => cloneM.mutate()} proxyMode={proxyMode} />
       </div>
     </div>
   );

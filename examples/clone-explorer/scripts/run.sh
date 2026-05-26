@@ -26,6 +26,10 @@ SERVER_PORT="${SERVER_PORT:-8787}"
 REMOTE_HOST="${REMOTE_HOST:-host.docker.internal}"
 CLONE_DIR="$APP_DIR/clone-repo"
 SOURCE="gfs-explorer-source"
+PROXY_PORT="${PROXY_PORT:-55444}"
+# `run.sh --proxy` routes the clone through the dockerized guepard proxy, which
+# auto-warms reads (no manual "warm" button needed).
+PROXY_MODE=""; [[ "${1:-}" == "--proxy" ]] && PROXY_MODE=1
 
 step() { printf '\n\033[1;34m== %s ==\033[0m\n' "$1"; }
 
@@ -63,6 +67,19 @@ OLD_CLONE="$(docker ps -q --filter "publish=${CLONE_PORT}")"
 [[ -n "$OLD_CLONE" ]] && docker rm -f "$OLD_CLONE" >/dev/null
 rm -rf "$CLONE_DIR"
 
+if [[ -n "$PROXY_MODE" ]]; then
+  step "Rebuild + start the guepard proxy (in front of the clone)"
+  # Always rebuild so proxy source changes are picked up every run (layer cache
+  # keeps it fast); then force-recreate the container from the fresh image.
+  docker compose --profile proxy build proxy
+  CLONE_PORT="$CLONE_PORT" PROXY_PORT="$PROXY_PORT" \
+    docker compose --profile proxy up -d --force-recreate proxy
+  echo "  proxy on localhost:${PROXY_PORT} → clone on ${REMOTE_HOST}:${CLONE_PORT} (idles until you clone)"
+  CLONE_URL="postgres://postgres:postgres@localhost:${PROXY_PORT}/postgres"
+else
+  CLONE_URL="postgres://postgres:postgres@localhost:${CLONE_PORT}/postgres"
+fi
+
 step "Serve the explorer"
 cat <<EOF
 
@@ -82,8 +99,11 @@ cat <<EOF
 
 EOF
 
+[[ -n "$PROXY_MODE" ]] && echo "  PROXY MODE: just browse the clone — the proxy auto-warms; pages flip remote→local on their own."
+
 SOURCE_URL="postgres://app:app@localhost:${SOURCE_PORT}/appdb" \
-CLONE_URL="postgres://postgres:postgres@localhost:${CLONE_PORT}/postgres" \
+CLONE_URL="$CLONE_URL" \
+PROXY_MODE="$PROXY_MODE" \
 SERVER_PORT="$SERVER_PORT" \
 GFS_BIN="$GFS_BIN" \
 CLONE_DIR="$CLONE_DIR" \

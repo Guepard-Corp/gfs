@@ -48,6 +48,33 @@ pnpm demo                   # = bash scripts/run.sh
 Seed size is configurable (`SEED_ROWS`, default 500k). Push it to a few million
 to make the dump-vs-lazy difference obvious — the clone still starts instantly.
 
+## Proxy mode (auto-warming)
+
+```bash
+pnpm demo -- --proxy        # or: bash scripts/run.sh --proxy
+```
+
+This (re)builds and starts the dockerized **guepard proxy** (`guepard-proxy-v2/`,
+rebuilt every run so source changes are picked up) in front of the clone and points the app at it (`localhost:55444`). Now you don't
+click anything: as you **page through the clone**, the proxy observes your reads,
+calls `gfs_sync.warm_query_chunks` to hydrate the touched chunk, and a periodic
+refresher applies the exclusion — so pages flip from **remote read** to
+**local (elided)** on their own. The manual "Warm this page" button is replaced
+by an **⚡ auto-warm** badge.
+
+This is the showcase of the project's intent: a normal app, connected to the
+clone through the proxy, transparently stops re-reading from the source as it
+warms — no app changes, no manual warming. The proxy is a thin sidecar that only
+talks to the database (it calls the in-DB `gfs_sync.*` functions); correctness is
+always guaranteed by the overlay, independent of the proxy.
+
+Proxy Prometheus metrics: `curl localhost:9090/metrics | grep '^proxy_'`
+(queries seen, warm calls, `proxy_cache_ranges` / `proxy_overlay_tables`).
+
+> The proxy terminates client TLS only if configured; here the app↔proxy link is
+> plaintext and proxy↔clone is local. Backend TLS, client TLS, and parameterized
+> (`Parse`/`Bind`) warming are all supported — see `guepard-proxy-v2/README.md`.
+
 ## Architecture
 
 ```

@@ -1109,6 +1109,11 @@ mod tests {
         // Ranges are coalesced before each rebuild so the CHECK stays compact.
         assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.coalesce_ranges(p_nsp text, p_tab text)"));
         assert!(sql.contains("PERFORM gfs_sync.coalesce_ranges(rec.schema_name, rec.table_name)"));
+        // refresh_exclusions skips unchanged tables (signature) and stays quiet.
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS gfs_sync.applied_exclusion"));
+        assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.exclusion_sig(p_nsp text, p_tab text)"));
+        assert!(sql.contains("CONTINUE WHEN prev_sig IS NOT DISTINCT FROM cur_sig"));
+        assert!(sql.contains("SET client_min_messages = 'warning'"));
         // whole_table strategy for non-range-able keys (uuid/text/composite):
         // hydrate everything + CHECK (false) so the foreign scan is always pruned.
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS gfs_sync.fully_cached"));

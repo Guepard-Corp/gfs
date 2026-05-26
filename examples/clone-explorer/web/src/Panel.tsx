@@ -10,6 +10,7 @@ interface Props {
   q: string;
   clone?: CloneState;
   onClone?: () => void;
+  proxyMode?: boolean;
 }
 
 const BADGE: Record<string, string> = {
@@ -46,7 +47,7 @@ function CloneTimer() {
   return <span className="timer">cloning… {s.toFixed(1)} s</span>;
 }
 
-export function Panel({ db, page, size, q, clone, onClone }: Props) {
+export function Panel({ db, page, size, q, clone, onClone, proxyMode }: Props) {
   const qc = useQueryClient();
   const isCloneReady = db === "source" || !!clone?.cloned;
 
@@ -131,7 +132,7 @@ export function Panel({ db, page, size, q, clone, onClone }: Props) {
               cloned in {(clone.ms / 1000).toFixed(2)} s
             </span>
           )}
-          {db === "clone" && (
+          {db === "clone" && !proxyMode && (
             <button
               className="warm"
               onClick={warmPage}
@@ -140,6 +141,11 @@ export function Panel({ db, page, size, q, clone, onClone }: Props) {
             >
               ↧ Warm this page
             </button>
+          )}
+          {db === "clone" && proxyMode && (
+            <span className="badge badge-proxy" title="The proxy auto-warms the pages you browse; no manual warm needed">
+              ⚡ auto-warm
+            </span>
           )}
           {data && (
             <span

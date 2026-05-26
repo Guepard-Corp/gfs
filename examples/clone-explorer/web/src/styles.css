@@ -57,6 +57,7 @@ button:hover:not(:disabled) { border-color: var(--accent); }
 button.warm { padding: 4px 10px; font-size: 12px; white-space: nowrap; }
 
 .badge-cloned { background: #1f3a4a; color: #8ed8f0; }
+.badge-proxy { background: #3a2f4a; color: #d8b3ff; }
 
 /* Clone call-to-action (shown until the user clones the source). */
 .clone-cta { display: flex; flex-direction: column; align-items: center; gap: 18px; padding: 48px 24px; text-align: center; }

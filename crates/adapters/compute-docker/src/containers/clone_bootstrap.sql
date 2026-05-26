@@ -41,6 +41,16 @@ CREATE TABLE IF NOT EXISTS gfs_sync.fully_cached (
   PRIMARY KEY (schema_name, table_name)
 );
 
+-- Signature of the cached state last applied to a table's exclusion CHECK, so
+-- refresh_exclusions() can skip tables whose ranges haven't changed (no needless
+-- AccessExclusive ALTER every tick).
+CREATE TABLE IF NOT EXISTS gfs_sync.applied_exclusion (
+  schema_name text NOT NULL,
+  table_name  text NOT NULL,
+  sig text NOT NULL,
+  PRIMARY KEY (schema_name, table_name)
+);
+
 -- Enable constraint exclusion so the planner can refute a query predicate that
 -- falls within a cached range against the foreign table's exclusion CHECK and
 -- prune the foreign scan entirely (zero remote contact). Applies to new sessions
@@ -655,12 +665,18 @@ GRANT EXECUTE ON FUNCTION gfs_sync.warm_whole_table(text, text) TO PUBLIC;
 -- `lock_timeout` bounds any read stall: a table it can't lock now is retried on
 -- the next call. Safe because cached_range is written in the same transaction as
 -- the hydration, so a rebuild only ever sees already-hydrated ranges.
+-- `client_min_messages = warning` keeps the routine `IF EXISTS` maintenance
+-- (DROP TEMP TABLE / DROP CONSTRAINT) from spamming NOTICEs to the caller.
 CREATE OR REPLACE FUNCTION gfs_sync.refresh_exclusions()
 RETURNS integer
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fn$
+LANGUAGE plpgsql SECURITY DEFINER
+  SET search_path = pg_catalog, pg_temp
+  SET client_min_messages = 'warning' AS $fn$
 DECLARE
-  rec record;
-  n   integer := 0;
+  rec      record;
+  cur_sig  text;
+  prev_sig text;
+  n        integer := 0;
 BEGIN
   SET LOCAL lock_timeout = '200ms';
   FOR rec IN
@@ -668,6 +684,12 @@ BEGIN
     UNION
     SELECT schema_name, table_name FROM gfs_sync.fully_cached
   LOOP
+    cur_sig := gfs_sync.exclusion_sig(rec.schema_name, rec.table_name);
+    SELECT sig INTO prev_sig FROM gfs_sync.applied_exclusion
+      WHERE schema_name = rec.schema_name AND table_name = rec.table_name;
+    -- Nothing changed since we last applied the CHECK → skip (no coalesce, no ALTER).
+    CONTINUE WHEN prev_sig IS NOT DISTINCT FROM cur_sig;
+
     BEGIN
       -- Coalescing is an optimization; isolate it so a failure never blocks the
       -- rebuild (which is what actually applies elision).
@@ -676,6 +698,11 @@ BEGIN
       EXCEPTION WHEN others THEN NULL;
       END;
       PERFORM gfs_sync.rebuild_exclusion(rec.schema_name, rec.table_name);
+      -- Record the post-coalesce signature so the next tick is a no-op.
+      INSERT INTO gfs_sync.applied_exclusion(schema_name, table_name, sig)
+        VALUES (rec.schema_name, rec.table_name,
+                gfs_sync.exclusion_sig(rec.schema_name, rec.table_name))
+        ON CONFLICT (schema_name, table_name) DO UPDATE SET sig = EXCLUDED.sig;
       n := n + 1;
     EXCEPTION
       WHEN lock_not_available THEN NULL;  -- table busy; retried next call
@@ -684,6 +711,19 @@ BEGIN
   END LOOP;
   RETURN n;
 END
+$fn$;
+
+-- Deterministic signature of a table's cached state (ranges + whole-table flag).
+CREATE OR REPLACE FUNCTION gfs_sync.exclusion_sig(p_nsp text, p_tab text)
+RETURNS text
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fn$
+  SELECT coalesce(
+           (SELECT string_agg(lo || ':' || hi, ',' ORDER BY lo, hi)
+              FROM gfs_sync.cached_range WHERE schema_name = p_nsp AND table_name = p_tab),
+           '')
+         || CASE WHEN EXISTS (SELECT 1 FROM gfs_sync.fully_cached
+                                WHERE schema_name = p_nsp AND table_name = p_tab)
+                 THEN '|W' ELSE '' END
 $fn$;
 
 GRANT EXECUTE ON FUNCTION gfs_sync.refresh_exclusions() TO PUBLIC;

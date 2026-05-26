@@ -42,6 +42,7 @@ export interface CloneStatus {
 }
 
 export const api = {
+  mode: () => json<{ proxy: boolean }>("/api/mode"),
   meta: () => json<{ maxId: number }>("/api/meta"),
   cloneStatus: () => json<CloneStatus>("/api/clone"),
   doClone: () => json<{ ok: true; ms: number }>("/api/clone", { method: "POST" }),

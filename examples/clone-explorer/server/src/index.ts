@@ -24,6 +24,10 @@ const SOURCE_USER = process.env.SOURCE_USER ?? "app";
 const SOURCE_PASS = process.env.SOURCE_PASS ?? "app";
 const DB_VERSION = process.env.DB_VERSION ?? "16";
 
+// Proxy mode: the clone is reached through the guepard proxy (CLONE_URL points at
+// it), which auto-warms reads. The UI adapts (hides the manual "warm" button).
+const PROXY_MODE = (process.env.PROXY_MODE ?? "") !== "";
+
 const app = Fastify({ logger: false });
 
 // Plain, readable console logging (one line per API request + domain events).
@@ -126,6 +130,8 @@ async function servedFrom(
 // ---------------------------------------------------------------------------
 // Data API
 // ---------------------------------------------------------------------------
+
+app.get("/api/mode", async () => ({ proxy: PROXY_MODE }));
 
 app.get("/api/meta", async () => {
   const [{ max }] = await source`SELECT coalesce(max(id), 0)::bigint AS max FROM products`;
