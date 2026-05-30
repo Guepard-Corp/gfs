@@ -172,7 +172,8 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
             None => return Ok(()),
         };
 
-        let mut definition = provider.definition();
+        let params = crate::model::config::GfsConfig::load_compute_params(path);
+        let mut definition = provider.definition_with_overrides(&params);
         if !environment.database_version.is_empty() {
             let base = definition
                 .image
@@ -788,6 +789,7 @@ mod tests {
         }
         fn definition(&self) -> ComputeDefinition {
             ComputeDefinition {
+                labels: Default::default(),
                 image: "postgres:17".into(),
                 env: vec![],
                 ports: vec![],
@@ -1434,6 +1436,7 @@ mod tests {
         }
         fn definition(&self) -> ComputeDefinition {
             ComputeDefinition {
+                labels: Default::default(),
                 image: "postgres:17".into(),
                 env: vec![],
                 ports: vec![],

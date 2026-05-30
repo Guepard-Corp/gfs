@@ -1,0 +1,38 @@
+[package]
+name = "gfs-console"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "gfs-console"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP server (same stack as the MCP HTTP transport)
+axum = { version = "0.7", features = ["json"] }
+tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+
+# Docker introspection (read-only): enumerate `gfs.managed=true` containers
+bollard = { workspace = true }
+
+# Telemetry scrape of the proxy's /metrics and /clones endpoints
+reqwest = { workspace = true }
+
+# Embed the built React frontend (web/dist) into the binary
+rust-embed = { version = "8", features = ["mime-guess"] }
+
+# Call GFS use cases in-process (no subprocess): schema extraction, compute,
+# clone — reusing the domain model + the Docker compute adapter.
+gfs-domain = { workspace = true }
+gfs-compute-docker = { workspace = true }
+# Run clone/compute via the CLI's exported command functions (in-process).
+gfs-cli = { workspace = true }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

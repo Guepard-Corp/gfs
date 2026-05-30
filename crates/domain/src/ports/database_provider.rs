@@ -5,7 +5,7 @@
 //! Use [`DatabaseProviderRegistry::register`] to add a provider, and
 //! [`DatabaseProviderRegistry::get`] / [`DatabaseProviderRegistry::list`] to look them up.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
 use crate::ports::compute::ComputeDefinition;
@@ -209,6 +209,38 @@ pub trait DatabaseProvider: Send + Sync {
 
     /// Default arguments for this database provider.
     fn default_args(&self) -> Vec<DatabaseProviderArg>;
+
+    /// Render user-supplied container parameter overrides (from
+    /// `[compute.params]`) into this provider's native argument syntax.
+    ///
+    /// Keys are logical setting names; the provider maps each into its own form
+    /// (e.g. PostgreSQL `-c name=value`, MySQL `--name=value`). The returned
+    /// args are appended *after* [`default_args`](Self::default_args), so for
+    /// engines where the last occurrence wins they override the defaults.
+    ///
+    /// Default: returns nothing (provider does not support overrides).
+    fn render_param_overrides(&self, params: &BTreeMap<String, String>) -> Vec<DatabaseProviderArg> {
+        let _ = params;
+        Vec::new()
+    }
+
+    /// [`definition`](Self::definition) with `params` rendered and appended to
+    /// `args`. Provisioning sites use this so container tuning from
+    /// `[compute.params]` is (re-)applied on every init/checkout/restart.
+    fn definition_with_overrides(&self, params: &BTreeMap<String, String>) -> ComputeDefinition {
+        let mut def = self.definition();
+        def.args
+            .extend(self.render_param_overrides(params).into_iter().flat_map(
+                |a| {
+                    if a.value.is_empty() {
+                        vec![a.name]
+                    } else {
+                        vec![a.name, a.value]
+                    }
+                },
+            ));
+        def
+    }
 
     /// Default signal sent to the database process when stopping (e.g. for graceful shutdown).
     /// Returns the signal number (e.g. [`SIGTERM`] = 15 on Unix). Default implementation returns SIGTERM.
@@ -504,6 +536,7 @@ mod tests {
         }
         fn definition(&self) -> ComputeDefinition {
             ComputeDefinition {
+                labels: Default::default(),
                 image: "test:latest".into(),
                 env: vec![],
                 ports: vec![],
@@ -607,6 +640,7 @@ mod tests {
             name: "test".into(),
         };
         let def = ComputeDefinition {
+            labels: Default::default(),
             image: "postgres:16".into(),
             env: vec![],
             ports: vec![],
@@ -619,6 +653,7 @@ mod tests {
         };
         assert_eq!(provider.version_from_image(&def), "16");
         let def_latest = ComputeDefinition {
+            labels: Default::default(),
             image: "postgres".into(),
             env: vec![],
             ports: vec![],

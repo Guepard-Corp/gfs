@@ -448,7 +448,7 @@ async fn start_restart_or_recreate(
     compute.stop(instance_id).await?;
     compute.remove_instance(instance_id).await?;
 
-    let mut definition = provider.definition();
+    let mut definition = provider.definition_with_overrides(&config.compute_params());
     if let Some(ref env) = config.environment
         && !env.database_version.is_empty()
     {

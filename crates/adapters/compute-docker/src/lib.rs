@@ -492,6 +492,11 @@ impl Compute for DockerCompute {
             } else {
                 Some(definition.args.clone())
             },
+            labels: if definition.labels.is_empty() {
+                None
+            } else {
+                Some(definition.labels.clone().into_iter().collect())
+            },
             ..Default::default()
         };
 

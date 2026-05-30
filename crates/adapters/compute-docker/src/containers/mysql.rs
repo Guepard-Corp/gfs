@@ -35,6 +35,7 @@ impl MysqlProvider {
 
     fn definition_impl() -> ComputeDefinition {
         ComputeDefinition {
+            labels: Default::default(),
             image: DEFAULT_IMAGE.to_string(),
             env: vec![
                 EnvVar {
@@ -168,6 +169,22 @@ impl DatabaseProvider for MysqlProvider {
         ]
     }
 
+    /// `mysqld` takes server variables as `--name=value` flags; a later flag
+    /// overrides an earlier one, so these (appended after the defaults) win
+    /// over `default_args` (e.g. `max_connections=200`).
+    fn render_param_overrides(
+        &self,
+        params: &std::collections::BTreeMap<String, String>,
+    ) -> Vec<DatabaseProviderArg> {
+        params
+            .iter()
+            .map(|(k, v)| DatabaseProviderArg {
+                name: format!("--{k}={v}"),
+                value: String::new(),
+            })
+            .collect()
+    }
+
     fn default_signal(&self) -> u32 {
         SIGTERM
     }
@@ -272,6 +289,7 @@ impl DatabaseProvider for MysqlProvider {
         match format {
             "sql" => Ok(ExportSpec {
                 definition: ComputeDefinition {
+                    labels: Default::default(),
                     image: self.definition().image,
                     env: vec![],
                     ports: vec![],
@@ -293,6 +311,7 @@ impl DatabaseProvider for MysqlProvider {
             }),
             "schema" => Ok(ExportSpec {
                 definition: ComputeDefinition {
+                    labels: Default::default(),
                     image: self.definition().image,
                     env: vec![],
                     ports: vec![],
@@ -330,6 +349,7 @@ impl DatabaseProvider for MysqlProvider {
         match format {
             "sql" => Ok(ImportSpec {
                 definition: ComputeDefinition {
+                    labels: Default::default(),
                     image: self.definition().image,
                     env: vec![],
                     ports: vec![],
@@ -527,6 +547,7 @@ COLUMNS_EOF
 
         Ok(Some(SchemaExtractionSpec {
             definition: ComputeDefinition {
+                labels: Default::default(),
                 image: self.definition().image,
                 env: vec![EnvVar {
                     name: "MYSQL_PWD".into(),
@@ -632,6 +653,30 @@ mod tests {
         assert_eq!(def.args.len(), args.len());
         assert_eq!(def.args.first(), Some(&"--skip-name-resolve".to_string()));
         assert_eq!(def.args.last(), Some(&"--bind-address=0.0.0.0".to_string()));
+    }
+
+    #[test]
+    fn render_param_overrides_emits_double_dash_flags() {
+        let provider = MysqlProvider::new();
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("max_connections".to_string(), "200".to_string());
+        let args = provider.render_param_overrides(&params);
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].name, "--max_connections=200");
+        assert!(args[0].value.is_empty());
+    }
+
+    #[test]
+    fn definition_with_overrides_appends_flag_after_defaults() {
+        let provider = MysqlProvider::new();
+        let base_len = provider.definition().args.len();
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("max_connections".to_string(), "200".to_string());
+        let def = provider.definition_with_overrides(&params);
+        // Default ships --max_connections=5; the override flag is appended last,
+        // and mysqld honours the last occurrence.
+        assert_eq!(def.args.len(), base_len + 1);
+        assert_eq!(def.args.last(), Some(&"--max_connections=200".to_string()));
     }
 
     #[test]

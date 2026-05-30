@@ -1,0 +1,37 @@
+@import 'tailwindcss';
+
+/* Industrial-precision palette, mirroring console-v3's design system. */
+@theme {
+  --color-background: #0a0a0b;
+  --color-card: #111113;
+  --color-foreground: #ededef;
+  --color-muted: #1a1a1d;
+  --color-muted-foreground: #8a8a92;
+  --color-border: #2a2a2e;
+  --color-primary: #ededef;
+  --color-destructive: #ef4444;
+  --radius: 0px;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-background);
+  color: var(--color-foreground);
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.custom-scrollbar::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+}

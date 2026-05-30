@@ -1238,6 +1238,7 @@ mod tests {
         }
         fn definition(&self) -> ComputeDefinition {
             ComputeDefinition {
+                labels: Default::default(),
                 image: "mock:latest".into(),
                 env: vec![],
                 ports: vec![],

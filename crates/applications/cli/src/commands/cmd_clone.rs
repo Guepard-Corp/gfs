@@ -63,6 +63,15 @@ pub async fn clone(
 
     // 1. Initialise the local repo and provision the matching local Postgres.
     //    (Reuses the standard init path, which also prints repo/connection info.)
+    //    Mark the container as a clone (+ its remote) via labels, overriding the
+    //    default gfs.role=source, so the warming proxy can discover it.
+    let labels = std::collections::BTreeMap::from([
+        ("gfs.role".to_string(), "clone".to_string()),
+        (
+            "gfs.remote".to_string(),
+            format!("{}:{}", remote.host, remote.port),
+        ),
+    ]);
     crate::commands::cmd_init::init(
         Some(target_path.clone()),
         Some("postgres".to_string()),
@@ -72,6 +81,7 @@ pub async fn clone(
         json_output,
         image,
         platform,
+        labels,
     )
     .await?;
 

@@ -3,7 +3,9 @@
 //! Provides a programmatic interface to run the CLI. Use `run()` for testing or embedding.
 
 mod cli_utils;
-mod commands;
+/// Command implementations, exported so other crates (e.g. the console) can run
+/// GFS operations in-process instead of shelling out to the `gfs` binary.
+pub mod commands;
 pub mod output;
 
 use std::ffi::OsString;
@@ -569,6 +571,7 @@ where
                     json_output,
                     None,
                     None,
+                    Default::default(),
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("{}", e))?;

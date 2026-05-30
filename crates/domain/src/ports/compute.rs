@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -253,6 +254,13 @@ pub struct ComputeDefinition {
     /// Optional command arguments passed to the container (e.g. PostgreSQL `-c key=value`).
     /// Populated from the database provider's `default_args()` when provisioning.
     pub args: Vec<String>,
+
+    /// Optional metadata labels attached to the runtime instance (e.g. Docker
+    /// container labels). Useful for observability enrichment — an external
+    /// collector can discover containers and map these onto resource attributes.
+    /// Empty by default; the runtime should attach nothing when this is empty.
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
 }
 
 /// A single port mapping (host port optional; container port required).

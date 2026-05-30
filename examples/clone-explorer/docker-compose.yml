@@ -16,30 +16,6 @@ services:
       timeout: 3s
       retries: 30
 
-  # Optional: the guepard wire-protocol proxy in front of the clone. Started only
-  # with the "proxy" profile (e.g. `scripts/run.sh --proxy`). It observes the
-  # app's reads and auto-warms the clone (no manual "warm" needed); a periodic
-  # refresher turns hydrated ranges into elision. Reaches the clone (created on
-  # the host by `gfs clone`) via host.docker.internal:CLONE_PORT.
-  proxy:
-    build:
-      context: ../../../guepard-proxy-v2
-    image: guepard-proxy-v2:latest
-    container_name: gfs-explorer-proxy
-    profiles: ["proxy"]
-    restart: unless-stopped
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    environment:
-      PROXY_LISTEN: "0.0.0.0:6432"
-      PROXY_BACKEND: "host.docker.internal:${CLONE_PORT:-55443}"
-      PROXY_METRICS: "0.0.0.0:9090"
-      PROXY_WARM: "true"
-      PROXY_WARM_DBNAME: "postgres"
-      PROXY_REFRESH_INTERVAL: "3"
-      PROXY_CACHE_METRICS: "true"
-      PROXY_CACHE_METRICS_INTERVAL: "2"
-      PROXY_LOG: "info"
-    ports:
-      - "${PROXY_PORT:-55444}:6432"
-      - "${PROXY_METRICS_PORT:-9090}:9090"
+# The optional auto-warming proxy is no longer a compose service: `scripts/run.sh
+# --proxy` now builds and runs the `guepard-proxy-v2` binary directly on the host
+# (it reaches the host-published clone at 127.0.0.1:CLONE_PORT). See the script.

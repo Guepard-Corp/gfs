@@ -153,7 +153,9 @@ app.get<{ Querystring: { db?: string } }>("/api/stats", async (req) => {
   let localProducts: number | null = null;
   let cachedRanges: number | null = null;
   if (db === "clone") {
-    const lp = await sql`SELECT count(*)::bigint AS n FROM products_local`.catch(() => [{ n: null }]);
+    // Local store = the faithful table (public.products); schema-qualified to
+    // count locally-owned rows, not the federating overlay (gfs_ovl__public.products).
+    const lp = await sql`SELECT count(*)::bigint AS n FROM public.products`.catch(() => [{ n: null }]);
     localProducts = lp[0].n == null ? null : Number(lp[0].n);
     const cr = await sql`SELECT count(*)::bigint AS n FROM gfs_sync.cached_range WHERE table_name = 'products'`.catch(
       () => [{ n: null }],
@@ -195,7 +197,12 @@ app.get<{ Querystring: { db?: string; page?: string; size?: string; q?: string }
 
 app.post<{ Body: { lo: number; hi: number } }>("/api/warm", async (req) => {
   const { lo, hi } = req.body;
-  const [{ n }] = await connFor("clone")`SELECT gfs_sync.warm_range('public', 'products', ${String(lo)}, ${String(hi)}) AS n`;
+  const clone = connFor("clone");
+  const [{ n }] = await clone`SELECT gfs_sync.warm_range('public', 'products', ${String(lo)}, ${String(hi)}) AS n`;
+  // warm_range only hydrates rows; the AccessExclusive CHECK rebuild is decoupled.
+  // In direct mode there is no proxy refresher, so apply the exclusion now so the
+  // warmed range is actually elided (builds the key-range CHECK / promotes to whole_table).
+  await clone`SELECT gfs_sync.refresh_exclusions()`;
   log(`warm: products [${lo},${hi}] → hydrated ${Number(n)} rows`);
   return { hydrated: Number(n) };
 });

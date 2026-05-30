@@ -1,0 +1,42 @@
+[package]
+name = "guepard-proxy-v2"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# Docker auto-discovery of GFS clone containers (gfs.managed/role labels). Pulls
+# in bollard + a small HTTP server for the /clones endpoint. On by default so the
+# examples work out of the box; build with --no-default-features for a lean,
+# DB-only proxy that talks to a single configured --backend.
+default = ["discovery"]
+discovery = [
+    "dep:bollard",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http-body-util",
+    "dep:serde_json",
+]
+
+[dependencies]
+anyhow = "1.0.102"
+bytes = "1.11.1"
+clap = { version = "4.6.1", features = ["derive", "env"] }
+metrics = "0.24.6"
+metrics-exporter-prometheus = "0.18.3"
+rustls = "0.23.40"
+rustls-native-certs = "0.8.3"
+rustls-pemfile = "2.2.0"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["full"] }
+tokio-postgres = "0.7.17"
+tokio-postgres-rustls = "0.14.0"
+tokio-rustls = "0.26.4"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+
+# --- discovery feature only ---
+bollard = { version = "0.20", optional = true }
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+serde_json = { version = "1", optional = true }

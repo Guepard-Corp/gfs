@@ -472,6 +472,7 @@ mod tests {
         }
         fn definition(&self) -> ComputeDefinition {
             ComputeDefinition {
+                labels: Default::default(),
                 image: "postgres:17".into(),
                 env: vec![],
                 ports: vec![],
@@ -523,6 +524,7 @@ mod tests {
             if format == "sql" {
                 Ok(ImportSpec {
                     definition: ComputeDefinition {
+                        labels: Default::default(),
                         image: "postgres:17".into(),
                         env: vec![],
                         ports: vec![],
@@ -578,6 +580,7 @@ mod tests {
             environment: Some(env.clone()),
             runtime: Some(runtime.clone()),
             storage: None,
+            compute: None,
         };
         config.save(dir).unwrap();
     }

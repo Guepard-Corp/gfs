@@ -71,6 +71,7 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
     /// When `database_provider` is set, either `database_version` must be set and
     /// non-empty, or `image` must override the full container image (which pins
     /// its own version, e.g. `pgvector/pgvector:pg16`).
+    #[allow(clippy::too_many_arguments)]
     pub async fn run(
         &self,
         path: PathBuf,
@@ -80,6 +81,7 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         database_port: Option<u16>,
         credentials: DatabaseCredentials,
         image: Option<String>,
+        labels: std::collections::BTreeMap<String, String>,
     ) -> std::result::Result<(), InitRepoError> {
         self.repository.init(&path, mount_point).await?;
 
@@ -91,6 +93,7 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
                 database_port,
                 credentials,
                 image,
+                labels,
             )
             .await?;
         }
@@ -98,6 +101,7 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn deploy_database(
         &self,
         repo_path: &std::path::Path,
@@ -106,6 +110,7 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         database_port: Option<u16>,
         credentials: DatabaseCredentials,
         image: Option<String>,
+        labels: std::collections::BTreeMap<String, String>,
     ) -> std::result::Result<(), InitRepoError> {
         let compute = self.compute.as_ref().ok_or_else(|| {
             InitRepoError::Compute(ComputeError::Internal(
@@ -129,7 +134,8 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
                 ))
             })?;
 
-        let mut definition = provider.definition();
+        let params = crate::model::config::GfsConfig::load_compute_params(repo_path);
+        let mut definition = provider.definition_with_overrides(&params);
         match image {
             // Explicit image override pins its own version (e.g. an image that
             // bundles an extension the default image lacks, like pgvector).
@@ -178,6 +184,30 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
             }
         }
 
+        // GFS-owned labels so external tooling (e.g. the warming proxy) can
+        // discover and classify this container straight from the Docker API,
+        // without connecting to the database. Caller-supplied labels are merged
+        // last and win: a plain `init` stays `gfs.role=source`, while `gfs clone`
+        // passes `gfs.role=clone` + `gfs.remote=<host>`.
+        let provider_version = provider.version_from_image(&definition);
+        let repo_label = repo_path
+            .canonicalize()
+            .unwrap_or_else(|_| repo_path.to_path_buf())
+            .display()
+            .to_string();
+        let mut gfs_labels: std::collections::BTreeMap<String, String> = [
+            ("gfs.managed", "true".to_string()),
+            ("gfs.role", "source".to_string()),
+            ("gfs.provider", provider_name.clone()),
+            ("gfs.provider_version", provider_version.clone()),
+            ("gfs.repo", repo_label),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        gfs_labels.extend(labels);
+        definition.labels = gfs_labels;
+
         let workspace_data_dir = self
             .repository
             .get_workspace_data_dir_for_head(repo_path)
@@ -213,11 +243,9 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
                 version: "24".to_string(),
             });
 
-        let database_version = provider.version_from_image(&definition);
-
         let environment = EnvironmentConfig {
             database_provider: provider_name,
-            database_version,
+            database_version: provider_version,
             database_port,
         };
         self.repository
@@ -408,14 +436,20 @@ mod tests {
         }
     }
 
-    struct MockCompute;
+    #[derive(Default)]
+    struct MockCompute {
+        /// Captures the labels of the last provisioned definition, so tests can
+        /// assert that the use case threads them through to `provision`.
+        provisioned_labels: std::sync::Mutex<Option<std::collections::BTreeMap<String, String>>>,
+    }
 
     #[async_trait]
     impl Compute for MockCompute {
         async fn provision(
             &self,
-            _: &ComputeDefinition,
+            definition: &ComputeDefinition,
         ) -> crate::ports::compute::Result<InstanceId> {
+            *self.provisioned_labels.lock().unwrap() = Some(definition.labels.clone());
             Ok(InstanceId("mock".into()))
         }
         async fn start(
@@ -544,6 +578,7 @@ mod tests {
         }
         fn definition(&self) -> ComputeDefinition {
             ComputeDefinition {
+                labels: Default::default(),
                 image: "postgres:17".into(),
                 env: vec![],
                 ports: vec![],
@@ -623,6 +658,7 @@ mod tests {
                 None,
                 DatabaseCredentials::default(),
                 None,
+                Default::default(),
             )
             .await;
         assert!(result.is_ok());
@@ -632,7 +668,7 @@ mod tests {
     async fn init_with_database_provider() {
         let usecase = InitRepositoryUseCase::new(
             Arc::new(MockRepository),
-            Some(Arc::new(MockCompute)),
+            Some(Arc::new(MockCompute::default())),
             Arc::new(MockRegistry),
         );
         let dir = tempfile::tempdir().unwrap();
@@ -645,16 +681,96 @@ mod tests {
                 None,
                 DatabaseCredentials::default(),
                 None,
+                Default::default(),
             )
             .await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
+    async fn init_threads_labels_to_provisioned_definition() {
+        let compute = Arc::new(MockCompute::default());
+        let usecase = InitRepositoryUseCase::new(
+            Arc::new(MockRepository),
+            Some(compute.clone()),
+            Arc::new(MockRegistry),
+        );
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert("guepard.org_id".to_string(), "org-1".to_string());
+        labels.insert("guepard.database_id".to_string(), "db-9".to_string());
+
+        usecase
+            .run(
+                dir.path().to_path_buf(),
+                None,
+                Some("postgres".into()),
+                Some("17".into()),
+                None,
+                DatabaseCredentials::default(),
+                None,
+                labels.clone(),
+            )
+            .await
+            .unwrap();
+
+        let provisioned = compute.provisioned_labels.lock().unwrap().clone().unwrap();
+        // Caller-supplied labels are threaded through to provision().
+        assert_eq!(provisioned.get("guepard.org_id").map(String::as_str), Some("org-1"));
+        assert_eq!(provisioned.get("guepard.database_id").map(String::as_str), Some("db-9"));
+        // GFS-owned discovery labels are added automatically.
+        assert_eq!(provisioned.get("gfs.managed").map(String::as_str), Some("true"));
+        assert_eq!(provisioned.get("gfs.role").map(String::as_str), Some("source"));
+        assert_eq!(provisioned.get("gfs.provider").map(String::as_str), Some("postgres"));
+        assert_eq!(provisioned.get("gfs.provider_version").map(String::as_str), Some("17"));
+        assert!(provisioned.contains_key("gfs.repo"));
+    }
+
+    #[tokio::test]
+    async fn caller_labels_override_default_role() {
+        let compute = Arc::new(MockCompute::default());
+        let usecase = InitRepositoryUseCase::new(
+            Arc::new(MockRepository),
+            Some(compute.clone()),
+            Arc::new(MockRegistry),
+        );
+        let dir = tempfile::tempdir().unwrap();
+
+        // A clone passes role=clone + remote=<host>; these must win over the
+        // default gfs.role=source.
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert("gfs.role".to_string(), "clone".to_string());
+        labels.insert("gfs.remote".to_string(), "db.example.com:5432".to_string());
+
+        usecase
+            .run(
+                dir.path().to_path_buf(),
+                None,
+                Some("postgres".into()),
+                Some("17".into()),
+                None,
+                DatabaseCredentials::default(),
+                None,
+                labels,
+            )
+            .await
+            .unwrap();
+
+        let provisioned = compute.provisioned_labels.lock().unwrap().clone().unwrap();
+        assert_eq!(provisioned.get("gfs.role").map(String::as_str), Some("clone"));
+        assert_eq!(
+            provisioned.get("gfs.remote").map(String::as_str),
+            Some("db.example.com:5432")
+        );
+        assert_eq!(provisioned.get("gfs.managed").map(String::as_str), Some("true"));
+    }
+
+    #[tokio::test]
     async fn init_database_version_required() {
         let usecase = InitRepositoryUseCase::new(
             Arc::new(MockRepository),
-            Some(Arc::new(MockCompute)),
+            Some(Arc::new(MockCompute::default())),
             Arc::new(MockRegistry),
         );
         let dir = tempfile::tempdir().unwrap();
@@ -667,6 +783,7 @@ mod tests {
                 None,
                 DatabaseCredentials::default(),
                 None,
+                Default::default(),
             )
             .await;
         assert!(matches!(
@@ -679,7 +796,7 @@ mod tests {
     async fn init_unknown_database_provider() {
         let usecase = InitRepositoryUseCase::new(
             Arc::new(MockRepository),
-            Some(Arc::new(MockCompute)),
+            Some(Arc::new(MockCompute::default())),
             Arc::new(MockRegistry),
         );
         let dir = tempfile::tempdir().unwrap();
@@ -692,6 +809,7 @@ mod tests {
                 None,
                 DatabaseCredentials::default(),
                 None,
+                Default::default(),
             )
             .await;
         assert!(matches!(
@@ -704,7 +822,7 @@ mod tests {
     async fn init_fails_when_repository_already_initialized() {
         let usecase = InitRepositoryUseCase::new(
             Arc::new(GfsRepository::new()),
-            Some(Arc::new(MockCompute)),
+            Some(Arc::new(MockCompute::default())),
             Arc::new(MockRegistry),
         );
         let dir = tempfile::tempdir().unwrap();
@@ -720,13 +838,23 @@ mod tests {
                 None,
                 DatabaseCredentials::default(),
                 None,
+                Default::default(),
             )
             .await;
         assert!(first.is_ok(), "first init should succeed: {:?}", first);
 
         // Second init fails with AlreadyInitialized
         let second = usecase
-            .run(path, None, None, None, None, DatabaseCredentials::default(), None)
+            .run(
+                path,
+                None,
+                None,
+                None,
+                None,
+                DatabaseCredentials::default(),
+                None,
+                Default::default(),
+            )
             .await;
         assert!(
             matches!(

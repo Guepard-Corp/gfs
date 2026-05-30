@@ -510,6 +510,7 @@ mod tests {
         }
         fn definition(&self) -> ComputeDefinition {
             ComputeDefinition {
+                labels: Default::default(),
                 image: "postgres:17".into(),
                 env: vec![],
                 ports: vec![],

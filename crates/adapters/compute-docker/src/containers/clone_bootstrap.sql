@@ -126,10 +126,12 @@ BEGIN
         IF keycols IS NOT NULL THEN
           BEGIN
             collist := gfs_sync.writable_cols(format('%I.%I', cur_shadow, cur_tab)::regclass);
+            PERFORM set_config('session_replication_role', 'replica', true);
             EXECUTE format(
               'INSERT INTO %I.%I (%s) SELECT %s FROM %I.%I WHERE %s ON CONFLICT (%s) DO NOTHING',
-              sch, cur_tab || '_local', collist, collist, cur_shadow, cur_tab, whereclause, keycols);
+              sch, cur_tab, collist, collist, cur_shadow, cur_tab, whereclause, keycols);
             GET DIAGNOSTICS rc = ROW_COUNT;
+            PERFORM set_config('session_replication_role', 'origin', true);
             n := n + rc;
           EXCEPTION WHEN others THEN
             NULL;  -- never let warming break the read
@@ -296,17 +298,26 @@ BEGIN
 END
 $fn$;
 
--- Build the overlay for one table whose foreign table was imported into its
--- shadow schema: a local store, a delete-tombstone table, an updatable view
--- (local wins; remote rows only if neither local nor tombstoned), mirrored
--- defaults/sequences, and INSTEAD OF triggers for copy-on-write. `p_keycols`
--- is the (possibly composite) conflict key. Returns false (and is a no-op) if
--- the foreign table is missing. Reusable to overlay a single table on demand.
+-- Build the overlay for one table. The FAITHFUL real table (p_nsp.p_tab, with
+-- the source's triggers / indexes / constraints / defaults) is the local store
+-- and already exists (replayed from pg_dump --schema-only before the bootstrap).
+-- This adds, in the side schema gfs_ovl__<schema>: a delete-tombstone table and
+-- an updatable VIEW (local wins; remote rows only if neither local nor
+-- tombstoned) with INSTEAD OF triggers that copy-on-write INTO the faithful
+-- table (so the source's own triggers/constraints fire). Apps read through the
+-- overlay (proxy interleaves search_path: gfs_ovl__<schema>, <schema>); the
+-- faithful name stays a real table so functions/triggers/DDL keep working.
+-- `p_keycols` is the (possibly composite) conflict key. Returns false (no-op)
+-- if the faithful table or its foreign table is missing.
 CREATE OR REPLACE FUNCTION gfs_sync.build_overlay(
   p_conn text, p_nsp text, p_tab text, p_keycols text[])
 RETURNS boolean
 LANGUAGE plpgsql AS $fn$
 DECLARE
+  ovl_nsp       text;  -- side overlay schema:    gfs_ovl__<schema>
+  store_fq      text;  -- faithful table (store): <schema>.<table>
+  ovl_fq        text;  -- overlay view:           gfs_ovl__<schema>.<table>
+  tomb          text;  -- tombstone table:        gfs_ovl__<schema>.<table>__deleted
   shadow        text;
   fq_remote     text;  -- shadow-qualified foreign table, regclass-castable
   fname         text;  -- gfs_sync trigger-function name prefix
@@ -323,19 +334,30 @@ DECLARE
   del_cols_def  text;  -- "a" int, "b" text  (for the tombstone table)
   upsert        text;
   seqcol        record;
-  seqname       text;
+  seqfq         text;
   startval      bigint;
   defcol        record;
 BEGIN
+  ovl_nsp   := 'gfs_ovl__' || p_nsp;
+  store_fq  := format('%I.%I', p_nsp, p_tab);
+  ovl_fq    := format('%I.%I', ovl_nsp, p_tab);
+  tomb      := format('%I.%I', ovl_nsp, p_tab || '__deleted');
   shadow    := 'gfs_remote_' || p_nsp;
   fq_remote := format('%I.%I', shadow, p_tab);
   fname     := p_nsp || '_' || p_tab;
 
-  -- Skip tables whose foreign import was skipped (e.g. unavailable extension type).
+  -- Need both the faithful table (replayed from the schema dump) and its foreign
+  -- table (imported). Skip if either is missing (e.g. unavailable extension type).
+  IF to_regclass(store_fq) IS NULL THEN
+    RAISE NOTICE 'gfs: no overlay for %.% (faithful table not present)', p_nsp, p_tab;
+    RETURN false;
+  END IF;
   IF to_regclass(fq_remote) IS NULL THEN
     RAISE NOTICE 'gfs: no overlay for %.% (foreign table not imported)', p_nsp, p_tab;
     RETURN false;
   END IF;
+
+  EXECUTE format('CREATE SCHEMA IF NOT EXISTS %I', ovl_nsp);
 
   -- Per-key-column fragments (composite-aware), aligned by key ordinal.
   SELECT string_agg(quote_ident(kc), ', ' ORDER BY ord),
@@ -348,59 +370,52 @@ BEGIN
     INTO conflict_cols, join_local, join_del, changed, where_old, where_new, old_vals
     FROM unnest(p_keycols) WITH ORDINALITY AS u(kc, ord);
 
-  -- Tombstone table column definitions (key columns + their types).
+  -- Tombstone table column definitions (key columns + their types), read from
+  -- the faithful table so types match exactly.
   SELECT string_agg(format('%I %s', u.kc, format_type(a.atttypid, a.atttypmod)), ', ' ORDER BY u.ord)
     INTO del_cols_def
     FROM unnest(p_keycols) WITH ORDINALITY AS u(kc, ord)
-    JOIN pg_attribute a ON a.attrelid = fq_remote::regclass AND a.attname = u.kc;
+    JOIN pg_attribute a ON a.attrelid = store_fq::regclass AND a.attname = u.kc;
 
-  -- Writable columns + non-key upsert SET list, from the imported foreign table.
-  -- Generated columns are excluded: they can't be written and are recomputed by
-  -- the local store (created with INCLUDING GENERATED below).
+  -- Writable columns + non-key upsert SET list, from the faithful table.
+  -- Generated columns are excluded: they can't be written and are recomputed
+  -- locally by the faithful table itself.
   SELECT string_agg(quote_ident(attname), ', ' ORDER BY attnum),
          string_agg('NEW.' || quote_ident(attname), ', ' ORDER BY attnum),
          string_agg(quote_ident(attname) || ' = EXCLUDED.' || quote_ident(attname),
                     ', ' ORDER BY attnum) FILTER (WHERE NOT (attname = ANY(p_keycols)))
     INTO collist, newlist, setlist
     FROM pg_attribute
-    WHERE attrelid = fq_remote::regclass AND attnum > 0 AND NOT attisdropped
+    WHERE attrelid = store_fq::regclass AND attnum > 0 AND NOT attisdropped
       AND attgenerated = '';
 
   upsert := CASE WHEN setlist IS NULL THEN 'DO NOTHING'
                  ELSE 'DO UPDATE SET ' || setlist END;
 
-  -- Local authoritative store + delete tombstones (in the real schema).
-  -- INCLUDING GENERATED so STORED generated columns recompute locally.
-  EXECUTE format('CREATE TABLE %I.%I (LIKE %s INCLUDING DEFAULTS INCLUDING GENERATED)',
-                 p_nsp, p_tab || '_local', fq_remote);
-  EXECUTE format('ALTER TABLE %I.%I ADD PRIMARY KEY (%s)',
-                 p_nsp, p_tab || '_local', conflict_cols);
-  EXECUTE format('CREATE TABLE %I.%I (%s, PRIMARY KEY (%s))',
-                 p_nsp, p_tab || '_deleted', del_cols_def, conflict_cols);
+  -- Delete tombstones (in the side overlay schema, NOT the faithful schema).
+  EXECUTE format('CREATE TABLE %s (%s, PRIMARY KEY (%s))', tomb, del_cols_def, conflict_cols);
 
-  -- Overlay view: local wins; remote only if neither local nor tombstoned.
+  -- Overlay view: local (faithful) wins; remote only if neither local nor tombstoned.
   EXECUTE format(
-    'CREATE VIEW %I.%I AS '
-    || 'SELECT * FROM %I.%I '
+    'CREATE VIEW %s AS '
+    || 'SELECT * FROM %s '
     || 'UNION ALL '
     || 'SELECT r.* FROM %s r '
-    || ' WHERE NOT EXISTS (SELECT 1 FROM %I.%I l WHERE %s) '
-    || '   AND NOT EXISTS (SELECT 1 FROM %I.%I d WHERE %s)',
-    p_nsp, p_tab, p_nsp, p_tab || '_local', fq_remote,
-    p_nsp, p_tab || '_local', join_local,
-    p_nsp, p_tab || '_deleted', join_del);
+    || ' WHERE NOT EXISTS (SELECT 1 FROM %s l WHERE %s) '
+    || '   AND NOT EXISTS (SELECT 1 FROM %s d WHERE %s)',
+    ovl_fq, store_fq, fq_remote,
+    store_fq, join_local,
+    tomb, join_del);
 
-  -- Surface the overlay nature in tooling (\d+) and guide DDL away from the view.
-  EXECUTE format('COMMENT ON VIEW %I.%I IS %L', p_nsp, p_tab, format(
-    'GFS lazy-clone overlay of %I.%I (local wins over remote). DDL/indexes: target %I.%I or the source. SELECT ... FOR UPDATE is not supported on this view.',
-    p_nsp, p_tab, p_nsp, p_tab || '_local'));
+  EXECUTE format('COMMENT ON VIEW %s IS %L', ovl_fq, format(
+    'GFS lazy-clone overlay of %I.%I (local wins over remote). Writes copy-on-write into the faithful table %I.%I (its triggers/constraints fire). SELECT ... FOR UPDATE is not supported on this view.',
+    p_nsp, p_tab, p_nsp, p_tab));
 
-  -- Auto-increment fidelity: IMPORT FOREIGN SCHEMA does not bring identity/
-  -- serial defaults, so local INSERTs omitting the key would fail. For each
-  -- auto-increment column, create a local sequence starting just past the
-  -- remote's current max and set it as the default on BOTH the view (applied
-  -- to NEW before the INSTEAD OF trigger fires) and the local store. Local
-  -- inserts then work and never collide with existing remote keys.
+  -- Auto-increment fidelity: pg_dump --schema-only brings the identity/serial
+  -- definitions but NOT the sequence position (that is data). Advance each
+  -- auto-increment sequence just past the remote's current max so local inserts
+  -- never collide with existing remote keys, and set the matching default on the
+  -- overlay view so an INSERT through the view gets a key before the trigger.
   FOR seqcol IN
     SELECT * FROM dblink(p_conn, format($seq$
       SELECT a.attname::text
@@ -414,25 +429,23 @@ BEGIN
               OR (ad.adbin IS NOT NULL AND pg_get_expr(ad.adbin, ad.adrelid) LIKE 'nextval(%%') )
     $seq$, p_nsp, p_tab)) AS r(col text)
   LOOP
+    seqfq := pg_get_serial_sequence(store_fq, seqcol.col);
+    IF seqfq IS NULL THEN CONTINUE; END IF;
     SELECT mx INTO startval FROM dblink(p_conn,
       format('SELECT COALESCE(max(%I),0)+1 FROM %I.%I', seqcol.col, p_nsp, p_tab))
       AS r(mx bigint);
-    seqname := p_tab || '_' || seqcol.col || '_gfsseq';
-    EXECUTE format('CREATE SEQUENCE %I.%I START WITH %s', p_nsp, seqname, startval);
-    EXECUTE format('ALTER TABLE %I.%I ALTER COLUMN %I SET DEFAULT nextval(%L)',
-                   p_nsp, p_tab || '_local', seqcol.col,
-                   format('%I.%I', p_nsp, seqname));
-    EXECUTE format('ALTER VIEW %I.%I ALTER COLUMN %I SET DEFAULT nextval(%L)',
-                   p_nsp, p_tab, seqcol.col,
-                   format('%I.%I', p_nsp, seqname));
+    EXECUTE format('SELECT setval(%L, %s, false)', seqfq, startval);
+    BEGIN
+      EXECUTE format('ALTER VIEW %s ALTER COLUMN %I SET DEFAULT nextval(%L)',
+                     ovl_fq, seqcol.col, seqfq);
+    EXCEPTION WHEN others THEN NULL;  -- GENERATED ALWAYS: the trigger insert defers to the table
+    END;
   END LOOP;
 
-  -- Plain defaults (now(), uuid_generate_v4(), constants, ...): IMPORT FOREIGN
-  -- SCHEMA drops column DEFAULTs, so an app relying on a NOT NULL DEFAULT now()
-  -- column would insert NULL and fail. Mirror the remote's defaults onto BOTH
-  -- the view (applied to NEW before the INSTEAD OF trigger fires) and the local
-  -- store (for direct inserts). Sequence/identity defaults are handled above.
-  -- Best-effort: a default that won't resolve locally is skipped, not fatal.
+  -- Mirror plain defaults (now(), uuid_generate_v4(), constants, ...) onto the
+  -- overlay VIEW so a value is present on NEW before the INSTEAD OF trigger fires
+  -- (the faithful table already carries them from the dump). Sequence/identity
+  -- defaults are handled above. Best-effort.
   FOR defcol IN
     SELECT * FROM dblink(p_conn, format($def$
       SELECT a.attname::text, pg_get_expr(ad.adbin, ad.adrelid)::text
@@ -447,59 +460,61 @@ BEGIN
     $def$, p_nsp, p_tab)) AS r(col text, def text)
   LOOP
     BEGIN
-      EXECUTE format('ALTER VIEW %I.%I ALTER COLUMN %I SET DEFAULT %s',
-                     p_nsp, p_tab, defcol.col, defcol.def);
-      EXECUTE format('ALTER TABLE %I.%I ALTER COLUMN %I SET DEFAULT %s',
-                     p_nsp, p_tab || '_local', defcol.col, defcol.def);
+      EXECUTE format('ALTER VIEW %s ALTER COLUMN %I SET DEFAULT %s',
+                     ovl_fq, defcol.col, defcol.def);
     EXCEPTION WHEN others THEN
       RAISE NOTICE 'gfs: could not mirror default for %.%.% (%); leaving unset',
         p_nsp, p_tab, defcol.col, SQLERRM;
     END;
   END LOOP;
 
-  -- INSTEAD OF INSERT: upsert into the local store; clear any tombstone.
+  -- INSTEAD OF INSERT: upsert into the faithful table (its triggers fire); clear tombstone.
   EXECUTE format(
     'CREATE FUNCTION gfs_sync.%I() RETURNS trigger LANGUAGE plpgsql AS $body$ '
     || 'BEGIN '
-    || '  INSERT INTO %I.%I (%s) VALUES (%s) ON CONFLICT (%s) %s; '
-    || '  DELETE FROM %I.%I WHERE %s; '
+    || '  INSERT INTO %s (%s) VALUES (%s) ON CONFLICT (%s) %s; '
+    || '  DELETE FROM %s WHERE %s; '
     || '  RETURN NEW; END $body$',
-    fname || '_ins', p_nsp, p_tab || '_local', collist, newlist, conflict_cols, upsert,
-    p_nsp, p_tab || '_deleted', where_new);
-  EXECUTE format('CREATE TRIGGER %I INSTEAD OF INSERT ON %I.%I '
+    fname || '_ins', store_fq, collist, newlist, conflict_cols, upsert,
+    tomb, where_new);
+  EXECUTE format('CREATE TRIGGER %I INSTEAD OF INSERT ON %s '
                  || 'FOR EACH ROW EXECUTE FUNCTION gfs_sync.%I()',
-                 p_tab || '_ins_trg', p_nsp, p_tab, fname || '_ins');
+                 p_tab || '_ins_trg', ovl_fq, fname || '_ins');
 
-  -- INSTEAD OF UPDATE: copy-on-write upsert; if the key changed, tombstone old.
+  -- INSTEAD OF UPDATE: copy-on-write — hydrate the remote row into the faithful
+  -- table, apply the update (its triggers fire); if the key changed, tombstone old.
   EXECUTE format(
     'CREATE FUNCTION gfs_sync.%I() RETURNS trigger LANGUAGE plpgsql AS $body$ '
     || 'BEGIN '
-    || '  INSERT INTO %I.%I (%s) VALUES (%s) ON CONFLICT (%s) %s; '
+    || '  INSERT INTO %s (%s) SELECT %s FROM %s WHERE %s ON CONFLICT (%s) DO NOTHING; '
+    || '  INSERT INTO %s (%s) VALUES (%s) ON CONFLICT (%s) %s; '
     || '  IF %s THEN '
-    || '    DELETE FROM %I.%I WHERE %s; '
-    || '    INSERT INTO %I.%I (%s) VALUES (%s) ON CONFLICT DO NOTHING; '
+    || '    DELETE FROM %s WHERE %s; '
+    || '    INSERT INTO %s (%s) VALUES (%s) ON CONFLICT DO NOTHING; '
     || '  END IF; '
     || '  RETURN NEW; END $body$',
-    fname || '_upd', p_nsp, p_tab || '_local', collist, newlist, conflict_cols, upsert,
+    fname || '_upd',
+    store_fq, collist, collist, fq_remote, where_old, conflict_cols,
+    store_fq, collist, newlist, conflict_cols, upsert,
     changed,
-    p_nsp, p_tab || '_local', where_old,
-    p_nsp, p_tab || '_deleted', conflict_cols, old_vals);
-  EXECUTE format('CREATE TRIGGER %I INSTEAD OF UPDATE ON %I.%I '
+    store_fq, where_old,
+    tomb, conflict_cols, old_vals);
+  EXECUTE format('CREATE TRIGGER %I INSTEAD OF UPDATE ON %s '
                  || 'FOR EACH ROW EXECUTE FUNCTION gfs_sync.%I()',
-                 p_tab || '_upd_trg', p_nsp, p_tab, fname || '_upd');
+                 p_tab || '_upd_trg', ovl_fq, fname || '_upd');
 
-  -- INSTEAD OF DELETE: remove from local store and tombstone the key.
+  -- INSTEAD OF DELETE: remove from the faithful table and tombstone the key.
   EXECUTE format(
     'CREATE FUNCTION gfs_sync.%I() RETURNS trigger LANGUAGE plpgsql AS $body$ '
     || 'BEGIN '
-    || '  DELETE FROM %I.%I WHERE %s; '
-    || '  INSERT INTO %I.%I (%s) VALUES (%s) ON CONFLICT DO NOTHING; '
+    || '  DELETE FROM %s WHERE %s; '
+    || '  INSERT INTO %s (%s) VALUES (%s) ON CONFLICT DO NOTHING; '
     || '  RETURN OLD; END $body$',
-    fname || '_del', p_nsp, p_tab || '_local', where_old,
-    p_nsp, p_tab || '_deleted', conflict_cols, old_vals);
-  EXECUTE format('CREATE TRIGGER %I INSTEAD OF DELETE ON %I.%I '
+    fname || '_del', store_fq, where_old,
+    tomb, conflict_cols, old_vals);
+  EXECUTE format('CREATE TRIGGER %I INSTEAD OF DELETE ON %s '
                  || 'FOR EACH ROW EXECUTE FUNCTION gfs_sync.%I()',
-                 p_tab || '_del_trg', p_nsp, p_tab, fname || '_del');
+                 p_tab || '_del_trg', ovl_fq, fname || '_del');
 
   INSERT INTO gfs_sync.table_meta(schema_name, table_name, key_cols)
     VALUES (p_nsp, p_tab, conflict_cols)
@@ -529,7 +544,7 @@ $fn$;
 -- Recompute the foreign table's exclusion CHECK from gfs_sync.cached_range.
 CREATE OR REPLACE FUNCTION gfs_sync.rebuild_exclusion(p_nsp text, p_tab text)
 RETURNS void
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fn$
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp SET statement_timeout = '0' AS $fn$
 DECLARE
   fq      text := format('%I.%I', 'gfs_remote_' || p_nsp, p_tab);
   keycol  text;
@@ -547,7 +562,7 @@ BEGIN
                WHERE schema_name = p_nsp AND table_name = p_tab) THEN
     EXECUTE format('ALTER FOREIGN TABLE %s DROP CONSTRAINT IF EXISTS gfs_excl', fq);
     EXECUTE format('CREATE OR REPLACE VIEW %I.%I AS SELECT * FROM %I.%I',
-                   p_nsp, p_tab, p_nsp, p_tab || '_local');
+                   'gfs_ovl__' || p_nsp, p_tab, p_nsp, p_tab);
     RETURN;
   END IF;
 
@@ -587,13 +602,14 @@ $fn$;
 -- A hydrated range is served correctly meanwhile (live), just not yet elided.
 CREATE OR REPLACE FUNCTION gfs_sync.warm_range(p_nsp text, p_tab text, p_lo text, p_hi text)
 RETURNS bigint
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fn$
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp SET statement_timeout = '0' AS $fn$
 DECLARE
-  fq      text := format('%I.%I', 'gfs_remote_' || p_nsp, p_tab);
-  keycol  text;
-  keytype text;
-  collist text;
-  rc      bigint := 0;
+  fq       text := format('%I.%I', 'gfs_remote_' || p_nsp, p_tab);
+  keycol   text;
+  keytype  text;
+  collist  text;
+  prev_role text;
+  rc       bigint := 0;
 BEGIN
   IF to_regclass(fq) IS NULL THEN
     RAISE NOTICE 'gfs: warm_range: no overlay for %.%', p_nsp, p_tab;
@@ -612,14 +628,20 @@ BEGIN
   SELECT format_type(a.atttypid, a.atttypmod) INTO keytype
     FROM pg_attribute a WHERE a.attrelid = fq::regclass AND a.attname = keycol;
 
-  -- Non-generated columns only (the local store keeps generated columns GENERATED
-  -- and recomputes them locally).
+  -- Non-generated columns only (the faithful table keeps generated columns
+  -- GENERATED and recomputes them locally).
   collist := gfs_sync.writable_cols(fq::regclass);
 
+  -- Hydration is NOT an application write: suppress the faithful table's triggers
+  -- for the bulk copy (rows arrive already post-trigger from the remote). Bounded
+  -- to the INSERT and best-effort (no-op if the role can't set it).
+  prev_role := current_setting('session_replication_role');
+  BEGIN PERFORM set_config('session_replication_role', 'replica', true); EXCEPTION WHEN others THEN NULL; END;
   EXECUTE format(
     'INSERT INTO %I.%I (%s) SELECT %s FROM %s WHERE %I BETWEEN %L::%s AND %L::%s ON CONFLICT DO NOTHING',
-    p_nsp, p_tab || '_local', collist, collist, fq, keycol, p_lo, keytype, p_hi, keytype);
+    p_nsp, p_tab, collist, collist, fq, keycol, p_lo, keytype, p_hi, keytype);
   GET DIAGNOSTICS rc = ROW_COUNT;
+  PERFORM set_config('session_replication_role', prev_role, true);
 
   INSERT INTO gfs_sync.cached_range(schema_name, table_name, lo, hi)
     VALUES (p_nsp, p_tab, p_lo, p_hi)
@@ -637,20 +659,24 @@ GRANT EXECUTE ON FUNCTION gfs_sync.warm_range(text, text, text, text) TO PUBLIC;
 -- Caller is responsible for only doing this on tables small enough to copy.
 CREATE OR REPLACE FUNCTION gfs_sync.warm_whole_table(p_nsp text, p_tab text)
 RETURNS bigint
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fn$
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp SET statement_timeout = '0' AS $fn$
 DECLARE
-  fq      text := format('%I.%I', 'gfs_remote_' || p_nsp, p_tab);
-  collist text;
-  rc      bigint := 0;
+  fq        text := format('%I.%I', 'gfs_remote_' || p_nsp, p_tab);
+  collist   text;
+  prev_role text;
+  rc        bigint := 0;
 BEGIN
   IF to_regclass(fq) IS NULL THEN
     RAISE NOTICE 'gfs: warm_whole_table: no overlay for %.%', p_nsp, p_tab;
     RETURN 0;
   END IF;
   collist := gfs_sync.writable_cols(fq::regclass);
+  prev_role := current_setting('session_replication_role');
+  BEGIN PERFORM set_config('session_replication_role', 'replica', true); EXCEPTION WHEN others THEN NULL; END;
   EXECUTE format('INSERT INTO %I.%I (%s) SELECT %s FROM %s ON CONFLICT DO NOTHING',
-                 p_nsp, p_tab || '_local', collist, collist, fq);
+                 p_nsp, p_tab, collist, collist, fq);
   GET DIAGNOSTICS rc = ROW_COUNT;
+  PERFORM set_config('session_replication_role', prev_role, true);
   INSERT INTO gfs_sync.fully_cached(schema_name, table_name)
     VALUES (p_nsp, p_tab) ON CONFLICT DO NOTHING;
   RETURN rc;  -- exclusion CHECK (false) applied by refresh_exclusions()
@@ -671,7 +697,8 @@ CREATE OR REPLACE FUNCTION gfs_sync.refresh_exclusions()
 RETURNS integer
 LANGUAGE plpgsql SECURITY DEFINER
   SET search_path = pg_catalog, pg_temp
-  SET client_min_messages = 'warning' AS $fn$
+  SET client_min_messages = 'warning'
+  SET statement_timeout = '0' AS $fn$
 DECLARE
   rec      record;
   cur_sig  text;
@@ -695,6 +722,12 @@ BEGIN
       -- rebuild (which is what actually applies elision).
       BEGIN
         PERFORM gfs_sync.coalesce_ranges(rec.schema_name, rec.table_name);
+      EXCEPTION WHEN others THEN NULL;
+      END;
+      -- Promote to whole_table if the cached range now covers everything, so the
+      -- rebuild below drops the foreign branch (non-key reads served locally).
+      BEGIN
+        PERFORM gfs_sync.maybe_promote_whole(rec.schema_name, rec.table_name);
       EXCEPTION WHEN others THEN NULL;
       END;
       PERFORM gfs_sync.rebuild_exclusion(rec.schema_name, rec.table_name);
@@ -734,7 +767,7 @@ GRANT EXECUTE ON FUNCTION gfs_sync.refresh_exclusions() TO PUBLIC;
 -- ([0,999] ∪ [1000,1999] = [0,1999]). Called by refresh_exclusions().
 CREATE OR REPLACE FUNCTION gfs_sync.coalesce_ranges(p_nsp text, p_tab text)
 RETURNS void
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fn$
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp SET statement_timeout = '0' AS $fn$
 DECLARE
   fq      text := format('%I.%I', 'gfs_remote_' || p_nsp, p_tab);
   keycol  text;
@@ -788,26 +821,81 @@ $fn$;
 
 GRANT EXECUTE ON FUNCTION gfs_sync.coalesce_ranges(text, text) TO PUBLIC;
 
+-- Promote a range-cached table to whole_table once its (coalesced) cached range
+-- covers the entire remote key span — i.e. every row is local. Then the foreign
+-- branch is dropped from the view (by rebuild_exclusion's fully_cached path), so
+-- even NON-KEY predicates (e.g. fuzzy ILIKE) are served locally instead of
+-- federating a full remote scan. Single-column integer keys only (the ones we
+-- range-chunk). The coverage check is a single bounded, index-friendly probe.
+CREATE OR REPLACE FUNCTION gfs_sync.maybe_promote_whole(p_nsp text, p_tab text)
+RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp SET statement_timeout = '0' AS $fn$
+DECLARE
+  fq          text := format('%I.%I', 'gfs_remote_' || p_nsp, p_tab);
+  keycol      text;
+  keytype     text;
+  conj        text;
+  has_outside boolean;
+BEGIN
+  IF to_regclass(fq) IS NULL THEN RETURN; END IF;
+  IF EXISTS (SELECT 1 FROM gfs_sync.fully_cached
+               WHERE schema_name = p_nsp AND table_name = p_tab) THEN
+    RETURN;  -- already whole-cached
+  END IF;
+
+  SELECT key_cols INTO keycol FROM gfs_sync.table_meta
+    WHERE schema_name = p_nsp AND table_name = p_tab;
+  IF keycol IS NULL OR position(',' in keycol) > 0 THEN RETURN; END IF;
+  keycol := btrim(keycol, '"');
+
+  SELECT format_type(a.atttypid, a.atttypmod) INTO keytype
+    FROM pg_attribute a WHERE a.attrelid = fq::regclass AND a.attname = keycol;
+  IF keytype NOT IN ('smallint', 'integer', 'bigint') THEN RETURN; END IF;
+
+  -- "outside every cached range" predicate (same shape as the exclusion CHECK).
+  SELECT string_agg(
+           format('(%I < %L::%s OR %I > %L::%s)', keycol, lo, keytype, keycol, hi, keytype),
+           ' AND ')
+    INTO conj
+    FROM gfs_sync.cached_range
+    WHERE schema_name = p_nsp AND table_name = p_tab;
+  IF conj IS NULL THEN RETURN; END IF;  -- no cached ranges
+
+  -- Any remote row not covered by some cached range? Bounded EXISTS; pushed to
+  -- the remote and PK-indexed. None ⇒ every row is local ⇒ promote to whole_table.
+  EXECUTE format('SELECT EXISTS(SELECT 1 FROM %s WHERE %s)', fq, conj) INTO has_outside;
+
+  IF NOT has_outside THEN
+    INSERT INTO gfs_sync.fully_cached(schema_name, table_name)
+      VALUES (p_nsp, p_tab) ON CONFLICT DO NOTHING;
+  END IF;
+END
+$fn$;
+
+GRANT EXECUTE ON FUNCTION gfs_sync.maybe_promote_whole(text, text) TO PUBLIC;
+
 -- Query-driven warming entry point (what a proxy/cron calls with the read SQL).
--- EXPLAINs the query, and for each foreign scan with a pushed predicate:
---   * integer single-column key → expand the touched key span to chunk
---     boundaries and warm_range() each chunk (enables elision, and nearby keys
---     in the chunk become local too);
---   * otherwise → copy exactly the predicate's rows into the local store
---     (ownership only, like warm_for_query; no range elision).
+-- EXPLAINs the query and, for each foreign scan, drives convergence to local:
+--   * pushed predicate, integer single-column key → expand the touched key span
+--     to chunk boundaries and warm_range() each chunk (enables elision);
+--   * pushed predicate, non-range-able key → whole-warm if small, else copy the
+--     predicate's rows (ownership only);
+--   * NO pushed predicate (full-table scan — the shape JOINs/aggregates/unfiltered
+--     reads produce) → whole-warm the table if it fits p_whole_max, so the join
+--     stops federating O(N×M) and re-runs locally on the indexed faithful table.
+--     Tables over the budget stay federated (inherent — can't pull everything).
 -- The key span is measured on the remote (min/max over the pushed predicate),
 -- so we never parse the SQL. Best-effort; broad predicates spanning more than
--- p_maxchunks chunks are skipped (a future whole_table strategy can cover those).
--- v1 chunking assumes non-negative integer keys.
+-- p_maxchunks chunks are skipped. v1 chunking assumes non-negative integer keys.
 -- SECURITY INVOKER (default): the EXPLAIN must resolve the caller's unqualified
 -- table names via the caller's search_path. The privileged DDL is encapsulated
--- in warm_range (SECURITY DEFINER), so this function needs only SELECT (to
--- EXPLAIN) + EXECUTE on warm_range.
+-- in warm_range/warm_whole_table (SECURITY DEFINER). statement_timeout=0 so an
+-- operator-set client timeout never aborts a (long) hydration.
 CREATE OR REPLACE FUNCTION gfs_sync.warm_query_chunks(
   p_sql text, p_chunk bigint DEFAULT 100000, p_maxchunks int DEFAULT 64,
   p_whole_max bigint DEFAULT 50000)
 RETURNS integer
-LANGUAGE plpgsql AS $fn$
+LANGUAGE plpgsql SET statement_timeout = '0' AS $fn$
 DECLARE
   line text; m text[];
   cur_shadow text := NULL; cur_tab text := NULL;
@@ -820,9 +908,10 @@ BEGIN
     IF cur_shadow IS NULL OR position('Remote SQL:' in line) = 0 THEN CONTINUE; END IF;
 
     whereclause := substring(line from ' WHERE (.*)$');
+    sch := substring(cur_shadow from 'gfs_remote_(.*)');
+    keytype := NULL;  -- reset per scan (no carryover from a previous table)
     IF whereclause IS NOT NULL THEN
       whereclause := regexp_replace(whereclause, '\s+ORDER BY .*$', '');
-      sch := substring(cur_shadow from 'gfs_remote_(.*)');
       SELECT key_cols INTO keycols
         FROM gfs_sync.table_meta WHERE schema_name = sch AND table_name = cur_tab;
 
@@ -864,15 +953,39 @@ BEGIN
             n := n + 1;
           ELSE
             collist := gfs_sync.writable_cols(format('%I.%I', cur_shadow, cur_tab)::regclass);
+            PERFORM set_config('session_replication_role', 'replica', true);
             EXECUTE format(
               'INSERT INTO %I.%I (%s) SELECT %s FROM %I.%I WHERE %s ON CONFLICT (%s) DO NOTHING',
-              sch, cur_tab || '_local', collist, collist, cur_shadow, cur_tab, whereclause, keycols);
+              sch, cur_tab, collist, collist, cur_shadow, cur_tab, whereclause, keycols);
             GET DIAGNOSTICS rc = ROW_COUNT;
+            PERFORM set_config('session_replication_role', 'origin', true);
             n := n + rc;
           END IF;
         END IF;
       EXCEPTION WHEN others THEN
         NULL;  -- never let warming break anything
+      END;
+    ELSE
+      -- No pushed predicate: a FULL-TABLE federated scan — the shape produced by
+      -- JOINs, aggregates and unfiltered reads (the predicate, if any, sits on
+      -- another table and can't reach this scan). These never converge via the
+      -- predicated path above, so the query keeps federating the whole table and
+      -- joining locally (O(N×M), CPU-bound). Converge by whole-warming the table
+      -- when it fits the budget: the overlay is then rewritten to the local
+      -- (indexed) faithful table and re-runs use index joins. Tables over the
+      -- budget are left federated (inherent — can't pull everything).
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM gfs_sync.fully_cached
+                         WHERE schema_name = sch AND table_name = cur_tab) THEN
+          EXECUTE format('SELECT count(*) FROM (SELECT 1 FROM %I.%I LIMIT %s) s',
+                         cur_shadow, cur_tab, p_whole_max + 1) INTO cnt;
+          IF cnt <= p_whole_max THEN
+            PERFORM gfs_sync.warm_whole_table(sch, cur_tab);
+            n := n + 1;
+          END IF;
+        END IF;
+      EXCEPTION WHEN others THEN
+        NULL;
       END;
     END IF;
     cur_shadow := NULL; cur_tab := NULL;
@@ -933,6 +1046,21 @@ BEGIN
   LOOP
     PERFORM gfs_sync.build_overlay(p_conn, rec.nsp, rec.tab, rec.keycols);
   END LOOP;
+
+  -- Default search_path: resolve UNQUALIFIED reads to the overlay (federated)
+  -- ahead of the faithful tables, for every mirrored schema — so even a bare
+  -- connection (no proxy) federates. Faithful schemas stay in the path so
+  -- functions, triggers and schema-qualified refs keep resolving. The proxy
+  -- refines this per session (and for dynamic SET search_path). Applies to new
+  -- sessions (apps/warmer connect after the bootstrap).
+  DECLARE sp text;
+  BEGIN
+    SELECT string_agg(quote_ident('gfs_ovl__' || x) || ', ' || quote_ident(x), ', ')
+      INTO sp FROM unnest(target_schemas) AS x;
+    IF sp IS NOT NULL THEN
+      EXECUTE format('ALTER DATABASE %I SET search_path = %s', current_database(), sp);
+    END IF;
+  END;
 END
 $fn$;
 

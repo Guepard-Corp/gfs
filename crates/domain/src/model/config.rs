@@ -63,6 +63,22 @@ impl fmt::Display for StorageConfig {
     }
 }
 
+/// Provider-agnostic tuning of the database container.
+///
+/// `params` is an open map of logical setting names to values (e.g.
+/// `max_connections = "200"`, `shared_buffers = "256MB"`). It is intentionally
+/// not validated here: each database provider renders these into its own
+/// container CLI syntax at provision time (PostgreSQL `-c name=value`, MySQL
+/// `--name=value`, …) via `DatabaseProvider::render_param_overrides`. Keys must
+/// therefore be valid settings for the configured provider.
+///
+/// A `BTreeMap` keeps the rendered argument order deterministic.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ComputeConfig {
+    #[serde(default)]
+    pub params: std::collections::BTreeMap<String, String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GfsConfig {
     pub mount_point: Option<String>,
@@ -78,6 +94,8 @@ pub struct GfsConfig {
     pub runtime: Option<RuntimeConfig>,
     #[serde(default)]
     pub storage: Option<StorageConfig>,
+    #[serde(default)]
+    pub compute: Option<ComputeConfig>,
 }
 
 impl GfsConfig {
@@ -95,6 +113,25 @@ impl GfsConfig {
             toml::to_string_pretty(self).map_err(|e| RepoError::InvalidConfig(e.to_string()))?;
         std::fs::write(config_path, content)?;
         Ok(())
+    }
+
+    /// Container parameter overrides (`[compute.params]`), or an empty map when
+    /// none are configured. Suitable to pass straight to
+    /// `DatabaseProvider::definition_with_overrides`.
+    pub fn compute_params(&self) -> std::collections::BTreeMap<String, String> {
+        self.compute
+            .as_ref()
+            .map(|c| c.params.clone())
+            .unwrap_or_default()
+    }
+
+    /// Load `compute_params` for `repo_path`, tolerating a missing/invalid
+    /// config (returns an empty map). Convenience for provisioning sites that
+    /// only need the overrides.
+    pub fn load_compute_params(repo_path: &Path) -> std::collections::BTreeMap<String, String> {
+        Self::load(repo_path)
+            .map(|c| c.compute_params())
+            .unwrap_or_default()
     }
 }
 
@@ -189,6 +226,7 @@ mod tests {
                 compression: Some("zstd".into()),
                 enable_reflink: true,
             }),
+            compute: None,
         };
         config.save(dir.path()).unwrap();
 
@@ -236,6 +274,49 @@ mod tests {
     }
 
     #[test]
+    fn compute_params_roundtrip_and_accessor() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(GFS_DIR)).unwrap();
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("max_connections".to_string(), "200".to_string());
+        params.insert("shared_buffers".to_string(), "256MB".to_string());
+        let config = GfsConfig {
+            mount_point: None,
+            version: "1".into(),
+            description: "test".into(),
+            user: None,
+            environment: None,
+            runtime: None,
+            storage: None,
+            compute: Some(ComputeConfig { params }),
+        };
+        config.save(dir.path()).unwrap();
+
+        let loaded = GfsConfig::load(dir.path()).unwrap();
+        let p = loaded.compute_params();
+        assert_eq!(p.get("max_connections").map(String::as_str), Some("200"));
+        assert_eq!(p.get("shared_buffers").map(String::as_str), Some("256MB"));
+    }
+
+    #[test]
+    fn compute_params_defaults_to_empty_when_absent() {
+        assert!(
+            GfsConfig {
+                mount_point: None,
+                version: String::new(),
+                description: String::new(),
+                user: None,
+                environment: None,
+                runtime: None,
+                storage: None,
+                compute: None,
+            }
+            .compute_params()
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn config_save_error_no_parent_dir() {
         let dir = tempfile::tempdir().unwrap();
         let config = GfsConfig {
@@ -246,6 +327,7 @@ mod tests {
             environment: None,
             runtime: None,
             storage: None,
+            compute: None,
         };
         // Pass path where .gfs does not exist; save writes to repo_path/.gfs/config.toml
         let result = config.save(dir.path());

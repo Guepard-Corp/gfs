@@ -373,6 +373,7 @@ mod tests {
             environment: env,
             runtime,
             storage: None,
+            compute: None,
         };
         config.save(path).expect("save config");
     }
@@ -616,6 +617,7 @@ GFS_SCHEMA_COLUMNS
         }
         fn definition(&self) -> ComputeDefinition {
             ComputeDefinition {
+                labels: Default::default(),
                 image: "mock:latest".into(),
                 env: vec![],
                 ports: vec![PortMapping {
@@ -726,6 +728,7 @@ GFS_SCHEMA_COLUMNS
         let provider = MockSchemaProvider {
             schema_spec: Some(SchemaExtractionSpec {
                 definition: ComputeDefinition {
+                    labels: Default::default(),
                     image: "postgres:latest".into(),
                     env: vec![],
                     ports: vec![],
@@ -863,6 +866,7 @@ GFS_SCHEMA_COLUMNS
         let provider = MockSchemaProvider {
             schema_spec: Some(SchemaExtractionSpec {
                 definition: ComputeDefinition {
+                    labels: Default::default(),
                     image: "postgres:latest".into(),
                     env: vec![],
                     ports: vec![],
@@ -919,6 +923,7 @@ GFS_SCHEMA_COLUMNS
         let provider = MockSchemaProvider {
             schema_spec: Some(SchemaExtractionSpec {
                 definition: ComputeDefinition {
+                    labels: Default::default(),
                     image: "postgres:latest".into(),
                     env: vec![],
                     ports: vec![],

@@ -39,6 +39,7 @@ impl PostgresqlProvider {
 
     fn definition_impl() -> ComputeDefinition {
         ComputeDefinition {
+            labels: Default::default(),
             image: DEFAULT_IMAGE.to_string(),
             env: vec![
                 EnvVar {
@@ -78,8 +79,13 @@ impl PostgresqlProvider {
                 value: "shared_buffers=32MB".into(),
             },
             DatabaseProviderArg {
+                // 16MB (vs the 2MB minimum): lets the planner pick a hash join
+                // (O(N+M)) instead of a nested-loop join-filter (O(N×M)) when a
+                // query still federates a multi-table join before warming has made
+                // the tables local — the difference between a pegged core and a
+                // bounded scan. Overridable via clone params.
                 name: "-c".into(),
-                value: "work_mem=2MB".into(),
+                value: "work_mem=16MB".into(),
             },
             DatabaseProviderArg {
                 name: "-c".into(),
@@ -153,11 +159,18 @@ fn conn_creds(params: &ConnectionParams) -> (&str, &str, &str) {
     )
 }
 
+/// Wrap a value in single quotes for safe use in a `sh -c` command, escaping any
+/// embedded single quote (`'` -> `'\''`).
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// Build the ephemeral tool-sidecar `ComputeDefinition` shared by export,
 /// import, schema-extraction, and clone: the database image with `PGPASSWORD`
 /// set and the data exchange directory mounted at `data_dir`.
 fn sidecar_definition(image: String, password: &str, data_dir: &str) -> ComputeDefinition {
     ComputeDefinition {
+        labels: Default::default(),
         image,
         env: vec![EnvVar {
             name: "PGPASSWORD".into(),
@@ -194,6 +207,22 @@ impl DatabaseProvider for PostgresqlProvider {
 
     fn default_args(&self) -> Vec<DatabaseProviderArg> {
         Self::default_args_impl()
+    }
+
+    /// PostgreSQL takes runtime settings as repeated `-c name=value` flags; the
+    /// last occurrence wins, so these (appended after the defaults) override
+    /// `default_args` (e.g. `max_connections=200`).
+    fn render_param_overrides(
+        &self,
+        params: &std::collections::BTreeMap<String, String>,
+    ) -> Vec<DatabaseProviderArg> {
+        params
+            .iter()
+            .map(|(k, v)| DatabaseProviderArg {
+                name: "-c".into(),
+                value: format!("{k}={v}"),
+            })
+            .collect()
     }
 
     fn default_signal(&self) -> u32 {
@@ -415,9 +444,50 @@ impl DatabaseProvider for PostgresqlProvider {
 
         let bootstrap_sql = build_clone_bootstrap_sql(remote);
 
-        // The sidecar runs psql against the LOCAL GFS database and feeds the
-        // bootstrap script via a quoted heredoc (no shell expansion inside).
-        let command = format!(
+        // Step 1 — FAITHFUL schema: dump the remote's DDL (tables, triggers,
+        // functions, indexes, constraints, sequences, types) and replay it onto
+        // the local clone, so the source's real objects exist as real tables (not
+        // overlay views). The overlay (gfs_ovl__<schema>) is layered on top by the
+        // bootstrap. `--no-owner --no-privileges` avoids depending on remote roles;
+        // restrict to the requested schemas when given.
+        let schema_flags = remote
+            .schemas
+            .iter()
+            .map(|s| format!(" -n {}", shell_single_quote(s)))
+            .collect::<String>();
+        let dump = format!(
+            "PGPASSWORD={rpass} pg_dump -h {rhost} -p {rport} -U {ruser} -d {rdb} --schema-only --no-owner --no-privileges{schemas} -f /tmp/gfs_faithful.sql",
+            rpass = shell_single_quote(&remote.password),
+            rhost = remote.host,
+            rport = remote.port,
+            ruser = remote.user,
+            rdb = remote.dbname,
+            schemas = schema_flags,
+        );
+
+        // Step 1b — sanitize the dump for cross-version replay. A pg_dump client
+        // >= 17 unconditionally emits `SET transaction_timeout = 0;` in the header,
+        // but that GUC only exists on a server >= 17. Replaying it onto an older
+        // local server raises "unrecognized configuration parameter" — harmless to
+        // the schema, noisy in the logs, and fatal if anything ever tightens the
+        // replay to ON_ERROR_STOP. Strip the line; it is irrelevant to a DDL replay.
+        let sanitize = "sed -i '/^SET transaction_timeout/d' /tmp/gfs_faithful.sql";
+
+        // Step 2 — replay the faithful schema into the LOCAL database. Best-effort
+        // (no ON_ERROR_STOP): an object that can't be recreated locally (e.g. a
+        // missing extension) is skipped, and its table is later skipped by the
+        // overlay builder, rather than aborting the whole clone.
+        let replay = format!(
+            "psql -h {host} -p {port} -U {user} -d {db} -f /tmp/gfs_faithful.sql || true",
+            host = local.host,
+            port = local.port,
+            user = user,
+            db = db,
+        );
+
+        // Step 3 — bootstrap FDW + overlay (fed via a quoted heredoc; no shell
+        // expansion inside). ON_ERROR_STOP=1 so a real failure fails the clone.
+        let bootstrap = format!(
             "psql -h {host} -p {port} -U {user} -d {db} -v ON_ERROR_STOP=1 <<'GFS_CLONE_BOOTSTRAP'\n{sql}\nGFS_CLONE_BOOTSTRAP\n",
             host = local.host,
             port = local.port,
@@ -425,6 +495,8 @@ impl DatabaseProvider for PostgresqlProvider {
             db = db,
             sql = bootstrap_sql,
         );
+
+        let command = format!("set -e\n{dump}\n{sanitize}\n{replay}\n{bootstrap}");
 
         Ok(CloneSpec {
             definition: sidecar_definition(self.definition().image, password, "/data"),
@@ -1017,8 +1089,14 @@ mod tests {
         assert!(sql.contains("to_regclass(fq_remote) IS NULL"));
         // dblink introspection connection string is present.
         assert!(sql.contains("host=rds.example.com port=5432 dbname=shop user=reader password=p@ss"));
-        // No leftover placeholders.
-        assert!(!sql.contains("__"));
+        // No leftover placeholders (the template still legitimately contains the
+        // reserved `gfs_ovl__` / `__deleted` names, so check the tokens directly).
+        for ph in [
+            "__RHOST__", "__RPORT__", "__RDB__", "__RUSER__", "__RPASS__", "__CONN__",
+            "__SCHEMAS_ARRAY__",
+        ] {
+            assert!(!sql.contains(ph), "leftover placeholder: {ph}");
+        }
     }
 
     #[test]
@@ -1037,17 +1115,19 @@ mod tests {
         let sql = build_clone_bootstrap_sql(&sample_remote());
         assert!(sql.contains("CREATE EXTENSION IF NOT EXISTS postgres_fdw;"));
         assert!(sql.contains("CREATE EXTENSION IF NOT EXISTS dblink;"));
-        // Overlay objects: local store, tombstones, view, copy-on-write triggers
-        // (schema-qualified, %I.%I).
-        assert!(sql.contains("CREATE TABLE %I.%I (LIKE %s INCLUDING DEFAULTS INCLUDING GENERATED)"));
+        // Faithful design: the real table (replayed from pg_dump) is the store;
+        // the overlay view + tombstone live in the reserved side schema gfs_ovl__.
+        assert!(sql.contains("'gfs_ovl__' || p_nsp"));
+        assert!(sql.contains("__deleted"));
+        assert!(sql.contains("to_regclass(store_fq) IS NULL"));
         // Generated columns are excluded from the writable column list (recomputed).
         assert!(sql.contains("AND attgenerated = ''"));
-        assert!(sql.contains("CREATE VIEW %I.%I AS"));
+        assert!(sql.contains("CREATE VIEW %s AS"));
         assert!(sql.contains("UNION ALL"));
         assert!(sql.contains("NOT EXISTS"));
-        assert!(sql.contains("INSTEAD OF INSERT ON %I.%I"));
-        assert!(sql.contains("INSTEAD OF UPDATE ON %I.%I"));
-        assert!(sql.contains("INSTEAD OF DELETE ON %I.%I"));
+        assert!(sql.contains("INSTEAD OF INSERT ON %s"));
+        assert!(sql.contains("INSTEAD OF UPDATE ON %s"));
+        assert!(sql.contains("INSTEAD OF DELETE ON %s"));
         assert!(sql.contains("ON CONFLICT (%s)"));
         assert!(sql.contains("gfs_sync.table_meta"));
         // Composite-key support: discovery returns (schema, table, key columns).
@@ -1058,16 +1138,18 @@ mod tests {
         assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.build_overlay("));
         assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.clone(p_conn text, p_schemas text[])"));
         assert!(sql.contains("PERFORM gfs_sync.build_overlay(p_conn, rec.nsp, rec.tab, rec.keycols)"));
-        // Remediations: any-role FDW access, local sequences, overlay comment.
+        // Remediations: any-role FDW access, overlay comment. Auto-increment
+        // fidelity: advance the faithful table's own sequence past the remote max
+        // (pg_dump brings the definition but not the position) and default the view.
         assert!(sql.contains("CREATE USER MAPPING FOR PUBLIC"));
-        assert!(sql.contains("CREATE SEQUENCE %I.%I START WITH %s"));
+        assert!(sql.contains("pg_get_serial_sequence(store_fq"));
+        assert!(sql.contains("SELECT setval(%L, %s, false)"));
         assert!(sql.contains("SET DEFAULT nextval(%L)"));
-        // Non-sequence defaults (now(), uuid_generate_v4(), ...) are mirrored
-        // onto both the view and the local store.
-        assert!(sql.contains("ALTER VIEW %I.%I ALTER COLUMN %I SET DEFAULT %s"));
-        assert!(sql.contains("ALTER TABLE %I.%I ALTER COLUMN %I SET DEFAULT %s"));
+        // Non-sequence defaults (now(), uuid_generate_v4(), ...) are mirrored onto
+        // the overlay view (the faithful table already carries them from the dump).
+        assert!(sql.contains("ALTER VIEW %s ALTER COLUMN %I SET DEFAULT %s"));
         assert!(sql.contains("a.attidentity NOT IN ('a','d')"));
-        assert!(sql.contains("COMMENT ON VIEW %I.%I IS %L"));
+        assert!(sql.contains("COMMENT ON VIEW %s IS %L"));
         // Copy-on-read warming function is installed.
         assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.warm_for_query(p_sql text)"));
         assert!(sql.contains("EXPLAIN (VERBOSE) "));
@@ -1114,6 +1196,10 @@ mod tests {
         assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.exclusion_sig(p_nsp text, p_tab text)"));
         assert!(sql.contains("CONTINUE WHEN prev_sig IS NOT DISTINCT FROM cur_sig"));
         assert!(sql.contains("SET client_min_messages = 'warning'"));
+        // Fully range-covered tables are promoted to whole_table so non-key
+        // predicates (fuzzy search) are served locally, not federated.
+        assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.maybe_promote_whole(p_nsp text, p_tab text)"));
+        assert!(sql.contains("PERFORM gfs_sync.maybe_promote_whole(rec.schema_name, rec.table_name)"));
         // whole_table strategy for non-range-able keys (uuid/text/composite):
         // hydrate everything + CHECK (false) so the foreign scan is always pruned.
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS gfs_sync.fully_cached"));
@@ -1181,6 +1267,53 @@ mod tests {
     }
 
     #[test]
+    fn render_param_overrides_emits_dash_c_pairs() {
+        let provider = PostgresqlProvider::new();
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("max_connections".to_string(), "200".to_string());
+        params.insert("shared_buffers".to_string(), "256MB".to_string());
+        let args = provider.render_param_overrides(&params);
+        assert_eq!(args.len(), 2);
+        // BTreeMap iterates in sorted key order: max_connections before shared_buffers.
+        assert_eq!(args[0].name, "-c");
+        assert_eq!(args[0].value, "max_connections=200");
+        assert_eq!(args[1].value, "shared_buffers=256MB");
+    }
+
+    #[test]
+    fn definition_with_overrides_appends_after_defaults_so_override_wins() {
+        let provider = PostgresqlProvider::new();
+        let base = provider.definition();
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("max_connections".to_string(), "200".to_string());
+        let def = provider.definition_with_overrides(&params);
+        // Override is appended after the default args (last `-c` wins in PostgreSQL).
+        assert_eq!(def.args.len(), base.args.len() + 2);
+        assert_eq!(def.args.last(), Some(&"max_connections=200".to_string()));
+        let last_default = base
+            .args
+            .iter()
+            .rposition(|a| a == "max_connections=10")
+            .expect("default max_connections present");
+        let override_pos = def
+            .args
+            .iter()
+            .rposition(|a| a == "max_connections=200")
+            .expect("override present");
+        assert!(override_pos > last_default, "override must come after default");
+    }
+
+    #[test]
+    fn definition_with_overrides_empty_params_is_noop() {
+        let provider = PostgresqlProvider::new();
+        let empty = std::collections::BTreeMap::new();
+        assert_eq!(
+            provider.definition_with_overrides(&empty).args,
+            provider.definition().args
+        );
+    }
+
+    #[test]
     fn clone_bootstrap_spec_wraps_sql_in_local_psql_heredoc() {
         let provider = PostgresqlProvider::new();
         let spec = provider
@@ -1193,5 +1326,10 @@ mod tests {
         assert!(spec.definition.env.iter().any(|e| e.name == "PGPASSWORD"
             && e.default.as_deref() == Some("localpw")));
         assert_eq!(spec.definition.image, provider.definition().image);
+        // The v17-only `transaction_timeout` GUC is stripped from the dump before
+        // replay so a pre-v17 local server doesn't choke on it.
+        assert!(spec
+            .command
+            .contains("sed -i '/^SET transaction_timeout/d' /tmp/gfs_faithful.sql"));
     }
 }

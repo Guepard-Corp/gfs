@@ -27,8 +27,9 @@ REMOTE_HOST="${REMOTE_HOST:-host.docker.internal}"
 CLONE_DIR="$APP_DIR/clone-repo"
 SOURCE="gfs-explorer-source"
 PROXY_PORT="${PROXY_PORT:-55444}"
-# `run.sh --proxy` routes the clone through the dockerized guepard proxy, which
-# auto-warms reads (no manual "warm" button needed).
+PROXY_METRICS_PORT="${PROXY_METRICS_PORT:-9090}"
+# `run.sh --proxy` routes the clone through the guepard proxy binary (built and
+# run on the host), which auto-warms reads (no manual "warm" button needed).
 PROXY_MODE=""; [[ "${1:-}" == "--proxy" ]] && PROXY_MODE=1
 
 step() { printf '\n\033[1;34m== %s ==\033[0m\n' "$1"; }
@@ -68,13 +69,37 @@ OLD_CLONE="$(docker ps -q --filter "publish=${CLONE_PORT}")"
 rm -rf "$CLONE_DIR"
 
 if [[ -n "$PROXY_MODE" ]]; then
-  step "Rebuild + start the guepard proxy (in front of the clone)"
-  # Always rebuild so proxy source changes are picked up every run (layer cache
-  # keeps it fast); then force-recreate the container from the fresh image.
-  docker compose --profile proxy build proxy
-  CLONE_PORT="$CLONE_PORT" PROXY_PORT="$PROXY_PORT" \
-    docker compose --profile proxy up -d --force-recreate proxy
-  echo "  proxy on localhost:${PROXY_PORT} → clone on ${REMOTE_HOST}:${CLONE_PORT} (idles until you clone)"
+  step "Build + start the guepard proxy binary (in front of the clone)"
+  # Remove a proxy container left over from an older dockerized run — it would
+  # still hold PROXY_PORT and the binary would die with "address already in use".
+  docker rm -f gfs-explorer-proxy >/dev/null 2>&1 || true
+  # Build fresh each run so proxy source changes are picked up (incremental, fast).
+  # Override PROXY_BIN with a prebuilt/release binary to skip the build.
+  if [[ -n "${PROXY_BIN:-}" ]]; then
+    PROXY_RUN="$PROXY_BIN"
+  else
+    ( cd "$REPO_ROOT" && cargo build -p guepard-proxy-v2 )
+    PROXY_RUN="$REPO_ROOT/target/debug/guepard-proxy-v2"
+  fi
+  # Auto-discovery: no --backend. The proxy watches Docker for the clone the UI
+  # creates (labels gfs.role=clone/gfs.provider=postgres) and fronts it on its
+  # own listener. --listen-base = PROXY_PORT so this single clone lands exactly on
+  # PROXY_PORT, keeping CLONE_URL stable. Live map at /clones on the metrics port.
+  "$PROXY_RUN" \
+    --discover --listen-base "${PROXY_PORT}" \
+    --metrics "127.0.0.1:${PROXY_METRICS_PORT}" \
+    --warm --warm-dbname postgres \
+    --refresh-interval 3 \
+    --cache-metrics --cache-metrics-interval 2 &
+  PROXY_PID=$!
+  trap 'kill "$PROXY_PID" 2>/dev/null || true' EXIT INT TERM
+  # A background crash (e.g. port in use) is silent under set -e — surface it.
+  sleep 0.5
+  if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+    echo "proxy failed to start (port ${PROXY_PORT}/${PROXY_METRICS_PORT} in use?). See the error above."
+    exit 1
+  fi
+  echo "  proxy[pid $PROXY_PID] auto-discovering clones → first lands on localhost:${PROXY_PORT}; metrics+/clones :${PROXY_METRICS_PORT}"
   CLONE_URL="postgres://postgres:postgres@localhost:${PROXY_PORT}/postgres"
 else
   CLONE_URL="postgres://postgres:postgres@localhost:${CLONE_PORT}/postgres"

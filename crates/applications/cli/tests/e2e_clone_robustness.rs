@@ -227,8 +227,8 @@ fn clone_with_image_supports_extension() {
     // With the right image, the vector-typed table clones fully (not skipped).
     assert_eq!(
         psql(&gfs, "postgres", "SELECT relkind FROM pg_class WHERE relname='products' AND relnamespace='public'::regnamespace"),
-        "v",
-        "products should be an overlay view when --image provides pgvector"
+        "r",
+        "products should be a faithful table when --image provides pgvector"
     );
     assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM products"), "2");
 }
@@ -471,7 +471,7 @@ fn clone_overlay_composite_key_crud() {
     // The composite-key table is registered and exposed as an overlay view.
     assert_eq!(
         psql(&gfs, "postgres", "SELECT relkind FROM pg_class WHERE relname='order_items' AND relnamespace='public'::regnamespace"),
-        "v"
+        "r"
     );
     assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM order_items"), "3");
     assert_eq!(
@@ -590,10 +590,17 @@ fn clone_skips_keyless_table() {
     let gfs = common::postgres::get_container_id(&repo_path);
     cleanup.add(gfs.clone());
 
-    // The keyed table cloned: overlay view + registered + correct count.
+    // The keyed table cloned: faithful real TABLE in public, overlay VIEW in
+    // gfs_ovl__public, registered, correct federated count.
     assert_eq!(
         psql(&gfs, "postgres", "SELECT relkind FROM pg_class WHERE relname='orders' AND relnamespace='public'::regnamespace"),
-        "v"
+        "r",
+        "the faithful table keeps the real name as a real table"
+    );
+    assert_eq!(
+        psql(&gfs, "postgres", "SELECT relkind FROM pg_class WHERE relname='orders' AND relnamespace='gfs_ovl__public'::regnamespace"),
+        "v",
+        "the overlay lives in the side schema gfs_ovl__public"
     );
     assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM orders"), "10");
     assert_eq!(
@@ -601,11 +608,12 @@ fn clone_skips_keyless_table() {
         "1"
     );
 
-    // The keyless table has no overlay in public and is not registered.
+    // The keyless table exists faithfully (pg_dump replays it) but gets NO overlay
+    // and is not registered — so it is never federated.
     assert_eq!(
-        psql(&gfs, "postgres", "SELECT count(*) FROM pg_class WHERE relname='logs' AND relnamespace='public'::regnamespace"),
+        psql(&gfs, "postgres", "SELECT count(*) FROM pg_class WHERE relname='logs' AND relnamespace='gfs_ovl__public'::regnamespace"),
         "0",
-        "keyless table must not be exposed as a public overlay"
+        "keyless table must not get an overlay"
     );
     assert_eq!(
         psql(&gfs, "postgres", "SELECT count(*) FROM gfs_sync.table_meta WHERE table_name='logs'"),
@@ -656,13 +664,15 @@ fn clone_reads_fail_gracefully_when_remote_down() {
         String::from_utf8_lossy(&read.stdout)
     );
 
-    // The authoritative local store survives the outage with the diverged value.
+    // The authoritative local store (the faithful table itself) survives the
+    // outage with the diverged value. Schema-qualified to read the store directly,
+    // not the overlay (which would try the downed remote).
     assert_eq!(
-        psql(&gfs, "postgres", "SELECT name FROM orders_local WHERE id=1"),
+        psql(&gfs, "postgres", "SELECT name FROM public.orders WHERE id=1"),
         "LOCAL1",
         "locally-owned rows must remain readable when the remote is gone"
     );
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM orders_local"), "1");
+    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM public.orders"), "1");
 }
 
 /// Built-in exotic column types (arrays, jsonb, numeric, inet, uuid, bytea,
@@ -763,26 +773,29 @@ fn clone_mirrors_all_schemas() {
     let gfs = common::postgres::get_container_id(&repo_path);
     cleanup.add(gfs.clone());
 
-    // Same table name in two schemas → distinct overlays, no collision.
+    // Same table name in two schemas → distinct faithful tables + distinct
+    // overlays (in gfs_ovl__sales / gfs_ovl__hr), no collision. The faithful
+    // tables keep the real name as real tables; federation is via the overlays.
     assert_eq!(
         psql(&gfs, "postgres", "SELECT relkind FROM pg_class WHERE relname='account' AND relnamespace='sales'::regnamespace"),
-        "v"
+        "r"
     );
     assert_eq!(
         psql(&gfs, "postgres", "SELECT relkind FROM pg_class WHERE relname='account' AND relnamespace='hr'::regnamespace"),
-        "v"
+        "r"
     );
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM sales.account"), "2");
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM hr.account"), "1");
+    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM gfs_ovl__sales.account"), "2");
+    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM gfs_ovl__hr.account"), "1");
     assert_eq!(
         psql(&gfs, "postgres", "SELECT count(DISTINCT schema_name) FROM gfs_sync.table_meta WHERE table_name='account'"),
         "2"
     );
 
-    // Write into one schema's overlay; the other and the remote are unaffected.
-    psql(&gfs, "postgres", "INSERT INTO sales.account VALUES (3,'initech')");
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM sales.account"), "3");
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM hr.account"), "1");
+    // Write into one schema's overlay (copy-on-write); the other and the remote
+    // are unaffected.
+    psql(&gfs, "postgres", "INSERT INTO gfs_ovl__sales.account VALUES (3,'initech')");
+    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM gfs_ovl__sales.account"), "3");
+    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM gfs_ovl__hr.account"), "1");
     assert_eq!(psql(remote, "shop", "SELECT count(*) FROM sales.account"), "2");
 }
 
@@ -813,12 +826,12 @@ fn clone_honors_schema_filter() {
     let gfs = common::postgres::get_container_id(&repo_path);
     cleanup.add(gfs.clone());
 
-    // Requested schema is mirrored.
+    // Requested schema is mirrored (faithful table + overlay; federated via overlay).
     assert_eq!(
         psql(&gfs, "postgres", "SELECT relkind FROM pg_class WHERE relname='account' AND relnamespace='sales'::regnamespace"),
-        "v"
+        "r"
     );
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM sales.account"), "2");
+    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM gfs_ovl__sales.account"), "2");
 
     // The unrequested schema was never created locally.
     assert_eq!(
@@ -865,8 +878,8 @@ fn clone_supports_enum_types() {
     );
     assert_eq!(
         psql(&gfs, "postgres", "SELECT relkind FROM pg_class WHERE relname='feelings' AND relnamespace='public'::regnamespace"),
-        "v",
-        "the enum-typed table must clone as an overlay view (not be skipped)"
+        "r",
+        "the enum-typed table must clone as a faithful table (not be skipped)"
     );
     assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM feelings"), "3");
     assert_eq!(psql(&gfs, "postgres", "SELECT m FROM feelings WHERE id=1"), "happy");
@@ -921,7 +934,7 @@ fn clone_supports_domain_types() {
     );
     assert_eq!(
         psql(&gfs, "postgres", "SELECT relkind FROM pg_class WHERE relname='addrs' AND relnamespace='public'::regnamespace"),
-        "v"
+        "r"
     );
     assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM addrs"), "2");
     assert_eq!(psql(&gfs, "postgres", "SELECT zip FROM addrs WHERE id=1"), "94105");
@@ -974,7 +987,7 @@ fn clone_supports_composite_types() {
     );
     assert_eq!(
         psql(&gfs, "postgres", "SELECT relkind FROM pg_class WHERE relname='people' AND relnamespace='public'::regnamespace"),
-        "v"
+        "r"
     );
     assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM people"), "2");
     assert_eq!(psql(&gfs, "postgres", "SELECT (p).name FROM people WHERE id=1"), "Ada");
@@ -1451,6 +1464,8 @@ fn clone_warm_range_handles_generated_columns() {
         "warm_range must tolerate generated columns, got:\n{}",
         String::from_utf8_lossy(&warm.stderr)
     );
+    // Decoupled: warm_range only hydrates; refresh_exclusions applies elision.
+    psql(&gfs, "postgres", "SELECT gfs_sync.refresh_exclusions()");
 
     // The warmed local rows recomputed the generated column locally...
     assert_eq!(psql(&gfs, "postgres", "SELECT total FROM orders WHERE id = 42"), "420");
@@ -1460,4 +1475,95 @@ fn clone_warm_range_handles_generated_columns() {
     // A non-warmed key still federates and stays correct.
     assert_eq!(psql(&gfs, "postgres", "SELECT total FROM orders WHERE id = 1500"), "15000");
     assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM orders"), "2000");
+}
+
+/// A non-key predicate (fuzzy `ILIKE`) can't refute the key-range exclusion
+/// CHECK, so it would federate a full remote scan even when every row is local.
+/// Fix: once range warming covers the whole table, refresh_exclusions promotes
+/// it to whole_table (drops the foreign branch from the view), so non-key reads
+/// are served locally too.
+#[test]
+#[serial]
+fn clone_fully_cached_elides_non_key_query() {
+    let repo = TempDir::new().unwrap();
+    let repo_path = repo.path().to_path_buf();
+    let mut cleanup = Cleanup::new(repo);
+
+    let remote = "gfs-e2e-fuzzy-remote";
+    cleanup.add(remote);
+    let port = start_remote(remote, "postgres:16");
+    seed_remote(remote, &format!(
+        "{READER} CREATE TABLE products (id bigint PRIMARY KEY, name text NOT NULL); \
+         INSERT INTO products SELECT g, 'Product '||g FROM generate_series(1,2000) g; {}",
+        grant_reader()));
+
+    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
+    let out = run_clone(&url, &repo_path, Some("16"));
+    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
+    let gfs = common::postgres::get_container_id(&repo_path);
+    cleanup.add(gfs.clone());
+
+    // Hydrate the WHOLE key span, then apply exclusion.
+    psql(&gfs, "postgres", "SELECT gfs_sync.warm_range('public','products','1','2000')");
+    psql(&gfs, "postgres", "SELECT gfs_sync.refresh_exclusions()");
+    // Schema-qualified reads the faithful store directly (bypassing the overlay).
+    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM public.products"), "2000");
+
+    // Key query is elided (sanity).
+    let key_plan = psql(&gfs, "postgres", "EXPLAIN SELECT id FROM products WHERE id BETWEEN 1 AND 50");
+    assert!(!key_plan.contains("Foreign Scan"), "key query should be elided:\n{key_plan}");
+
+    // Non-key fuzzy query: every matching row is local, so it must NOT federate.
+    let fuzzy_plan = psql(&gfs, "postgres",
+        "EXPLAIN SELECT id, name FROM products WHERE name ILIKE '%Product 1%' ORDER BY id LIMIT 50");
+    assert!(
+        !fuzzy_plan.contains("Foreign Scan"),
+        "fully-cached table must serve a non-key query locally (no remote scan):\n{fuzzy_plan}"
+    );
+
+    // Correctness regardless.
+    let n = psql(&gfs, "postgres", "SELECT count(*) FROM products WHERE name ILIKE '%Product 1%'");
+    assert!(n.parse::<i64>().unwrap() > 0, "fuzzy search should match rows");
+}
+
+/// Promotion also fires when the table is covered by SEVERAL non-adjacent ranges
+/// (a gap in the key space with no rows there), not just a single coalesced one.
+#[test]
+#[serial]
+fn clone_promote_whole_from_multiple_ranges() {
+    let repo = TempDir::new().unwrap();
+    let repo_path = repo.path().to_path_buf();
+    let mut cleanup = Cleanup::new(repo);
+
+    let remote = "gfs-e2e-multirange-remote";
+    cleanup.add(remote);
+    let port = start_remote(remote, "postgres:16");
+    // Rows only in [1,1000] and [2001,3000]; the (1000,2001) gap has no rows.
+    seed_remote(remote, &format!(
+        "{READER} CREATE TABLE products (id bigint PRIMARY KEY, name text NOT NULL); \
+         INSERT INTO products SELECT g,'Product '||g FROM generate_series(1,1000) g; \
+         INSERT INTO products SELECT g,'Product '||g FROM generate_series(2001,3000) g; {}",
+        grant_reader()));
+
+    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
+    let out = run_clone(&url, &repo_path, Some("16"));
+    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
+    let gfs = common::postgres::get_container_id(&repo_path);
+    cleanup.add(gfs.clone());
+
+    // Two non-adjacent ranges (won't coalesce) that together cover every row.
+    psql(&gfs, "postgres", "SELECT gfs_sync.warm_range('public','products','1','1000')");
+    psql(&gfs, "postgres", "SELECT gfs_sync.warm_range('public','products','2001','3000')");
+    psql(&gfs, "postgres", "SELECT gfs_sync.refresh_exclusions()");
+    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM public.products"), "2000");
+    assert_eq!(
+        psql(&gfs, "postgres", "SELECT count(*) FROM gfs_sync.fully_cached WHERE table_name='products'"),
+        "1",
+        "covered-by-multiple-ranges table should be promoted to whole_table"
+    );
+
+    let fuzzy = psql(&gfs, "postgres",
+        "EXPLAIN SELECT id FROM products WHERE name ILIKE '%Product 2%' ORDER BY id LIMIT 50");
+    assert!(!fuzzy.contains("Foreign Scan"), "non-key query must be local after promotion:\n{fuzzy}");
+    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM products"), "2000");
 }

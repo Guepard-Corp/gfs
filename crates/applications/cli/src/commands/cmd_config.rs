@@ -54,6 +54,10 @@ pub fn run(path: Option<PathBuf>, key: String, value: Option<String>, global: bo
 // Repo-local helpers
 // ---------------------------------------------------------------------------
 
+/// Prefix for open-ended database container parameter overrides, stored under
+/// `[compute.params]` and rendered to provider-native flags at provision time.
+const COMPUTE_PARAM_PREFIX: &str = "compute.params.";
+
 fn get(repo_path: &std::path::Path, key: &str) -> Result<()> {
     let config = match GfsConfig::load(repo_path) {
         Ok(c) => c,
@@ -61,6 +65,17 @@ fn get(repo_path: &std::path::Path, key: &str) -> Result<()> {
             return Err(repo_error_to_anyhow(e, repo_path));
         }
     };
+
+    if let Some(name) = key.strip_prefix(COMPUTE_PARAM_PREFIX) {
+        if let Some(v) = config
+            .compute
+            .as_ref()
+            .and_then(|c| c.params.get(name))
+        {
+            print!("{v}");
+        }
+        return Ok(());
+    }
 
     let out: String = match key {
         KEY_USER_NAME => config
@@ -112,11 +127,13 @@ fn set(repo_path: &std::path::Path, key: &str, value: &str) -> Result<()> {
         anyhow::bail!("'{}' is a global-only setting; use --global to set it", key);
     }
 
-    if !SUPPORTED_KEYS.contains(&key) {
+    let compute_param = key.strip_prefix(COMPUTE_PARAM_PREFIX);
+    if compute_param.is_none() && !SUPPORTED_KEYS.contains(&key) {
         anyhow::bail!(
-            "unsupported config key '{}'; supported: {:?}",
+            "unsupported config key '{}'; supported: {:?} (or '{}<name>')",
             key,
-            SUPPORTED_KEYS
+            SUPPORTED_KEYS,
+            COMPUTE_PARAM_PREFIX,
         );
     }
 
@@ -127,6 +144,19 @@ fn set(repo_path: &std::path::Path, key: &str, value: &str) -> Result<()> {
     }
 
     let mut config = GfsConfig::load(repo_path).map_err(|e| repo_error_to_anyhow(e, repo_path))?;
+
+    if let Some(name) = compute_param {
+        if name.is_empty() {
+            anyhow::bail!("missing parameter name after '{}'", COMPUTE_PARAM_PREFIX);
+        }
+        let mut compute = config.compute.clone().unwrap_or_default();
+        compute.params.insert(name.to_string(), value.to_string());
+        config.compute = Some(compute);
+        config
+            .save(repo_path)
+            .map_err(|e| repo_error_to_anyhow(e, repo_path))?;
+        return Ok(());
+    }
 
     match key {
         KEY_USER_NAME => {

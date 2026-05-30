@@ -54,8 +54,10 @@ to make the dump-vs-lazy difference obvious — the clone still starts instantly
 pnpm demo -- --proxy        # or: bash scripts/run.sh --proxy
 ```
 
-This (re)builds and starts the dockerized **guepard proxy** (`guepard-proxy-v2/`,
-rebuilt every run so source changes are picked up) in front of the clone and points the app at it (`localhost:55444`). Now you don't
+This builds and starts the **guepard proxy** binary
+(`crates/applications/proxy/`, `cargo build` each run so source changes are picked up) in **auto-discovery** mode (no `--backend`): it watches Docker for the clone the
+UI creates (labels `gfs.role=clone`/`gfs.provider=postgres`) and fronts it on
+`localhost:55444` — the live clone→port map is at `curl localhost:9090/clones`. Now you don't
 click anything: as you **page through the clone**, the proxy observes your reads,
 calls `gfs_sync.warm_query_chunks` to hydrate the touched chunk, and a periodic
 refresher applies the exclusion — so pages flip from **remote read** to
@@ -73,7 +75,7 @@ Proxy Prometheus metrics: `curl localhost:9090/metrics | grep '^proxy_'`
 
 > The proxy terminates client TLS only if configured; here the app↔proxy link is
 > plaintext and proxy↔clone is local. Backend TLS, client TLS, and parameterized
-> (`Parse`/`Bind`) warming are all supported — see `guepard-proxy-v2/README.md`.
+> (`Parse`/`Bind`) warming are all supported — see `crates/applications/proxy/README.md`.
 
 ## Architecture
 

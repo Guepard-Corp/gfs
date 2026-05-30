@@ -17,6 +17,7 @@ use crate::cli_utils::get_repo_dir;
 use crate::output::{cyan, dimmed, green};
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub async fn init(
     path: Option<PathBuf>,
     database_provider: Option<String>,
@@ -26,6 +27,7 @@ pub async fn init(
     json_output: bool,
     image: Option<String>,
     platform: Option<String>,
+    labels: std::collections::BTreeMap<String, String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::trace!("Initializing Guepard environment at: {:?}", path);
 
@@ -58,6 +60,7 @@ pub async fn init(
             database_port,
             credentials,
             image,
+            labels,
         )
         .await?;
 
