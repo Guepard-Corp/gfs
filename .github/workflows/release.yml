@@ -163,7 +163,7 @@ jobs:
 
       - name: Create GitHub Release
         id: create_release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ steps.new_version.outputs.version }}
           name: Release ${{ steps.new_version.outputs.version }}
@@ -250,7 +250,7 @@ jobs:
           mv ${{ matrix.artifact_name }}.tar.gz ${{ github.workspace }}/
 
       - name: Upload Release Asset
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ needs.create-release.outputs.version }}
           files: ./${{ matrix.artifact_name }}.tar.gz
@@ -270,7 +270,7 @@ jobs:
           tar czf gfs-ai-tools-${{ needs.create-release.outputs.version }}.tar.gz skills agents
 
       - name: Upload AI tools Release Asset
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ needs.create-release.outputs.version }}
           files: ./gfs-ai-tools-${{ needs.create-release.outputs.version }}.tar.gz
