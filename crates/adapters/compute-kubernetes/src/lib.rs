@@ -492,6 +492,37 @@ impl KubernetesCompute {
             .map_err(|e| ComputeError::Internal(format!("k8s pod list failed: {e}")))?;
         Ok(pods.items.into_iter().next())
     }
+
+    fn env_from_pod(pod: &Pod) -> Vec<(String, String)> {
+        let Some(containers) = pod.spec.as_ref().and_then(|s| s.containers.first()) else {
+            return vec![];
+        };
+        containers
+            .env
+            .as_ref()
+            .map(|vars| {
+                vars.iter()
+                    .filter_map(|e| e.value.as_ref().map(|v| (e.name.clone(), v.clone())))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    async fn pod_env_for_instance(&self, id: &InstanceId) -> Vec<(String, String)> {
+        if let Ok(Some(pod)) = self.get_pod(id).await {
+            let env = Self::env_from_pod(&pod);
+            if !env.is_empty() {
+                return env;
+            }
+        }
+        if let Ok(out) = self.exec(id, "printenv POSTGRES_PASSWORD", None).await {
+            let pw = out.stdout.trim();
+            if out.exit_code == 0 && !pw.is_empty() {
+                return vec![("POSTGRES_PASSWORD".to_string(), pw.to_string())];
+            }
+        }
+        vec![]
+    }
 }
 
 #[async_trait]
@@ -574,17 +605,15 @@ impl Compute for KubernetesCompute {
                     })?
                 }
             };
-            return Ok(InstanceConnectionInfo {
-                host,
-                port,
-                env: vec![],
-            });
+            let mut env = self.pod_env_for_instance(id).await;
+            return Ok(InstanceConnectionInfo { host, port, env });
         }
 
+        let mut env = self.pod_env_for_instance(id).await;
         Ok(InstanceConnectionInfo {
             host: cluster_host,
             port: compute_port,
-            env: vec![],
+            env,
         })
     }
 
