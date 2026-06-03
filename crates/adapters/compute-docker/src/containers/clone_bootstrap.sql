@@ -290,3 +290,13 @@ $fn$;
 
 -- Run the clone.
 SELECT gfs_sync.clone('__CONN__', __SCHEMAS_ARRAY__);
+
+-- Auto-calibrate the cost router by probing the source link (network throughput,
+-- scan rate, latency). Best-effort: the clone works even if this is skipped.
+DO $cal$
+BEGIN
+  PERFORM gfs.calibrate();
+EXCEPTION WHEN others THEN
+  RAISE NOTICE 'gfs: cost calibration skipped (%)', SQLERRM;
+END
+$cal$;

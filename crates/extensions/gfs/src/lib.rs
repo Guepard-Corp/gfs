@@ -196,12 +196,60 @@ unsafe fn classify_scan(
     if info.collist.is_empty() {
         return;
     }
+    bump_access(relid);
     if info.whole_cached {
         return; // owned -> serve local
     }
-    if info.chunk_kind != "int" || info.key_attno == 0 {
-        // non-rangeable (uuid) / small table -> own it whole on first touch.
+
+    // What would we OWN to satisfy this scan?  (plan_rows is unreliable here — the
+    // local clone table is (near-)empty at plan time — so we size from the catalog.)
+    let b = info.row_bytes.max(1) as f64; // bytes/row
+    let tr = info.source_rows.max(0) as f64; // source table size
+    let h = (info.access_count as f64).min(info.w_horizon); // amortization horizon
+
+    let rng = if info.chunk_kind == "int" && info.key_attno != 0 {
+        extract_key_range(plan, scanrelid, info.key_attno, tag)
+    } else {
+        None
+    };
+    let (own_rows, lo, hi, whole) = match rng {
+        Some((lo, hi)) => {
+            if gfs_is_covered(relid, lo, hi) {
+                return; // range already owned -> local
+            }
+            // own the key span (clamped to the table size)
+            let span = ((hi - lo).saturating_add(1)).max(0) as f64;
+            (span.min(tr.max(1.0)), lo, hi, false)
+        }
+        None => (tr, 0i64, 0i64, true), // own the whole table
+    };
+
+    // Cost / energy model:
+    //   E(own)  = net * bytes(own_rows)          -- one-time pull
+    //   E(feder)= source * source_rows           -- per call: the SOURCE re-scans
+    //                                               the table (incl. prod-load penalty)
+    // OWN when the pull is negligible (small/cheap), or — below the capacity ceiling
+    // — amortized over the H expected future calls. Selective ranges & small tables
+    // -> own; huge tables -> never own (federate); mid tables -> own once queried
+    // enough (converge). Tr cancels for full scans, so the flip is ~ net*B/source calls.
+    let own_cost = info.w_net * b * own_rows;
+    let fed_call = info.w_source * tr.max(1.0);
+    let own = own_cost <= info.w_negligible
+        || (own_cost <= info.w_ceiling && own_cost <= (h + 1.0) * fed_call);
+
+    if own {
         ctx.hydrations.push(Hydration {
+            local_ref: info.local_ref,
+            source_ref: info.source_ref,
+            collist: info.collist,
+            relid,
+            key_col: info.key_col,
+            lo,
+            hi,
+            whole,
+        });
+    } else {
+        ctx.federate_targets.push(Hydration {
             local_ref: info.local_ref,
             source_ref: info.source_ref,
             collist: info.collist,
@@ -211,40 +259,6 @@ unsafe fn classify_scan(
             hi: 0,
             whole: true,
         });
-        return;
-    }
-    // Range-keyed table: does the query bound the key?
-    match extract_key_range(plan, scanrelid, info.key_attno, tag) {
-        Some((lo, hi)) => {
-            if gfs_is_covered(relid, lo, hi) {
-                // range already owned -> local
-            } else {
-                ctx.hydrations.push(Hydration {
-                    local_ref: info.local_ref,
-                    source_ref: info.source_ref,
-                    collist: info.collist,
-                    relid,
-                    key_col: info.key_col,
-                    lo,
-                    hi,
-                    whole: false,
-                });
-            }
-        }
-        None => {
-            // No range bound, not owned -> must reach the source. Record as a
-            // whole-table target (used to federate, or to own as a fallback).
-            ctx.federate_targets.push(Hydration {
-                local_ref: info.local_ref,
-                source_ref: info.source_ref,
-                collist: info.collist,
-                relid,
-                key_col: info.key_col,
-                lo: 0,
-                hi: 0,
-                whole: true,
-            });
-        }
     }
 }
 
@@ -442,6 +456,14 @@ struct CloneInfo {
     whole_cached: bool,
     key_col: String,
     key_attno: i16,
+    source_rows: i64,  // Tr: source table size (reltuples, captured at register)
+    row_bytes: i64,    // B: avg bytes/row
+    access_count: i64, // H: times this table has been queried (amortization)
+    w_net: f64,        // cost weights (gfs.cost)
+    w_source: f64,
+    w_negligible: f64,
+    w_ceiling: f64,
+    w_horizon: f64,
 }
 
 unsafe fn spi_text(p: *mut c_char) -> Option<String> {
@@ -463,8 +485,10 @@ unsafe fn gfs_lookup_clone(relid: pg_sys::Oid) -> Option<CloneInfo> {
                               AND NOT attisdropped AND attgenerated = ''), ''), \
                 s.chunk_kind, s.whole_cached::int::text, s.key_col, \
                 COALESCE((SELECT attnum FROM pg_attribute WHERE attrelid = s.relid \
-                            AND attname = s.key_col), 0)::text \
-           FROM gfs.clone_source s \
+                            AND attname = s.key_col), 0)::text, \
+                s.source_rows::text, s.row_bytes::text, s.access_count::text, \
+                x.net::text, x.source::text, x.negligible::text, x.ceiling::text, x.horizon::text \
+           FROM gfs.clone_source s, gfs.cost x \
           WHERE s.relid::oid = {} AND to_regclass(s.source_ref) IS NOT NULL",
         u32::from(relid)
     ))
@@ -477,6 +501,7 @@ unsafe fn gfs_lookup_clone(relid: pg_sys::Oid) -> Option<CloneInfo> {
         let row = *(*tt).vals;
         let td = (*tt).tupdesc;
         let g = |i| spi_text(pg_sys::SPI_getvalue(row, td, i));
+        let num = |i| g(i).and_then(|s| s.trim().parse::<f64>().ok()).unwrap_or(0.0);
         if let (Some(l), Some(s), Some(c), Some(k), Some(w), Some(kc), Some(at)) =
             (g(1), g(2), g(3), g(4), g(5), g(6), g(7))
         {
@@ -488,11 +513,33 @@ unsafe fn gfs_lookup_clone(relid: pg_sys::Oid) -> Option<CloneInfo> {
                 whole_cached: w == "1",
                 key_col: kc,
                 key_attno: at.trim().parse::<i16>().unwrap_or(0),
+                source_rows: num(8) as i64,
+                row_bytes: num(9) as i64,
+                access_count: num(10) as i64,
+                w_net: num(11),
+                w_source: num(12),
+                w_negligible: num(13),
+                w_ceiling: num(14),
+                w_horizon: num(15),
             });
         }
     }
     pg_sys::SPI_finish();
     out
+}
+
+/// Increment the per-table access counter (drives the amortization horizon H).
+unsafe fn bump_access(relid: pg_sys::Oid) {
+    if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
+        return;
+    }
+    let q = CString::new(format!(
+        "UPDATE gfs.clone_source SET access_count = access_count + 1 WHERE relid::oid = {}",
+        u32::from(relid)
+    ))
+    .unwrap();
+    pg_sys::SPI_execute(q.as_ptr(), false, 0);
+    pg_sys::SPI_finish();
 }
 
 unsafe fn gfs_source_oid(relid: pg_sys::Oid) -> Option<pg_sys::Oid> {
@@ -619,9 +666,68 @@ CREATE TABLE gfs.clone_source (
     source_ref   text     NOT NULL,
     key_col      text     NOT NULL DEFAULT 'id',
     chunk_kind   text     NOT NULL DEFAULT 'whole',  -- 'int' (range key) | 'whole'
-    whole_cached boolean  NOT NULL DEFAULT false
+    whole_cached boolean  NOT NULL DEFAULT false,
+    source_rows  bigint   NOT NULL DEFAULT 0,        -- Tr: source size (cost model)
+    row_bytes    int      NOT NULL DEFAULT 100,      -- B: avg bytes/row
+    access_count bigint   NOT NULL DEFAULT 0         -- H: query frequency (amortization)
 );
-COMMENT ON TABLE gfs.clone_source IS 'Per clone table: source (foreign) ref, range key, and whether it is fully owned';
+COMMENT ON TABLE gfs.clone_source IS 'Per clone table: source ref, range key, ownership, and cost-model stats';
+
+-- Cost/energy weights for the hydrate-vs-federate router (single row, tunable).
+-- E(own)   = net * bytes_pulled              (one-time)
+-- E(feder) = source * rows_scanned_at_source (per call; incl. prod-load penalty)
+-- Own when E(own) <= negligible, or amortized over <= horizon future calls.
+CREATE TABLE gfs.cost (
+    net        float8 NOT NULL DEFAULT 1,           -- MEASURED: seconds per byte pulled (network)
+    source     float8 NOT NULL DEFAULT 20,          -- MEASURED: seconds per row the source scans
+    negligible float8 NOT NULL DEFAULT 100000,      -- MEASURED: one round-trip (own if cheaper)
+    ceiling    float8 NOT NULL DEFAULT 1000000000,  -- POLICY: never own above this (capacity cap)
+    horizon    float8 NOT NULL DEFAULT 1000,        -- POLICY: cap on H (expected future calls)
+    prod_load  float8 NOT NULL DEFAULT 1            -- POLICY: penalty multiplier on source scans (offload prod)
+);
+INSERT INTO gfs.cost DEFAULT VALUES;
+COMMENT ON TABLE gfs.cost IS 'Router weights: net/source/negligible are MEASURED by gfs.calibrate(); ceiling/horizon/prod_load are policy';
+
+-- Auto-calibrate the cost weights by probing the source over the live FDW link:
+-- network throughput (sec/byte), source scan rate (sec/row), round-trip latency.
+-- The hydrate-vs-federate flip then self-tunes to the real link + source speed.
+-- Run at clone time and periodically (load/throughput drift).
+CREATE FUNCTION gfs.calibrate(sample int DEFAULT 5000) RETURNS gfs.cost
+LANGUAGE plpgsql AS $$
+DECLARE fref text; tr bigint; b int; t0 timestamptz; t1 timestamptz;
+        lat float8; net_s float8; src_s float8; pl float8; scanned bigint; r gfs.cost;
+BEGIN
+    -- probe the largest registered source (network + source speed are global)
+    SELECT source_ref, GREATEST(source_rows,1), GREATEST(row_bytes,1)
+      INTO fref, tr, b
+      FROM gfs.clone_source WHERE to_regclass(source_ref) IS NOT NULL
+     ORDER BY source_rows DESC LIMIT 1;
+    IF fref IS NULL THEN RETURN (SELECT c FROM gfs.cost c LIMIT 1); END IF;
+    SELECT prod_load INTO pl FROM gfs.cost LIMIT 1;
+
+    t0 := clock_timestamp();
+    EXECUTE format('SELECT 1 FROM %s LIMIT 1', fref);
+    t1 := clock_timestamp();
+    lat := GREATEST(extract(epoch FROM t1 - t0), 1e-6);
+
+    t0 := clock_timestamp();                                   -- pull `sample` rows
+    EXECUTE format('SELECT count(*) FROM (SELECT * FROM %s LIMIT %s) s', fref, sample);
+    t1 := clock_timestamp();
+    net_s := GREATEST(extract(epoch FROM t1 - t0) - lat, 1e-9) / GREATEST(sample * b, 1);
+
+    t0 := clock_timestamp();                                   -- source scans up to `sample` rows
+    EXECUTE format('SELECT count(*) FROM (SELECT 1 FROM %s LIMIT %s) s', fref, sample);
+    t1 := clock_timestamp();
+    scanned := LEAST(sample::bigint, tr);
+    src_s := GREATEST(extract(epoch FROM t1 - t0) - lat, 1e-9) / GREATEST(scanned, 1);
+
+    UPDATE gfs.cost SET net = net_s, source = src_s * pl, negligible = lat
+      RETURNING * INTO r;
+    RETURN r;
+END;
+$$;
+COMMENT ON FUNCTION gfs.calibrate(int) IS
+  'Probe the source (network throughput, scan rate, latency) and set the cost weights accordingly';
 
 CREATE TABLE gfs.cached (
     relid regclass NOT NULL REFERENCES gfs.clone_source(relid) ON DELETE CASCADE,
@@ -673,7 +779,7 @@ $$;
 
 CREATE FUNCTION gfs.register_clone(local regclass, source_ref text, key_col text DEFAULT 'id')
 RETURNS void LANGUAGE plpgsql AS $$
-DECLARE kind text := 'whole';
+DECLARE kind text := 'whole'; j json; srows bigint := 0; sbytes int := 100;
 BEGIN
     -- range-key strategy only for integer keys; everything else hydrates whole.
     SELECT CASE WHEN t.typname IN ('int2','int4','int8') THEN 'int' ELSE 'whole' END
@@ -682,11 +788,28 @@ BEGIN
      WHERE a.attrelid = local AND a.attname = key_col;
     kind := COALESCE(kind, 'whole');
 
-    INSERT INTO gfs.clone_source(relid, source_ref, key_col, chunk_kind)
-         VALUES (local, source_ref, key_col, kind)
+    -- Cost-model stats from the SOURCE's planner estimate (reltuples + width) via
+    -- postgres_fdw remote estimate -- NO scan, so it stays cheap on a multi-TB
+    -- source. We toggle use_remote_estimate just for this EXPLAIN (then reset it so
+    -- normal query planning doesn't pay a remote round-trip). Best-effort defaults.
+    BEGIN
+        BEGIN EXECUTE format('ALTER FOREIGN TABLE %s OPTIONS (ADD use_remote_estimate %L)', source_ref, 'true');
+        EXCEPTION WHEN others THEN
+            BEGIN EXECUTE format('ALTER FOREIGN TABLE %s OPTIONS (SET use_remote_estimate %L)', source_ref, 'true'); EXCEPTION WHEN others THEN NULL; END;
+        END;
+        EXECUTE format('EXPLAIN (FORMAT JSON) SELECT * FROM %s', source_ref) INTO j;
+        srows  := GREATEST((j->0->'Plan'->>'Plan Rows')::bigint, 0);
+        sbytes := GREATEST((j->0->'Plan'->>'Plan Width')::int, 1);
+        BEGIN EXECUTE format('ALTER FOREIGN TABLE %s OPTIONS (DROP use_remote_estimate)', source_ref); EXCEPTION WHEN others THEN NULL; END;
+    EXCEPTION WHEN others THEN srows := 0; sbytes := 100;
+    END;
+
+    INSERT INTO gfs.clone_source(relid, source_ref, key_col, chunk_kind, source_rows, row_bytes)
+         VALUES (local, source_ref, key_col, kind, srows, sbytes)
     ON CONFLICT (relid)
         DO UPDATE SET source_ref = EXCLUDED.source_ref, key_col = EXCLUDED.key_col,
-                      chunk_kind = EXCLUDED.chunk_kind;
+                      chunk_kind = EXCLUDED.chunk_kind, source_rows = EXCLUDED.source_rows,
+                      row_bytes = EXCLUDED.row_bytes;
     INSERT INTO gfs.clone_stats(relid) VALUES (local) ON CONFLICT (relid) DO NOTHING;
 END;
 $$;
@@ -727,6 +850,7 @@ COMMENT ON FUNCTION gfs.warm(regclass) IS
 
 CREATE VIEW gfs.clones AS
     SELECT s.relid::text AS clone, s.source_ref, s.key_col, s.chunk_kind, s.whole_cached,
+           s.source_rows, s.row_bytes, s.access_count,
            COALESCE(st.fetch_calls, 0)    AS fetch_calls,
            COALESCE(st.rows_fetched, 0)   AS rows_fetched,
            COALESCE(st.federate_calls, 0) AS federate_calls,
@@ -737,7 +861,7 @@ CREATE VIEW gfs.clones AS
      ORDER BY s.relid::text;
 
 GRANT USAGE ON SCHEMA gfs TO PUBLIC;
-GRANT SELECT ON gfs.clone_source, gfs.cached, gfs.clone_stats, gfs.clones TO PUBLIC;
+GRANT SELECT ON gfs.clone_source, gfs.cached, gfs.clone_stats, gfs.cost, gfs.clones TO PUBLIC;
 "#,
     name = "gfs_catalog",
 );

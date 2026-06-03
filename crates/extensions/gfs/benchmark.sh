@@ -110,9 +110,16 @@ note "Clone"
   --image "$GFS_IMAGE" --port "$CLONE_PORT" "$CLONE_DIR" >/dev/null 2>&1
 cln "SELECT 1" >/dev/null || { red "clone unreachable\n"; exit 1; }
 
+note "Auto-calibration -- weights MEASURED by probing the source link at clone time"
+echo "  calibrated: $(cln "SELECT 'net='||round(net::numeric,9)||' s/byte  source='||round(source::numeric,9)||' s/row  negligible(latency)='||round(negligible::numeric,6)||' s' FROM gfs.cost")"
+echo "  flip point  = (net*B)/source calls; auto-adapts (slow link -> federate longer; slow/loaded source -> own sooner)"
+echo "  -> pinning fixed weights below so the scenario routes are reproducible (calibration timing varies run to run)"
+cln "UPDATE gfs.cost SET net=1, source=20, negligible=100000, ceiling=1000000000, horizon=1000" >/dev/null
+
 reset_clone() {
   cln "TRUNCATE products,categories,customers,orders,order_items,reviews;
-       DELETE FROM gfs.cached; UPDATE gfs.clone_source SET whole_cached=false;
+       DELETE FROM gfs.cached;
+       UPDATE gfs.clone_source SET whole_cached=false, access_count=0;
        UPDATE gfs.clone_stats SET rows_fetched=0,fetch_calls=0,federate_calls=0;" >/dev/null
 }
 ck() { # md5 of the ordered result of a query (set-equality across clone/source)
@@ -130,14 +137,15 @@ time_ms() { # $1=clone|source  $2=query
 SHOTS="${SHOTS:-3}"   # times each scenario is fired (no reset between shots)
 TOT_HYD=0; TOT_FED=0; HDR=0
 
-# scenario: name | expected-1st-routing | query
-# Fires the query SHOTS times WITHOUT reset and shows the route each time, so the
-# cache behaviour is visible: a range/key query fills the cache (fetched -> local
-# -> local); a federate query does NOT cache (federated every shot -- until warmed).
+# scenario: name | query
+# Fires the query SHOTS times WITHOUT reset. The cost/energy router decides the
+# route each shot (fetched=hydrate, federated=push to source, local=cached/owned);
+# we ASSERT correctness (clone result == source) and REPORT the route sequence +
+# what was hydrated (the route is cost-driven, hence shown, not hard-asserted).
 scenario() {
-  local name="$1" want="$2" q="$3"
-  [[ $HDR == 0 ]] && { printf "  %-16s %-30s %5s %6s %-10s %s\n" \
-    SCENARIO "route per shot (1->$SHOTS)" hyd rows "ms 1->$SHOTS" ok; HDR=1; }
+  local name="$1" q="$2"
+  [[ $HDR == 0 ]] && { printf "  %-16s %-26s %6s %6s %-10s %s\n" \
+    SCENARIO "route per shot (1->$SHOTS)" hyd rows "ms 1->$SHOTS" correct; HDR=1; }
   reset_clone
   local routes=() hyd_tot=0 fed_tot=0 ms1="" msN=""
   local s
@@ -151,28 +159,23 @@ scenario() {
   done
   local rows cs ss; rows="$(cln "SELECT count(*) FROM ($q) t")"
   cs="$(cln "$(ck "$q")")"; ss="$(src "$(ck "$q")")"
-  # Expected: shot1 == want; subsequent shots cache iff range (fetched->local),
-  # federate never caches (federated->federated).
-  local exp_rest; [[ "$want" == fetched ]] && exp_rest=local || exp_rest=federated
-  local pass=1
-  [[ "$cs" == "$ss" ]] || pass=0
-  [[ "${routes[0]}" == "$want" ]] || pass=0
-  local i; for ((i=1; i<${#routes[@]}; i++)); do [[ "${routes[i]}" == "$exp_rest" ]] || pass=0; done
   TOT_HYD=$((TOT_HYD+hyd_tot)); TOT_FED=$((TOT_FED+fed_tot))
   local shotstr="" r; for r in "${routes[@]}"; do shotstr="${shotstr:+$shotstr->}$r"; done
-  local ok; if [[ $pass == 1 ]]; then ok="$(grn PASS)"; PASS=$((PASS+1)); else ok="$(red FAIL)"; FAIL=$((FAIL+1)); fi
-  printf "  %-16s %-30s %5s %6s %4s->%-4s %s\n" "$name" "$shotstr" "$hyd_tot" "$rows" "$ms1" "$msN" "$ok"
+  local ok; if [[ "$cs" == "$ss" ]]; then ok="$(grn correct)"; PASS=$((PASS+1)); else ok="$(red 'WRONG (!=source)')"; FAIL=$((FAIL+1)); fi
+  printf "  %-16s %-26s %6s %6s %4s->%-4s %s\n" "$name" "$shotstr" "$hyd_tot" "$rows" "$ms1" "$msN" "$ok"
 }
 
-note "Scenarios -- each fired ${SHOTS}x (no reset). route per shot shows the cache filling: fetched->local (owned) vs federated->federated (never caches)"
-scenario "products range"  fetched   "SELECT id,name,category_id,price_cents,in_stock FROM products WHERE id BETWEEN 1 AND 50 ORDER BY id"
-scenario "fuzzy products"  federated "SELECT id,name FROM products WHERE name ILIKE '%crimson%' ORDER BY id LIMIT 50"
-scenario "reviews fuzzy"   federated "SELECT id,product_id,rating FROM reviews WHERE body ILIKE '%great%' ORDER BY id LIMIT 50"
-scenario "by category"     federated "SELECT p.id,p.name FROM products p JOIN categories c ON c.id=p.category_id WHERE c.name='games' ORDER BY p.id LIMIT 50"
-scenario "customer orders" federated "SELECT o.id,oi.line,oi.total_cents FROM customers cu JOIN orders o ON o.customer_id=cu.id JOIN order_items oi ON oi.order_id=o.id WHERE cu.n=1 ORDER BY o.id,oi.line LIMIT 100"
-scenario "recent orders"   federated "SELECT id,status FROM orders WHERE placed_at > now() - '7 days'::interval ORDER BY id LIMIT 50"
-scenario "dashboard"       federated "SELECT c.name, count(*) n, sum(oi.total_cents) rev FROM order_items oi JOIN products p ON p.id=oi.product_id JOIN categories c ON c.id=p.category_id GROUP BY c.name ORDER BY c.name"
-scenario "subquery agg"    federated "SELECT count(*) FROM (SELECT id FROM products WHERE name ILIKE '%bravo%' ORDER BY id LIMIT 50) t"
+note "Scenarios -- each fired ${SHOTS}x (no reset). route = the cost router's choice; we assert clone result == source"
+echo "  cost inputs (Tr rows/B bytes): $(cln "SELECT string_agg(clone||'='||source_rows||'r/'||row_bytes||'B',' ' ORDER BY clone) FROM gfs.clones")"
+echo "  cost weights: $(cln "SELECT 'net='||net||' source='||source||' negligible='||negligible||' horizon='||horizon FROM gfs.cost")"
+scenario "products range"  "SELECT id,name,category_id,price_cents,in_stock FROM products WHERE id BETWEEN 1 AND 50 ORDER BY id"
+scenario "fuzzy products"  "SELECT id,name FROM products WHERE name ILIKE '%crimson%' ORDER BY id LIMIT 50"
+scenario "reviews fuzzy"   "SELECT id,product_id,rating FROM reviews WHERE body ILIKE '%great%' ORDER BY id LIMIT 50"
+scenario "by category"     "SELECT p.id,p.name FROM products p JOIN categories c ON c.id=p.category_id WHERE c.name='games' ORDER BY p.id LIMIT 50"
+scenario "customer orders" "SELECT o.id,oi.line,oi.total_cents FROM customers cu JOIN orders o ON o.customer_id=cu.id JOIN order_items oi ON oi.order_id=o.id WHERE cu.n=1 ORDER BY o.id,oi.line LIMIT 100"
+scenario "recent orders"   "SELECT id,status FROM orders WHERE placed_at > now() - '7 days'::interval ORDER BY id LIMIT 50"
+scenario "dashboard"       "SELECT c.name, count(*) n, sum(oi.total_cents) rev FROM order_items oi JOIN products p ON p.id=oi.product_id JOIN categories c ON c.id=p.category_id GROUP BY c.name ORDER BY c.name"
+scenario "subquery agg"    "SELECT count(*) FROM (SELECT id FROM products WHERE name ILIKE '%bravo%' ORDER BY id LIMIT 50) t"
 
 note "Convergence -- widening range fills + coalesces the cache; warm makes a federate table local"
 reset_clone
@@ -191,6 +194,20 @@ nosource "shot4 [40,80] span"     "$RQB 40 AND 80 ORDER BY id"  "(spans two fetc
 reset_clone
 cln "SELECT gfs.warm('public.products'); SELECT gfs.warm('public.categories');" >/dev/null
 nosource "by-category after warm" "SELECT p.id FROM products p JOIN categories c ON c.id=p.category_id WHERE c.name='games' LIMIT 50" "(warmed -> owned)"
+
+note "Cost amortization -- a federate query fired repeatedly flips to OWN once it pays off (the 'number of calls' factor)"
+reset_clone
+FQ="SELECT id,name FROM products WHERE name ILIKE '%crimson%' ORDER BY id LIMIT 50"
+seqs="" flip=""
+for i in $(seq 1 15); do
+  b="$(counters)"; cln "$FQ" >/dev/null; a="$(counters)"
+  read -r bf bd <<<"$b"; read -r af ad <<<"$a"
+  r="L"; [[ "$ad" -gt "$bd" ]] && r="F"; [[ "$af" -gt "$bf" ]] && r="O"
+  seqs="$seqs$r"; [[ -z "$flip" && "$r" == "O" ]] && flip="$i"
+done
+echo "  products fuzzy x15 (F=federated O=owned): $seqs"
+if [[ -n "$flip" ]]; then PASS=$((PASS+1)); printf "  %s\n" "$(grn "PASS")  flipped federated->OWN at call $flip (cost amortized: net*B*Tr <= calls*source*rows)"
+else FAIL=$((FAIL+1)); printf "  %s\n" "$(red FAIL) never owned in 15 calls (raise SHOTS or lower gfs.cost.source)"; fi
 
 # ---------------------------------------------------------------------------
 note "Stats (deterministic)"
