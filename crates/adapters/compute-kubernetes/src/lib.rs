@@ -47,6 +47,14 @@ fn k8s_pvc_size_gi() -> String {
         .unwrap_or_else(|| DEFAULT_PVC_SIZE_GI.to_string())
 }
 
+/// Pin Postgres to a worker node (e.g. `guepard-dp-01` on Multipass; AWS DP hostname).
+fn k8s_schedule_node_name() -> Option<String> {
+    std::env::var("GFS_K8S_NODE_NAME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// When true (default), Postgres Services are NodePort so `get_connection_info`
 /// can return a host:port reachable from outside the VPC (worker public IP/EIP).
 fn k8s_expose_nodeport() -> bool {
@@ -82,27 +90,18 @@ fn is_valid_k8s_node_port(port: i32) -> bool {
     (30000..=32767).contains(&port)
 }
 
-/// hostPort on the StatefulSet container (reachable via worker public IP/EIP).
-fn instance_host_port(compute_port: u16) -> Option<i32> {
-    instance_expose_port(compute_port).or_else(|| {
-        std::env::var("GFS_K8S_NODE_PORT")
-            .ok()
-            .and_then(|s| s.trim().parse::<i32>().ok())
-            .or_else(|| {
-                if compute_port == 5432 {
-                    std::env::var("GFS_K8S_POSTGRES_NODE_PORT")
-                        .ok()
-                        .and_then(|s| s.trim().parse::<i32>().ok())
-                } else {
-                    None
-                }
-            })
-    })
+/// hostPort on the pod (console `deployment_request.port` or `GFS_INSTANCE_NODE_PORT`).
+fn host_port_from_mapping(mapping: &PortMapping) -> Option<i32> {
+    mapping
+        .host_port
+        .map(i32::from)
+        .or_else(|| instance_expose_port(mapping.compute_port))
 }
 
-/// Fixed NodePort on the Service only when the port is in the k8s-valid range.
-fn k8s_service_node_port(compute_port: u16) -> Option<i32> {
-    instance_host_port(compute_port).filter(|p| is_valid_k8s_node_port(*p))
+/// NodePort on the Service — only when explicitly pinned and in 30000–32767.
+/// Never use cluster-wide env vars (would collide across instances).
+fn service_node_port_from_mapping(mapping: &PortMapping) -> Option<i32> {
+    host_port_from_mapping(mapping).filter(|p| is_valid_k8s_node_port(*p))
 }
 const APP_LABEL_KEY: &str = "app.kubernetes.io/name";
 const APP_LABEL_VALUE: &str = "gfs";
@@ -226,7 +225,7 @@ impl KubernetesCompute {
                     ..Default::default()
                 };
                 if k8s_expose_nodeport() {
-                    cp.host_port = instance_host_port(p.compute_port);
+                    cp.host_port = host_port_from_mapping(p);
                 }
                 cp
             })
@@ -283,13 +282,22 @@ impl KubernetesCompute {
                     spec: Some(PodSpec {
                         containers: vec![container],
                         volumes: Some(volumes),
-                        // CSI ZFS uses WaitForFirstConsumer; legacy local-path pinned cp via env unset.
-                        node_selector: k8s_storage_class().is_none().then(|| {
-                            BTreeMap::from([(
-                                "node-role.kubernetes.io/control-plane".to_string(),
-                                "true".to_string(),
-                            )])
-                        }),
+                        node_selector: k8s_schedule_node_name()
+                            .map(|name| {
+                                BTreeMap::from([(
+                                    "kubernetes.io/hostname".to_string(),
+                                    name,
+                                )])
+                            })
+                            .or_else(|| {
+                                // Legacy local-path: pin to control-plane when no ZFS SC.
+                                k8s_storage_class().is_none().then(|| {
+                                    BTreeMap::from([(
+                                        "node-role.kubernetes.io/control-plane".to_string(),
+                                        "true".to_string(),
+                                    )])
+                                })
+                            }),
                         ..Default::default()
                     }),
                 },
@@ -316,7 +324,7 @@ impl KubernetesCompute {
                     ..Default::default()
                 };
                 if k8s_expose_nodeport() {
-                    sp.node_port = k8s_service_node_port(p.compute_port);
+                    sp.node_port = service_node_port_from_mapping(p);
                 }
                 sp
             })
@@ -554,15 +562,17 @@ impl Compute for KubernetesCompute {
                 .ok()
                 .filter(|h| !h.is_empty())
                 .unwrap_or(cluster_host);
-            let port = if let Some(hp) = instance_host_port(compute_port) {
-                hp as u16
-            } else {
+            let port = {
                 let svc = self.get_service(&id.0).await?;
-                Self::node_port_from_service(&svc, compute_port).ok_or_else(|| {
-                    ComputeError::Internal(format!(
-                        "NodePort not allocated yet for service {svc_name} port {compute_port}"
-                    ))
-                })?
+                if let Some(hp) = instance_expose_port(compute_port) {
+                    hp as u16
+                } else {
+                    Self::node_port_from_service(&svc, compute_port).ok_or_else(|| {
+                        ComputeError::Internal(format!(
+                            "NodePort not allocated yet for service {svc_name} port {compute_port}"
+                        ))
+                    })?
+                }
             };
             return Ok(InstanceConnectionInfo {
                 host,
