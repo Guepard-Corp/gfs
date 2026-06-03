@@ -14,6 +14,11 @@ members = [
     "crates/domain",
     "crates/telemetry",
 ]
+# The gfs Table Access Method extension is a pgrx cdylib with its own
+# panic=unwind profile and pinned toolchain; build it with cargo-pgrx from its
+# own directory (`cd crates/extensions/gfs && cargo pgrx ...`). Excluded so a
+# plain `cargo build` of the workspace never pulls in pgrx.
+exclude = ["crates/extensions/gfs"]
 
 [workspace.package]
 version      = "0.3.2"

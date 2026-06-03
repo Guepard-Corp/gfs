@@ -1111,126 +1111,31 @@ mod tests {
     }
 
     #[test]
-    fn clone_bootstrap_sql_builds_overlay() {
+    fn clone_bootstrap_sql_requires_gfs_no_overlay_fallback() {
         let sql = build_clone_bootstrap_sql(&sample_remote());
-        assert!(sql.contains("CREATE EXTENSION IF NOT EXISTS postgres_fdw;"));
-        assert!(sql.contains("CREATE EXTENSION IF NOT EXISTS dblink;"));
-        // Faithful design: the real table (replayed from pg_dump) is the store;
-        // the overlay view + tombstone live in the reserved side schema gfs_ovl__.
-        assert!(sql.contains("'gfs_ovl__' || p_nsp"));
-        assert!(sql.contains("__deleted"));
-        assert!(sql.contains("to_regclass(store_fq) IS NULL"));
-        // Generated columns are excluded from the writable column list (recomputed).
-        assert!(sql.contains("AND attgenerated = ''"));
-        assert!(sql.contains("CREATE VIEW %s AS"));
-        assert!(sql.contains("UNION ALL"));
-        assert!(sql.contains("NOT EXISTS"));
-        assert!(sql.contains("INSTEAD OF INSERT ON %s"));
-        assert!(sql.contains("INSTEAD OF UPDATE ON %s"));
-        assert!(sql.contains("INSTEAD OF DELETE ON %s"));
-        assert!(sql.contains("ON CONFLICT (%s)"));
-        assert!(sql.contains("gfs_sync.table_meta"));
-        // Composite-key support: discovery returns (schema, table, key columns).
-        assert!(sql.contains("AS r(nsp text, tab text, keycols text[])"));
-        // Per-schema shadow import.
-        assert!(sql.contains("'gfs_remote_' || p_sch"));
-        // Tier 3: logic lives in reusable gfs_sync.* functions orchestrated by clone().
-        assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.build_overlay("));
-        assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.clone(p_conn text, p_schemas text[])"));
-        assert!(sql.contains("PERFORM gfs_sync.build_overlay(p_conn, rec.nsp, rec.tab, rec.keycols)"));
-        // Remediations: any-role FDW access, overlay comment. Auto-increment
-        // fidelity: advance the faithful table's own sequence past the remote max
-        // (pg_dump brings the definition but not the position) and default the view.
-        assert!(sql.contains("CREATE USER MAPPING FOR PUBLIC"));
-        assert!(sql.contains("pg_get_serial_sequence(store_fq"));
-        assert!(sql.contains("SELECT setval(%L, %s, false)"));
-        assert!(sql.contains("SET DEFAULT nextval(%L)"));
-        // Non-sequence defaults (now(), uuid_generate_v4(), ...) are mirrored onto
-        // the overlay view (the faithful table already carries them from the dump).
-        assert!(sql.contains("ALTER VIEW %s ALTER COLUMN %I SET DEFAULT %s"));
-        assert!(sql.contains("a.attidentity NOT IN ('a','d')"));
-        assert!(sql.contains("COMMENT ON VIEW %s IS %L"));
-        // Copy-on-read warming function is installed.
-        assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.warm_for_query(p_sql text)"));
-        assert!(sql.contains("EXPLAIN (VERBOSE) "));
-        // The flawed partition mechanic must be gone.
-        assert!(!sql.contains("PARTITION BY RANGE"));
-        assert!(!sql.contains("ATTACH PARTITION"));
-        assert!(!sql.contains("hydrate_for_query"));
-    }
 
-    #[test]
-    fn clone_bootstrap_sql_has_range_elision() {
-        let sql = build_clone_bootstrap_sql(&sample_remote());
-        // Cached-range metadata + constraint exclusion + the warm_range primitive
-        // that hydrates a range and rebuilds the foreign table's exclusion CHECK.
-        assert!(sql.contains("CREATE TABLE IF NOT EXISTS gfs_sync.cached_range"));
-        assert!(sql.contains("SET constraint_exclusion = on"));
-        assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.rebuild_exclusion(p_nsp text, p_tab text)"));
-        assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.warm_range(p_nsp text, p_tab text, p_lo text, p_hi text)"));
-        assert!(sql.contains("ADD CONSTRAINT gfs_excl CHECK"));
-        // Driveable by a low-privilege role (proxy/cron).
-        assert!(sql.contains("SECURITY DEFINER"));
-        assert!(sql.contains("GRANT EXECUTE ON FUNCTION gfs_sync.warm_range"));
-        // Query-driven entry point: expands a query's key span to chunks.
-        assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.warm_query_chunks("));
-        assert!(sql.contains("PERFORM gfs_sync.warm_range(sch, cur_tab"));
-        assert!(sql.contains("GRANT EXECUTE ON FUNCTION gfs_sync.warm_query_chunks"));
-        // Hydration writes an explicit non-generated column list (never SELECT *),
-        // so warming tolerates STORED generated columns in the local store.
-        assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.writable_cols(p_relid regclass)"));
-        assert!(sql.contains("AND attgenerated = ''"));
-        assert!(!sql.contains("_local SELECT * FROM"));
-        // CHECK rebuild is decoupled from hydration into a periodic refresher
-        // (lock_timeout-bounded) instead of running on every warm.
-        assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.refresh_exclusions()"));
-        assert!(sql.contains("SET LOCAL lock_timeout"));
-        assert!(sql.contains("GRANT EXECUTE ON FUNCTION gfs_sync.refresh_exclusions"));
-        // warm_range no longer rebuilds the CHECK itself.
-        assert!(!sql.contains("PERFORM gfs_sync.rebuild_exclusion(p_nsp, p_tab)"));
-        // Ranges are coalesced before each rebuild so the CHECK stays compact.
-        assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.coalesce_ranges(p_nsp text, p_tab text)"));
-        assert!(sql.contains("PERFORM gfs_sync.coalesce_ranges(rec.schema_name, rec.table_name)"));
-        // refresh_exclusions skips unchanged tables (signature) and stays quiet.
-        assert!(sql.contains("CREATE TABLE IF NOT EXISTS gfs_sync.applied_exclusion"));
-        assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.exclusion_sig(p_nsp text, p_tab text)"));
-        assert!(sql.contains("CONTINUE WHEN prev_sig IS NOT DISTINCT FROM cur_sig"));
-        assert!(sql.contains("SET client_min_messages = 'warning'"));
-        // Fully range-covered tables are promoted to whole_table so non-key
-        // predicates (fuzzy search) are served locally, not federated.
-        assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.maybe_promote_whole(p_nsp text, p_tab text)"));
-        assert!(sql.contains("PERFORM gfs_sync.maybe_promote_whole(rec.schema_name, rec.table_name)"));
-        // whole_table strategy for non-range-able keys (uuid/text/composite):
-        // hydrate everything + CHECK (false) so the foreign scan is always pruned.
-        assert!(sql.contains("CREATE TABLE IF NOT EXISTS gfs_sync.fully_cached"));
-        assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.warm_whole_table(p_nsp text, p_tab text)"));
-        // Fully-cached tables drop the foreign branch from the view entirely.
-        assert!(sql.contains("CREATE OR REPLACE VIEW %I.%I AS SELECT * FROM %I.%I"));
-        assert!(sql.contains("GRANT EXECUTE ON FUNCTION gfs_sync.warm_whole_table"));
-    }
-
-    #[test]
-    fn clone_bootstrap_sql_builds_composite_key_fragments() {
-        let sql = build_clone_bootstrap_sql(&sample_remote());
-        // Key-column fragments are built per key ordinal, so composite PKs work.
-        assert!(sql.contains("unnest(p_keycols) WITH ORDINALITY AS u(kc, ord)"));
-        // Key-change detection in the UPDATE trigger uses IS DISTINCT FROM per col.
-        assert!(sql.contains("IS DISTINCT FROM OLD."));
-        // Tombstone table preserves each key column's type (composite-aware).
-        assert!(sql.contains("format_type(a.atttypid, a.atttypmod)"));
-        // Non-key columns drive the upsert SET list.
-        assert!(sql.contains("FILTER (WHERE NOT (attname = ANY(p_keycols)))"));
-    }
-
-    #[test]
-    fn clone_bootstrap_sql_mirrors_only_non_sequence_defaults() {
-        let sql = build_clone_bootstrap_sql(&sample_remote());
-        // The default-mirroring loop selects column defaults that are NOT
-        // identity and NOT a nextval(...) — those are handled by the sequence
-        // loop above and must not be double-applied here.
-        assert!(sql.contains("a.attidentity NOT IN ('a','d')"));
-        assert!(sql.contains("NOT LIKE 'nextval(%"));
-        assert!(sql.contains("pg_get_expr(ad.adbin, ad.adrelid)"));
+        // The copy-on-read extension (gfs) is REQUIRED — there is no overlay
+        // fallback. It is created unconditionally (so it aborts under \set
+        // ON_ERROR_STOP if the image lacks it), NOT in a best-effort wrapper.
+        assert!(sql.contains("CREATE EXTENSION IF NOT EXISTS gfs;"));
+        assert!(!sql.contains("$gfstam$")); // not the old best-effort wrapper
+        assert!(!sql.contains("using the overlay")); // not the old fallback notice
+        // The clone logic is a planner hook in the extension's shared library; it
+        // must be preloaded on every connection to this database.
+        assert!(sql.contains("SET session_preload_libraries"));
+        // clone() builds copy-on-read tables only: the faithful table stays a plain
+        // heap table (NO custom access method) and we register its source.
+        assert!(!sql.contains("SET ACCESS METHOD gfs"));
+        assert!(sql.contains("gfs.register_clone(store_fq::regclass, fq_remote, p_keycols[1])"));
+        assert!(sql.contains("PERFORM gfs_sync.build_clone(rec.nsp, rec.tab, rec.keycols)"));
+        // Foreign keys are dropped so lazy per-table copy-on-read never trips RI.
+        assert!(sql.contains("contype = 'f'"));
+        assert!(sql.contains("DROP CONSTRAINT"));
+        // No fallback: clone() never calls build_overlay and installs no shim.
+        assert!(!sql.contains("PERFORM gfs_sync.build_overlay"));
+        assert!(!sql.contains("ALTER DATABASE %I SET search_path"));
+        // A probe other components can read to know this is a gfs clone.
+        assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.clone_tam()"));
     }
 
     #[test]

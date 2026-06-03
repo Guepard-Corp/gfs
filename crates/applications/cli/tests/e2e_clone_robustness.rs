@@ -1567,3 +1567,72 @@ fn clone_promote_whole_from_multiple_ranges() {
     assert!(!fuzzy.contains("Foreign Scan"), "non-key query must be local after promotion:\n{fuzzy}");
     assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM products"), "2000");
 }
+
+/// Transitive FK warming (level 0): warming a CHILD table also follows its
+/// foreign keys to warm the referenced PARENT rows, so a JOIN to the parent is
+/// served entirely locally — the overlay view otherwise defeats postgres_fdw's
+/// join pushdown and federates both sides. The parent (a small dimension table)
+/// is promoted to whole_table so its Foreign Scan is elided in the join (a JOIN
+/// gives the planner no direct qual on the parent key, so only whole_table can
+/// drop the foreign branch). See docs/rfcs/008-remote-clone/poc-join-fk.
+#[test]
+#[serial]
+fn clone_transitive_fk_warming_localizes_join() {
+    let repo = TempDir::new().unwrap();
+    let repo_path = repo.path().to_path_buf();
+    let mut cleanup = Cleanup::new(repo);
+
+    let remote = "gfs-e2e-fkwarm-remote";
+    cleanup.add(remote);
+    let port = start_remote(remote, "postgres:16");
+    // orders.customer_id REFERENCES customers(id): a classic star-schema join.
+    seed_remote(remote, &format!(
+        "{READER} \
+         CREATE TABLE customers (id bigint PRIMARY KEY, name text NOT NULL); \
+         CREATE TABLE orders (id bigint PRIMARY KEY, \
+            customer_id bigint NOT NULL REFERENCES customers(id), total numeric NOT NULL); \
+         INSERT INTO customers SELECT g, 'cust'||g FROM generate_series(1,500) g; \
+         INSERT INTO orders SELECT g, ((g-1)%500)+1, g*1.5 FROM generate_series(1,5000) g; {}",
+        grant_reader()
+    ));
+
+    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
+    let out = run_clone(&url, &repo_path, Some("16"));
+    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
+    let gfs = common::postgres::get_container_id(&repo_path);
+    cleanup.add(gfs.clone());
+
+    let join = "SELECT o.id, c.name FROM orders o \
+                JOIN customers c ON o.customer_id = c.id WHERE o.id BETWEEN 1 AND 50";
+
+    // Cold: at least one side federates.
+    let cold = psql(&gfs, "postgres", &format!("EXPLAIN (VERBOSE) {join}"));
+    assert!(cold.contains("Foreign Scan"), "cold join should federate:\n{cold}");
+
+    // Warm the child query. warm_query_chunks hydrates the orders chunk AND,
+    // transitively via the FK, the referenced customers — promoting the small
+    // customers dimension to whole_table.
+    psql(&gfs, "postgres", &format!(
+        "SELECT gfs_sync.warm_query_chunks('SELECT * FROM orders WHERE id BETWEEN 1 AND 50', 1000)"));
+    psql(&gfs, "postgres", "SELECT gfs_sync.refresh_exclusions()");
+
+    // The parent must now be locally materialized (transitive warm reached it).
+    let cust_local = psql(&gfs, "postgres", "SELECT count(*) FROM public.customers");
+    assert_eq!(cust_local, "500", "transitive FK warm must hydrate the parent customers");
+
+    // And the JOIN must be fully local: no Foreign Scan on either side.
+    let warm = psql(&gfs, "postgres", &format!("EXPLAIN (VERBOSE) {join}"));
+    assert!(!warm.contains("Foreign Scan"),
+        "after transitive FK warm the join must be fully local:\n{warm}");
+
+    // Correctness preserved: same result as reading the source directly.
+    let res = psql(&gfs, "postgres",
+        "SELECT count(*), coalesce(sum(o.total),0) FROM orders o \
+         JOIN customers c ON o.customer_id=c.id WHERE o.id BETWEEN 1 AND 50");
+    let src = psql(remote, "shop",
+        "SELECT count(*), coalesce(sum(o.total),0) FROM orders o \
+         JOIN customers c ON o.customer_id=c.id WHERE o.id BETWEEN 1 AND 50");
+    assert_eq!(res, src, "overlay join result must match source");
+
+    drop(cleanup);
+}

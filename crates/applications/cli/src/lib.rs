@@ -136,6 +136,64 @@ pub enum McpAction {
 }
 
 // ---------------------------------------------------------------------------
+// Proxy daemon subcommands (used by commands)
+// ---------------------------------------------------------------------------
+
+/// Shared flags for `gfs proxy start` and `gfs proxy run` (foreground). Defaults
+/// favour the common case: auto-discover GFS clones from Docker labels, warming
+/// on, cache-coverage metrics on.
+#[derive(clap::Args, Clone, Debug)]
+pub struct ProxyStartOpts {
+    /// Pin a single backend (`host:port`). Omit for Docker auto-discovery.
+    #[arg(long)]
+    pub backend: Option<String>,
+
+    /// First listen port assigned to auto-discovered clones (discovery only).
+    #[arg(long, default_value_t = 55500)]
+    pub listen_base: u16,
+
+    /// Address for the proxy's HTTP server (serves `/metrics` and `/clones`).
+    #[arg(long, default_value = "127.0.0.1:9090")]
+    pub metrics: String,
+
+    /// Disable in-DB cache warming (on by default).
+    #[arg(long)]
+    pub no_warm: bool,
+
+    /// Disable periodic in-DB cache-coverage scraping (on by default).
+    #[arg(long)]
+    pub no_cache_metrics: bool,
+
+    /// Extra flags forwarded verbatim to `guepard-proxy-v2`
+    /// (e.g. `gfs proxy start -- --refresh-interval 5 --backend-tls`).
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub extra: Vec<String>,
+}
+
+#[derive(Subcommand)]
+pub enum ProxyAction {
+    /// Start the proxy as a background daemon (writes ~/.gfs/proxy.pid).
+    Start(ProxyStartOpts),
+    /// Stop the proxy daemon.
+    Stop,
+    /// Stop and start the daemon, replaying the previous start arguments.
+    Restart,
+    /// Show daemon status + the live clone→listener map (from `GET /clones`).
+    Status,
+    /// Tail the proxy log file (~/.gfs/proxy.log).
+    Logs {
+        /// Follow new output (like `tail -f`).
+        #[arg(short = 'f', long)]
+        follow: bool,
+        /// Number of last lines to print.
+        #[arg(short = 'n', long, default_value_t = 100)]
+        tail: usize,
+    },
+    /// Run the proxy in the foreground (no detach) — for debugging / systemd.
+    Run(ProxyStartOpts),
+}
+
+// ---------------------------------------------------------------------------
 // CLI definition
 // ---------------------------------------------------------------------------
 
@@ -405,6 +463,12 @@ enum TopLevel {
         action: Option<McpAction>,
     },
 
+    /// Manage the guepard-proxy-v2 daemon (auto-discovers GFS clones by default).
+    Proxy {
+        #[command(subcommand)]
+        action: ProxyAction,
+    },
+
     /// Execute a SQL query or open an interactive database terminal
     Query {
         /// Path to the GFS repository root (default: current directory)
@@ -504,6 +568,7 @@ fn command_name(cmd: &TopLevel) -> &'static str {
         TopLevel::Storage { .. } => "storage",
         TopLevel::Compute { .. } => "compute",
         TopLevel::Mcp { .. } => "mcp",
+        TopLevel::Proxy { .. } => "proxy",
         TopLevel::Version => "version",
     }
 }
@@ -738,6 +803,10 @@ where
             TopLevel::Mcp { path, action } => {
                 let action = action.unwrap_or(McpAction::Stdio);
                 commands::cmd_mcp::run(path, action).await?;
+                Ok(0)
+            }
+            TopLevel::Proxy { action } => {
+                commands::cmd_proxy::run(action).await?;
                 Ok(0)
             }
             TopLevel::Version => {

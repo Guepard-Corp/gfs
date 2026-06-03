@@ -398,21 +398,26 @@ impl Compute for DockerCompute {
     async fn provision(&self, definition: &ComputeDefinition) -> Result<InstanceId> {
         use std::collections::HashMap;
 
-        // Ensure the image exists locally by pulling it if necessary.
+        // Ensure the image exists locally, pulling it if necessary. A pull failure
+        // is TOLERATED when the image is already present locally — e.g. a
+        // locally-built image (like `gfs-postgres:16`) that was never pushed to a
+        // registry, so `docker pull` 404s but `docker run` would work.
         let mut pull_builder = bollard::query_parameters::CreateImageOptionsBuilder::default()
             .from_image(definition.image.as_str());
         if let Some(p) = self.platform.as_deref() {
             pull_builder = pull_builder.platform(p);
         }
         let pull_opts = pull_builder.build();
-        self.docker
+        if let Err(e) = self
+            .docker
             .create_image(Some(pull_opts), None, None)
             .try_collect::<Vec<_>>()
             .await
-            // A pull failure (missing tag, no manifest for this arch, auth) is
-            // not "instance not found" — surface it as what it is.
-            .map_err(|e| {
-                ComputeError::Internal(format!(
+        {
+            // Fall back to a locally-present image; only surface the pull error
+            // (missing tag, no manifest for this arch, auth) if it isn't local.
+            if self.docker.inspect_image(&definition.image).await.is_err() {
+                return Err(ComputeError::Internal(format!(
                     "failed to pull image '{}': {e}{}",
                     definition.image,
                     if self.platform.is_none() {
@@ -420,8 +425,14 @@ impl Compute for DockerCompute {
                     } else {
                         ""
                     }
-                ))
-            })?;
+                )));
+            }
+            tracing::debug!(
+                image = %definition.image,
+                error = %e,
+                "image pull failed but the image is present locally; using the local image"
+            );
+        }
 
         let image_name = definition.image.to_ascii_lowercase();
         let prefix = if image_name.contains("mysql") {
@@ -877,15 +888,21 @@ impl Compute for DockerCompute {
         command: &str,
         linked_to: Option<&InstanceId>,
     ) -> Result<ExecOutput> {
-        // 1. Pull image.
+        // 1. Pull image (tolerate a pull failure when it's already present locally,
+        //    e.g. a locally-built image never pushed to a registry).
         let pull_opts = bollard::query_parameters::CreateImageOptionsBuilder::default()
             .from_image(definition.image.as_str())
             .build();
-        self.docker
+        if let Err(e) = self
+            .docker
             .create_image(Some(pull_opts), None, None)
             .try_collect::<Vec<_>>()
             .await
-            .map_err(|e| classify(definition.image.as_str(), e))?;
+        {
+            if self.docker.inspect_image(&definition.image).await.is_err() {
+                return Err(classify(definition.image.as_str(), e));
+            }
+        }
 
         // 2. Resolve the network of the linked instance so the task can reach it.
         let linked_network = if let Some(target) = linked_to {

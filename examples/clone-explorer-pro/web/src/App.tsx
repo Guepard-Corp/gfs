@@ -2,8 +2,8 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient, keepPreviousData } from "@tanstack/react-query";
 import { api, type Db, type Result, type Stats } from "./api.js";
 
-const BADGE: Record<string, string> = { source: "b-source", remote: "b-remote", local: "b-local" };
-const LABEL: Record<string, string> = { source: "source", remote: "remote read", local: "local (elided)" };
+const BADGE: Record<string, string> = { source: "b-source", fetched: "b-remote", federated: "b-federated", local: "b-local" };
+const LABEL: Record<string, string> = { source: "source", fetched: "fetched (copy-on-read)", federated: "federated (computed at source)", local: "local" };
 
 function prettyBytes(n: number): string {
   const u = ["B", "KB", "MB", "GB"];
@@ -60,7 +60,7 @@ function TwoPane({
     // while still served remotely — stop once it's local. Joins, aggregates and
     // temporal filters federate forever, so we never re-poll them.
     refetchInterval: (q) =>
-      proxy && canElide && q.state.data?.servedFrom === "remote" ? 2500 : false,
+      proxy && canElide && q.state.data?.servedFrom === "fetched" ? 2500 : false,
   });
   return (
     <div className="panes">
@@ -71,14 +71,17 @@ function TwoPane({
 }
 
 type Tab = "products" | "search" | "reviews" | "category" | "customer" | "recent" | "dashboard";
+// With the gfs Table Access Method every read is copy-on-read: the first touch
+// fetches the rows it needs from the source and writes them through locally;
+// re-run the same query and it's served entirely locally.
 const TABS: { id: Tab; label: string; hint: string }[] = [
-  { id: "products", label: "Products (range)", hint: "key predicate → elided once warmed" },
-  { id: "search", label: "Fuzzy search", hint: "non-key → federates, then local once whole-cached" },
-  { id: "reviews", label: "Reviews search", hint: "fuzzy on text body" },
-  { id: "category", label: "By category", hint: "JOIN products⋈categories" },
-  { id: "customer", label: "Customer orders", hint: "3-table JOIN" },
-  { id: "recent", label: "Recent orders", hint: "temporal filter (federates)" },
-  { id: "dashboard", label: "Dashboard", hint: "aggregate JOIN (federates)" },
+  { id: "products", label: "Products (range)", hint: "key range → fetched on 1st read, local after" },
+  { id: "search", label: "Fuzzy search", hint: "non-key filter → fetches matching rows, then local" },
+  { id: "reviews", label: "Reviews search", hint: "fuzzy on text body → fetched then local" },
+  { id: "category", label: "By category", hint: "JOIN products⋈categories → both warm on read" },
+  { id: "customer", label: "Customer orders", hint: "3-table JOIN → warms each on read" },
+  { id: "recent", label: "Recent orders", hint: "temporal filter → fetched then local" },
+  { id: "dashboard", label: "Dashboard", hint: "aggregate JOIN → warms the joined tables" },
 ];
 
 function StatLine({ label, db }: { label: string; db: Db }) {
@@ -89,7 +92,7 @@ function StatLine({ label, db }: { label: string; db: Db }) {
     <span className="stat">
       {label}: <b>{prettyBytes(d.sizeBytes)}</b>
       {db === "clone" && (
-        <> · local products <b>{d.localProducts ?? "—"}</b> · ranges <b>{d.cachedRanges ?? "—"}</b> · whole <b>{d.fullyCached ?? "—"}</b></>
+        <> · rows fetched (copy-on-read) <b>{(d.rowsFetched ?? 0).toLocaleString()}</b></>
       )}
     </span>
   );
@@ -111,7 +114,9 @@ export function App() {
   });
   const cloned = clone.data?.cloned ?? false;
   const proxy = mode.data?.proxy ?? false;
+  const cloneUrl = mode.data?.cloneUrl ?? "";
   const maxProduct = meta.data?.maxProduct ?? 0;
+  const sourceRows = meta.data?.sourceRows ?? 0;
   const cats = meta.data?.categories ?? [];
 
   const [tab, setTab] = useState<Tab>("products");
@@ -125,12 +130,12 @@ export function App() {
   const hi = lo + size - 1;
 
   const warmM = useMutation({
-    mutationFn: (r: { table: string; lo: number; hi: number }) => api.warm(r.table, r.lo, r.hi),
+    mutationFn: (table: string) => api.warm(table),
     onSuccess: () => qc.invalidateQueries(),
   });
 
-  // Only these scenarios can ever be served locally (key-range CHECK, or
-  // whole-table promotion for the fuzzy ones); the rest federate by design.
+  // With copy-on-read every read warms its tables; canElide is kept only to drive
+  // the optional proxy-mode re-poll (a no-op in direct mode).
   const canElide = tab === "products" || tab === "search" || tab === "reviews";
 
   let body = null as React.ReactNode;
@@ -166,8 +171,16 @@ export function App() {
           <button className="clone-btn" onClick={() => cloneM.mutate()}>▶ Clone the source</button>
         )}
         {cloned && clone.data?.ms != null && <span className="badge b-cloned">cloned in {(clone.data.ms / 1000).toFixed(2)} s</span>}
-        <span className="muted">source rows: {maxProduct.toLocaleString()}</span>
+        <span className="muted">source rows: {sourceRows.toLocaleString()}</span>
       </div>
+
+      {cloned && cloneUrl && (
+        <div className="bar connbar">
+          <span className="muted">target (clone):</span>
+          <code className="connstr" title="connection string of the clone the explorer queries">{cloneUrl}</code>
+          <button className="copybtn" onClick={() => navigator.clipboard?.writeText(cloneUrl)} title="copy">⧉ copy</button>
+        </div>
+      )}
 
       <div className="tabs">
         {TABS.map((t) => (
@@ -182,11 +195,8 @@ export function App() {
             <span className="pageinfo">ids {lo}–{hi}</span>
             <button onClick={() => setPage((p) => p + 1)}>Next ›</button>
             {cloned && (
-              <button className="warm" disabled={warmM.isPending} onClick={() => warmM.mutate({ table: "products", lo, hi })}>↧ warm this page</button>
-            )}
-            {cloned && (
-              <button className="warm" disabled={warmM.isPending} onClick={() => warmM.mutate({ table: "products", lo: 1, hi: maxProduct })}>
-                ↧↧ warm whole products
+              <button className="warm" disabled={warmM.isPending} onClick={() => warmM.mutate("products")}>
+                ↧↧ warm whole products (copy-on-read)
               </button>
             )}
           </>

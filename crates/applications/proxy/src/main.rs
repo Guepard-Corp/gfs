@@ -1,15 +1,11 @@
-mod cache_stats;
 mod config;
-mod db;
 #[cfg(feature = "discovery")]
 mod discovery;
 mod pg;
 mod proxy;
-mod refresher;
 mod stream;
 mod telemetry;
 mod tls;
-mod warmer;
 
 use clap::Parser;
 
@@ -33,7 +29,6 @@ async fn main() -> anyhow::Result<()> {
         listen = %cfg.listen,
         backend = cfg.backend.as_deref().unwrap_or("<discover>"),
         metrics = %cfg.metrics,
-        warm = cfg.warm,
         discover,
         "guepard-proxy-v2 starting"
     );

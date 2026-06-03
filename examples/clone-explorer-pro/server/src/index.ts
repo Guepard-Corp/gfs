@@ -7,7 +7,7 @@ import { spawn } from "node:child_process";
 import Fastify from "fastify";
 import fastifyStatic from "@fastify/static";
 
-import { source, connFor, pickDb, attachClone, cloneReady, cloneTimeMs, type DbName } from "./db.js";
+import { source, connFor, pickDb, attachClone, cloneReady, cloneTimeMs, SOURCE_URL, CLONE_URL, type DbName } from "./db.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const webDist = join(here, "../../web/dist");
@@ -22,6 +22,11 @@ const SOURCE_DB = process.env.SOURCE_DB ?? "appdb";
 const SOURCE_USER = process.env.SOURCE_USER ?? "app";
 const SOURCE_PASS = process.env.SOURCE_PASS ?? "app";
 const DB_VERSION = process.env.DB_VERSION ?? "16";
+// The clone REQUIRES the gfs copy-on-read storage extension (clone_bootstrap.sql
+// runs `CREATE EXTENSION gfs` unconditionally — no overlay fallback), so it must
+// run on an image that ships it. Build with:
+//   docker build -t gfs-postgres:16 ../../crates/extensions/gfs
+const CLONE_IMAGE = process.env.CLONE_IMAGE ?? "gfs-postgres:16";
 const PROXY_MODE = (process.env.PROXY_MODE ?? "") !== "";
 
 const app = Fastify({ logger: false });
@@ -65,7 +70,7 @@ async function prepClone(): Promise<void> {
 }
 
 let cloning = false;
-app.get("/api/mode", async () => ({ proxy: PROXY_MODE }));
+app.get("/api/mode", async () => ({ proxy: PROXY_MODE, sourceUrl: SOURCE_URL, cloneUrl: CLONE_URL }));
 app.get("/api/clone", async () => ({ cloned: cloneReady(), ms: cloneTimeMs(), cloning }));
 app.post("/api/clone", async (_req, reply) => {
   if (cloning) return reply.code(409).send({ error: "clone already in progress" });
@@ -75,7 +80,7 @@ app.post("/api/clone", async (_req, reply) => {
     const from = `postgres://${SOURCE_USER}:${SOURCE_PASS}@${REMOTE_HOST}:${SOURCE_PORT}/${SOURCE_DB}`;
     log(`clone: provisioning from ${REMOTE_HOST}:${SOURCE_PORT}/${SOURCE_DB} on port ${CLONE_PORT}…`);
     const t0 = Date.now();
-    await run(GFS_BIN, ["clone", "--from", from, "--database-version", DB_VERSION, "--port", CLONE_PORT, CLONE_DIR]);
+    await run(GFS_BIN, ["clone", "--from", from, "--image", CLONE_IMAGE, "--database-version", DB_VERSION, "--port", CLONE_PORT, CLONE_DIR]);
     const ms = Date.now() - t0;
     await attachClone(ms);
     log(`clone: ready in ${ms}ms`);
@@ -89,11 +94,31 @@ app.post("/api/clone", async (_req, reply) => {
 });
 
 // ---------------------------------------------------------------------------
-// Scenario runner: execute a query, time it, and detect where it was served.
-// EXPLAIN (no ANALYZE) is cheap and only used to label remote vs local.
+// Scenario runner: execute a query, time it, and detect copy-on-read activity.
+//
+// The clone's tables are REAL local tables; the gfs planner hook fetches each
+// query's matching rows before it runs (no overlay view, no foreign scan in the
+// app's plan), so EXPLAIN always looks local. We surface copy-on-read the honest
+// way: snapshot the extension's cumulative `rows_fetched` (gfs.clone_stats) before
+// and after the query. A query that fetched rows from the source is "fetched"
+// (first touch), otherwise "local" (already written through → independent).
 // ---------------------------------------------------------------------------
 
-type Served = "source" | "remote" | "local";
+type Served = "source" | "fetched" | "federated" | "local";
+
+type Sql = ReturnType<typeof connFor>;
+
+// Cumulative copy-on-read counters across all clone tables: rows hydrated locally,
+// and queries pushed to the source (federated). A query that raised rows_fetched
+// hydrated rows ("fetched"); one that raised federate_calls but not rows_fetched
+// was computed at the source ("federated"); neither → served from the local
+// cache ("local").
+async function counters(sql: Sql): Promise<{ fetched: number; federated: number }> {
+  const r = await sql`SELECT COALESCE(sum(rows_fetched),0)::bigint AS f,
+                             COALESCE(sum(federate_calls),0)::bigint AS d FROM gfs.clones`
+    .catch(() => [{ f: 0, d: 0 }] as { f: number | string; d: number | string }[]);
+  return { fetched: Number(r[0].f), federated: Number(r[0].d) };
+}
 
 async function scenario(
   db: DbName,
@@ -101,13 +126,17 @@ async function scenario(
   params: unknown[] = [],
 ): Promise<{ rows: unknown[]; ms: number; servedFrom: Served }> {
   const sql = connFor(db);
+  const before = db === "clone" ? await counters(sql) : { fetched: 0, federated: 0 };
   const t0 = performance.now();
   const rows = (await sql.unsafe(text, params as never[])) as unknown[];
   const ms = Number((performance.now() - t0).toFixed(1));
   let servedFrom: Served = "source";
   if (db === "clone") {
-    const plan = await sql.unsafe(`EXPLAIN (FORMAT JSON) ${text}`, params as never[]);
-    servedFrom = JSON.stringify(plan).includes("Foreign Scan") ? "remote" : "local";
+    const after = await counters(sql);
+    servedFrom =
+      after.fetched > before.fetched ? "fetched"
+      : after.federated > before.federated ? "federated"
+      : "local";
   }
   return { rows, ms, servedFrom };
 }
@@ -126,9 +155,18 @@ app.get("/api/meta", async () => {
   const [r] = await source`
     SELECT (SELECT max(id) FROM products)::bigint AS max_product,
            (SELECT max(n) FROM customers)::bigint AS customers,
-           (SELECT max(id) FROM orders)::bigint   AS orders`;
+           (SELECT max(id) FROM orders)::bigint   AS orders,
+           (SELECT COALESCE(sum(reltuples), 0)::bigint
+              FROM pg_class
+             WHERE relkind = 'r' AND relnamespace = 'public'::regnamespace) AS source_rows`;
   const cats = await source`SELECT name FROM categories ORDER BY id`;
-  return { maxProduct: Number(r.max_product), customers: Number(r.customers), orders: Number(r.orders), categories: cats.map((c) => c.name) };
+  return {
+    maxProduct: Number(r.max_product),
+    customers: Number(r.customers),
+    orders: Number(r.orders),
+    sourceRows: Number(r.source_rows),
+    categories: cats.map((c) => c.name),
+  };
 });
 
 app.get<{ Querystring: { db?: string } }>("/api/stats", async (req) => {
@@ -137,36 +175,29 @@ app.get<{ Querystring: { db?: string } }>("/api/stats", async (req) => {
   const [{ bytes }] = await sql`SELECT pg_database_size(current_database())::bigint AS bytes`;
   const out: Record<string, unknown> = { db, sizeBytes: Number(bytes) };
   if (db === "clone") {
-    // The local store IS the faithful table (public.<t>); schema-qualified so we
-    // count locally-owned rows, not the overlay (gfs_ovl__public.<t>) which would
-    // federate the full remote set.
-    const local = async (t: string) =>
-      sql
-        .unsafe(`SELECT count(*)::bigint AS n FROM public.${t}`)
-        .then((r) => Number((r as unknown as { n: string }[])[0].n))
-        .catch(() => null);
-    out.localProducts = await local("products");
-    out.localOrders = await local("orders");
-    out.localReviews = await local("reviews");
-    const cr = await sql`SELECT count(*)::bigint AS n FROM gfs_sync.cached_range`.catch(() => [{ n: null }]);
-    out.cachedRanges = cr[0].n == null ? null : Number(cr[0].n);
-    const fc = await sql`SELECT count(*)::bigint AS n FROM gfs_sync.fully_cached`.catch(() => [{ n: null }]);
-    out.fullyCached = fc[0].n == null ? null : Number(fc[0].n);
+    // Copy-on-read progress straight from the extension's catalog. (We must NOT
+    // `count(*) FROM public.<t>` here — that's a real seq scan on the gfs table
+    // and would itself copy-on-read the whole table. The catalog is read-only.)
+    const rows = (await sql`
+      SELECT clone, rows_fetched::bigint AS fetched, fetch_calls::bigint AS calls
+        FROM gfs.clones ORDER BY clone`.catch(() => [])) as { clone: string; fetched: string; calls: string }[];
+    out.copyOnRead = rows.map((r) => ({ table: r.clone, fetched: Number(r.fetched), calls: Number(r.calls) }));
+    out.rowsFetched = rows.reduce((a, r) => a + Number(r.fetched), 0);
   }
   return out;
 });
 
-app.post<{ Body: { table: string; lo: number; hi: number } }>("/api/warm", async (req) => {
-  const { table, lo, hi } = req.body;
+app.post<{ Body: { table?: string } }>("/api/warm", async (req) => {
+  // Copy-on-read materializes per row on read; gfs.warm() forces a full seq scan
+  // so the whole table is fetched + written through at once (then it's local and
+  // independent of the source). Whole-table, so no lo/hi range.
+  const table = req.body?.table ?? "products";
   const safe = /^[a-z_]+$/.test(table) ? table : "products";
   const clone = connFor("clone");
-  const [{ n }] = await clone`
-    SELECT gfs_sync.warm_range('public', ${safe}, ${String(Math.trunc(lo))}, ${String(Math.trunc(hi))}) AS n`;
-  // warm_range only hydrates (the AccessExclusive CHECK rebuild is decoupled).
-  // In direct mode there is no proxy refresher, so apply the exclusion now —
-  // this builds the key-range CHECK and promotes to whole_table if fully covered.
-  await clone`SELECT gfs_sync.refresh_exclusions()`;
-  log(`warm: ${safe} [${lo},${hi}] → ${Number(n)} rows`);
+  const [{ n }] = (await clone.unsafe(
+    `SELECT gfs.warm('public.${safe}'::regclass)::bigint AS n`,
+  )) as unknown as { n: string }[];
+  log(`warm: ${safe} → ${Number(n)} rows materialized (copy-on-read)`);
   return { hydrated: Number(n) };
 });
 

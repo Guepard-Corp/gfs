@@ -1,0 +1,21 @@
+# Keep the build context tiny: only the extension sources are COPYied. Exclude
+# throwaway clusters, logs, local build artifacts and dev helpers.
+_devdata/
+_pgdata/
+_pgdata_fed/
+_pgdata_fdw/
+_pgdata_idx/
+_pgdata_fk/
+_diagdata/
+*.log
+*.o
+*.so
+*.dylib
+*.bc
+target/
+c-ref/
+dev.sh
+diag.sh
+run.sh
+probe_*.sh
+README.md

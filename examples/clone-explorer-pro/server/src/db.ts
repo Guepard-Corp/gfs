@@ -3,13 +3,17 @@ import postgres from "postgres";
 type Conn = ReturnType<typeof postgres>;
 const opts = { max: 6, onnotice: () => {} };
 
-// Pin constraint_exclusion on the clone so foreign-scan pruning is deterministic
-// regardless of pool timing (the bootstrap also sets it via ALTER DATABASE).
-const cloneOpts = { ...opts, connection: { constraint_exclusion: "on" } };
+// The gfs copy-on-read is a planner hook: before a query runs it reads the query's
+// per-table predicate, fetches ONLY the matching rows from the source into the real
+// local table, then the normal plan executes. So the clone uses its indexes
+// normally — no need to force seq scans. The laziness is row-granular: a selective
+// query fetches only its rows (an unrestricted scan, e.g. a full aggregate, fetches
+// the whole table — correct, since it genuinely needs every row).
+const cloneOpts = { ...opts };
 
-const SOURCE_URL =
+export const SOURCE_URL =
   process.env.SOURCE_URL ?? "postgres://app:app@localhost:55452/appdb";
-const CLONE_URL =
+export const CLONE_URL =
   process.env.CLONE_URL ?? "postgres://postgres:postgres@localhost:55453/postgres";
 
 export const source: Conn = postgres(SOURCE_URL, opts);

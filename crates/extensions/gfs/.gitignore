@@ -1,0 +1,23 @@
+# Rust/cargo build output (the crate is built with cargo-pgrx)
+target/
+# C build artifacts (c-ref/)
+*.o
+*.so
+*.dylib
+*.bc
+_pgdata/
+_pgdata_fed/
+_pgdata_fdw/
+_pgdata_idx/
+_pgdata_fk/
+_devdata/
+_diagdata/
+_pg.log
+_pg_fed.log
+_pg_fdw.log
+_pg_idx.log
+_pg_fk.log
+_dev_pg.log
+_diag_pg.log
+diag.sh
+dev.sh

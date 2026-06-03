@@ -8,6 +8,9 @@ header h1 { margin: 0 0 4px; font-size: 22px; }
 .bar, .controls { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 10px 12px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; margin-bottom: 10px; }
 .grow { flex: 1; }
 .muted { color: var(--muted); font-size: 12px; }
+.connbar { padding: 7px 12px; }
+.connstr { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--fg); background: #0d1117; border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; user-select: all; }
+.copybtn { padding: 3px 9px; font-size: 12px; }
 .stat { font-size: 12px; color: var(--muted); }
 .stat b { color: var(--fg); }
 button { background: #21262d; color: var(--fg); border: 1px solid var(--border); border-radius: 7px; padding: 5px 11px; cursor: pointer; font-size: 13px; }
@@ -29,6 +32,7 @@ select, input[type=number] { background: #0d1117; border: 1px solid var(--border
 .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; font-weight: 600; white-space: nowrap; }
 .b-source { background: #2a2f3a; color: var(--muted); }
 .b-remote { background: #4a2f2f; color: #ffb3b3; }
+.b-federated { background: #3a2f4a; color: #d3b3ff; }
 .b-local { background: #1f4a2f; color: #8ef0a8; }
 .b-cloned { background: #1f3a4a; color: #8ed8f0; }
 .b-proxy { background: #3a2f4a; color: #d8b3ff; }

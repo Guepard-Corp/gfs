@@ -1,0 +1,5 @@
+[target.'cfg(target_os="macos")']
+# Postgres symbols are resolved at LOAD time, not link time (the .so is loaded
+# into the postgres backend). Without this, linking the cdylib on macOS fails
+# with "Undefined symbols: _palloc, _heap_insert, …".
+rustflags = ["-Clink-arg=-Wl,-undefined,dynamic_lookup"]

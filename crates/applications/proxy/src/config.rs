@@ -4,8 +4,9 @@ use std::path::PathBuf;
 use clap::Parser;
 
 /// guepard-proxy-v2 — a thin PostgreSQL wire-protocol proxy that fronts a single
-/// configured backend, observes queries for telemetry, and (optionally) triggers
-/// in-DB cache warming for GFS lazy clones.
+/// configured backend (or auto-discovers GFS clones) and pumps bytes verbatim,
+/// counting connection/byte telemetry. GFS clones are copy-on-read in-DB (the
+/// gfs Table Access Method), so the proxy does no query sniffing or warming.
 ///
 /// Inspired by guepard-proxy (v1) but stripped of SNI/Nomad routing: the backend
 /// is configured, so the same binary works locally (Docker) and in the cloud.
@@ -48,40 +49,6 @@ pub struct Config {
     /// Log filter (overridden by RUST_LOG if set).
     #[arg(long, default_value = "info", env = "PROXY_LOG")]
     pub log: String,
-
-    /// Enable cache warming: observe read queries and call the in-DB
-    /// `gfs_sync.warm_for_query($1)` on a side connection. No-op (zero overhead)
-    /// on backends that don't expose that function.
-    #[arg(long, default_value_t = false, env = "PROXY_WARM")]
-    pub warm: bool,
-
-    /// Role used by the warmer's side connection (needs EXECUTE on
-    /// `gfs_sync.warm_for_query`). Distinct from client credentials.
-    #[arg(long, default_value = "postgres", env = "PROXY_WARM_USER")]
-    pub warm_user: String,
-
-    /// Password for the warming role.
-    #[arg(long, default_value = "postgres", env = "PROXY_WARM_PASSWORD")]
-    pub warm_password: String,
-
-    /// Database the clone overlay (and `gfs_sync`) lives in.
-    #[arg(long, default_value = "postgres", env = "PROXY_WARM_DBNAME")]
-    pub warm_dbname: String,
-
-    /// Seconds between `gfs_sync.refresh_exclusions()` calls, which apply newly
-    /// hydrated ranges as elision (the AccessExclusive CHECK rebuild, decoupled
-    /// from per-read warming). Only runs with `--warm`.
-    #[arg(long, default_value_t = 10, env = "PROXY_REFRESH_INTERVAL")]
-    pub refresh_interval: u64,
-
-    /// Periodically scrape in-DB cache-coverage stats (`gfs_sync`) and expose
-    /// them as gauges. No-op on backends that aren't GFS clones.
-    #[arg(long, default_value_t = false, env = "PROXY_CACHE_METRICS")]
-    pub cache_metrics: bool,
-
-    /// Seconds between cache-coverage scrapes.
-    #[arg(long, default_value_t = 15, env = "PROXY_CACHE_METRICS_INTERVAL")]
-    pub cache_metrics_interval: u64,
 
     /// PEM certificate chain for TLS termination. Set together with `--tls-key`
     /// to accept `sslmode=require` clients; omit for plaintext only.

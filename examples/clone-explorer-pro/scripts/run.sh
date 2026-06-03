@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Bring up a large multi-table SOURCE and serve the richer SOURCE-vs-CLONE
 # explorer (joins, fuzzy search, temporal filters, aggregate dashboard, writes).
-# The clone is created from the UI. `--proxy` fronts the clone with the
-# auto-warming proxy binary, built and run on the host (rebuilt every run).
+# The clone is created from the UI (copy-on-read via the gfs TAM extension).
+# `--proxy` fronts the clone with the guepard-proxy-v2 binary (built on the host,
+# rebuilt every run) — now a transparent passthrough; copy-on-read is in-DB, so
+# the proxy no longer warms. The clone works the same without --proxy.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -10,12 +12,18 @@ APP_DIR="$(pwd)"
 REPO_ROOT="$(cd ../.. && pwd)"
 [[ -f .env ]] && set -a && . ./.env && set +a
 
+# Large source by default — the point is that copy-on-read stays cheap on a big
+# source. The gfs planner hook is ROW-granular: a selective query (id range, fuzzy
+# match, a customer's orders) fetches only its matching rows, fast, regardless of
+# the source size. (An unrestricted scan, e.g. the full-table aggregate on the
+# Dashboard tab, does fetch the whole table on first load — correct, it needs
+# every row.) Override any of these for a smaller/bigger source.
 GFS_BIN="${GFS_BIN:-$REPO_ROOT/target/debug/gfs}"
 SEED_PRODUCTS="${SEED_PRODUCTS:-1000000}"
 SEED_CUSTOMERS="${SEED_CUSTOMERS:-50000}"
 SEED_ORDERS="${SEED_ORDERS:-300000}"
-SEED_REVIEWS="${SEED_REVIEWS:-250000}"
-SEED_EVENTS="${SEED_EVENTS:-1000000}"
+SEED_REVIEWS="${SEED_REVIEWS:-200000}"
+SEED_EVENTS="${SEED_EVENTS:-0}"
 SOURCE_PORT="${SOURCE_PORT:-55452}"
 CLONE_PORT="${CLONE_PORT:-55453}"
 PROXY_PORT="${PROXY_PORT:-55454}"
@@ -31,6 +39,15 @@ step() { printf '\n\033[1;34m== %s ==\033[0m\n' "$1"; }
 if [[ ! -x "$GFS_BIN" ]]; then
   echo "gfs binary not found at $GFS_BIN  (build: cd $REPO_ROOT && cargo build -p gfs-cli)"
   exit 1
+fi
+
+# The clone REQUIRES the gfs copy-on-read extension (clone_bootstrap.sql runs
+# `CREATE EXTENSION gfs` with no overlay fallback), so it must run on an image
+# that ships it. Build it once if missing (heavy: rustup + cargo-pgrx + release).
+GFS_IMAGE="${GFS_IMAGE:-gfs-postgres:16}"
+if ! docker image inspect "$GFS_IMAGE" >/dev/null 2>&1; then
+  step "Build the gfs Postgres image ($GFS_IMAGE) — first run only, ~10-20 min"
+  docker build -t "$GFS_IMAGE" "$REPO_ROOT/crates/extensions/gfs"
 fi
 
 step "Install Node dependencies"
@@ -77,12 +94,11 @@ if [[ -n "$PROXY_MODE" ]]; then
   # creates (labels gfs.role=clone/gfs.provider=postgres) and fronts it on its
   # own listener. --listen-base = PROXY_PORT so this single clone lands exactly on
   # PROXY_PORT, keeping CLONE_URL stable. Live map at /clones on the metrics port.
+  # NOTE: with the gfs TAM the clone is copy-on-read in-DB, so the proxy no longer
+  # warms — it is a transparent passthrough (+ discovery/front). No --warm flags.
   "$PROXY_RUN" \
     --discover --listen-base "${PROXY_PORT}" \
-    --metrics "127.0.0.1:${PROXY_METRICS_PORT}" \
-    --warm --warm-dbname postgres \
-    --refresh-interval 3 \
-    --cache-metrics --cache-metrics-interval 2 &
+    --metrics "127.0.0.1:${PROXY_METRICS_PORT}" &
   PROXY_PID=$!
   trap 'kill "$PROXY_PID" 2>/dev/null || true' EXIT INT TERM
   # A background crash (e.g. port in use) is silent under set -e — surface it.
@@ -102,15 +118,18 @@ cat <<EOF
 
   Open http://localhost:${SERVER_PORT}   (click "Clone the source" on the right)
 
-  Scenarios to try on the CLONE:
-    * Browse products by id range        -> elided once warmed (key predicate)
-    * Fuzzy search products / reviews     -> federates, then local once whole-cached
-    * Filter by category                  -> JOIN products⋈categories (overlays)
-    * Customer order history              -> 3-table JOIN
-    * Recent orders (last N days)         -> temporal filter (federates)
-    * Dashboard (revenue / category)      -> aggregate JOIN (federates: anti-join blocks push-down)
-    * Place order / write review          -> copy-on-write divergence; source untouched
-$([[ -n "$PROXY_MODE" ]] && echo "    * PROXY MODE: just browse — pages flip remote->local on their own.")
+  The CLONE is a copy-on-read clone (gfs Table Access Method): the first read of
+  any data FETCHES it from the source and writes it through locally — re-run the
+  same query and it is served entirely locally (badge flips fetched -> local).
+  Scenarios to try on the CLONE (watch the "served from" badge + "rows fetched"):
+    * Browse products by id range        -> fetched on 1st read, local after
+    * Fuzzy search products / reviews     -> fetches matching rows, then local
+    * Filter by category                  -> JOIN warms both tables on read
+    * Customer order history              -> 3-table JOIN warms each on read
+    * Recent orders (last N days)         -> fetched then local
+    * Dashboard (revenue / category)      -> aggregate JOIN warms the joined tables
+    * "warm whole products"               -> materialize a table in one shot
+    * Place order / write review          -> writes diverge locally; source untouched
 
   Tear down: docker compose down -v ; rm -rf "$CLONE_DIR"
 
@@ -121,4 +140,5 @@ CLONE_URL="$CLONE_URL" PROXY_MODE="$PROXY_MODE" \
 SERVER_PORT="$SERVER_PORT" GFS_BIN="$GFS_BIN" CLONE_DIR="$CLONE_DIR" CLONE_PORT="$CLONE_PORT" \
 REMOTE_HOST="$REMOTE_HOST" SOURCE_PORT="$SOURCE_PORT" \
 SOURCE_DB="appdb" SOURCE_USER="app" SOURCE_PASS="app" DB_VERSION="16" \
+CLONE_IMAGE="$GFS_IMAGE" \
   pnpm --filter clone-explorer-pro-server run start

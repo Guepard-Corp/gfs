@@ -153,10 +153,19 @@ fn e2e_clone_postgres() {
     cleanup.gfs_container = Some(gfs_container.clone());
 
     // 4. Validate the overlay on the cloned DB (what a direct app connection sees).
+    // Faithful-overlay layout: public.orders is the real faithful table ('r',
+    // carrying the source's constraints/triggers), and the overlay view lives in
+    // gfs_ovl__public.orders ('v'). A bare `orders` read resolves to the overlay
+    // first via the default search_path (gfs_ovl__public, public).
     assert_eq!(
         psql_gfs(&gfs_container, "SELECT relkind FROM pg_class WHERE relname='orders' AND relnamespace='public'::regnamespace"),
+        "r",
+        "public.orders should be the faithful local table"
+    );
+    assert_eq!(
+        psql_gfs(&gfs_container, "SELECT relkind FROM pg_class WHERE relname='orders' AND relnamespace='gfs_ovl__public'::regnamespace"),
         "v",
-        "public.orders should be an overlay view"
+        "gfs_ovl__public.orders should be the overlay view"
     );
     assert_eq!(
         psql_gfs(&gfs_container, "SELECT count(*) FROM gfs_sync.table_meta WHERE table_name='orders'"),

@@ -1,0 +1,4 @@
+comment = 'GFS lazy-clone Table Access Method (PoC): a real heap-backed table, copy-on-read'
+default_version = '0.0.1'
+module_pathname = '$libdir/gfs'
+relocatable = false
