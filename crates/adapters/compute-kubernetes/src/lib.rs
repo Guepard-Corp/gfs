@@ -885,8 +885,16 @@ impl Compute for KubernetesCompute {
         id: &InstanceId,
         compute_port: u16,
     ) -> Result<InstanceConnectionInfo> {
-        // From inside cluster, service DNS works the same.
-        self.get_connection_info(id, compute_port).await
+        // Task pods run in-cluster; they must reach the DB via Service DNS, not
+        // NodePort / external host (see get_connection_info when GFS_K8S_EXPOSE_NODEPORT=1).
+        let svc_name = Self::svc_name(&id.0);
+        let cluster_host = format!("{svc_name}.{}.svc.cluster.local", self.namespace);
+        let mut env = self.pod_env_for_instance(id).await;
+        Ok(InstanceConnectionInfo {
+            host: cluster_host,
+            port: compute_port,
+            env,
+        })
     }
 
     async fn run_task(
