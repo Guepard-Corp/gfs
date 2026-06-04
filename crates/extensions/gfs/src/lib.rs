@@ -24,7 +24,7 @@
 //! the table is whole_cached); otherwise it federates (reads the source) — never a
 //! partial local result.
 
-use core::ffi::{c_char, c_int};
+use core::ffi::{c_char, c_int, c_void};
 use std::ffi::{CStr, CString};
 
 use pgrx::pg_sys;
@@ -89,11 +89,15 @@ struct Hydration {
     lo: i64,
     hi: i64,
     whole: bool,
+    where_sql: String, // PARTIAL hydration: fetch only rows matching this predicate
+    pred_key: String,  // completeness key for the predicate (so repeats serve local)
+    partial_cap: i64,  // PARTIAL: hard row cap (LIMIT = cap+1); overflow -> federate, never local-incomplete
 }
 
 struct Ctx {
-    hydrations: Vec<Hydration>,      // range/whole fetches for coverable/small tables
+    hydrations: Vec<Hydration>,       // range/whole fetches for coverable/small tables
     federate_targets: Vec<Hydration>, // tables to push to the source (whole-fallback if swap fails)
+    partials: Vec<Hydration>,         // selective per-predicate fetches on too-big tables (capped, self-validating)
 }
 
 unsafe fn gfs_route(
@@ -105,9 +109,22 @@ unsafe fn gfs_route(
     let parse_copy = pg_sys::copyObjectImpl(parse as *const _) as *mut pg_sys::Query;
     let stmt = base_plan(parse, qs, cursor, params); // cold plan, to inspect
 
-    let mut ctx = Ctx { hydrations: Vec::new(), federate_targets: Vec::new() };
+    let mut ctx =
+        Ctx { hydrations: Vec::new(), federate_targets: Vec::new(), partials: Vec::new() };
     if !stmt.is_null() {
         classify_walk((*stmt).planTree, (*stmt).rtable, &mut ctx);
+    }
+
+    // PARTIAL pre-pass: pull each selective slice with a HARD cap. The capped pull
+    // self-validates selectivity against REALITY (not an estimate): if the source
+    // had more than the cap of matching rows, the slice is not actually selective
+    // -> we must NOT serve it local (the cap truncated it) -> federate this query.
+    // A committed slice records cached_predicate.complete so repeats serve local.
+    for p in &ctx.partials {
+        if !do_hydrate(p) {
+            // overflowed -> incomplete locally -> federate the whole query (correct + bounded)
+            ctx.federate_targets.push(whole_of(p));
+        }
     }
 
     // A not-yet-owned table accessed without a range-key bound must reach the
@@ -117,6 +134,7 @@ unsafe fn gfs_route(
     // incomplete result.
     if !ctx.federate_targets.is_empty() {
         if !parse_copy.is_null() && swap_clone_rtes_to_foreign(parse_copy) > 0 {
+            gfs_throttle(); // rate-limit source contact (the federated query hits prod)
             return base_plan(parse_copy, qs, cursor, params);
         }
         for t in &ctx.federate_targets {
@@ -126,7 +144,9 @@ unsafe fn gfs_route(
 
     // Hydrate the needed ranges/small tables, then re-plan on the populated local
     // tables (fresh stats -> indexes used).
-    let did = !ctx.hydrations.is_empty() || !ctx.federate_targets.is_empty();
+    let did = !ctx.hydrations.is_empty()
+        || !ctx.federate_targets.is_empty()
+        || !ctx.partials.is_empty();
     for h in &ctx.hydrations {
         do_hydrate(h);
     }
@@ -134,6 +154,24 @@ unsafe fn gfs_route(
         base_plan(parse_copy, qs, cursor, params)
     } else {
         stmt // everything already owned/covered -> local
+    }
+}
+
+/// A whole-table federate/own descriptor for the same relation as `h` (used when a
+/// partial slice overflows: the table must reach the source as a whole).
+fn whole_of(h: &Hydration) -> Hydration {
+    Hydration {
+        local_ref: h.local_ref.clone(),
+        source_ref: h.source_ref.clone(),
+        collist: h.collist.clone(),
+        relid: h.relid,
+        key_col: h.key_col.clone(),
+        lo: 0,
+        hi: 0,
+        whole: true,
+        where_sql: String::new(),
+        pred_key: String::new(),
+        partial_cap: 0,
     }
 }
 
@@ -201,63 +239,144 @@ unsafe fn classify_scan(
         return; // owned -> serve local
     }
 
-    // What would we OWN to satisfy this scan?  (plan_rows is unreliable here — the
-    // local clone table is (near-)empty at plan time — so we size from the catalog.)
     let b = info.row_bytes.max(1) as f64; // bytes/row
     let tr = info.source_rows.max(0) as f64; // source table size
     let h = (info.access_count as f64).min(info.w_horizon); // amortization horizon
-
-    let rng = if info.chunk_kind == "int" && info.key_attno != 0 {
-        extract_key_range(plan, scanrelid, info.key_attno, tag)
-    } else {
-        None
+    let s = String::new;
+    let mk = |lo: i64, hi: i64, whole: bool, w: String, p: String, cap: i64| Hydration {
+        local_ref: info.local_ref.clone(),
+        source_ref: info.source_ref.clone(),
+        collist: info.collist.clone(),
+        relid,
+        key_col: info.key_col.clone(),
+        lo,
+        hi,
+        whole,
+        where_sql: w,
+        pred_key: p,
+        partial_cap: cap,
     };
-    let (own_rows, lo, hi, whole) = match rng {
-        Some((lo, hi)) => {
+
+    // 1. RANGE-key bound (id BETWEEN ...) -> range model: covered -> local, else own
+    //    the key span (with subset/coalesce coverage). Best for key browsing.
+    if info.chunk_kind == "int" && info.key_attno != 0 {
+        if let Some((lo, hi)) = extract_key_range(plan, scanrelid, info.key_attno, tag) {
             if gfs_is_covered(relid, lo, hi) {
-                return; // range already owned -> local
+                return; // already owned
             }
-            // own the key span (clamped to the table size)
             let span = ((hi - lo).saturating_add(1)).max(0) as f64;
-            (span.min(tr.max(1.0)), lo, hi, false)
+            let own_rows = span.min(tr.max(1.0));
+            push_by_cost(ctx, own_rows, b, tr, h, &info, mk(lo, hi, false, s(), s(), 0));
+            return;
         }
-        None => (tr, 0i64, 0i64, true), // own the whole table
-    };
+    }
 
-    // Cost / energy model:
-    //   E(own)  = net * bytes(own_rows)          -- one-time pull
-    //   E(feder)= source * source_rows           -- per call: the SOURCE re-scans
-    //                                               the table (incl. prod-load penalty)
-    // OWN when the pull is negligible (small/cheap), or — below the capacity ceiling
-    // — amortized over the H expected future calls. Selective ranges & small tables
-    // -> own; huge tables -> never own (federate); mid tables -> own once queried
-    // enough (converge). Tr cancels for full scans, so the flip is ~ net*B/source calls.
+    // 2. WHOLE-OWN affordability gate. Identical arithmetic to push_by_cost at
+    //    own_rows=Tr, hoisted here BEFORE any predicate work. If the table is
+    //    affordable to own WHOLE (or terminal no_partial), the partial branch is
+    //    skipped entirely -- whole-own (1 contact, then all-local) dominates partial
+    //    and this gate is independent of selectivity, so no slice can flip an
+    //    ownable table into partial. This is the line that keeps the benchmark at
+    //    source_ops=12 and makes the cost-v3 ordering regression structurally
+    //    impossible.
+    let whole_own_cost = info.w_net * b * tr;
+    let fed_call = info.w_source * tr.max(1.0);
+    let whole_ownable = whole_own_cost <= info.w_negligible
+        || (whole_own_cost <= info.w_ceiling && whole_own_cost <= (h + 1.0) * fed_call);
+    if whole_ownable || info.no_partial {
+        // push_by_cost(Tr) owns iff whole_ownable, else federates -- never partial.
+        push_by_cost(ctx, tr, b, tr, h, &info, mk(0, 0, true, s(), s(), 0));
+        return;
+    }
+
+    // 3. NOT whole-ownable: a SELECTIVE single-relation predicate can be PARTIAL-
+    //    owned (its matching slice only), keeping a too-big clone partial.
+    if let Some(pred) = deparse_restriction(relid, plan, scanrelid, tag) {
+        match gfs_pred_state(relid, &pred) {
+            Some((true, _)) => return, // complete -> serve local (0 contact)
+            Some((_, true)) => {
+                // known not-selective (a prior capped pull overflowed) -> federate, no re-probe
+                push_by_cost(ctx, tr, b, tr, h, &info, mk(0, 0, true, s(), s(), 0));
+                return;
+            }
+            None => {
+                // SECOND-CHANCE: a predicate's FIRST sighting federates (== cost-v2)
+                // and is only recorded as "seen" (no contact, no estimate); partial
+                // is paid only once reuse is demonstrated (the 2nd identical touch).
+                gfs_note_pred_seen(relid, &pred);
+                push_by_cost(ctx, tr, b, tr, h, &info, mk(0, 0, true, s(), s(), 0));
+                return;
+            }
+            Some((false, false)) => {} // seen before -> consider partial below
+        }
+
+        // CONTACT cap / ROW cap / headroom -> PROMOTE: collapse the piecemeal slices
+        //   into ONE whole-own (if capacity allows) or mark terminal no_partial and
+        //   federate per call. The contact cap bounds tiny-slice floods the row cap
+        //   is blind to; the scarce resource is CONTACTS.
+        let cap_rows = (info.w_partial_max_frac * tr).floor().max(1.0);
+        let contact_cap_hit = gfs_pred_count(relid) >= info.w_max_partial_preds;
+        let row_cap_hit = (info.partial_rows as f64) >= info.w_promote_frac * tr;
+        let headroom_ok = (info.partial_rows as f64) + cap_rows <= info.w_promote_frac * tr;
+        if contact_cap_hit || row_cap_hit || !headroom_ok {
+            if whole_own_cost <= info.w_ceiling {
+                ctx.hydrations.push(mk(0, 0, true, s(), s(), 0)); // forced whole-own (one final contact)
+            } else {
+                gfs_set_no_partial(relid);
+                ctx.federate_targets.push(mk(0, 0, true, s(), s(), 0));
+            }
+            return;
+        }
+
+        // CAPACITY: even the maximum allowed slice (partial_max_frac*Tr) must fit
+        //   under the ceiling -- this uses the CAP, not an estimate, so no mis-
+        //   estimate can sneak an over-budget slice through. The real pull is then
+        //   hard-capped and self-validated in do_hydrate (overflow -> federate).
+        if info.w_net * b * cap_rows <= info.w_ceiling {
+            ctx.partials.push(mk(0, 0, false, pred.clone(), pred, cap_rows as i64));
+        } else {
+            push_by_cost(ctx, tr, b, tr, h, &info, mk(0, 0, true, s(), s(), 0)); // slice too big -> federate
+        }
+        return;
+    }
+
+    // 4. No usable restriction (join-derived / aggregate input) -> cost decides
+    //    own-whole vs federate (not whole-ownable here -> federate).
+    push_by_cost(ctx, tr, b, tr, h, &info, mk(0, 0, true, s(), s(), 0));
+}
+
+/// Cost/energy gate: OWN (push `hyd`) when the pull is negligible, or -- below the
+/// capacity ceiling -- amortized over H calls; else FEDERATE (push the source to
+/// it). E(own)=net*B*own_rows (one-time); E(feder)=source*Tr per call (the source
+/// re-scans every time, incl. prod-load penalty).
+unsafe fn push_by_cost(
+    ctx: &mut Ctx,
+    own_rows: f64,
+    b: f64,
+    tr: f64,
+    h: f64,
+    info: &CloneInfo,
+    hyd: Hydration,
+) {
     let own_cost = info.w_net * b * own_rows;
     let fed_call = info.w_source * tr.max(1.0);
     let own = own_cost <= info.w_negligible
         || (own_cost <= info.w_ceiling && own_cost <= (h + 1.0) * fed_call);
-
     if own {
-        ctx.hydrations.push(Hydration {
-            local_ref: info.local_ref,
-            source_ref: info.source_ref,
-            collist: info.collist,
-            relid,
-            key_col: info.key_col,
-            lo,
-            hi,
-            whole,
-        });
+        ctx.hydrations.push(hyd);
     } else {
         ctx.federate_targets.push(Hydration {
-            local_ref: info.local_ref,
-            source_ref: info.source_ref,
-            collist: info.collist,
-            relid,
-            key_col: info.key_col,
+            local_ref: hyd.local_ref,
+            source_ref: hyd.source_ref,
+            collist: hyd.collist,
+            relid: hyd.relid,
+            key_col: hyd.key_col,
             lo: 0,
             hi: 0,
             whole: true,
+            where_sql: String::new(),
+            pred_key: String::new(),
+            partial_cap: 0,
         });
     }
 }
@@ -395,6 +514,144 @@ unsafe fn push_list(out: &mut Vec<*mut pg_sys::Node>, list: *mut pg_sys::List) {
 }
 
 // ===========================================================================
+// Deparse a scan's pushable restriction into a remote WHERE (for PARTIAL
+// hydration: fetch only the matching rows, not the whole table).
+// ===========================================================================
+struct PushCtx {
+    ok: bool,
+    scanrelid: pg_sys::Index,
+}
+
+#[pg_guard]
+unsafe extern "C-unwind" fn push_walker(node: *mut pg_sys::Node, ctx: *mut c_void) -> bool {
+    if node.is_null() {
+        return false;
+    }
+    let c = &mut *(ctx as *mut PushCtx);
+    match (*node).type_ {
+        pg_sys::NodeTag::T_Var => {
+            let v = node as *mut pg_sys::Var;
+            if (*v).varno < 1 || (*v).varno as u32 != c.scanrelid || (*v).varlevelsup != 0 {
+                c.ok = false;
+                return true;
+            }
+        }
+        pg_sys::NodeTag::T_Const
+        | pg_sys::NodeTag::T_BoolExpr
+        | pg_sys::NodeTag::T_RelabelType
+        | pg_sys::NodeTag::T_NullTest => {}
+        pg_sys::NodeTag::T_OpExpr => {
+            if u32::from((*(node as *mut pg_sys::OpExpr)).opno) >= pg_sys::FirstNormalObjectId {
+                c.ok = false;
+                return true;
+            }
+        }
+        pg_sys::NodeTag::T_ScalarArrayOpExpr => {
+            if u32::from((*(node as *mut pg_sys::ScalarArrayOpExpr)).opno)
+                >= pg_sys::FirstNormalObjectId
+            {
+                c.ok = false;
+                return true;
+            }
+        }
+        _ => {
+            c.ok = false;
+            return true;
+        }
+    }
+    pg_sys::expression_tree_walker_impl(node, Some(push_walker), ctx)
+}
+
+unsafe fn node_is_pushable(node: *mut pg_sys::Node, scanrelid: pg_sys::Index) -> bool {
+    if node.is_null() || pg_sys::contain_volatile_functions(node) {
+        return false;
+    }
+    let mut c = PushCtx { ok: true, scanrelid };
+    push_walker(node, &mut c as *mut _ as *mut c_void);
+    c.ok
+}
+
+#[pg_guard]
+unsafe extern "C-unwind" fn rewrite_walker(node: *mut pg_sys::Node, ctx: *mut c_void) -> bool {
+    if node.is_null() {
+        return false;
+    }
+    if (*node).type_ == pg_sys::NodeTag::T_Var {
+        let v = node as *mut pg_sys::Var;
+        let scanrelid = *(ctx as *mut pg_sys::Index);
+        if (*v).varno as u32 == scanrelid {
+            (*v).varno = 1;
+            (*v).varnosyn = 1;
+        }
+    }
+    pg_sys::expression_tree_walker_impl(node, Some(rewrite_walker), ctx)
+}
+
+unsafe fn deparse_one(
+    relid: pg_sys::Oid,
+    relname: *mut c_char,
+    node: *mut pg_sys::Node,
+    scanrelid: pg_sys::Index,
+) -> Option<String> {
+    let copy = pg_sys::copyObjectImpl(node as *const _) as *mut pg_sys::Node;
+    if copy.is_null() {
+        return None;
+    }
+    let mut sr = scanrelid;
+    rewrite_walker(copy, &mut sr as *mut _ as *mut c_void);
+    let ctx = pg_sys::deparse_context_for(relname as *const c_char, relid);
+    let s = pg_sys::deparse_expression(copy, ctx, false, false);
+    if s.is_null() {
+        return None;
+    }
+    Some(CStr::from_ptr(s).to_string_lossy().into_owned())
+}
+
+/// AND of all pushable single-relation restriction conditions on this scan,
+/// deparsed to bare-column SQL (a WHERE for fetching just the matching rows).
+/// None if the scan has no usable restriction (join-derived / aggregate input).
+unsafe fn deparse_restriction(
+    relid: pg_sys::Oid,
+    plan: *mut pg_sys::Plan,
+    scanrelid: pg_sys::Index,
+    tag: pg_sys::NodeTag,
+) -> Option<String> {
+    let mut conds: Vec<*mut pg_sys::Node> = Vec::new();
+    push_list(&mut conds, (*plan).qual);
+    match tag {
+        pg_sys::NodeTag::T_IndexScan => {
+            push_list(&mut conds, (*(plan as *mut pg_sys::IndexScan)).indexqualorig)
+        }
+        pg_sys::NodeTag::T_BitmapHeapScan => {
+            push_list(&mut conds, (*(plan as *mut pg_sys::BitmapHeapScan)).bitmapqualorig)
+        }
+        pg_sys::NodeTag::T_IndexOnlyScan => {
+            push_list(&mut conds, (*(plan as *mut pg_sys::IndexOnlyScan)).recheckqual)
+        }
+        _ => {}
+    }
+    let relname = pg_sys::get_rel_name(relid);
+    if relname.is_null() {
+        return None;
+    }
+    let mut frags: Vec<String> = Vec::new();
+    for node in conds {
+        if !node.is_null() && node_is_pushable(node, scanrelid) {
+            if let Some(s) = deparse_one(relid, relname, node, scanrelid) {
+                if !frags.contains(&s) {
+                    frags.push(s);
+                }
+            }
+        }
+    }
+    if frags.is_empty() {
+        None
+    } else {
+        Some(frags.iter().map(|f| format!("({})", f)).collect::<Vec<_>>().join(" AND "))
+    }
+}
+
+// ===========================================================================
 // Federate: rewrite clone RTEs -> foreign tables so postgres_fdw pushes down.
 // ===========================================================================
 unsafe fn swap_clone_rtes_to_foreign(query: *mut pg_sys::Query) -> i32 {
@@ -459,11 +716,16 @@ struct CloneInfo {
     source_rows: i64,  // Tr: source table size (reltuples, captured at register)
     row_bytes: i64,    // B: avg bytes/row
     access_count: i64, // H: times this table has been queried (amortization)
+    partial_rows: i64, // cumulative rows pulled by committed partial hydrations
+    no_partial: bool,  // terminal: too big to own -> federate per call, no more probes
     w_net: f64,        // cost weights (gfs.cost)
     w_source: f64,
     w_negligible: f64,
     w_ceiling: f64,
     w_horizon: f64,
+    w_partial_max_frac: f64,  // max slice fraction + hard pull cap
+    w_promote_frac: f64,      // cumulative-pull fraction that auto-promotes to whole-own
+    w_max_partial_preds: i64, // max distinct partial predicates (contacts) before promote
 }
 
 unsafe fn spi_text(p: *mut c_char) -> Option<String> {
@@ -487,7 +749,9 @@ unsafe fn gfs_lookup_clone(relid: pg_sys::Oid) -> Option<CloneInfo> {
                 COALESCE((SELECT attnum FROM pg_attribute WHERE attrelid = s.relid \
                             AND attname = s.key_col), 0)::text, \
                 s.source_rows::text, s.row_bytes::text, s.access_count::text, \
-                x.net::text, x.source::text, x.negligible::text, x.ceiling::text, x.horizon::text \
+                x.net::text, x.source::text, x.negligible::text, x.ceiling::text, x.horizon::text, \
+                s.partial_rows::text, s.no_partial::int::text, \
+                x.partial_max_frac::text, x.promote_frac::text, x.max_partial_preds::text \
            FROM gfs.clone_source s, gfs.cost x \
           WHERE s.relid::oid = {} AND to_regclass(s.source_ref) IS NOT NULL",
         u32::from(relid)
@@ -521,6 +785,11 @@ unsafe fn gfs_lookup_clone(relid: pg_sys::Oid) -> Option<CloneInfo> {
                 w_negligible: num(13),
                 w_ceiling: num(14),
                 w_horizon: num(15),
+                partial_rows: num(16) as i64,
+                no_partial: g(17).as_deref() == Some("1"),
+                w_partial_max_frac: num(18),
+                w_promote_frac: num(19),
+                w_max_partial_preds: num(20) as i64,
             });
         }
     }
@@ -596,6 +865,95 @@ unsafe fn gfs_is_covered(relid: pg_sys::Oid, lo: i64, hi: i64) -> bool {
     covered
 }
 
+/// State of a predicate in the catalog: None = never seen; Some((complete,
+/// overflowed)). complete=true -> matching rows fully hydrated (serve local);
+/// overflowed=true -> a prior capped pull found too many matches (not selective ->
+/// federate, never partial again); (false,false) -> a "seen once" second-chance
+/// marker (the next identical touch may partial-hydrate).
+unsafe fn gfs_pred_state(relid: pg_sys::Oid, pred: &str) -> Option<(bool, bool)> {
+    if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
+        return None;
+    }
+    let q = CString::new(format!(
+        "SELECT complete::int::text, overflowed::int::text FROM gfs.cached_predicate \
+           WHERE relid::oid = {} AND pred = '{}'",
+        u32::from(relid),
+        pred.replace('\'', "''")
+    ))
+    .unwrap();
+    let mut out = None;
+    if pg_sys::SPI_execute(q.as_ptr(), true, 1) == pg_sys::SPI_OK_SELECT as i32
+        && pg_sys::SPI_processed == 1
+    {
+        let tt = pg_sys::SPI_tuptable;
+        let row = *(*tt).vals;
+        let td = (*tt).tupdesc;
+        let c = spi_text(pg_sys::SPI_getvalue(row, td, 1)).as_deref() == Some("1");
+        let o = spi_text(pg_sys::SPI_getvalue(row, td, 2)).as_deref() == Some("1");
+        out = Some((c, o));
+    }
+    pg_sys::SPI_finish();
+    out
+}
+
+/// Record a predicate as SEEN (second-chance marker, complete=false) without
+/// contacting the source -- so its NEXT identical touch is eligible for partial.
+unsafe fn gfs_note_pred_seen(relid: pg_sys::Oid, pred: &str) {
+    if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
+        return;
+    }
+    let q = CString::new(format!(
+        "INSERT INTO gfs.cached_predicate(relid, pred) VALUES ({}::oid::regclass, '{}') \
+         ON CONFLICT DO NOTHING",
+        u32::from(relid),
+        pred.replace('\'', "''")
+    ))
+    .unwrap();
+    pg_sys::SPI_execute(q.as_ptr(), false, 0);
+    pg_sys::SPI_finish();
+}
+
+/// Count of fully-hydrated (complete) partial predicates for this table -- the
+/// CONTACT-cap input for the promote guard.
+unsafe fn gfs_pred_count(relid: pg_sys::Oid) -> i64 {
+    if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
+        return 0;
+    }
+    let q = CString::new(format!(
+        "SELECT count(*)::int8::text FROM gfs.cached_predicate \
+           WHERE relid::oid = {} AND complete",
+        u32::from(relid)
+    ))
+    .unwrap();
+    let mut n = 0i64;
+    if pg_sys::SPI_execute(q.as_ptr(), true, 1) == pg_sys::SPI_OK_SELECT as i32
+        && pg_sys::SPI_processed == 1
+    {
+        let tt = pg_sys::SPI_tuptable;
+        let row = *(*tt).vals;
+        let td = (*tt).tupdesc;
+        n = spi_text(pg_sys::SPI_getvalue(row, td, 1))
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0);
+    }
+    pg_sys::SPI_finish();
+    n
+}
+
+/// Mark a table terminally un-ownable: federate every call, stop probing/partialing.
+unsafe fn gfs_set_no_partial(relid: pg_sys::Oid) {
+    if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
+        return;
+    }
+    let q = CString::new(format!(
+        "UPDATE gfs.clone_source SET no_partial = true WHERE relid::oid = {}",
+        u32::from(relid)
+    ))
+    .unwrap();
+    pg_sys::SPI_execute(q.as_ptr(), false, 0);
+    pg_sys::SPI_finish();
+}
+
 /// Count a query that was pushed to the source for this clone table (so the demo
 /// can label it "federated" rather than "local" — it returned 0 hydrated rows but
 /// did contact the source).
@@ -612,10 +970,104 @@ unsafe fn bump_federate(relid: pg_sys::Oid) {
     pg_sys::SPI_finish();
 }
 
-unsafe fn do_hydrate(h: &Hydration) {
+/// Prod-protection gate: before contacting the source, consume a rate-limit token;
+/// if the per-clone budget is exhausted, wait (back-pressure, bounded) so 100s of
+/// clones can't overwhelm the prod source. No-op when max_rate = 0 (unlimited).
+unsafe fn gfs_throttle() {
     if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
         return;
     }
+    let q = CString::new("SELECT gfs.take_token()").unwrap();
+    let mut wait = 0.0f64;
+    if pg_sys::SPI_execute(q.as_ptr(), false, 1) == pg_sys::SPI_OK_SELECT as i32
+        && pg_sys::SPI_processed == 1
+    {
+        let tt = pg_sys::SPI_tuptable;
+        let row = *(*tt).vals;
+        let td = (*tt).tupdesc;
+        if let Some(s) = spi_text(pg_sys::SPI_getvalue(row, td, 1)) {
+            wait = s.trim().parse::<f64>().unwrap_or(0.0);
+        }
+    }
+    pg_sys::SPI_finish();
+    if wait > 0.0 {
+        // bounded per call so we never block a backend pathologically long
+        let us = (wait.min(1.0) * 1_000_000.0) as core::ffi::c_long;
+        pg_sys::pg_usleep(us);
+    }
+}
+
+/// Fetch a hydration into the local table. Returns true when the slice/table is
+/// COMPLETE (safe to serve local); returns false ONLY for a PARTIAL pull that
+/// overflowed its cap (too many matches -> not selective -> caller must federate,
+/// the local rows are an incomplete subset and are never claimed complete).
+unsafe fn do_hydrate(h: &Hydration) -> bool {
+    gfs_throttle(); // rate-limit source contact
+    if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
+        // Couldn't hydrate. A partial would be incomplete -> federate (false). A
+        // whole/range fetch failed but never claimed completeness -> safe (true).
+        return h.where_sql.is_empty();
+    }
+
+    // PARTIAL: pull the matching slice with a HARD cap and self-validate against
+    // REALITY (not an estimate). One source contact. `matched` (LIMIT cap+1) tells
+    // us whether the source had MORE than the cap of matching rows: if so the slice
+    // is not actually selective -> mark it overflowed (never partial again) and the
+    // caller federates this query; the <=cap+1 rows already inserted are a genuine
+    // subset (no completeness is claimed for them), so they are harmless.
+    if !h.where_sql.is_empty() {
+        let cap = h.partial_cap.max(0);
+        let sql = format!(
+            "WITH picked AS (SELECT {c} FROM {s} WHERE {w} LIMIT {lim}), \
+                  ins AS (INSERT INTO {l} ({c}) SELECT {c} FROM picked ON CONFLICT DO NOTHING RETURNING 1) \
+             SELECT (SELECT count(*) FROM picked)::int8::text, (SELECT count(*) FROM ins)::int8::text",
+            c = h.collist, s = h.source_ref, w = h.where_sql, l = h.local_ref, lim = cap + 1
+        );
+        let q = CString::new(sql).unwrap();
+        let (mut matched, mut inserted) = (0i64, 0i64);
+        if pg_sys::SPI_execute(q.as_ptr(), false, 0) == pg_sys::SPI_OK_SELECT as i32
+            && pg_sys::SPI_processed == 1
+        {
+            let tt = pg_sys::SPI_tuptable;
+            let row = *(*tt).vals;
+            let td = (*tt).tupdesc;
+            matched = spi_text(pg_sys::SPI_getvalue(row, td, 1))
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
+            inserted = spi_text(pg_sys::SPI_getvalue(row, td, 2))
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
+        }
+        let overflow = matched > cap; // strictly more than the cap matched -> not selective
+        let p = h.pred_key.replace('\'', "''");
+        let rec = if overflow {
+            format!(
+                "INSERT INTO gfs.cached_predicate(relid, pred, overflowed) VALUES ({r}::oid::regclass, '{p}', true) \
+                 ON CONFLICT (relid, pred) DO UPDATE SET overflowed = true",
+                r = u32::from(h.relid), p = p
+            )
+        } else {
+            format!(
+                "INSERT INTO gfs.cached_predicate(relid, pred, complete) VALUES ({r}::oid::regclass, '{p}', true) \
+                 ON CONFLICT (relid, pred) DO UPDATE SET complete = true",
+                r = u32::from(h.relid), p = p
+            )
+        };
+        pg_sys::SPI_execute(CString::new(rec).unwrap().as_ptr(), false, 0);
+        if !overflow {
+            let pr = CString::new(format!(
+                "UPDATE gfs.clone_source SET partial_rows = partial_rows + {} WHERE relid::oid = {}",
+                inserted, u32::from(h.relid)
+            ))
+            .unwrap();
+            pg_sys::SPI_execute(pr.as_ptr(), false, 0);
+        }
+        hydrate_finish(h, inserted);
+        pg_sys::SPI_finish();
+        return !overflow;
+    }
+
+    // WHOLE / RANGE.
     let sql = if h.whole {
         format!(
             "INSERT INTO {l} ({c}) SELECT {c} FROM {s} ON CONFLICT DO NOTHING",
@@ -631,15 +1083,20 @@ unsafe fn do_hydrate(h: &Hydration) {
     let rc = pg_sys::SPI_execute(q.as_ptr(), false, 0);
     let n = if rc == pg_sys::SPI_OK_INSERT as i32 { pg_sys::SPI_processed as i64 } else { 0 };
 
-    // Record completeness so future queries elide the source.
     let rec = if h.whole {
         format!("UPDATE gfs.clone_source SET whole_cached = true WHERE relid::oid = {}", u32::from(h.relid))
     } else {
         format!("SELECT gfs.note_range({}::oid::regclass, {}, {})", u32::from(h.relid), h.lo, h.hi)
     };
     pg_sys::SPI_execute(CString::new(rec).unwrap().as_ptr(), false, 0);
+    hydrate_finish(h, n);
+    pg_sys::SPI_finish();
+    true
+}
 
-    // Refresh planner stats + activity counter.
+/// Post-fetch: refresh planner stats (so fresh rows use indexes) + bump activity.
+/// Caller holds an open SPI connection.
+unsafe fn hydrate_finish(h: &Hydration, n: i64) {
     let an = CString::new(format!("ANALYZE {}", h.local_ref)).unwrap();
     pg_sys::SPI_execute(an.as_ptr(), false, 0);
     let stat = CString::new(format!(
@@ -650,7 +1107,6 @@ unsafe fn do_hydrate(h: &Hydration) {
     ))
     .unwrap();
     pg_sys::SPI_execute(stat.as_ptr(), false, 0);
-    pg_sys::SPI_finish();
 }
 
 // ===========================================================================
@@ -669,7 +1125,9 @@ CREATE TABLE gfs.clone_source (
     whole_cached boolean  NOT NULL DEFAULT false,
     source_rows  bigint   NOT NULL DEFAULT 0,        -- Tr: source size (cost model)
     row_bytes    int      NOT NULL DEFAULT 100,      -- B: avg bytes/row
-    access_count bigint   NOT NULL DEFAULT 0         -- H: query frequency (amortization)
+    access_count bigint   NOT NULL DEFAULT 0,        -- H: query frequency (amortization)
+    partial_rows bigint   NOT NULL DEFAULT 0,        -- cumulative rows pulled by COMMITTED partial hydrations
+    no_partial   boolean  NOT NULL DEFAULT false     -- terminal: too big to own; federate per call, no more probes
 );
 COMMENT ON TABLE gfs.clone_source IS 'Per clone table: source ref, range key, ownership, and cost-model stats';
 
@@ -683,10 +1141,52 @@ CREATE TABLE gfs.cost (
     negligible float8 NOT NULL DEFAULT 100000,      -- MEASURED: one round-trip (own if cheaper)
     ceiling    float8 NOT NULL DEFAULT 1000000000,  -- POLICY: never own above this (capacity cap)
     horizon    float8 NOT NULL DEFAULT 1000,        -- POLICY: cap on H (expected future calls)
-    prod_load  float8 NOT NULL DEFAULT 1            -- POLICY: penalty multiplier on source scans (offload prod)
+    prod_load  float8 NOT NULL DEFAULT 1,           -- POLICY: penalty multiplier on source scans (offload prod)
+    -- PARTIAL hydration is now COST-COMPUTED (no flag): it is the third leg of the
+    -- router, reachable ONLY for a table that is NOT whole-ownable (too big) AND
+    -- whose predicate slice is selective enough to fit the budget below. These are
+    -- policy knobs in the same class as ceiling/horizon.
+    partial_max_frac  float8 NOT NULL DEFAULT 0.05, -- POLICY: max slice fraction S/Tr to partial-own;
+                                                    --   ALSO the hard real-pull cap (LIMIT ceil(frac*Tr)+1).
+    promote_frac      float8 NOT NULL DEFAULT 0.5,  -- POLICY: cumulative partial-pulled fraction of Tr at which
+                                                    --   piecemeal slices auto-promote to ONE whole-own.
+    max_partial_preds int    NOT NULL DEFAULT 10    -- POLICY: max distinct partial predicates (CONTACTS) before
+                                                    --   promote; bounds tiny-slice floods the row cap can't see.
 );
 INSERT INTO gfs.cost DEFAULT VALUES;
 COMMENT ON TABLE gfs.cost IS 'Router weights: net/source/negligible are MEASURED by gfs.calibrate(); ceiling/horizon/prod_load are policy';
+
+-- Prod protection: a token bucket capping this clone's rate of SOURCE contact
+-- (hydrate fetches + federated queries). 100s of clones must not hammer the prod
+-- source -- set max_rate = total_prod_budget / expected_clones. The hook waits
+-- (back-pressure) when out of tokens; it NEVER serves a wrong/partial result.
+CREATE TABLE gfs.budget (
+    max_rate float8       NOT NULL DEFAULT 0,   -- source contacts/sec allowed (0 = unlimited)
+    tokens   float8       NOT NULL DEFAULT 0,
+    ts       timestamptz  NOT NULL DEFAULT clock_timestamp()
+);
+INSERT INTO gfs.budget DEFAULT VALUES;
+COMMENT ON TABLE gfs.budget IS 'Per-clone source-contact rate limit (token bucket); protects the prod source';
+
+-- Consume one token; return the seconds the caller must wait (0 if available).
+CREATE FUNCTION gfs.take_token() RETURNS float8 LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp AS $$
+DECLARE rate float8; tok float8; last timestamptz; elapsed float8; wait float8 := 0;
+BEGIN
+    SELECT max_rate, tokens, ts INTO rate, tok, last FROM gfs.budget FOR UPDATE;
+    IF rate IS NULL OR rate <= 0 THEN RETURN 0; END IF;            -- unlimited
+    elapsed := GREATEST(extract(epoch FROM clock_timestamp() - last), 0);
+    tok := LEAST(rate, tok + rate * elapsed);                       -- refill (1s bucket)
+    IF tok >= 1 THEN
+        UPDATE gfs.budget SET tokens = tok - 1, ts = clock_timestamp();
+    ELSE
+        wait := (1 - tok) / rate;
+        UPDATE gfs.budget SET tokens = 0, ts = clock_timestamp();
+    END IF;
+    RETURN wait;
+END;
+$$;
+COMMENT ON FUNCTION gfs.take_token() IS 'Token-bucket gate for source contact; returns seconds to wait';
 
 -- Auto-calibrate the cost weights by probing the source over the live FDW link:
 -- network throughput (sec/byte), source scan rate (sec/row), round-trip latency.
@@ -736,6 +1236,15 @@ CREATE TABLE gfs.cached (
 );
 CREATE INDEX ON gfs.cached (relid);
 COMMENT ON TABLE gfs.cached IS 'Hydrated key ranges per clone table (range-granular completeness for elision)';
+
+CREATE TABLE gfs.cached_predicate (
+    relid      regclass NOT NULL REFERENCES gfs.clone_source(relid) ON DELETE CASCADE,
+    pred       text     NOT NULL,
+    complete   boolean  NOT NULL DEFAULT false,  -- true = matching rows fully hydrated -> serve local
+    overflowed boolean  NOT NULL DEFAULT false,  -- true = capped pull overflowed (not selective) -> never partial again
+    PRIMARY KEY (relid, pred)
+);
+COMMENT ON TABLE gfs.cached_predicate IS 'Non-key predicates seen by the router: complete=fully hydrated (local), overflowed=too many matches (federate). A bare row (both false) is a second-chance "seen once" marker.';
 
 CREATE TABLE gfs.clone_stats (
     relid          regclass PRIMARY KEY REFERENCES gfs.clone_source(relid) ON DELETE CASCADE,
@@ -850,18 +1359,19 @@ COMMENT ON FUNCTION gfs.warm(regclass) IS
 
 CREATE VIEW gfs.clones AS
     SELECT s.relid::text AS clone, s.source_ref, s.key_col, s.chunk_kind, s.whole_cached,
-           s.source_rows, s.row_bytes, s.access_count,
+           s.source_rows, s.row_bytes, s.access_count, s.partial_rows, s.no_partial,
            COALESCE(st.fetch_calls, 0)    AS fetch_calls,
            COALESCE(st.rows_fetched, 0)   AS rows_fetched,
            COALESCE(st.federate_calls, 0) AS federate_calls,
            (SELECT count(*) FROM gfs.cached c WHERE c.relid = s.relid) AS cached_ranges,
+           (SELECT count(*) FROM gfs.cached_predicate p WHERE p.relid = s.relid AND p.complete) AS cached_preds,
            st.last_fetch
       FROM gfs.clone_source s
       LEFT JOIN gfs.clone_stats st USING (relid)
      ORDER BY s.relid::text;
 
 GRANT USAGE ON SCHEMA gfs TO PUBLIC;
-GRANT SELECT ON gfs.clone_source, gfs.cached, gfs.clone_stats, gfs.cost, gfs.clones TO PUBLIC;
+GRANT SELECT ON gfs.clone_source, gfs.cached, gfs.cached_predicate, gfs.clone_stats, gfs.cost, gfs.budget, gfs.clones TO PUBLIC;
 "#,
     name = "gfs_catalog",
 );

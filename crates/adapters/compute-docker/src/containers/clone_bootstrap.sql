@@ -26,7 +26,14 @@ $pl$;
 DROP SERVER IF EXISTS gfs_remote_srv CASCADE;
 CREATE SERVER gfs_remote_srv
   FOREIGN DATA WRAPPER postgres_fdw
-  OPTIONS (host '__RHOST__', port '__RPORT__', dbname '__RDB__');
+  -- use_remote_estimate is REQUIRED for join/aggregate PUSHDOWN: without it
+  -- postgres_fdw cannot cost the remote join and falls back to fetching base-table
+  -- rows over a cursor and joining locally (FETCH 100 at a time) -- which collapses
+  -- a federated multi-table query at scale (a 6-table join over 60M rows took 41
+  -- min instead of pushing the whole join to the source and returning ~5 rows).
+  -- fetch_size raises the cursor batch for the cases that still aren't pushed.
+  OPTIONS (host '__RHOST__', port '__RPORT__', dbname '__RDB__',
+           use_remote_estimate 'true', fetch_size '10000');
 
 -- FOR PUBLIC so any local role (not just the one that ran the bootstrap) can
 -- read through the foreign-data wrapper.

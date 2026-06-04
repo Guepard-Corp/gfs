@@ -119,7 +119,8 @@ cln "UPDATE gfs.cost SET net=1, source=20, negligible=100000, ceiling=1000000000
 reset_clone() {
   cln "TRUNCATE products,categories,customers,orders,order_items,reviews;
        DELETE FROM gfs.cached;
-       UPDATE gfs.clone_source SET whole_cached=false, access_count=0;
+       DELETE FROM gfs.cached_predicate;
+       UPDATE gfs.clone_source SET whole_cached=false, access_count=0, partial_rows=0, no_partial=false;
        UPDATE gfs.clone_stats SET rows_fetched=0,fetch_calls=0,federate_calls=0;" >/dev/null
 }
 ck() { # md5 of the ordered result of a query (set-equality across clone/source)
@@ -208,6 +209,120 @@ done
 echo "  products fuzzy x15 (F=federated O=owned): $seqs"
 if [[ -n "$flip" ]]; then PASS=$((PASS+1)); printf "  %s\n" "$(grn "PASS")  flipped federated->OWN at call $flip (cost amortized: net*B*Tr <= calls*source*rows)"
 else FAIL=$((FAIL+1)); printf "  %s\n" "$(red FAIL) never owned in 15 calls (raise SHOTS or lower gfs.cost.source)"; fi
+
+# ---------------------------------------------------------------------------
+note "Prod budget -- caps the source-contact RATE (protects prod: 100s of clones must not hammer it)"
+reset_clone
+CAP=30
+cln "UPDATE gfs.budget SET max_rate=$CAP, tokens=0, ts=clock_timestamp()" >/dev/null
+N=90; t0=$(date +%s)
+for i in $(seq 1 $N); do cln "SELECT id,name FROM products WHERE id BETWEEN $((i*200)) AND $((i*200+9)) ORDER BY id" >/dev/null 2>&1; done
+el=$(( $(date +%s) - t0 )); [[ $el -lt 1 ]] && el=1
+ops=$(cln "SELECT COALESCE(sum(fetch_calls+federate_calls),0) FROM gfs.clones")
+res=$(awk -v o="$ops" -v e="$el" -v c="$CAP" 'BEGIN{r=o/e; printf "%.0f %s", r, (r<=c*1.6?"ok":"hi")}')
+read -r rate flag <<<"$res"
+if [[ "$flag" == ok ]]; then PASS=$((PASS+1)); printf "  %s  %s contacts in %ss = ~%s/s (cap %s/s)\n" "$(grn 'PASS capped')" "$ops" "$el" "$rate" "$CAP"
+else FAIL=$((FAIL+1)); printf "  %s  ~%s/s exceeds cap %s/s\n" "$(red FAIL)" "$rate" "$CAP"; fi
+cln "UPDATE gfs.budget SET max_rate=0" >/dev/null   # back to unlimited for the rest
+
+# ---------------------------------------------------------------------------
+# OBJECTIVE regression guard. The corrected goal: a clone serves the app while
+# touching the SOURCE as little as possible (protecting prod -- 100s of clones
+# must not hammer it) and staying PARTIAL (no full copy). So over a representative
+# query stream we measure: source_ops (queries that hit the source -- MINIMIZE),
+# rows_pulled (data copied locally -- keep low), local% (served with no source --
+# MAXIMIZE). Results are appended to benchmark.results.tsv and compared to the
+# previous run -> IMPROVED / REGRESSED.
+note "Objective workload -- representative stream (no reset); minimize source contact, stay partial, local-first"
+srcops()  { cln "SELECT COALESCE(sum(fetch_calls+federate_calls),0) FROM gfs.clones"; }
+pulled()  { cln "SELECT COALESCE(sum(rows_fetched),0) FROM gfs.clones"; }
+reset_clone
+# A realistic app stream: selective range browsing (should hydrate then go local),
+# repeated analytics (the prod-load risk), a few one-offs.
+WL=()
+for lo in 1 51 101 1 151 51 201 1 251 101; do WL+=("SELECT id,name FROM products WHERE id BETWEEN $lo AND $((lo+49)) ORDER BY id"); done
+for t in crimson delta crimson; do WL+=("SELECT id FROM products WHERE name ILIKE '%$t%' ORDER BY id LIMIT 50"); done
+for c in games audio games; do WL+=("SELECT p.id FROM products p JOIN categories c ON c.id=p.category_id WHERE c.name='$c' LIMIT 50"); done
+WL+=("SELECT c.name,sum(oi.total_cents) FROM order_items oi JOIN products p ON p.id=oi.product_id JOIN categories c ON c.id=p.category_id GROUP BY c.name")
+WL+=("SELECT c.name,sum(oi.total_cents) FROM order_items oi JOIN products p ON p.id=oi.product_id JOIN categories c ON c.id=p.category_id GROUP BY c.name")
+s0="$(srcops)"; r0="$(pulled)"; local=0; total=0
+for qq in "${WL[@]}"; do
+  b="$(srcops)"; cln "$qq" >/dev/null 2>&1; a="$(srcops)"
+  total=$((total+1)); [[ "$a" == "$b" ]] && local=$((local+1))
+done
+SRC_OPS=$(( $(srcops) - s0 )); ROWS_PULLED=$(( $(pulled) - r0 ))
+SRC_TOTAL="$(cln "SELECT COALESCE(sum(source_rows),0) FROM gfs.clones")"
+LOCAL_PCT=$(( local*100/total ))
+PULL_PCT=$(( SRC_TOTAL>0 ? ROWS_PULLED*100/SRC_TOTAL : 0 ))
+echo "  $total queries -> source_ops=$SRC_OPS (hits on prod)  rows_pulled=$ROWS_PULLED (${PULL_PCT}% of source = partiality)  local=${LOCAL_PCT}%"
+
+RESULTS="$EXT_DIR/benchmark.results.tsv"
+LABEL="${LABEL:-run}"
+prev=""
+[[ -f "$RESULTS" ]] && prev="$(grep -v '^#' "$RESULTS" | tail -1 || true)"
+[[ -f "$RESULTS" ]] || printf '# label\tsource_ops\trows_pulled\tpull_pct\tlocal_pct\tqueries  (objective: source_ops DOWN, pull_pct low, local_pct UP)\n' > "$RESULTS"
+printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$LABEL" "$SRC_OPS" "$ROWS_PULLED" "$PULL_PCT" "$LOCAL_PCT" "$total" >> "$RESULTS"
+if [[ -n "$prev" ]]; then
+  read -r pl psrc prows ppull plocal ptot <<<"$prev"
+  printf "  vs [%s]: source_ops %s->%s   pull%% %s->%s   local%% %s->%s\n" "$pl" "$psrc" "$SRC_OPS" "$ppull" "$PULL_PCT" "$plocal" "$LOCAL_PCT"
+  d=$((SRC_OPS - psrc))
+  if   [[ $d -lt 0 ]]; then printf "  %s\n" "$(grn "IMPROVED") $((-d)) fewer source contacts"
+  elif [[ $d -gt 0 ]]; then printf "  %s\n" "$(red "REGRESSED") $d more source contacts"
+  else printf "  %s\n" "same source contacts"; fi
+else
+  echo "  (baseline saved as [$LABEL]; re-run after a change to compare)"
+fi
+
+# ---------------------------------------------------------------------------
+# PARTIAL HYDRATION is now COST-COMPUTED (no flag). It is the third leg of the
+# router, reachable ONLY for a table that is NOT whole-ownable (too big for the
+# ceiling) AND whose predicate slice is selective (<= partial_max_frac of Tr).
+# Whole-ownable tables (the whole objective workload) NEVER reach it -> no
+# regression. Here we force products NOT whole-ownable (lower the ceiling between
+# the slice cost and the whole-own cost) and show: (a) a SELECTIVE non-key
+# predicate partial-owns only its slice; (b) a NON-SELECTIVE one federates with a
+# BOUNDED probe (the capped pull self-validates against reality -- a mis-estimated
+# predicate can never drag most of the table over). second-chance: the 1st sighting
+# federates (== baseline), partial engages on the 2nd identical touch.
+note "Partial hydration (COMPUTED, no flag) -- too-big table: selective predicate partial-owns its slice; non-selective federates (bounded)"
+SRCTOT="$(src "SELECT count(*) FROM products")"
+# products whole-own cost ~= net*B*Tr (B~34, Tr=20000) ~= 680k; slice cap cost
+# ~= net*B*0.05*Tr ~= 34k. ceiling=100k sits between -> not whole-ownable, slice OK.
+cln "UPDATE gfs.cost SET ceiling=100000" >/dev/null
+CAP="$(cln "SELECT floor(partial_max_frac*${SRCTOT})::int FROM gfs.cost")"
+
+# (a) SELECTIVE non-key predicate (~300 rows = 1.5% < 5%): 2nd touch partial-hydrates the slice.
+reset_clone
+SELQ="SELECT id FROM products WHERE price_cents <= 400 ORDER BY id"
+cln "$SELQ" >/dev/null 2>&1   # 1st: federate (record seen)
+cln "$SELQ" >/dev/null 2>&1   # 2nd: partial-hydrate only the matching slice
+SEL_PULL="$(pulled)"
+SEL_MATCH="$(src "SELECT count(*) FROM ($SELQ) t")"
+SEL_OK=$([[ "$(cln "$(ck "$SELQ")")" == "$(src "$(ck "$SELQ")")" ]] && echo 1 || echo 0)
+
+# (b) NON-SELECTIVE predicate (~20% >> 5%): the capped probe overflows -> federate (bounded, never whole).
+reset_clone
+NSQ="SELECT id FROM products WHERE name ILIKE '%crimson%' ORDER BY id"
+cln "$NSQ" >/dev/null 2>&1    # 1st: federate (record seen)
+cln "$NSQ" >/dev/null 2>&1    # 2nd: capped probe overflows -> federate
+NS_PULL="$(pulled)"
+NS_ALL="$(src "SELECT count(*) FROM ($NSQ) t")"
+NS_OK=$([[ "$(cln "$(ck "$NSQ")")" == "$(src "$(ck "$NSQ")")" ]] && echo 1 || echo 0)
+
+cln "UPDATE gfs.cost SET ceiling=1000000000" >/dev/null   # restore default
+
+printf "  selective (price<=400, %s rows of %s): pulled=%s (the slice, not the table)  result==source:%s\n" "$SEL_MATCH" "$SRCTOT" "$SEL_PULL" "$SEL_OK"
+printf "  non-selective (ILIKE crimson, %s rows): pulled=%s (bounded by cap~%s, not %s nor whole)  result==source:%s\n" "$NS_ALL" "$NS_PULL" "$CAP" "$NS_ALL" "$NS_OK"
+if [[ "$SEL_OK" == 1 && "$SEL_PULL" -gt 0 && "$SEL_PULL" -le "$CAP" ]]; then
+  printf "  %s selective predicate partial-owns ONLY its slice (%s <= cap %s)\n" "$(grn PASS)" "$SEL_PULL" "$CAP"; PASS=$((PASS+1))
+else
+  printf "  %s selective partial (pulled=%s cap=%s ok=%s)\n" "$(red FAIL)" "$SEL_PULL" "$CAP" "$SEL_OK"; FAIL=$((FAIL+1))
+fi
+if [[ "$NS_OK" == 1 && "$NS_PULL" -le $((CAP+5)) ]]; then
+  printf "  %s non-selective federates, pull BOUNDED by cap (no mis-estimate over-pull: %s <= %s)\n" "$(grn PASS)" "$NS_PULL" "$((CAP+5))"; PASS=$((PASS+1))
+else
+  printf "  %s non-selective bound (pulled=%s cap=%s ok=%s)\n" "$(red FAIL)" "$NS_PULL" "$CAP" "$NS_OK"; FAIL=$((FAIL+1))
+fi
 
 # ---------------------------------------------------------------------------
 note "Stats (deterministic)"

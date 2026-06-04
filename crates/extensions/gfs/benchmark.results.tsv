@@ -1,0 +1,9 @@
+# label	source_ops	rows_pulled	pull_pct	local_pct	queries  (objective: source_ops DOWN, pull_pct low, local_pct UP)
+cost-v1	12	30012	60	44	18
+cost-v1-rerun	12	30012	60	44	18
+cost-v2	12	30012	60	44	18
+cost-v3	14	30012	60	38	18
+cost-v4	12	30012	60	44	18
+cost-v5	12	30012	60	44	18
+cost-v6	12	30012	60	44	18
+cost-v7	12	30012	60	44	18
