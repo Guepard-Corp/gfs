@@ -404,6 +404,14 @@ impl DatabaseProvider for MysqlProvider {
         Ok(cmd)
     }
 
+    fn query_in_instance_command(&self, sql: &str) -> std::result::Result<String, ProviderError> {
+        const DELIM: &str = "GFS_SQL_EOF";
+        let body = gfs_domain::utils::shell::sql_heredoc_body(DELIM, sql)?;
+        Ok(format!(
+            r#"MYSQL_PWD="${{MYSQL_ROOT_PASSWORD:-mysql}}" mysql -h 127.0.0.1 -u root "${{MYSQL_DATABASE:-mysql}}" -e "{body}""#
+        ))
+    }
+
     // -----------------------------------------------------------------------
     // Schema Extraction
     // -----------------------------------------------------------------------

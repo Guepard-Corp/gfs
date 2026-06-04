@@ -12,6 +12,7 @@ use gfs_domain::ports::database_provider::{
     ConnectionParams, DatabaseProviderRegistry, InMemoryDatabaseProviderRegistry,
 };
 use gfs_domain::ports::repository::Repository;
+use gfs_domain::usecases::repository::execute_query_usecase::ExecuteQueryUseCase;
 
 use super::compute_support::compute_for_repo;
 use crate::cli_utils::get_repo_dir;
@@ -53,7 +54,26 @@ pub async fn run(
     let registry_impl = InMemoryDatabaseProviderRegistry::new();
     containers::register_all(&registry_impl)
         .context("failed to register database providers")?;
-    let registry: Arc<dyn DatabaseProviderRegistry> = Arc::new(registry_impl);
+    let registry = Arc::new(registry_impl);
+
+    let is_k8s = runtime
+        .runtime_provider
+        .trim()
+        .eq_ignore_ascii_case("kubernetes");
+
+    if is_k8s {
+        let sql = query.as_deref().context(
+            "interactive query is not supported for kubernetes runtime; pass SQL as an argument",
+        )?;
+        let out = ExecuteQueryUseCase::new(compute, registry.clone())
+            .run(&repo_path, sql)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        print!("{}", out.stdout);
+        return Ok(());
+    }
+
+    let registry: Arc<dyn DatabaseProviderRegistry> = registry;
 
     // Get the provider
     let provider = registry

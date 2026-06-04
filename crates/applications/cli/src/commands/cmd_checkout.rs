@@ -11,10 +11,11 @@ use anyhow::{Context, Result};
 use gfs_domain::adapters::gfs_repository::GfsRepository;
 use gfs_domain::model::config::GfsConfig;
 use gfs_domain::ports::compute::Compute;
-use gfs_domain::ports::database_provider::DatabaseProviderRegistry;
 use gfs_domain::ports::database_provider::InMemoryDatabaseProviderRegistry;
 use gfs_domain::ports::repository::Repository;
 use gfs_domain::usecases::repository::checkout_repo_usecase::CheckoutRepoUseCase;
+use gfs_compute_kubernetes::checkout::restore_database_volume_from_snapshot;
+use gfs_compute_kubernetes::KubernetesCompute;
 use serde_json::json;
 
 use super::compute_support::compute_for_repo;
@@ -61,16 +62,7 @@ pub async fn checkout(
         .unwrap_or(false);
 
     let commit_hash = if is_k8s {
-        // 1) stop (best-effort)
-        if let Ok(cfg) = GfsConfig::load(&repo_path)
-            && let Some(rt) = cfg.runtime
-        {
-            let _ = compute
-                .stop(&gfs_domain::ports::compute::InstanceId(rt.container_name))
-                .await;
-        }
-
-        // 2) repo checkout (create branch ref first when -b, then switch HEAD)
+        // Validate refs before stopping compute — bad input must not leave the DB offline.
         let checkout_rev = if let Some(ref branch_name) = create_branch {
             let branch_name = branch_name.trim();
             if branch_name.is_empty() {
@@ -97,8 +89,21 @@ pub async fn checkout(
             if revision.trim().is_empty() {
                 anyhow::bail!("revision required or use -b <branch_name>");
             }
-            revision.clone()
+            let target = revision.trim();
+            repository
+                .rev_parse(&repo_path, target)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            target.to_string()
         };
+
+        if let Ok(cfg) = GfsConfig::load(&repo_path)
+            && let Some(rt) = cfg.runtime
+        {
+            let _ = compute
+                .stop(&gfs_domain::ports::compute::InstanceId(rt.container_name))
+                .await;
+        }
 
         repository
             .checkout(&repo_path, &checkout_rev)
@@ -111,73 +116,22 @@ pub async fn checkout(
             gfs_domain::repo_utils::repo_layout::get_commit_from_hash(&repo_path, &commit_hash)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
         let snapshot_hash = commit.snapshot_hash;
-        let vs_name = format!("gfs-snap-{}", &snapshot_hash[..32.min(snapshot_hash.len())]);
-        let new_pvc = format!(
-            "gfs-ws-{}-{}",
-            &snapshot_hash[..8.min(snapshot_hash.len())],
-            chrono::Utc::now().timestamp_millis()
-        );
 
         let storage = gfs_storage_kubernetes::KubernetesStorage::new(None).await?;
-        gfs_domain::ports::storage::StoragePort::clone(
+        let k8s_compute = KubernetesCompute::new(None)
+            .await
+            .map_err(|e| anyhow::anyhow!("kubernetes compute: {e}"))?;
+
+        restore_database_volume_from_snapshot(
             &storage,
-                &gfs_domain::ports::storage::VolumeId("unused".into()),
-                gfs_domain::ports::storage::VolumeId(new_pvc.clone()),
-                gfs_domain::ports::storage::CloneOptions {
-                    from_snapshot: Some(gfs_domain::ports::storage::SnapshotId(vs_name)),
-                },
+            &k8s_compute,
+            registry.clone(),
+            repository.clone(),
+            &repo_path,
+            &snapshot_hash,
         )
-        .await?;
-
-        // 4) recreate compute instance bound to the restored PVC
-        if let Ok(mut cfg) = GfsConfig::load(&repo_path) {
-            if let Some(rt) = cfg.runtime.take() {
-                let _ = compute
-                    .remove_instance(&gfs_domain::ports::compute::InstanceId(rt.container_name))
-                    .await;
-            }
-            cfg.mount_point = Some(new_pvc.clone());
-            let _ = cfg.save(&repo_path);
-        }
-
-        // Provision new instance with PVC override via host_data_dir = pvc:<name>
-        let provider = registry
-            .get(
-                gfs_domain::model::config::GfsConfig::load(&repo_path)
-                    .ok()
-                    .and_then(|c| c.environment.map(|e| e.database_provider))
-                    .unwrap_or_else(|| "postgres".into())
-                    .as_str(),
-            )
-            .context("unknown database provider")?;
-        let mut def = provider.definition();
-        if let Ok(cfg) = GfsConfig::load(&repo_path)
-            && let Some(env) = cfg.environment.as_ref()
-        {
-            let base = def
-                .image
-                .split(':')
-                .next()
-                .unwrap_or(&def.image);
-            def.image = format!("{}:{}", base, env.database_version);
-        }
-        def.host_data_dir = Some(std::path::PathBuf::from(format!("pvc:{new_pvc}")));
-        let new_id = compute.provision(&def).await?;
-        let _ = compute.start(&new_id, Default::default()).await?;
-        let runtime = compute.describe_runtime().await.unwrap_or(gfs_domain::ports::compute::RuntimeDescriptor {
-            provider: "kubernetes".into(),
-            version: "unknown".into(),
-        });
-        repository
-            .update_runtime_config(
-                &repo_path,
-                gfs_domain::model::config::RuntimeConfig {
-                    runtime_provider: runtime.provider,
-                    runtime_version: runtime.version,
-                    container_name: new_id.0.clone(),
-                },
-            )
-            .await?;
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         commit_hash
     } else {

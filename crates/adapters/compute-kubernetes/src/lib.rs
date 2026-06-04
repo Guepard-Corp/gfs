@@ -30,7 +30,7 @@ use kube::{Api, Client};
 use serde_json::json;
 
 const DEFAULT_NAMESPACE: &str = "gfs";
-const DEFAULT_PVC_SIZE_GI: &str = "5";
+const DEFAULT_PVC_SIZE_GI: &str = "1";
 
 fn k8s_storage_class() -> Option<String> {
     std::env::var("GFS_K8S_STORAGE_CLASS")
@@ -107,6 +107,25 @@ const APP_LABEL_KEY: &str = "app.kubernetes.io/name";
 const APP_LABEL_VALUE: &str = "gfs";
 const INSTANCE_LABEL_KEY: &str = "gfs.guepard.run/instance";
 
+/// A pod is exec-able only when it is Running and its `Ready` condition is True.
+fn pod_is_ready(pod: &Pod) -> bool {
+    let running = pod
+        .status
+        .as_ref()
+        .and_then(|s| s.phase.as_deref())
+        == Some("Running");
+    let ready = pod
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .map(|cs| {
+            cs.iter()
+                .any(|c| c.type_ == "Ready" && c.status == "True")
+        })
+        .unwrap_or(false);
+    running && ready
+}
+
 fn now_suffix() -> String {
     // short, dns-safe suffix
     format!("{}", Utc::now().timestamp_millis())
@@ -145,6 +164,8 @@ fn labels_for(instance: &str) -> BTreeMap<String, String> {
     m.insert(INSTANCE_LABEL_KEY.to_string(), instance.to_string());
     m
 }
+
+pub mod checkout;
 
 #[derive(Clone)]
 pub struct KubernetesCompute {
@@ -452,6 +473,51 @@ impl KubernetesCompute {
         Ok(name)
     }
 
+    /// Poll for a pod that is Running AND Ready, preferring the newest and
+    /// ignoring Terminating pods. After a checkout reprovision the old pod may
+    /// still be Terminating while the new one is Pending; exec'ing into a
+    /// not-ready pod fails the WebSocket upgrade with `400 Bad Request`.
+    async fn wait_ready_pod_name(&self, instance: &str) -> Result<String> {
+        use std::time::{Duration, Instant};
+        let api = self.api_pods();
+        let lp = ListParams::default().labels(&format!("{INSTANCE_LABEL_KEY}={instance}"));
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut last_phase = String::new();
+        loop {
+            let pods = api
+                .list(&lp)
+                .await
+                .map_err(|e| ComputeError::Internal(format!("k8s pod list failed: {e}")))?;
+            let mut ready: Vec<&Pod> = pods
+                .items
+                .iter()
+                .filter(|p| p.metadata.deletion_timestamp.is_none() && pod_is_ready(p))
+                .collect();
+            ready.sort_by(|a, b| {
+                a.metadata
+                    .creation_timestamp
+                    .as_ref()
+                    .map(|t| t.0)
+                    .cmp(&b.metadata.creation_timestamp.as_ref().map(|t| t.0))
+            });
+            if let Some(name) = ready.last().and_then(|p| p.metadata.name.clone()) {
+                return Ok(name);
+            }
+            last_phase = pods
+                .items
+                .first()
+                .and_then(|p| p.status.as_ref())
+                .and_then(|s| s.phase.clone())
+                .unwrap_or_else(|| "<none>".into());
+            if Instant::now() >= deadline {
+                return Err(ComputeError::Internal(format!(
+                    "pod for instance '{instance}' not Ready in time (last phase: {last_phase})"
+                )));
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
     fn instance_status_from_pod(instance: &InstanceId, pod: Option<Pod>) -> InstanceStatus {
         let Some(pod) = pod else {
             return InstanceStatus {
@@ -523,14 +589,31 @@ impl KubernetesCompute {
         }
         vec![]
     }
-}
 
-#[async_trait]
-impl Compute for KubernetesCompute {
-    async fn provision(&self, definition: &ComputeDefinition) -> Result<InstanceId> {
-        let raw = instance_name_from_definition(definition);
-        let instance = ensure_dns_label(&raw);
-        // Create the default PVC only when an override isn't provided.
+    /// k3s-only: provision with a fixed StatefulSet name and optional pinned NodePort (30000–32767).
+    pub async fn provision_pinned(
+        &self,
+        definition: &ComputeDefinition,
+        instance_name: &str,
+        node_port: Option<u16>,
+    ) -> Result<InstanceId> {
+        let mut ports = definition.ports.clone();
+        if let Some(port) = node_port.filter(|p| is_valid_k8s_node_port(i32::from(*p))) {
+            for mapping in &mut ports {
+                mapping.host_port = Some(port);
+            }
+        }
+        let mut def = definition.clone();
+        def.ports = ports;
+        self.provision_with_instance(&def, instance_name).await
+    }
+
+    async fn provision_with_instance(
+        &self,
+        definition: &ComputeDefinition,
+        instance_name: &str,
+    ) -> Result<InstanceId> {
+        let instance = ensure_dns_label(instance_name);
         let wants_override = definition
             .host_data_dir
             .as_ref()
@@ -542,6 +625,40 @@ impl Compute for KubernetesCompute {
         self.ensure_service(&instance, &definition.ports).await?;
         self.ensure_statefulset(&instance, definition).await?;
         Ok(InstanceId(instance))
+    }
+
+    /// Tear down StatefulSet/Service and delete `{instance}-data` plus any extra PVC names.
+    pub async fn remove_instance_with_pvcs(
+        &self,
+        id: &InstanceId,
+        extra_pvcs: &[String],
+    ) -> Result<()> {
+        let stss = self.api_statefulsets();
+        let svcs = self.api_services();
+        let pvcs = self.api_pvcs();
+
+        let _ = stss.delete(&id.0, &DeleteParams::default()).await;
+        let _ = svcs.delete(&Self::svc_name(&id.0), &DeleteParams::default()).await;
+
+        let mut names = vec![format!("{}-data", id.0)];
+        for extra in extra_pvcs {
+            let e = extra.trim();
+            if !e.is_empty() && !names.iter().any(|n| n == e) {
+                names.push(e.to_string());
+            }
+        }
+        for name in names {
+            let _ = pvcs.delete(&name, &DeleteParams::default()).await;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Compute for KubernetesCompute {
+    async fn provision(&self, definition: &ComputeDefinition) -> Result<InstanceId> {
+        let raw = instance_name_from_definition(definition);
+        self.provision_with_instance(definition, &raw).await
     }
 
     async fn start(&self, id: &InstanceId, _options: StartOptions) -> Result<InstanceStatus> {
@@ -644,7 +761,7 @@ impl Compute for KubernetesCompute {
     }
 
     async fn exec(&self, id: &InstanceId, command: &str, _user: Option<&str>) -> Result<ExecOutput> {
-        let pod = self.find_pod_name(&id.0).await?;
+        let pod = self.wait_ready_pod_name(&id.0).await?;
         let pods = self.api_pods();
         let ap = AttachParams::default()
             .container("db")
@@ -652,14 +769,31 @@ impl Compute for KubernetesCompute {
             .stdout(true)
             .stdin(false)
             .tty(false);
-        let mut attached = pods
-            .exec(
-                &pod,
-                vec!["/bin/sh".to_string(), "-c".to_string(), command.to_string()],
-                &ap,
-            )
-            .await
-            .map_err(|e| ComputeError::Internal(format!("k8s exec failed: {e}")))?;
+        // The kubelet stream can still reject the WebSocket upgrade (400) for a
+        // moment after the pod reports Ready; retry transient upgrade failures.
+        let mut attached = {
+            let mut attempt = 0;
+            loop {
+                match pods
+                    .exec(
+                        &pod,
+                        vec!["/bin/sh".to_string(), "-c".to_string(), command.to_string()],
+                        &ap,
+                    )
+                    .await
+                {
+                    Ok(a) => break a,
+                    Err(e) if attempt < 5 => {
+                        attempt += 1;
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        tracing::debug!("k8s exec upgrade retry {attempt}/5: {e}");
+                    }
+                    Err(e) => {
+                        return Err(ComputeError::Internal(format!("k8s exec failed: {e}")));
+                    }
+                }
+            }
+        };
 
         let mut stdout = String::new();
         let mut stderr = String::new();
@@ -743,17 +877,7 @@ impl Compute for KubernetesCompute {
     }
 
     async fn remove_instance(&self, id: &InstanceId) -> Result<()> {
-        let stss = self.api_statefulsets();
-        let svcs = self.api_services();
-        let pvcs = self.api_pvcs();
-
-        let _ = stss.delete(&id.0, &DeleteParams::default()).await;
-        let _ = svcs.delete(&Self::svc_name(&id.0), &DeleteParams::default()).await;
-        // Only delete the default PVC derived from instance name.
-        let _ = pvcs
-            .delete(&format!("{}-data", id.0), &DeleteParams::default())
-            .await;
-        Ok(())
+        self.remove_instance_with_pvcs(id, &[]).await
     }
 
     async fn get_task_connection_info(

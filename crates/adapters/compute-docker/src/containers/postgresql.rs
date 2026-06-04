@@ -543,6 +543,14 @@ impl DatabaseProvider for PostgresqlProvider {
         Ok(cmd)
     }
 
+    fn query_in_instance_command(&self, sql: &str) -> std::result::Result<String, ProviderError> {
+        const DELIM: &str = "GFS_SQL_EOF";
+        let body = gfs_domain::utils::shell::sql_heredoc_body(DELIM, sql)?;
+        Ok(format!(
+            r#"PGPASSWORD="${{POSTGRES_PASSWORD:-postgres}}" psql -h 127.0.0.1 -U "${{POSTGRES_USER:-postgres}}" -d "${{POSTGRES_DB:-postgres}}" -v ON_ERROR_STOP=1 -c "{body}""#
+        ))
+    }
+
     // -----------------------------------------------------------------------
     // Schema Extraction
     // -----------------------------------------------------------------------
@@ -960,6 +968,19 @@ mod tests {
         assert!(spec.command.contains("pg_restore"));
         assert!(spec.command.contains("/data/import.dump"));
         assert_eq!(spec.input_filename, "import.dump");
+    }
+
+    #[test]
+    fn query_in_instance_command_uses_loopback_and_heredoc() {
+        let provider = PostgresqlProvider::new();
+        let cmd = provider
+            .query_in_instance_command("SELECT 1;")
+            .expect("query command");
+        assert!(cmd.contains("127.0.0.1"));
+        assert!(cmd.contains("POSTGRES_USER:-postgres"));
+        assert!(cmd.contains("GFS_SQL_EOF"));
+        assert!(cmd.contains("SELECT 1;"));
+        assert!(!cmd.starts_with("psql postgresql://"));
     }
 
     #[test]

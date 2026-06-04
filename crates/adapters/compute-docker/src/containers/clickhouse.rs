@@ -464,6 +464,14 @@ fi"#,
         Ok(cmd)
     }
 
+    fn query_in_instance_command(&self, sql: &str) -> std::result::Result<String, ProviderError> {
+        const DELIM: &str = "GFS_SQL_EOF";
+        let body = gfs_domain::utils::shell::sql_heredoc_body(DELIM, sql)?;
+        Ok(format!(
+            r#"clickhouse-client --host 127.0.0.1 --user "${{CLICKHOUSE_USER:-default}}" --password "${{CLICKHOUSE_PASSWORD:-clickhouse}}" --database "${{CLICKHOUSE_DB:-default}}" --query "{body}""#
+        ))
+    }
+
     fn schema_extraction_queries(&self) -> std::collections::HashMap<String, String> {
         let mut queries = std::collections::HashMap::new();
 

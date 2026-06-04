@@ -391,6 +391,17 @@ pub trait DatabaseProvider: Send + Sync {
         query: Option<&str>,
     ) -> std::result::Result<std::process::Command, ProviderError>;
 
+    /// Shell command to run **inside** the running database instance (via [`Compute::exec`]).
+    ///
+    /// Uses container env vars and loopback — no host-side client binaries. Interactive
+    /// sessions are not supported; `sql` must be non-empty.
+    fn query_in_instance_command(&self, sql: &str) -> std::result::Result<String, ProviderError> {
+        let _ = sql;
+        Err(ProviderError::UnsupportedFormat(
+            "query_in_instance".into(),
+        ))
+    }
+
     // -----------------------------------------------------------------------
     // Schema Extraction
     // -----------------------------------------------------------------------

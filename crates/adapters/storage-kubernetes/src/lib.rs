@@ -17,14 +17,14 @@ use gfs_domain::ports::storage::{
 };
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, PersistentVolumeClaimSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use kube::api::{Api, DynamicObject, Patch, PatchParams};
+use kube::api::{Api, DeleteParams, DynamicObject, Patch, PatchParams};
 use kube::core::{ApiResource, GroupVersionKind};
 use kube::Client;
 use serde_json::json;
 
 const DEFAULT_NAMESPACE: &str = "gfs";
 const DEFAULT_SNAPSHOT_CLASS: &str = "openebs-zfs-gfs-snapclass";
-const DEFAULT_PVC_SIZE_GI: &str = "5";
+const DEFAULT_PVC_SIZE_GI: &str = "1";
 
 fn k8s_snapshot_class() -> String {
     std::env::var("GFS_K8S_SNAPSHOT_CLASS")
@@ -107,9 +107,58 @@ impl KubernetesStorage {
         Api::namespaced_with(self.client.clone(), &self.namespace, &ar)
     }
 
-    async fn wait_snapshot_ready(&self, name: &str) -> std::result::Result<(), StorageError> {
-        let api = self.api_volume_snapshots();
+    /// Delete a PVC if it exists (best-effort; waits for removal).
+    pub async fn delete_pvc(&self, name: &str) -> std::result::Result<(), StorageError> {
+        let pvcs = self.api_pvcs();
+        let name = name.trim();
+        if name.is_empty() {
+            return Ok(());
+        }
+        match pvcs.delete(name, &DeleteParams::default()).await {
+            Ok(_) => {}
+            Err(kube::Error::Api(err)) if err.code == 404 => return Ok(()),
+            Err(e) => {
+                return Err(StorageError::Internal(format!("delete pvc failed: {e}")));
+            }
+        }
         for _ in 0..120 {
+            if pvcs.get(name).await.is_err() {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        Err(StorageError::Internal(format!(
+            "pvc '{name}' still exists after delete"
+        )))
+    }
+
+    /// Wait until PVC phase is Bound (after restore from VolumeSnapshot).
+    pub async fn wait_pvc_bound(&self, name: &str) -> std::result::Result<(), StorageError> {
+        let pvcs = self.api_pvcs();
+        for _ in 0..240 {
+            let pvc = pvcs
+                .get(name)
+                .await
+                .map_err(|_| StorageError::NotFound(name.to_string()))?;
+            let phase = pvc
+                .status
+                .as_ref()
+                .and_then(|s| s.phase.as_deref())
+                .unwrap_or("");
+            if phase == "Bound" {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        Err(StorageError::Internal(format!(
+            "pvc '{name}' did not reach Bound in time"
+        )))
+    }
+
+    pub async fn wait_snapshot_ready(&self, name: &str) -> std::result::Result<(), StorageError> {
+        let api = self.api_volume_snapshots();
+        // ZFS VolumeSnapshots on dev k3s can take >60s under load.
+        for _ in 0..360 {
             let vs = api
                 .get(name)
                 .await
