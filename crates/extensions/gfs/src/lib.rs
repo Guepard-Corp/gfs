@@ -109,6 +109,13 @@ unsafe fn gfs_route(
     params: pg_sys::ParamListInfo,
 ) -> *mut pg_sys::PlannedStmt {
     let parse_copy = pg_sys::copyObjectImpl(parse as *const _) as *mut pg_sys::Query;
+    // A WRITE (UPDATE/DELETE/INSERT..SELECT) must NEVER be federated: swapping the
+    // query's clone RTEs to foreign would swap the ModifyTable's RESULT relation too,
+    // sending the write to the SOURCE (corrupting prod, or erroring on a read-only
+    // mapping). For writes we therefore never swap -> the federate fallback below
+    // whole-hydrates those tables LOCALLY, so the write applies to complete local
+    // data with the source untouched. Only SELECT may federate.
+    let is_write = !parse.is_null() && (*parse).commandType != pg_sys::CmdType::CMD_SELECT;
     let stmt = base_plan(parse, qs, cursor, params); // cold plan, to inspect
 
     let mut ctx =
@@ -135,10 +142,12 @@ unsafe fn gfs_route(
     // e.g. an exotic shape): own those tables whole — NEVER serve a local
     // incomplete result.
     if !ctx.federate_targets.is_empty() {
-        if !parse_copy.is_null() && swap_clone_rtes_to_foreign(parse_copy) > 0 {
+        if !is_write && !parse_copy.is_null() && swap_clone_rtes_to_foreign(parse_copy) > 0 {
             gfs_throttle(); // rate-limit source contact (the federated query hits prod)
             return base_plan(parse_copy, qs, cursor, params);
         }
+        // Writes never reach the swap above -> they whole-hydrate locally here, so an
+        // UPDATE/DELETE applies to complete local data (source untouched).
         for t in &ctx.federate_targets {
             do_hydrate(t); // whole-table fallback (correct, not lazy)
         }
