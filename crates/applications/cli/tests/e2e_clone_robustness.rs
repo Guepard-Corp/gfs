@@ -315,3 +315,31 @@ fn clone_local_writes_leave_source_untouched() {
     assert_eq!(psql(remote, "shop", "SELECT count(*) FROM orders"), src_before, "SOURCE rows not deleted");
     drop(cl);
 }
+
+/// A locally-deleted row stays deleted: a later whole-table warm must NOT resurrect
+/// it (copy-on-write tombstones).
+#[test]
+#[serial]
+fn clone_local_delete_not_resurrected_by_warm() {
+    if !gfs_image_present() { return; }
+    let repo = TempDir::new().unwrap();
+    let repo_path = repo.path().to_path_buf();
+    let mut cl = Cleanup::new(repo);
+    let remote = "gfs-e2e-rob-tomb";
+    let clone = setup(&mut cl, remote, &repo_path);
+
+    psql(&clone, "postgres", "DELETE FROM orders WHERE id=5");
+    assert_eq!(psql(&clone, "postgres", "SELECT count(*) FROM orders WHERE id=5"), "0", "row deleted locally");
+    assert_eq!(psql(&clone, "postgres", "SELECT count(*) FROM gfs.tombstone WHERE relid='orders'::regclass"), "1",
+        "delete recorded a tombstone");
+
+    // Warm the whole table from the source -> the tombstoned row must NOT come back.
+    psql(&clone, "postgres", "SELECT gfs.warm('orders'::regclass)");
+    assert_eq!(psql(&clone, "postgres", "SELECT count(*) FROM orders WHERE id=5"), "0",
+        "tombstoned row NOT resurrected by warm");
+    assert_eq!(psql(&clone, "postgres", "SELECT count(*) FROM orders"),
+        (psql(remote, "shop", "SELECT count(*) FROM orders").parse::<i64>().unwrap() - 1).to_string(),
+        "clone has every source row except the one deleted");
+    assert_eq!(psql(remote, "shop", "SELECT count(*) FROM orders WHERE id=5"), "1", "source row untouched");
+    drop(cl);
+}

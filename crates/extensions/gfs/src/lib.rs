@@ -1094,6 +1094,35 @@ unsafe fn do_hydrate(h: &Hydration) -> bool {
         return h.where_sql.is_empty() && !h.time_key;
     }
 
+    // Exclude copy-on-write DELETE tombstones so hydration never resurrects a local
+    // DELETE -- only when this table has tombstones (the no-deletes case stays
+    // zero-overhead). `src` aliases the source so `to_jsonb(src)` builds the row.
+    let src = format!("{} src", h.source_ref);
+    let excl = {
+        let q = CString::new(format!(
+            "SELECT EXISTS(SELECT 1 FROM gfs.tombstone WHERE relid::oid = {})::int::text",
+            u32::from(h.relid)
+        ))
+        .unwrap();
+        let mut has = false;
+        if pg_sys::SPI_execute(q.as_ptr(), true, 1) == pg_sys::SPI_OK_SELECT as i32
+            && pg_sys::SPI_processed == 1
+        {
+            let tt = pg_sys::SPI_tuptable;
+            let row = *(*tt).vals;
+            let td = (*tt).tupdesc;
+            has = spi_text(pg_sys::SPI_getvalue(row, td, 1)).as_deref() == Some("1");
+        }
+        if has {
+            format!(
+                " AND NOT EXISTS (SELECT 1 FROM gfs.tombstone tb WHERE tb.relid::oid = {} AND to_jsonb(src) @> tb.pk)",
+                u32::from(h.relid)
+            )
+        } else {
+            String::new()
+        }
+    };
+
     // PARTIAL: pull the matching slice with a HARD cap and self-validate against
     // REALITY (not an estimate). One source contact. `matched` (LIMIT cap+1) tells
     // us whether the source had MORE than the cap of matching rows: if so the slice
@@ -1103,10 +1132,10 @@ unsafe fn do_hydrate(h: &Hydration) -> bool {
     if !h.where_sql.is_empty() {
         let cap = h.partial_cap.max(0);
         let sql = format!(
-            "WITH picked AS (SELECT {c} FROM {s} WHERE {w} LIMIT {lim}), \
+            "WITH picked AS (SELECT {c} FROM {s} WHERE {w}{excl} LIMIT {lim}), \
                   ins AS (INSERT INTO {l} ({c}) SELECT {c} FROM picked ON CONFLICT DO NOTHING RETURNING 1) \
              SELECT (SELECT count(*) FROM picked)::int8::text, (SELECT count(*) FROM ins)::int8::text",
-            c = h.collist, s = h.source_ref, w = h.where_sql, l = h.local_ref, lim = cap + 1
+            c = h.collist, s = src, w = h.where_sql, excl = excl, l = h.local_ref, lim = cap + 1
         );
         let q = CString::new(sql).unwrap();
         let (mut matched, mut inserted) = (0i64, 0i64);
@@ -1167,10 +1196,10 @@ unsafe fn do_hydrate(h: &Hydration) -> bool {
         }
         let where_clause = if conds.is_empty() { "true".to_string() } else { conds.join(" AND ") };
         let sql = format!(
-            "WITH picked AS (SELECT {c} FROM {s} WHERE {w} LIMIT {lim}), \
+            "WITH picked AS (SELECT {c} FROM {s} WHERE {w}{excl} LIMIT {lim}), \
                   ins AS (INSERT INTO {l} ({c}) SELECT {c} FROM picked ON CONFLICT DO NOTHING RETURNING 1) \
              SELECT (SELECT count(*) FROM picked)::int8::text, (SELECT count(*) FROM ins)::int8::text",
-            c = h.collist, s = h.source_ref, w = where_clause, l = h.local_ref, lim = cap + 1
+            c = h.collist, s = src, w = where_clause, excl = excl, l = h.local_ref, lim = cap + 1
         );
         let q = CString::new(sql).unwrap();
         let (mut matched, mut inserted) = (0i64, 0i64);
@@ -1196,13 +1225,13 @@ unsafe fn do_hydrate(h: &Hydration) -> bool {
     // WHOLE / RANGE.
     let sql = if h.whole {
         format!(
-            "INSERT INTO {l} ({c}) SELECT {c} FROM {s} ON CONFLICT DO NOTHING",
-            l = h.local_ref, c = h.collist, s = h.source_ref
+            "INSERT INTO {l} ({c}) SELECT {c} FROM {s} WHERE true{excl} ON CONFLICT DO NOTHING",
+            l = h.local_ref, c = h.collist, s = src, excl = excl
         )
     } else {
         format!(
-            "INSERT INTO {l} ({c}) SELECT {c} FROM {s} WHERE {k} BETWEEN {lo} AND {hi} ON CONFLICT DO NOTHING",
-            l = h.local_ref, c = h.collist, s = h.source_ref, k = h.key_col, lo = h.lo, hi = h.hi
+            "INSERT INTO {l} ({c}) SELECT {c} FROM {s} WHERE {k} BETWEEN {lo} AND {hi}{excl} ON CONFLICT DO NOTHING",
+            l = h.local_ref, c = h.collist, s = src, k = h.key_col, lo = h.lo, hi = h.hi, excl = excl
         )
     };
     let q = CString::new(sql).unwrap();
@@ -1372,6 +1401,30 @@ CREATE TABLE gfs.cached_predicate (
 );
 COMMENT ON TABLE gfs.cached_predicate IS 'Non-key predicates seen by the router: complete=fully hydrated (local), overflowed=too many matches (federate). A bare row (both false) is a second-chance "seen once" marker.';
 
+-- Copy-on-write DELETE tombstones: a user DELETE on a clone table records the
+-- deleted row's PRIMARY KEY (as jsonb) here, so later copy-on-read hydration never
+-- re-fetches/resurrects it. Matched by `to_jsonb(source_row) @> pk`.
+CREATE TABLE gfs.tombstone (
+    relid regclass NOT NULL REFERENCES gfs.clone_source(relid) ON DELETE CASCADE,
+    pk    jsonb    NOT NULL,
+    PRIMARY KEY (relid, pk)
+);
+COMMENT ON TABLE gfs.tombstone IS 'PRIMARY KEYs of locally-deleted rows; hydration excludes them so a local DELETE is never resurrected';
+
+CREATE FUNCTION gfs.note_tombstone() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE pkcols text[]; pkjson jsonb;
+BEGIN
+    SELECT array_agg(a.attname) INTO pkcols
+      FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+     WHERE i.indrelid = TG_RELID AND i.indisprimary;
+    IF pkcols IS NULL THEN RETURN OLD; END IF;            -- keyless table: nothing to tombstone
+    SELECT jsonb_object_agg(k, v) INTO pkjson
+      FROM jsonb_each(to_jsonb(OLD)) AS j(k, v) WHERE k = ANY(pkcols);
+    INSERT INTO gfs.tombstone(relid, pk) VALUES (TG_RELID, pkjson) ON CONFLICT DO NOTHING;
+    RETURN OLD;
+END $$;
+COMMENT ON FUNCTION gfs.note_tombstone() IS 'AFTER DELETE trigger: record the deleted row PK so hydration never resurrects it';
+
 CREATE TABLE gfs.clone_stats (
     relid          regclass PRIMARY KEY REFERENCES gfs.clone_source(relid) ON DELETE CASCADE,
     fetch_calls    bigint NOT NULL DEFAULT 0,
@@ -1449,6 +1502,9 @@ BEGIN
                       chunk_kind = EXCLUDED.chunk_kind, source_rows = EXCLUDED.source_rows,
                       row_bytes = EXCLUDED.row_bytes;
     INSERT INTO gfs.clone_stats(relid) VALUES (local) ON CONFLICT (relid) DO NOTHING;
+    -- Record local DELETEs so hydration never resurrects them (copy-on-write).
+    EXECUTE format('CREATE OR REPLACE TRIGGER gfs_tombstone AFTER DELETE ON %s
+                    FOR EACH ROW EXECUTE FUNCTION gfs.note_tombstone()', local);
 END;
 $$;
 COMMENT ON FUNCTION gfs.register_clone(regclass, text, text) IS
@@ -1472,8 +1528,12 @@ BEGIN
     SELECT string_agg(quote_ident(attname), ', ' ORDER BY attnum) INTO cols
       FROM pg_attribute
      WHERE attrelid = local AND attnum > 0 AND NOT attisdropped AND attgenerated = '';
-    EXECUTE format('INSERT INTO %s (%s) SELECT %s FROM %s ON CONFLICT DO NOTHING',
-                   local::text, cols, cols, src);
+    -- Exclude locally-deleted rows so warming never resurrects a copy-on-write DELETE.
+    EXECUTE format('INSERT INTO %s (%s) SELECT %s FROM %s s
+                    WHERE NOT EXISTS (SELECT 1 FROM gfs.tombstone tb
+                                       WHERE tb.relid = %L::regclass AND to_jsonb(s) @> tb.pk)
+                    ON CONFLICT DO NOTHING',
+                   local::text, cols, cols, src, local::text);
     GET DIAGNOSTICS n = ROW_COUNT;
     EXECUTE format('ANALYZE %s', local::text);
     UPDATE gfs.clone_source SET whole_cached = true WHERE relid = local;
@@ -1500,7 +1560,7 @@ CREATE VIEW gfs.clones AS
      ORDER BY s.relid::text;
 
 GRANT USAGE ON SCHEMA gfs TO PUBLIC;
-GRANT SELECT ON gfs.clone_source, gfs.cached, gfs.cached_predicate, gfs.clone_stats, gfs.cost, gfs.budget, gfs.clones TO PUBLIC;
+GRANT SELECT ON gfs.clone_source, gfs.cached, gfs.cached_predicate, gfs.tombstone, gfs.clone_stats, gfs.cost, gfs.budget, gfs.clones TO PUBLIC;
 "#,
     name = "gfs_catalog",
 );

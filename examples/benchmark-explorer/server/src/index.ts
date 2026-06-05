@@ -282,7 +282,7 @@ app.post("/api/reset", async () => {
     DECLARE t text;
     BEGIN
       FOR t IN SELECT clone FROM gfs.clones LOOP EXECUTE 'TRUNCATE '||t; END LOOP;
-      DELETE FROM gfs.cached; DELETE FROM gfs.cached_predicate;
+      DELETE FROM gfs.cached; DELETE FROM gfs.cached_predicate; DELETE FROM gfs.tombstone;
       UPDATE gfs.clone_source SET whole_cached=false, access_count=0, partial_rows=0, no_partial=false;
       UPDATE gfs.clone_stats SET rows_fetched=0, fetch_calls=0, federate_calls=0;
     END $$;`);
