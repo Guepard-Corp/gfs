@@ -1081,6 +1081,200 @@ unsafe fn gfs_throttle() {
     }
 }
 
+/// Hard cap on concurrent dblink scans regardless of the gfs.cost knob (one source
+/// gets at most this many parallel readers per backfill, to protect prod).
+const PARALLEL_WORKERS_CAP: i64 = 8;
+
+/// Record coverage (whole_cached / coalesced range) and refresh planner stats after
+/// a whole/int-range fetch. Shared by the single-statement path and the parallel
+/// backfill. Caller holds an open SPI connection.
+unsafe fn record_whole_or_range(h: &Hydration, n: i64) {
+    let rec = if h.whole {
+        format!("UPDATE gfs.clone_source SET whole_cached = true WHERE relid::oid = {}", u32::from(h.relid))
+    } else {
+        format!("SELECT gfs.note_range({}::oid::regclass, {}, {})", u32::from(h.relid), h.lo, h.hi)
+    };
+    pg_sys::SPI_execute(CString::new(rec).unwrap().as_ptr(), false, 0);
+    hydrate_finish(h, n);
+}
+
+/// Disconnect dblink backfill connections `0..upto` (best-effort cleanup on bail).
+unsafe fn cleanup_backfill_conns(relid: pg_sys::Oid, upto: usize) {
+    for k in 0..upto {
+        let d = CString::new(format!("SELECT dblink_disconnect('gfs_bf_{}_{}')", u32::from(relid), k)).unwrap();
+        pg_sys::SPI_execute(d.as_ptr(), false, 0);
+    }
+}
+
+/// Read column 1 of the single-row result of the just-run SPI SELECT as text.
+unsafe fn spi_cell1() -> Option<String> {
+    if pg_sys::SPI_processed != 1 {
+        return None;
+    }
+    let tt = pg_sys::SPI_tuptable;
+    let row = *(*tt).vals;
+    spi_text(pg_sys::SPI_getvalue(row, (*tt).tupdesc, 1))
+}
+
+/// Fan a large whole/int-range backfill over N concurrent dblink scans against the
+/// source -- CTID-block partitioning for a whole table (no usable key -> heap scan),
+/// key-range split for an int range (indexed key) -- instead of one FDW cursor. The
+/// N scans run concurrently on the source; we drain + insert locally. Returns
+/// Some(rows_inserted) on success, or None to fall back to the single-statement path
+/// (parallelism disabled, table too small, range not large enough, or source
+/// metadata unavailable). Caller holds SPI open. Every per-worker insert is
+/// ON CONFLICT DO NOTHING, so a fallback after a partial fan is idempotent/harmless.
+/// Read-only on the source; no replication slot. dblink reuses the existing FDW
+/// server `gfs_remote_srv` (+ its PUBLIC user mapping) -- no new connstr/secret.
+unsafe fn try_parallel_backfill(h: &Hydration, has_tomb: bool) -> Option<i64> {
+    // --- knobs + source size estimate + dblink availability (one row) ---
+    let q = CString::new(format!(
+        "SELECT x.parallel_workers::text, x.parallel_min_pages::text, x.parallel_min_frac::text, \
+                s.source_rows::text, s.row_bytes::text, \
+                (to_regprocedure('dblink_send_query(text,text)') IS NOT NULL)::int::text \
+           FROM gfs.cost x, gfs.clone_source s WHERE s.relid::oid = {}",
+        u32::from(h.relid)
+    )).unwrap();
+    if pg_sys::SPI_execute(q.as_ptr(), true, 1) != pg_sys::SPI_OK_SELECT as i32 || pg_sys::SPI_processed != 1 {
+        return None;
+    }
+    let tt = pg_sys::SPI_tuptable;
+    let row = *(*tt).vals;
+    let td = (*tt).tupdesc;
+    let num = |i| spi_text(pg_sys::SPI_getvalue(row, td, i)).and_then(|s| s.trim().parse::<f64>().ok());
+    let workers = num(1).unwrap_or(0.0) as i64;
+    let min_pages = num(2).unwrap_or(f64::INFINITY);
+    let min_frac = num(3).unwrap_or(1.0);
+    let source_rows = num(4).unwrap_or(0.0);
+    let row_bytes = num(5).unwrap_or(1.0).max(1.0);
+    let has_dblink = num(6).unwrap_or(0.0) as i64 == 1;
+
+    if workers <= 1 || !has_dblink {
+        return None; // disabled (kill-switch), or dblink not installed -> single-statement path
+    }
+    let n = workers.clamp(1, PARALLEL_WORKERS_CAP) as usize;
+    let est_pages = (source_rows.max(0.0) * row_bytes / 8192.0).ceil();
+    if est_pages <= min_pages {
+        return None; // too small to be worth fanning out
+    }
+    if !h.whole {
+        let span = (h.hi.saturating_sub(h.lo)).saturating_add(1).max(0) as f64;
+        if span < min_frac * source_rows.max(1.0) {
+            return None; // a narrow range stays on the indexed single-statement path
+        }
+    }
+
+    // --- real source-side schema.table behind the foreign table (quoted) ---
+    let fq = CString::new(format!(
+        "SELECT quote_ident(COALESCE((SELECT option_value FROM pg_options_to_table(ft.ftoptions) WHERE option_name = 'schema_name'), n.nspname)), \
+                quote_ident(COALESCE((SELECT option_value FROM pg_options_to_table(ft.ftoptions) WHERE option_name = 'table_name'), c.relname)) \
+           FROM pg_foreign_table ft JOIN pg_class c ON c.oid = ft.ftrelid JOIN pg_namespace n ON n.oid = c.relnamespace \
+          WHERE ft.ftrelid = '{}'::regclass",
+        h.source_ref.replace('\'', "''")
+    )).unwrap();
+    if pg_sys::SPI_execute(fq.as_ptr(), true, 1) != pg_sys::SPI_OK_SELECT as i32 || pg_sys::SPI_processed != 1 {
+        return None;
+    }
+    let tt = pg_sys::SPI_tuptable;
+    let row = *(*tt).vals;
+    let td = (*tt).tupdesc;
+    let sch = spi_text(pg_sys::SPI_getvalue(row, td, 1))?;
+    let tbl = spi_text(pg_sys::SPI_getvalue(row, td, 2))?;
+    let src_qual = format!("{}.{}", sch, tbl);
+
+    // --- typed column list for dblink_get_result (same types as the local table) ---
+    let cq = CString::new(format!(
+        "SELECT string_agg(quote_ident(attname) || ' ' || format_type(atttypid, atttypmod), ', ' ORDER BY attnum) \
+           FROM pg_attribute WHERE attrelid = '{}'::regclass AND attnum > 0 AND NOT attisdropped AND attgenerated = ''",
+        h.local_ref.replace('\'', "''")
+    )).unwrap();
+    if pg_sys::SPI_execute(cq.as_ptr(), true, 1) != pg_sys::SPI_OK_SELECT as i32 {
+        return None;
+    }
+    let coldef = spi_cell1()?;
+    if coldef.is_empty() {
+        return None;
+    }
+
+    // --- partition predicates ---
+    let preds: Vec<String> = if h.whole {
+        // CTID-block: [0, est_pages] split into n page ranges; last worker open-ended
+        // (captures rows beyond the estimate). ctid is pushed verbatim by dblink.
+        let per = (est_pages / n as f64).ceil().max(1.0) as i64;
+        (0..n)
+            .map(|k| {
+                let lo = k as i64 * per;
+                if k == n - 1 {
+                    format!("ctid >= '({},0)'::tid", lo)
+                } else {
+                    format!("ctid >= '({},0)'::tid AND ctid < '({},0)'::tid", lo, (k as i64 + 1) * per)
+                }
+            })
+            .collect()
+    } else {
+        // key-range split of [lo, hi] over the indexed int key
+        let span = (h.hi - h.lo).saturating_add(1).max(1);
+        let step = (span as f64 / n as f64).ceil().max(1.0) as i64;
+        (0..n)
+            .filter_map(|k| {
+                let wlo = h.lo.saturating_add(k as i64 * step);
+                if wlo > h.hi {
+                    return None;
+                }
+                let whi = if k == n - 1 { h.hi } else { wlo.saturating_add(step - 1).min(h.hi) };
+                Some(format!("{} BETWEEN {} AND {}", h.key_col, wlo, whi))
+            })
+            .collect()
+    };
+    if preds.is_empty() {
+        return None;
+    }
+    let m = preds.len();
+
+    // Tombstone exclusion re-aliased to the local result set `t` (the source query
+    // can't see the local gfs.tombstone table; we filter after the fetch instead).
+    let excl_t = if has_tomb {
+        format!(" AND NOT EXISTS (SELECT 1 FROM gfs.tombstone tb WHERE tb.relid::oid = {} AND to_jsonb(t) @> tb.pk)", u32::from(h.relid))
+    } else {
+        String::new()
+    };
+
+    // Open all connections + dispatch all scans: the N source scans now run
+    // concurrently. A connect/dispatch failure bails to the single-statement path.
+    for (k, pred) in preds.iter().enumerate() {
+        let conn = format!("gfs_bf_{}_{}", u32::from(h.relid), k);
+        let c = CString::new(format!("SELECT dblink_connect('{}', 'gfs_remote_srv')", conn)).unwrap();
+        if pg_sys::SPI_execute(c.as_ptr(), false, 0) != pg_sys::SPI_OK_SELECT as i32 {
+            cleanup_backfill_conns(h.relid, k);
+            return None;
+        }
+        // dollar-quote the remote SQL so the ctid literals need no escaping.
+        let remote = format!("SELECT {} FROM {} WHERE {}", h.collist, src_qual, pred);
+        let s = CString::new(format!("SELECT dblink_send_query('{}', $gfsq${}$gfsq$)", conn, remote)).unwrap();
+        if pg_sys::SPI_execute(s.as_ptr(), false, 0) != pg_sys::SPI_OK_SELECT as i32 {
+            cleanup_backfill_conns(h.relid, k + 1);
+            return None;
+        }
+    }
+
+    // Drain each result and insert locally (sequential locally; the slow source
+    // scan + network already overlapped across workers).
+    let mut total: i64 = 0;
+    for k in 0..m {
+        let conn = format!("gfs_bf_{}_{}", u32::from(h.relid), k);
+        let ins = CString::new(format!(
+            "INSERT INTO {l} ({c}) SELECT {c} FROM dblink_get_result('{conn}') AS t({cd}) WHERE true{excl} ON CONFLICT DO NOTHING",
+            l = h.local_ref, c = h.collist, conn = conn, cd = coldef, excl = excl_t
+        )).unwrap();
+        if pg_sys::SPI_execute(ins.as_ptr(), false, 0) == pg_sys::SPI_OK_INSERT as i32 {
+            total += pg_sys::SPI_processed as i64;
+        }
+        let d = CString::new(format!("SELECT dblink_disconnect('{}')", conn)).unwrap();
+        pg_sys::SPI_execute(d.as_ptr(), false, 0);
+    }
+    Some(total)
+}
+
 /// Fetch a hydration into the local table. Returns true when the slice/table is
 /// COMPLETE (safe to serve local); returns false ONLY for a PARTIAL pull that
 /// overflowed its cap (too many matches -> not selective -> caller must federate,
@@ -1222,7 +1416,15 @@ unsafe fn do_hydrate(h: &Hydration) -> bool {
         return !overflow;
     }
 
-    // WHOLE / RANGE.
+    // WHOLE / RANGE. Try a parallel fan over the source first (CTID-block / key-range
+    // split via concurrent dblink scans); fall back to one FDW statement on any
+    // ineligibility or setup failure. ON CONFLICT DO NOTHING keeps both paths
+    // idempotent, so a fallback after a partial fan is safe.
+    if let Some(n) = try_parallel_backfill(h, !excl.is_empty()) {
+        record_whole_or_range(h, n);
+        pg_sys::SPI_finish();
+        return true;
+    }
     let sql = if h.whole {
         format!(
             "INSERT INTO {l} ({c}) SELECT {c} FROM {s} WHERE true{excl} ON CONFLICT DO NOTHING",
@@ -1237,14 +1439,7 @@ unsafe fn do_hydrate(h: &Hydration) -> bool {
     let q = CString::new(sql).unwrap();
     let rc = pg_sys::SPI_execute(q.as_ptr(), false, 0);
     let n = if rc == pg_sys::SPI_OK_INSERT as i32 { pg_sys::SPI_processed as i64 } else { 0 };
-
-    let rec = if h.whole {
-        format!("UPDATE gfs.clone_source SET whole_cached = true WHERE relid::oid = {}", u32::from(h.relid))
-    } else {
-        format!("SELECT gfs.note_range({}::oid::regclass, {}, {})", u32::from(h.relid), h.lo, h.hi)
-    };
-    pg_sys::SPI_execute(CString::new(rec).unwrap().as_ptr(), false, 0);
-    hydrate_finish(h, n);
+    record_whole_or_range(h, n);
     pg_sys::SPI_finish();
     true
 }
@@ -1305,8 +1500,15 @@ CREATE TABLE gfs.cost (
                                                     --   ALSO the hard real-pull cap (LIMIT ceil(frac*Tr)+1).
     promote_frac      float8 NOT NULL DEFAULT 0.5,  -- POLICY: cumulative partial-pulled fraction of Tr at which
                                                     --   piecemeal slices auto-promote to ONE whole-own.
-    max_partial_preds int    NOT NULL DEFAULT 10    -- POLICY: max distinct partial predicates (CONTACTS) before
+    max_partial_preds int    NOT NULL DEFAULT 10,   -- POLICY: max distinct partial predicates (CONTACTS) before
                                                     --   promote; bounds tiny-slice floods the row cap can't see.
+    -- PARALLEL BACKFILL: a large whole/int-range fetch fans the source scan over N
+    -- concurrent dblink connections (CTID-block for whole, key-range split for a
+    -- range) instead of one FDW cursor. Pure read; no slot. parallel_workers=1
+    -- disables it entirely (hot kill-switch, no redeploy).
+    parallel_workers   int    NOT NULL DEFAULT 4,    -- POLICY: N concurrent dblink scans (1 = disabled; hard-capped in code)
+    parallel_min_pages bigint NOT NULL DEFAULT 4096, -- POLICY: est. source heap pages above which we parallelize (~32MB @ 8KB)
+    parallel_min_frac  float8 NOT NULL DEFAULT 0.5   -- POLICY: a RANGE fetch parallelizes only when its key span covers > this fraction of Tr
 );
 INSERT INTO gfs.cost DEFAULT VALUES;
 COMMENT ON TABLE gfs.cost IS 'Router weights: net/source/negligible are MEASURED by gfs.calibrate(); ceiling/horizon/prod_load are policy';
