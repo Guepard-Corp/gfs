@@ -91,7 +91,9 @@ struct Hydration {
     whole: bool,
     where_sql: String, // PARTIAL hydration: fetch only rows matching this predicate
     pred_key: String,  // completeness key for the predicate (so repeats serve local)
-    partial_cap: i64,  // PARTIAL: hard row cap (LIMIT = cap+1); overflow -> federate, never local-incomplete
+    partial_cap: i64,  // PARTIAL / time-range: hard row cap (LIMIT = cap+1); overflow -> federate
+    time_key: bool,    // lo/hi are epoch MICROSECONDS on a date/timestamp key (capped range hydrate)
+    key_type: String,  // typname of the key column (for the temporal literal reconstruction)
 }
 
 struct Ctx {
@@ -172,6 +174,8 @@ fn whole_of(h: &Hydration) -> Hydration {
         where_sql: String::new(),
         pred_key: String::new(),
         partial_cap: 0,
+        time_key: false,
+        key_type: String::new(),
     }
 }
 
@@ -255,14 +259,39 @@ unsafe fn classify_scan(
         where_sql: w,
         pred_key: p,
         partial_cap: cap,
+        time_key: false,
+        key_type: info.key_type.clone(),
     };
 
-    // 1. RANGE-key bound (id BETWEEN ...) -> range model: covered -> local, else own
-    //    the key span (with subset/coalesce coverage). Best for key browsing.
-    if info.chunk_kind == "int" && info.key_attno != 0 {
-        if let Some((lo, hi)) = extract_key_range(plan, scanrelid, info.key_attno, tag) {
+    // 1. RANGE-key bound (id BETWEEN / placed_at BETWEEN) -> range model: covered ->
+    //    local (elision), else fetch the missing key span. INTEGER keys size the
+    //    span in rows; TEMPORAL keys (date/timestamp) map the bound to epoch micros
+    //    and fetch a CAPPED slice (we can't size micros in rows) that self-validates
+    //    (overflow -> federate) -- both record coalesced coverage in gfs.cached.
+    let is_time = info.chunk_kind == "time";
+    if (info.chunk_kind == "int" || is_time) && info.key_attno != 0 {
+        if let Some((lo, hi)) = extract_key_range(plan, scanrelid, info.key_attno, tag, is_time) {
             if gfs_is_covered(relid, lo, hi) {
-                return; // already owned
+                return; // already owned (range covered) -> serve local
+            }
+            if is_time {
+                let cap = (info.w_partial_max_frac * tr).floor().max(1.0) as i64;
+                ctx.partials.push(Hydration {
+                    local_ref: info.local_ref.clone(),
+                    source_ref: info.source_ref.clone(),
+                    collist: info.collist.clone(),
+                    relid,
+                    key_col: info.key_col.clone(),
+                    lo,
+                    hi,
+                    whole: false,
+                    where_sql: String::new(),
+                    pred_key: String::new(),
+                    partial_cap: cap,
+                    time_key: true,
+                    key_type: info.key_type.clone(),
+                });
+                return;
             }
             let span = ((hi - lo).saturating_add(1)).max(0) as f64;
             let own_rows = span.min(tr.max(1.0));
@@ -377,6 +406,8 @@ unsafe fn push_by_cost(
             where_sql: String::new(),
             pred_key: String::new(),
             partial_cap: 0,
+            time_key: false,
+            key_type: String::new(),
         });
     }
 }
@@ -394,11 +425,17 @@ unsafe fn rte_fetch(
 // ===========================================================================
 // Range extraction: find [lo,hi] bounds on the table's range key in a scan.
 // ===========================================================================
+// Temporal sentinels (epoch microseconds, UTC) used as the "unbounded" range ends
+// for time keys: reconstructable by to_timestamp and safe under note_range's +1.
+const TIME_FAR_PAST: i64 = -62_135_596_800_000_000; // 0001-01-01
+const TIME_FAR_FUTURE: i64 = 253_402_300_799_000_000; // 9999-12-31 23:59:59
+
 unsafe fn extract_key_range(
     plan: *mut pg_sys::Plan,
     scanrelid: pg_sys::Index,
     key_attno: i16,
     tag: pg_sys::NodeTag,
+    is_time: bool,
 ) -> Option<(i64, i64)> {
     let mut conds: Vec<*mut pg_sys::Node> = Vec::new();
     push_list(&mut conds, (*plan).qual);
@@ -415,8 +452,8 @@ unsafe fn extract_key_range(
         _ => {}
     }
 
-    let mut lo = i64::MIN;
-    let mut hi = i64::MAX;
+    let (mut lo, mut hi) = if is_time { (TIME_FAR_PAST, TIME_FAR_FUTURE) } else { (i64::MIN, i64::MAX) };
+    let decode = |n: *mut pg_sys::Node| if is_time { const_time(n) } else { const_int(n) };
     let mut bounded = false;
     for node in conds {
         if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_OpExpr {
@@ -429,11 +466,11 @@ unsafe fn extract_key_range(
         }
         let a = args.get_ptr(0).unwrap();
         let b = args.get_ptr(1).unwrap();
-        // Identify (Var on the key column, Const integer); handle either order.
+        // Identify (Var on the key column, Const int/temporal); handle either order.
         let (cst, var_left) = if is_key_var(a, scanrelid, key_attno) {
-            (const_int(b), true)
+            (decode(b), true)
         } else if is_key_var(b, scanrelid, key_attno) {
-            (const_int(a), false)
+            (decode(a), false)
         } else {
             continue;
         };
@@ -490,6 +527,40 @@ unsafe fn const_int(node: *mut pg_sys::Node) -> Option<i64> {
         23 => Some(d as i32 as i64), // int4
         21 => Some(d as i16 as i64), // int2
         _ => None,
+    }
+}
+
+/// Decode a DATE / TIMESTAMP / TIMESTAMPTZ Const to epoch MICROSECONDS (UTC), so a
+/// temporal range key maps onto the same integer gfs.cached coverage as integers.
+/// PG stores these relative to 2000-01-01; we shift to the 1970 Unix epoch (the
+/// offset is 946_684_800 s = 10_957 days) and treat the value as UTC -- matched by
+/// the `to_timestamp(...) AT TIME ZONE 'UTC'` reconstruction in do_hydrate.
+unsafe fn const_time(node: *mut pg_sys::Node) -> Option<i64> {
+    if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_Const {
+        return None;
+    }
+    let c = node as *mut pg_sys::Const;
+    if (*c).constisnull {
+        return None;
+    }
+    const PG_EPOCH_US: i64 = 946_684_800_000_000; // 2000-01-01 in epoch microseconds
+    let raw = (*c).constvalue.value() as i64;
+    match u32::from((*c).consttype) {
+        1082 => Some((raw as i32 as i64) * 86_400_000_000 + PG_EPOCH_US), // date: int4 days since 2000
+        1114 | 1184 => Some(raw + PG_EPOCH_US),                            // timestamp(tz): int8 micros since 2000
+        _ => None,
+    }
+}
+
+/// Rebuild a temporal literal from epoch microseconds for the hydration WHERE,
+/// keyed to the column type and pinned to UTC so it round-trips const_time exactly
+/// (timestamptz compares by absolute instant; timestamp/date are wall-clock-as-UTC).
+fn time_recon(epoch_us: i64, key_type: &str) -> String {
+    let base = format!("to_timestamp({}::float8 / 1000000.0)", epoch_us);
+    match key_type {
+        "timestamp" => format!("({} AT TIME ZONE 'UTC')", base),
+        "date" => format!("({} AT TIME ZONE 'UTC')::date", base),
+        _ => base, // timestamptz (absolute instant) + safe fallback
     }
 }
 
@@ -712,6 +783,7 @@ struct CloneInfo {
     chunk_kind: String,
     whole_cached: bool,
     key_col: String,
+    key_type: String,  // typname of the key column ('date'/'timestamp'/'timestamptz' for chunk_kind='time')
     key_attno: i16,
     source_rows: i64,  // Tr: source table size (reltuples, captured at register)
     row_bytes: i64,    // B: avg bytes/row
@@ -751,7 +823,9 @@ unsafe fn gfs_lookup_clone(relid: pg_sys::Oid) -> Option<CloneInfo> {
                 s.source_rows::text, s.row_bytes::text, s.access_count::text, \
                 x.net::text, x.source::text, x.negligible::text, x.ceiling::text, x.horizon::text, \
                 s.partial_rows::text, s.no_partial::int::text, \
-                x.partial_max_frac::text, x.promote_frac::text, x.max_partial_preds::text \
+                x.partial_max_frac::text, x.promote_frac::text, x.max_partial_preds::text, \
+                COALESCE((SELECT t.typname FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid \
+                            WHERE a.attrelid = s.relid AND a.attname = s.key_col), '') \
            FROM gfs.clone_source s, gfs.cost x \
           WHERE s.relid::oid = {} AND to_regclass(s.source_ref) IS NOT NULL",
         u32::from(relid)
@@ -776,6 +850,7 @@ unsafe fn gfs_lookup_clone(relid: pg_sys::Oid) -> Option<CloneInfo> {
                 chunk_kind: k,
                 whole_cached: w == "1",
                 key_col: kc,
+                key_type: g(21).unwrap_or_default(),
                 key_attno: at.trim().parse::<i16>().unwrap_or(0),
                 source_rows: num(8) as i64,
                 row_bytes: num(9) as i64,
@@ -1004,9 +1079,10 @@ unsafe fn gfs_throttle() {
 unsafe fn do_hydrate(h: &Hydration) -> bool {
     gfs_throttle(); // rate-limit source contact
     if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
-        // Couldn't hydrate. A partial would be incomplete -> federate (false). A
-        // whole/range fetch failed but never claimed completeness -> safe (true).
-        return h.where_sql.is_empty();
+        // Couldn't hydrate. A capped pull (partial / time-range) would be incomplete
+        // -> federate (false). A whole/int-range fetch never claims completeness on
+        // failure -> safe (true).
+        return h.where_sql.is_empty() && !h.time_key;
     }
 
     // PARTIAL: pull the matching slice with a HARD cap and self-validate against
@@ -1067,6 +1143,47 @@ unsafe fn do_hydrate(h: &Hydration) -> bool {
         return !overflow;
     }
 
+    // TIME-RANGE: a date/timestamp key bound mapped to epoch micros. We can't size
+    // micros in rows, so fetch a CAPPED slice of the temporal window and self-
+    // validate: if it overflows the cap the window is too big -> federate (no
+    // coverage recorded); else record the [lo,hi] range (coalesced) for elision.
+    if h.time_key {
+        let cap = h.partial_cap.max(0);
+        let mut conds: Vec<String> = Vec::new();
+        if h.lo != TIME_FAR_PAST {
+            conds.push(format!("{} >= {}", h.key_col, time_recon(h.lo, &h.key_type)));
+        }
+        if h.hi != TIME_FAR_FUTURE {
+            conds.push(format!("{} <= {}", h.key_col, time_recon(h.hi, &h.key_type)));
+        }
+        let where_clause = if conds.is_empty() { "true".to_string() } else { conds.join(" AND ") };
+        let sql = format!(
+            "WITH picked AS (SELECT {c} FROM {s} WHERE {w} LIMIT {lim}), \
+                  ins AS (INSERT INTO {l} ({c}) SELECT {c} FROM picked ON CONFLICT DO NOTHING RETURNING 1) \
+             SELECT (SELECT count(*) FROM picked)::int8::text, (SELECT count(*) FROM ins)::int8::text",
+            c = h.collist, s = h.source_ref, w = where_clause, l = h.local_ref, lim = cap + 1
+        );
+        let q = CString::new(sql).unwrap();
+        let (mut matched, mut inserted) = (0i64, 0i64);
+        if pg_sys::SPI_execute(q.as_ptr(), false, 0) == pg_sys::SPI_OK_SELECT as i32
+            && pg_sys::SPI_processed == 1
+        {
+            let tt = pg_sys::SPI_tuptable;
+            let row = *(*tt).vals;
+            let td = (*tt).tupdesc;
+            matched = spi_text(pg_sys::SPI_getvalue(row, td, 1)).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+            inserted = spi_text(pg_sys::SPI_getvalue(row, td, 2)).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+        }
+        let overflow = matched > cap;
+        if !overflow {
+            let nr = CString::new(format!("SELECT gfs.note_range({}::oid::regclass, {}, {})", u32::from(h.relid), h.lo, h.hi)).unwrap();
+            pg_sys::SPI_execute(nr.as_ptr(), false, 0);
+        }
+        hydrate_finish(h, inserted);
+        pg_sys::SPI_finish();
+        return !overflow;
+    }
+
     // WHOLE / RANGE.
     let sql = if h.whole {
         format!(
@@ -1121,7 +1238,7 @@ CREATE TABLE gfs.clone_source (
     relid        regclass PRIMARY KEY,
     source_ref   text     NOT NULL,
     key_col      text     NOT NULL DEFAULT 'id',
-    chunk_kind   text     NOT NULL DEFAULT 'whole',  -- 'int' (range key) | 'whole'
+    chunk_kind   text     NOT NULL DEFAULT 'whole',  -- 'int' (int range key) | 'time' (date/timestamp range key) | 'whole'
     whole_cached boolean  NOT NULL DEFAULT false,
     source_rows  bigint   NOT NULL DEFAULT 0,        -- Tr: source size (cost model)
     row_bytes    int      NOT NULL DEFAULT 100,      -- B: avg bytes/row
@@ -1290,8 +1407,11 @@ CREATE FUNCTION gfs.register_clone(local regclass, source_ref text, key_col text
 RETURNS void LANGUAGE plpgsql AS $$
 DECLARE kind text := 'whole'; j json; srows bigint := 0; sbytes int := 100;
 BEGIN
-    -- range-key strategy only for integer keys; everything else hydrates whole.
-    SELECT CASE WHEN t.typname IN ('int2','int4','int8') THEN 'int' ELSE 'whole' END
+    -- range-key strategy: integer keys hydrate key ranges; date/timestamp keys
+    -- hydrate capped TIME ranges (epoch-micros coverage); everything else whole.
+    SELECT CASE WHEN t.typname IN ('int2','int4','int8') THEN 'int'
+                WHEN t.typname IN ('date','timestamp','timestamptz') THEN 'time'
+                ELSE 'whole' END
       INTO kind
       FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
      WHERE a.attrelid = local AND a.attname = key_col;

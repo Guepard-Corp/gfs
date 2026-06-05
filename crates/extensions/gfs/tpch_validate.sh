@@ -200,6 +200,27 @@ Q10="SELECT c_custkey,n_name,round(sum(l_extendedprice*(1-l_discount))::numeric,
 echo "  Q10 (4-table join):         route=$(route_of "$Q10")"; assert_eq "Q10 4-table join" "$Q10"
 
 # ---------------------------------------------------------------------------
+note "P5 -- TEMPORAL range-hydrate (re-register orders on the DATE key o_orderdate)"
+OSRC="$(cln "SELECT source_ref FROM gfs.clone_source WHERE relid='orders'::regclass")"
+cln "SELECT gfs.unregister_clone('orders'::regclass)" >/dev/null
+cln "SELECT gfs.register_clone('orders'::regclass, '$OSRC', 'o_orderdate')" >/dev/null
+echo "  orders re-registered on o_orderdate -> chunk_kind=$(cln "SELECT chunk_kind FROM gfs.clone_source WHERE relid='orders'::regclass")"
+reset_clone
+W1="SELECT o_orderkey FROM orders WHERE o_orderdate BETWEEN date '1994-01-01' AND date '1994-01-31' ORDER BY o_orderkey"
+r1="$(route_of "$W1")"; r2="$(route_of "$W1")"
+echo "  narrow window 1994-01 (shot1->shot2): $r1 -> $r2   (pulled=$(pulled) rows, not the table)"
+[[ "$r1" == fetched && "$r2" == local ]] && { PASS=$((PASS+1)); echo "  $(grn PASS) time-range fetched then elided (local)"; } || { FAIL=$((FAIL+1)); echo "  $(red FAIL) P5 route ($r1->$r2)"; }
+assert_eq "P5 time-range" "$W1"
+SUB="SELECT o_orderkey FROM orders WHERE o_orderdate BETWEEN date '1994-01-10' AND date '1994-01-20' ORDER BY o_orderkey"
+r3="$(route_of "$SUB")"
+echo "  sub-window 1994-01-10..20: $r3   (expect local -- covered by the cached range)"
+[[ "$r3" == local ]] && { PASS=$((PASS+1)); echo "  $(grn PASS) sub-window elided (range coverage, 0 source contact)"; } || { FAIL=$((FAIL+1)); echo "  $(red FAIL) sub-window ($r3)"; }
+assert_eq "P5 sub-window" "$SUB"
+WIDE="SELECT o_orderkey FROM orders WHERE o_orderdate BETWEEN date '1992-01-01' AND date '1998-12-31' ORDER BY o_orderkey LIMIT 100"
+echo "  wide window 1992..1998: $(route_of "$WIDE")   (exceeds cap -> federate, bounded; correctness still holds)"
+assert_eq "P5 wide window" "$WIDE"
+
+# ---------------------------------------------------------------------------
 note "Clone state"
 cln "SELECT clone,whole_cached,no_partial,partial_rows,access_count,rows_fetched,federate_calls FROM gfs.clones ORDER BY clone" \
   | awk -F'|' 'BEGIN{printf "  %-10s %-6s %-5s %-9s %-7s %-9s %-6s\n","table","whole","noP","partRows","access","fetched","feder"}{printf "  %-10s %-6s %-5s %-9s %-7s %-9s %-6s\n",$1,$2,$3,$4,$5,$6,$7}'

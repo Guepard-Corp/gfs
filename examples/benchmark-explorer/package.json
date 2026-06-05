@@ -1,0 +1,16 @@
+{
+  "name": "gfs-benchmark-explorer",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.14.0",
+  "description": "Explore the GFS lazy-clone cost router on TPC-H, side by side: run range / selective / multi-table-join queries on the SOURCE and the CLONE, watch the route (fetched / partial / federated / local), inspect the router catalog, tune the cost weights live, and prove join pushdown.",
+  "scripts": {
+    "demo": "bash scripts/run.sh",
+    "build:web": "pnpm --filter benchmark-explorer-web run build",
+    "server": "pnpm --filter benchmark-explorer-server run start"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild"]
+  }
+}
