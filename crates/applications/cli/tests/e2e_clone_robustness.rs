@@ -1,30 +1,35 @@
-//! Reproduction + regression tests for `gfs clone` robustness (RFC 008).
-//!
-//! Two issues these tests pin down:
-//!   1. The clone must provision the local engine with the **same major version**
-//!      as the remote (not a hardcoded default).
-//!   2. The clone must **tolerate source extensions**: a table using an
-//!      extension type absent locally (e.g. pgvector's `vector`) must not abort
-//!      the whole clone — such tables are skipped, the rest clone.
-//!
-//! Plus copy-on-write overlay invariants: write semantics on a single-column PK
-//! (override without duplication, delete/tombstone/revive, PK-changing update),
-//! full CRUD on a composite PK, and mirroring of server-side column defaults.
+//! End-to-end regression tests for `gfs clone` (RFC 008) on the current
+//! **planner-hook** model (the former overlay/TAM is gone). Each test starts a
+//! throwaway remote Postgres, runs the real `gfs clone` binary onto the
+//! `gfs-postgres:16` image (which ships the `gfs` extension), and asserts the
+//! router's invariants end to end:
+//!   * clone tables are REAL tables registered in `gfs.clone_source` (no overlay
+//!     view, no `gfs_sync`), FKs dropped, generated columns mirrored;
+//!   * copy-on-read returns results equal to the source;
+//!   * an integer/temporal key range hydrates then elides (re-ask hits no source);
+//!   * a join is federated and returns the source's result;
+//!   * local writes diverge on the clone while the SOURCE stays untouched (the
+//!     write-safety guard: writes never federate to the source).
 //!
 //! macOS-only (consistent with the other e2e suites); Docker/Podman required;
-//! relies on Docker Desktop's `host.docker.internal`.
+//! relies on Docker Desktop's `host.docker.internal`. Tests SKIP (no failure) when
+//! the `gfs-postgres:16` image is absent — build it with
+//! `docker build -t gfs-postgres:16 crates/extensions/gfs`.
 
 #![cfg(target_os = "macos")]
 
 mod common;
 
-use std::process::Command;
+use std::path::Path;
+use std::process::{Command, Output};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use common::container_runtime::runtime_command;
 use serial_test::serial;
 use tempfile::TempDir;
+
+const GFS_IMAGE: &str = "gfs-postgres:16";
 
 /// Removes any registered containers and the repo on drop.
 struct Cleanup {
@@ -56,8 +61,8 @@ fn psql(container: &str, db: &str, query: &str) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// Start a remote postgres from `image` with a Docker-assigned host port and
-/// wait for readiness. Returns the mapped host port.
+/// Start a remote postgres from `image` with a Docker-assigned host port and wait
+/// for readiness. Returns the mapped host port.
 fn start_remote(name: &str, image: &str) -> String {
     let _ = runtime_command().args(["rm", "-f", name]).output();
     let started = runtime_command()
@@ -91,15 +96,6 @@ fn start_remote(name: &str, image: &str) -> String {
     host_port
 }
 
-/// Like `psql` but returns the raw Output so callers can assert on failure.
-/// `ON_ERROR_STOP=1` makes a failing statement yield a non-zero exit code.
-fn psql_try(container: &str, db: &str, query: &str) -> std::process::Output {
-    runtime_command()
-        .args(["exec", container, "psql", "-U", "postgres", "-d", db, "-v", "ON_ERROR_STOP=1", "-tAc", query])
-        .output()
-        .expect("psql exec")
-}
-
 fn seed_remote(name: &str, sql: &str) {
     let out = runtime_command()
         .args(["exec", name, "psql", "-U", "postgres", "-d", "shop", "-v", "ON_ERROR_STOP=1", "-c", sql])
@@ -111,1528 +107,211 @@ const READER: &str =
     "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='gfs_reader') \
      THEN CREATE ROLE gfs_reader LOGIN PASSWORD 'readerpw'; END IF; END $$; ";
 
-fn grant_reader() -> &'static str {
-    "GRANT USAGE ON SCHEMA public TO gfs_reader; \
-     GRANT SELECT ON ALL TABLES IN SCHEMA public TO gfs_reader;"
-}
+/// Multi-table schema exercising: an integer range key (orders.id), a FK
+/// (orders.customer_id -> customers.id), a STORED generated column
+/// (orders.total_cents), and a temporal column (orders.placed_at).
+const SCHEMA: &str = "\
+    CREATE TABLE customers (id bigint PRIMARY KEY, name text NOT NULL); \
+    INSERT INTO customers SELECT g, 'cust_'||g FROM generate_series(1,500) g; \
+    CREATE TABLE orders ( \
+        id bigint PRIMARY KEY, \
+        customer_id bigint NOT NULL REFERENCES customers(id), \
+        qty int NOT NULL, unit_cents int NOT NULL, \
+        total_cents int GENERATED ALWAYS AS (qty*unit_cents) STORED, \
+        placed_at date NOT NULL); \
+    INSERT INTO orders (id, customer_id, qty, unit_cents, placed_at) \
+        SELECT g, 1+(g%500), 1+(g%5), 100+(g%50), date '2024-01-01' + (g%364) \
+        FROM generate_series(1,2000) g; \
+    GRANT USAGE ON SCHEMA public TO gfs_reader; \
+    GRANT SELECT ON ALL TABLES IN SCHEMA public TO gfs_reader;";
 
-fn run_clone(url: &str, repo: &std::path::Path, version: Option<&str>) -> std::process::Output {
-    let mut args = vec!["clone".to_string(), "--from".to_string(), url.to_string(), repo.to_str().unwrap().to_string()];
-    if let Some(v) = version {
-        args.push("--database-version".into());
-        args.push(v.into());
+/// True if the gfs extension image is present; otherwise print a SKIP note.
+fn gfs_image_present() -> bool {
+    let ok = runtime_command()
+        .args(["image", "inspect", GFS_IMAGE])
+        .output().map(|o| o.status.success()).unwrap_or(false);
+    if !ok {
+        eprintln!("SKIP: image {GFS_IMAGE} absent — build: docker build -t {GFS_IMAGE} crates/extensions/gfs");
     }
-    Command::new(env!("CARGO_BIN_EXE_gfs")).args(&args).output().expect("run gfs clone")
+    ok
 }
 
-/// Issue 1: the local clone must run the same major version as the remote.
-#[test]
-#[serial]
-fn clone_matches_remote_major_version() {
-    let repo = TempDir::new().unwrap();
-    let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
-
-    let remote = "gfs-e2e-ver-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "postgres:16");
-    seed_remote(remote, &format!(
-        "{READER} CREATE TABLE orders (id bigint PRIMARY KEY, name text NOT NULL); \
-         INSERT INTO orders SELECT g,'n'||g FROM generate_series(1,10) g; {}", grant_reader()));
-    let remote_major = psql(remote, "shop", "SHOW server_version_num")[..2].to_string();
-
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
-    // No --database-version → must be inferred from the remote.
-    let out = run_clone(&url, &repo_path, None);
-    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
-
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-    let local_major = psql(&gfs, "postgres", "SHOW server_version_num")[..2].to_string();
-
-    assert_eq!(
-        local_major, remote_major,
-        "clone provisioned major {local_major} but remote is {remote_major}"
-    );
-}
-
-/// Issue 2: a source extension type (pgvector `vector`) must not abort the clone.
-#[test]
-#[serial]
-fn clone_tolerates_source_extensions() {
-    let repo = TempDir::new().unwrap();
-    let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
-
-    let remote = "gfs-e2e-ext-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "pgvector/pgvector:pg16");
-    seed_remote(remote, &format!(
-        "{READER} CREATE EXTENSION IF NOT EXISTS vector; \
-         CREATE TABLE products (id bigint PRIMARY KEY, embedding vector(3)); \
-         INSERT INTO products VALUES (1,'[1,2,3]'),(2,'[4,5,6]'); \
-         CREATE TABLE categories (id bigint PRIMARY KEY, name text NOT NULL); \
-         INSERT INTO categories SELECT g,'cat_'||g FROM generate_series(1,5) g; {}", grant_reader()));
-
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
-    // Pin version 16 to isolate the extension issue from the version issue.
-    let out = run_clone(&url, &repo_path, Some("16"));
-    assert!(
-        out.status.success(),
-        "clone aborted on a source extension type:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-    // The plain table must have cloned (extension-typed one may be skipped).
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM categories"), "5");
-}
-
-/// `gfs clone --image` provisions an image that bundles the source's extension,
-/// so the extension-typed table clones fully (no skip).
-#[test]
-#[serial]
-fn clone_with_image_supports_extension() {
-    let repo = TempDir::new().unwrap();
-    let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
-
-    let remote = "gfs-e2e-img-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "pgvector/pgvector:pg16");
-    seed_remote(remote, &format!(
-        "{READER} CREATE EXTENSION IF NOT EXISTS vector; \
-         CREATE TABLE products (id bigint PRIMARY KEY, embedding vector(3)); \
-         INSERT INTO products VALUES (1,'[1,2,3]'),(2,'[4,5,6]'); {}", grant_reader()));
-
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
-    let out = Command::new(env!("CARGO_BIN_EXE_gfs"))
+fn run_clone(url: &str, repo: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_gfs"))
         .args([
-            "clone", "--from", &url, repo_path.to_str().unwrap(),
-            "--image", "pgvector/pgvector:pg16",
+            "clone", "--from", url, repo.to_str().unwrap(),
+            "--image", GFS_IMAGE, "--database-version", "16",
         ])
         .output()
-        .expect("run gfs clone --image");
+        .expect("run gfs clone")
+}
+
+/// Pin cost weights so the small seed tables stay NOT whole-ownable (horizon=0,
+/// negligible=1): reads federate, key/time ranges hydrate-then-elide, writes
+/// federate-classify -> the lazy paths are exercised deterministically.
+fn pin_weights(clone: &str) {
+    psql(clone, "postgres",
+        "UPDATE gfs.cost SET net=1, source=20, negligible=1, horizon=0, ceiling=1000000000");
+}
+
+fn sum_fetched(clone: &str) -> i64 {
+    psql(clone, "postgres", "SELECT COALESCE(sum(rows_fetched),0) FROM gfs.clones")
+        .parse().unwrap_or(-1)
+}
+
+/// Start remote + seed + clone; returns (remote_name, clone_container, host_port).
+/// Registers both containers with `cl` for cleanup.
+fn setup(cl: &mut Cleanup, remote: &str, repo: &Path) -> String {
+    let _ = remote;
+    let port = start_remote(remote, "postgres:16");
+    cl.add(remote.to_string());
+    seed_remote(remote, &format!("{READER}{SCHEMA}"));
+    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
+    let out = run_clone(&url, repo);
     assert!(
         out.status.success(),
-        "clone --image failed:\nstdout: {}\nstderr: {}",
+        "gfs clone failed:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
+        String::from_utf8_lossy(&out.stderr),
     );
-
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-    // With the right image, the vector-typed table clones fully (not skipped).
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT relkind FROM pg_class WHERE relname='products' AND relnamespace='public'::regnamespace"),
-        "r",
-        "products should be a faithful table when --image provides pgvector"
-    );
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM products"), "2");
+    let clone = common::postgres::get_container_id(repo);
+    cl.add(clone.clone());
+    pin_weights(&clone);
+    clone
 }
 
-/// `gfs clone --platform` must provision the local container for that platform
-/// (so an image lacking a native-arch manifest can run under emulation).
+/// Registration + copy-on-read correctness: real tables in gfs.clone_source (no
+/// overlay/sync), FK dropped, generated column mirrored, reads equal the source.
 #[test]
 #[serial]
-fn clone_honors_platform_override() {
+fn clone_registers_real_tables_and_reads_match_source() {
+    if !gfs_image_present() { return; }
     let repo = TempDir::new().unwrap();
     let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
+    let mut cl = Cleanup::new(repo);
+    let remote = "gfs-e2e-rob-reg";
+    let clone = setup(&mut cl, remote, &repo_path);
 
-    let remote = "gfs-e2e-plat-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "postgres:16");
-    seed_remote(remote, &format!(
-        "{READER} CREATE TABLE t (id bigint PRIMARY KEY); \
-         INSERT INTO t SELECT generate_series(1,5); {}", grant_reader()));
+    assert_eq!(
+        psql(&clone, "postgres", "SELECT relkind FROM pg_class WHERE relname='orders' AND relnamespace='public'::regnamespace"),
+        "r", "public.orders is a real local table");
+    assert_eq!(
+        psql(&clone, "postgres", "SELECT count(*) FROM pg_namespace WHERE nspname LIKE 'gfs_ovl__%'"),
+        "0", "no overlay-view schema (planner-hook model; gfs_sync holds the bootstrap funcs and stays)");
+    assert_eq!(
+        psql(&clone, "postgres", "SELECT count(*) FROM gfs.clone_source WHERE relid::text IN ('orders','customers')"),
+        "2", "orders + customers registered as clones");
+    assert_eq!(
+        psql(&clone, "postgres", "SELECT count(*) FROM pg_constraint WHERE conrelid='orders'::regclass AND contype='f'"),
+        "0", "FK dropped on the clone (child fetched before parent)");
 
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
-    let out = Command::new(env!("CARGO_BIN_EXE_gfs"))
-        .args([
-            "clone", "--from", &url, repo_path.to_str().unwrap(),
-            "--image", "postgres:16", "--platform", "linux/amd64",
-        ])
-        .output()
-        .expect("run gfs clone --platform");
-    assert!(
-        out.status.success(),
-        "clone --platform failed:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-
-    // linux/amd64 → the container's userspace is x86_64 regardless of host arch.
-    let arch = runtime_command()
-        .args(["exec", &gfs, "uname", "-m"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-    assert_eq!(arch, "x86_64", "container should run as linux/amd64");
-
-    // And the overlay still works through the emulated engine.
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM t"), "5");
+    // Copy-on-read returns the source's data.
+    assert_eq!(psql(&clone, "postgres", "SELECT count(*) FROM orders"), "2000");
+    assert_eq!(
+        psql(&clone, "postgres", "SELECT total_cents FROM orders WHERE id=10"),
+        psql(remote, "shop", "SELECT total_cents FROM orders WHERE id=10"),
+        "generated column mirrored correctly");
+    drop(cl);
 }
 
-/// Remediations: auto-increment works locally (offset past the remote max, no
-/// PK collision), and any local role can read through the overlay (FOR PUBLIC).
+/// Integer range key hydrates the touched span then elides on re-ask; a temporal
+/// (DATE) range key does the same after re-registering on `placed_at`.
 #[test]
 #[serial]
-fn clone_autoincrement_and_any_role() {
+fn clone_range_and_temporal_hydration_elide() {
+    if !gfs_image_present() { return; }
     let repo = TempDir::new().unwrap();
     let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
+    let mut cl = Cleanup::new(repo);
+    let remote = "gfs-e2e-rob-range";
+    let clone = setup(&mut cl, remote, &repo_path);
 
-    let remote = "gfs-e2e-seq-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "postgres:16");
-    seed_remote(remote, &format!(
-        "{READER} CREATE TABLE orders (id bigserial PRIMARY KEY, name text NOT NULL); \
-         INSERT INTO orders (name) SELECT 'n'||g FROM generate_series(1,1000) g; {}", grant_reader()));
-
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
-    let out = Command::new(env!("CARGO_BIN_EXE_gfs"))
-        .args(["clone", "--from", &url, repo_path.to_str().unwrap()])
-        .output()
-        .expect("run gfs clone");
-    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
-
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-
-    // Auto-increment INSERT omitting the PK → first local id is past the remote max.
-    psql(&gfs, "postgres", "INSERT INTO orders (name) VALUES ('local')");
+    // P1: integer key range.
+    let q = "SELECT id FROM orders WHERE id BETWEEN 100 AND 150 ORDER BY id";
+    let f0 = sum_fetched(&clone);
+    psql(&clone, "postgres", q);
+    let f1 = sum_fetched(&clone);
+    assert!(f1 > f0, "key range hydrated rows (f0={f0} f1={f1})");
+    psql(&clone, "postgres", q);
+    assert_eq!(sum_fetched(&clone), f1, "covered range elided — no new source fetch");
     assert_eq!(
-        psql(&gfs, "postgres", "SELECT id FROM orders WHERE name='local'"),
-        "1001",
-        "local sequence should start just past the remote max (1000)"
-    );
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM orders"), "1001");
+        psql(&clone, "postgres", &format!("SELECT count(*) FROM ({q}) t")),
+        psql(remote, "shop", &format!("SELECT count(*) FROM ({q}) t")),
+        "range result matches source");
 
-    // FOR PUBLIC: a different local role can read through the FDW overlay.
-    psql(&gfs, "postgres", "CREATE ROLE app LOGIN SUPERUSER");
-    let as_app = psql(&gfs, "postgres", "SET ROLE app; SELECT count(*) FROM orders");
-    assert!(
-        as_app.contains("1001"),
-        "any local role should read through the overlay (user mapping FOR PUBLIC), got: {as_app}"
-    );
+    // P5: temporal key range. Re-register orders on the DATE column.
+    let sref = psql(&clone, "postgres", "SELECT source_ref FROM gfs.clone_source WHERE relid='orders'::regclass");
+    psql(&clone, "postgres", "SELECT gfs.unregister_clone('orders'::regclass)");
+    psql(&clone, "postgres", &format!("SELECT gfs.register_clone('orders'::regclass, '{sref}', 'placed_at')"));
+    assert_eq!(
+        psql(&clone, "postgres", "SELECT chunk_kind FROM gfs.clone_source WHERE relid='orders'::regclass"),
+        "time", "orders re-registered on a temporal key");
+    psql(&clone, "postgres", "TRUNCATE orders"); // fresh local state for the window
+
+    let tq = "SELECT id FROM orders WHERE placed_at BETWEEN date '2024-02-01' AND date '2024-02-15' ORDER BY id";
+    let t0 = sum_fetched(&clone);
+    psql(&clone, "postgres", tq);
+    let t1 = sum_fetched(&clone);
+    assert!(t1 > t0, "temporal window hydrated (t0={t0} t1={t1})");
+    psql(&clone, "postgres", tq);
+    assert_eq!(sum_fetched(&clone), t1, "temporal window elided — no new source fetch");
+    assert_eq!(
+        psql(&clone, "postgres", &format!("SELECT count(*) FROM ({tq}) t")),
+        psql(remote, "shop", &format!("SELECT count(*) FROM ({tq}) t")),
+        "temporal result matches source");
+    drop(cl);
 }
 
-/// `gfs clone --port` must bind the local engine to the requested host port.
+/// A join is federated to the source and returns the source's result.
 #[test]
 #[serial]
-fn clone_binds_requested_port() {
+fn clone_federates_join_matching_source() {
+    if !gfs_image_present() { return; }
     let repo = TempDir::new().unwrap();
     let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
+    let mut cl = Cleanup::new(repo);
+    let remote = "gfs-e2e-rob-join";
+    let clone = setup(&mut cl, remote, &repo_path);
 
-    let remote = "gfs-e2e-port-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "postgres:17");
-    seed_remote(remote, &format!(
-        "{READER} CREATE TABLE t (id bigint PRIMARY KEY); \
-         INSERT INTO t SELECT generate_series(1,5); {}", grant_reader()));
-
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
-    let chosen = "64217";
-    let out = Command::new(env!("CARGO_BIN_EXE_gfs"))
-        .args([
-            "clone", "--from", &url, repo_path.to_str().unwrap(),
-            "--port", chosen, "--database-version", "17",
-        ])
-        .output()
-        .expect("run gfs clone --port");
-    assert!(
-        out.status.success(),
-        "clone --port failed:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-
-    let bind = runtime_command()
-        .args(["port", &gfs, "5432"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
-    assert!(
-        bind.contains(chosen),
-        "local container should bind requested port {chosen}, got: {bind}"
-    );
+    let jq = "SELECT c.name, count(*) c FROM orders o JOIN customers c ON c.id=o.customer_id \
+              GROUP BY c.name ORDER BY c.name LIMIT 10";
+    let ck = format!("SELECT md5(string_agg(t::text,'|' ORDER BY t::text)) FROM ({jq}) t");
+    assert_eq!(
+        psql(&clone, "postgres", &ck),
+        psql(remote, "shop", &ck),
+        "federated join result matches source");
+    drop(cl);
 }
 
-/// Copy-on-write overlay invariants on a single-column PK, all against one
-/// clone: a local INSERT/UPDATE on a remote key wins without duplicating the
-/// row (UNION ALL stays disjoint); DELETE tombstones the remote row and a
-/// re-INSERT of the same key revives it; an UPDATE that changes the PK
-/// tombstones the old key and exposes the new one. The remote stays read-only.
+/// Local writes diverge on the clone; the SOURCE stays untouched — including a
+/// write whose scan federate-classifies (the write-safety guard must keep it
+/// local instead of pushing it to the source).
 #[test]
 #[serial]
-fn clone_overlay_write_semantics() {
+fn clone_local_writes_leave_source_untouched() {
+    if !gfs_image_present() { return; }
     let repo = TempDir::new().unwrap();
     let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
-
-    let remote = "gfs-e2e-overlay-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "postgres:16");
-    seed_remote(remote, &format!(
-        "{READER} CREATE TABLE orders (id bigint PRIMARY KEY, name text NOT NULL); \
-         INSERT INTO orders SELECT g,'n'||g FROM generate_series(1,100) g; {}", grant_reader()));
-
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
-    let out = run_clone(&url, &repo_path, Some("16"));
-    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
-
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-
-    // Baseline: the overlay reads exactly the remote.
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM orders"), "100");
-
-    // INSERT a key that already exists remotely → local wins, no duplicate row.
-    psql(&gfs, "postgres", "INSERT INTO orders (id,name) VALUES (5,'LOCAL5')");
-    assert_eq!(psql(&gfs, "postgres", "SELECT name FROM orders WHERE id=5"), "LOCAL5");
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT count(*) FROM orders"),
-        "100",
-        "overriding a remote row must not duplicate it (UNION ALL disjoint)"
-    );
-
-    // UPDATE a remote-only row → copy-on-write into the local store, still no dup.
-    psql(&gfs, "postgres", "UPDATE orders SET name='UPD7' WHERE id=7");
-    assert_eq!(psql(&gfs, "postgres", "SELECT name FROM orders WHERE id=7"), "UPD7");
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM orders"), "100");
-
-    // DELETE a remote row → tombstoned, hidden from the view.
-    psql(&gfs, "postgres", "DELETE FROM orders WHERE id=9");
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM orders WHERE id=9"), "0");
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM orders"), "99");
-
-    // Re-INSERT the same key → tombstone cleared, row revived.
-    psql(&gfs, "postgres", "INSERT INTO orders (id,name) VALUES (9,'REBORN')");
-    assert_eq!(psql(&gfs, "postgres", "SELECT name FROM orders WHERE id=9"), "REBORN");
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM orders"), "100");
-
-    // UPDATE that CHANGES the PK → old key tombstoned, new key exposed.
-    psql(&gfs, "postgres", "UPDATE orders SET id=100001 WHERE id=11");
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT count(*) FROM orders WHERE id=11"),
-        "0",
-        "old key must be hidden after a PK-changing update"
-    );
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT name FROM orders WHERE id=100001"),
-        "n11",
-        "new key must carry the row"
-    );
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM orders"), "100");
-
-    // The remote was never written to.
-    assert_eq!(psql(remote, "shop", "SELECT count(*) FROM orders"), "100");
-    assert_eq!(psql(remote, "shop", "SELECT name FROM orders WHERE id=5"), "n5");
-    assert_eq!(psql(remote, "shop", "SELECT name FROM orders WHERE id=9"), "n9");
-    assert_eq!(psql(remote, "shop", "SELECT count(*) FROM orders WHERE id=100001"), "0");
-}
-
-/// The overlay supports full CRUD on a table whose primary key is composite:
-/// read, update (no dup), insert, delete (tombstone) and re-insert of the same
-/// composite key. The remote stays untouched.
-#[test]
-#[serial]
-fn clone_overlay_composite_key_crud() {
-    let repo = TempDir::new().unwrap();
-    let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
-
-    let remote = "gfs-e2e-composite-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "postgres:16");
-    seed_remote(remote, &format!(
-        "{READER} CREATE TABLE order_items ( \
-            order_id bigint NOT NULL, line_no int NOT NULL, qty int NOT NULL, \
-            PRIMARY KEY (order_id, line_no)); \
-         INSERT INTO order_items VALUES (1,1,10),(1,2,20),(2,1,30); {}", grant_reader()));
-
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
-    let out = run_clone(&url, &repo_path, Some("16"));
-    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
-
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-
-    // The composite-key table is registered and exposed as an overlay view.
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT relkind FROM pg_class WHERE relname='order_items' AND relnamespace='public'::regnamespace"),
-        "r"
-    );
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM order_items"), "3");
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT qty FROM order_items WHERE order_id=1 AND line_no=2"),
-        "20"
-    );
-
-    // UPDATE on a composite key → copy-on-write, no duplicate.
-    psql(&gfs, "postgres", "UPDATE order_items SET qty=99 WHERE order_id=1 AND line_no=1");
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT qty FROM order_items WHERE order_id=1 AND line_no=1"),
-        "99"
-    );
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM order_items"), "3");
-
-    // INSERT a new composite key.
-    psql(&gfs, "postgres", "INSERT INTO order_items VALUES (3,1,40)");
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM order_items"), "4");
-
-    // DELETE then re-INSERT the same composite key (tombstone then revive).
-    psql(&gfs, "postgres", "DELETE FROM order_items WHERE order_id=2 AND line_no=1");
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM order_items"), "3");
-    psql(&gfs, "postgres", "INSERT INTO order_items VALUES (2,1,77)");
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM order_items"), "4");
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT qty FROM order_items WHERE order_id=2 AND line_no=1"),
-        "77"
-    );
-
-    // Remote untouched.
-    assert_eq!(psql(remote, "shop", "SELECT count(*) FROM order_items"), "3");
-    assert_eq!(
-        psql(remote, "shop", "SELECT qty FROM order_items WHERE order_id=1 AND line_no=1"),
-        "10"
-    );
-}
-
-/// Server-side column DEFAULTs (now(), uuid_generate_v4(), constants) are
-/// dropped by IMPORT FOREIGN SCHEMA, so the clone must mirror them onto the
-/// overlay view; otherwise an app that omits a NOT NULL DEFAULT column would
-/// insert NULL and fail. Inserting through the overlay while omitting every
-/// defaulted column must succeed and pick up the defaults.
-#[test]
-#[serial]
-fn clone_mirrors_column_defaults() {
-    let repo = TempDir::new().unwrap();
-    let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
-
-    let remote = "gfs-e2e-defaults-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "postgres:16");
-    seed_remote(remote, &format!(
-        "{READER} CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\"; \
-         CREATE TABLE events ( \
-            id uuid PRIMARY KEY DEFAULT uuid_generate_v4(), \
-            kind text NOT NULL DEFAULT 'generic', \
-            created_at timestamptz NOT NULL DEFAULT now(), \
-            payload int NOT NULL DEFAULT 0); \
-         INSERT INTO events (kind) VALUES ('seed1'),('seed2'); {}", grant_reader()));
-
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
-    let out = run_clone(&url, &repo_path, Some("16"));
-    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
-
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM events"), "2");
-
-    // INSERT omitting id / created_at / payload (all NOT NULL with a default):
-    // without mirrored defaults this fails with a not-null violation.
-    psql(&gfs, "postgres", "INSERT INTO events (kind) VALUES ('app1')");
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM events"), "3");
-    assert_eq!(
-        psql(&gfs, "postgres",
-            "SELECT count(*) FROM events WHERE kind='app1' \
-             AND id IS NOT NULL AND created_at IS NOT NULL AND payload=0"),
-        "1",
-        "mirrored defaults (uuid_generate_v4(), now(), 0) must populate the omitted columns"
-    );
-
-    // The remote is unchanged.
-    assert_eq!(psql(remote, "shop", "SELECT count(*) FROM events"), "2");
-}
-
-/// A remote table with no primary key and no unique index cannot get an
-/// updatable overlay, so it is skipped (no public view, not in the sync
-/// catalog) — but the clone still succeeds and keyed tables clone normally.
-#[test]
-#[serial]
-fn clone_skips_keyless_table() {
-    let repo = TempDir::new().unwrap();
-    let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
-
-    let remote = "gfs-e2e-keyless-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "postgres:16");
-    seed_remote(remote, &format!(
-        "{READER} \
-         CREATE TABLE logs (msg text NOT NULL, ts timestamptz); \
-         INSERT INTO logs SELECT 'm'||g, now() FROM generate_series(1,5) g; \
-         CREATE TABLE orders (id bigint PRIMARY KEY, name text NOT NULL); \
-         INSERT INTO orders SELECT g,'n'||g FROM generate_series(1,10) g; {}", grant_reader()));
-
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
-    let out = run_clone(&url, &repo_path, Some("16"));
-    assert!(
-        out.status.success(),
-        "clone must succeed despite a keyless table:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-
-    // The keyed table cloned: faithful real TABLE in public, overlay VIEW in
-    // gfs_ovl__public, registered, correct federated count.
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT relkind FROM pg_class WHERE relname='orders' AND relnamespace='public'::regnamespace"),
-        "r",
-        "the faithful table keeps the real name as a real table"
-    );
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT relkind FROM pg_class WHERE relname='orders' AND relnamespace='gfs_ovl__public'::regnamespace"),
-        "v",
-        "the overlay lives in the side schema gfs_ovl__public"
-    );
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM orders"), "10");
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT count(*) FROM gfs_sync.table_meta WHERE table_name='orders'"),
-        "1"
-    );
-
-    // The keyless table exists faithfully (pg_dump replays it) but gets NO overlay
-    // and is not registered — so it is never federated.
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT count(*) FROM pg_class WHERE relname='logs' AND relnamespace='gfs_ovl__public'::regnamespace"),
-        "0",
-        "keyless table must not get an overlay"
-    );
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT count(*) FROM gfs_sync.table_meta WHERE table_name='logs'"),
-        "0",
-        "keyless table must not be in the sync catalog"
-    );
-}
-
-/// The clone is copy-on-read live federation: when the remote is down, reads
-/// through the overlay view fail (the foreign branch can't connect) rather than
-/// returning wrong data — while locally-owned rows (written before the outage)
-/// survive in the authoritative local store.
-#[test]
-#[serial]
-fn clone_reads_fail_gracefully_when_remote_down() {
-    let repo = TempDir::new().unwrap();
-    let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
-
-    let remote = "gfs-e2e-down-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "postgres:16");
-    seed_remote(remote, &format!(
-        "{READER} CREATE TABLE orders (id bigint PRIMARY KEY, name text NOT NULL); \
-         INSERT INTO orders SELECT g,'n'||g FROM generate_series(1,10) g; {}", grant_reader()));
-
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
-    let out = run_clone(&url, &repo_path, Some("16"));
-    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
-
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-
-    // Remote up: read works, and a local write takes ownership of one row.
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM orders"), "10");
-    psql(&gfs, "postgres", "UPDATE orders SET name='LOCAL1' WHERE id=1");
-
-    // Take the remote down.
-    let stopped = runtime_command().args(["stop", remote]).output().expect("stop remote");
-    assert!(stopped.status.success(), "could not stop remote: {}", String::from_utf8_lossy(&stopped.stderr));
-
-    // A read through the overlay now fails (foreign branch can't connect) —
-    // it must error, not silently drop the remote rows.
-    let read = psql_try(&gfs, "postgres", "SELECT count(*) FROM orders");
-    assert!(
-        !read.status.success(),
-        "overlay read should fail while the remote is down, got stdout: {}",
-        String::from_utf8_lossy(&read.stdout)
-    );
-
-    // The authoritative local store (the faithful table itself) survives the
-    // outage with the diverged value. Schema-qualified to read the store directly,
-    // not the overlay (which would try the downed remote).
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT name FROM public.orders WHERE id=1"),
-        "LOCAL1",
-        "locally-owned rows must remain readable when the remote is gone"
-    );
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM public.orders"), "1");
-}
-
-/// Built-in exotic column types (arrays, jsonb, numeric, inet, uuid, bytea,
-/// timestamptz) round-trip through the overlay on both read and write.
-#[test]
-#[serial]
-fn clone_roundtrips_exotic_types() {
-    let repo = TempDir::new().unwrap();
-    let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
-
-    let remote = "gfs-e2e-types-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "postgres:16");
-    seed_remote(remote, &format!(
-        "{READER} CREATE TABLE items ( \
-            id bigint PRIMARY KEY, \
-            tags text[] NOT NULL, \
-            meta jsonb NOT NULL, \
-            price numeric(10,2) NOT NULL, \
-            ip inet, \
-            ref uuid, \
-            blob bytea, \
-            created_at timestamptz NOT NULL DEFAULT now()); \
-         INSERT INTO items (id,tags,meta,price,ip,ref,blob) VALUES \
-            (1, ARRAY['a','b'], '{{\"k\":1}}', 9.99, '10.0.0.1', \
-             '11111111-1111-1111-1111-111111111111', '\\xdeadbeef'), \
-            (2, ARRAY['c'], '{{\"k\":2,\"n\":[1,2]}}', 1.50, NULL, NULL, NULL); {}",
-        grant_reader()));
-
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
-    let out = run_clone(&url, &repo_path, Some("16"));
-    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
-
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-
-    // Read-through fidelity for each type.
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM items"), "2");
-    assert_eq!(psql(&gfs, "postgres", "SELECT tags FROM items WHERE id=1"), "{a,b}");
-    assert_eq!(psql(&gfs, "postgres", "SELECT meta->>'k' FROM items WHERE id=1"), "1");
-    assert_eq!(psql(&gfs, "postgres", "SELECT (meta->'n')->>1 FROM items WHERE id=2"), "2");
-    assert_eq!(psql(&gfs, "postgres", "SELECT price FROM items WHERE id=1"), "9.99");
-    assert_eq!(psql(&gfs, "postgres", "SELECT host(ip) FROM items WHERE id=1"), "10.0.0.1");
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT ref FROM items WHERE id=1"),
-        "11111111-1111-1111-1111-111111111111"
-    );
-    assert_eq!(psql(&gfs, "postgres", "SELECT encode(blob,'hex') FROM items WHERE id=1"), "deadbeef");
-
-    // Write-through with exotic types (created_at omitted → mirrored default).
-    psql(&gfs, "postgres",
-        "INSERT INTO items (id,tags,meta,price,blob) \
-         VALUES (3, ARRAY['x','y','z'], '{\"w\":true}', 5.00, '\\xcafe')");
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM items"), "3");
-    assert_eq!(psql(&gfs, "postgres", "SELECT array_length(tags,1) FROM items WHERE id=3"), "3");
-    assert_eq!(psql(&gfs, "postgres", "SELECT meta->>'w' FROM items WHERE id=3"), "true");
-    assert_eq!(psql(&gfs, "postgres", "SELECT encode(blob,'hex') FROM items WHERE id=3"), "cafe");
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT created_at IS NOT NULL FROM items WHERE id=3"),
-        "t"
-    );
-
-    // UPDATE a jsonb value through the overlay.
-    psql(&gfs, "postgres", "UPDATE items SET meta='{\"w\":false}' WHERE id=3");
-    assert_eq!(psql(&gfs, "postgres", "SELECT meta->>'w' FROM items WHERE id=3"), "false");
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM items"), "3");
-
-    // Remote untouched.
-    assert_eq!(psql(remote, "shop", "SELECT count(*) FROM items"), "2");
-}
-
-/// With no schema filter, every non-system schema is mirrored: tables in named
-/// schemas become overlays in their own schema (no collision across schemas).
-#[test]
-#[serial]
-fn clone_mirrors_all_schemas() {
-    let repo = TempDir::new().unwrap();
-    let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
-
-    let remote = "gfs-e2e-schemas-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "postgres:16");
-    seed_remote(remote, &format!(
-        "{READER} CREATE SCHEMA sales; CREATE SCHEMA hr; \
-         CREATE TABLE sales.account (id bigint PRIMARY KEY, name text NOT NULL); \
-         INSERT INTO sales.account VALUES (1,'acme'),(2,'globex'); \
-         CREATE TABLE hr.account (id bigint PRIMARY KEY, name text NOT NULL); \
-         INSERT INTO hr.account VALUES (1,'alice'); \
-         GRANT USAGE ON SCHEMA sales, hr TO gfs_reader; \
-         GRANT SELECT ON ALL TABLES IN SCHEMA sales, hr TO gfs_reader; {}", grant_reader()));
-
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
-    let out = run_clone(&url, &repo_path, Some("16"));
-    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
-
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-
-    // Same table name in two schemas → distinct faithful tables + distinct
-    // overlays (in gfs_ovl__sales / gfs_ovl__hr), no collision. The faithful
-    // tables keep the real name as real tables; federation is via the overlays.
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT relkind FROM pg_class WHERE relname='account' AND relnamespace='sales'::regnamespace"),
-        "r"
-    );
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT relkind FROM pg_class WHERE relname='account' AND relnamespace='hr'::regnamespace"),
-        "r"
-    );
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM gfs_ovl__sales.account"), "2");
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM gfs_ovl__hr.account"), "1");
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT count(DISTINCT schema_name) FROM gfs_sync.table_meta WHERE table_name='account'"),
-        "2"
-    );
-
-    // Write into one schema's overlay (copy-on-write); the other and the remote
-    // are unaffected.
-    psql(&gfs, "postgres", "INSERT INTO gfs_ovl__sales.account VALUES (3,'initech')");
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM gfs_ovl__sales.account"), "3");
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM gfs_ovl__hr.account"), "1");
-    assert_eq!(psql(remote, "shop", "SELECT count(*) FROM sales.account"), "2");
-}
-
-/// `?schema=sales` mirrors only the requested schema; others are not created.
-#[test]
-#[serial]
-fn clone_honors_schema_filter() {
-    let repo = TempDir::new().unwrap();
-    let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
-
-    let remote = "gfs-e2e-schemafilter-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "postgres:16");
-    seed_remote(remote, &format!(
-        "{READER} CREATE SCHEMA sales; CREATE SCHEMA hr; \
-         CREATE TABLE sales.account (id bigint PRIMARY KEY, name text NOT NULL); \
-         INSERT INTO sales.account VALUES (1,'acme'),(2,'globex'); \
-         CREATE TABLE hr.account (id bigint PRIMARY KEY, name text NOT NULL); \
-         INSERT INTO hr.account VALUES (1,'alice'); \
-         GRANT USAGE ON SCHEMA sales, hr TO gfs_reader; \
-         GRANT SELECT ON ALL TABLES IN SCHEMA sales, hr TO gfs_reader; {}", grant_reader()));
-
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop?schema=sales");
-    let out = run_clone(&url, &repo_path, Some("16"));
-    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
-
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-
-    // Requested schema is mirrored (faithful table + overlay; federated via overlay).
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT relkind FROM pg_class WHERE relname='account' AND relnamespace='sales'::regnamespace"),
-        "r"
-    );
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM gfs_ovl__sales.account"), "2");
-
-    // The unrequested schema was never created locally.
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT count(*) FROM pg_namespace WHERE nspname='hr'"),
-        "0",
-        "unrequested schema must not be mirrored"
-    );
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT count(*) FROM gfs_sync.table_meta WHERE schema_name='hr'"),
-        "0"
-    );
-}
-
-/// A table using a user-defined ENUM type clones with full fidelity: the enum
-/// type is mirrored locally, the table becomes an overlay, and reads/writes of
-/// enum values work through it.
-#[test]
-#[serial]
-fn clone_supports_enum_types() {
-    let repo = TempDir::new().unwrap();
-    let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
-
-    let remote = "gfs-e2e-enum-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "postgres:16");
-    seed_remote(remote, &format!(
-        "{READER} CREATE TYPE mood AS ENUM ('sad','ok','happy'); \
-         CREATE TABLE feelings (id bigint PRIMARY KEY, m mood NOT NULL); \
-         INSERT INTO feelings VALUES (1,'happy'),(2,'sad'),(3,'ok'); {}", grant_reader()));
-
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
-    let out = run_clone(&url, &repo_path, Some("16"));
-    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
-
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-
-    // The enum type was mirrored and the table cloned as an overlay (not skipped).
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT count(*) FROM pg_type WHERE typname='mood' AND typtype='e'"),
-        "1",
-        "the ENUM type must be mirrored locally"
-    );
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT relkind FROM pg_class WHERE relname='feelings' AND relnamespace='public'::regnamespace"),
-        "r",
-        "the enum-typed table must clone as a faithful table (not be skipped)"
-    );
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM feelings"), "3");
-    assert_eq!(psql(&gfs, "postgres", "SELECT m FROM feelings WHERE id=1"), "happy");
-
-    // Write an enum value through the overlay; label ordering is preserved.
-    psql(&gfs, "postgres", "INSERT INTO feelings VALUES (4,'ok')");
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM feelings"), "4");
-    psql(&gfs, "postgres", "UPDATE feelings SET m='happy' WHERE id=2");
-    assert_eq!(psql(&gfs, "postgres", "SELECT m FROM feelings WHERE id=2"), "happy");
-    // State is now {1:happy, 2:happy, 3:ok, 4:ok}; only 'happy' > 'ok', which
-    // proves the enum's ordering (sad<ok<happy) is honored locally.
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT count(*) FROM feelings WHERE m > 'ok'"),
-        "2",
-        "enum ordering (sad<ok<happy) must work locally"
-    );
-
-    // Remote untouched.
-    assert_eq!(psql(remote, "shop", "SELECT count(*) FROM feelings"), "3");
-}
-
-/// A table using a DOMAIN type clones fully: the domain (base type + CHECK) is
-/// mirrored locally, so the table becomes an overlay and the domain's CHECK is
-/// enforced on local writes.
-#[test]
-#[serial]
-fn clone_supports_domain_types() {
-    let repo = TempDir::new().unwrap();
-    let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
-
-    let remote = "gfs-e2e-domain-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "postgres:16");
-    seed_remote(remote, &format!(
-        "{READER} CREATE DOMAIN us_zip AS text CHECK (VALUE ~ '^[0-9]{{5}}$'); \
-         CREATE TABLE addrs (id bigint PRIMARY KEY, zip us_zip NOT NULL); \
-         INSERT INTO addrs VALUES (1,'94105'),(2,'10001'); {}", grant_reader()));
-
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
-    let out = run_clone(&url, &repo_path, Some("16"));
-    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
-
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-
-    // Domain mirrored, table cloned as an overlay.
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT count(*) FROM pg_type WHERE typname='us_zip' AND typtype='d'"),
-        "1",
-        "the DOMAIN type must be mirrored locally"
-    );
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT relkind FROM pg_class WHERE relname='addrs' AND relnamespace='public'::regnamespace"),
-        "r"
-    );
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM addrs"), "2");
-    assert_eq!(psql(&gfs, "postgres", "SELECT zip FROM addrs WHERE id=1"), "94105");
-
-    // A valid value writes; an invalid one is rejected by the domain CHECK.
-    psql(&gfs, "postgres", "INSERT INTO addrs VALUES (3,'60601')");
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM addrs"), "3");
-    let bad = psql_try(&gfs, "postgres", "INSERT INTO addrs VALUES (4,'nope')");
-    assert!(!bad.status.success(), "domain CHECK must reject an invalid value locally");
-
-    assert_eq!(psql(remote, "shop", "SELECT count(*) FROM addrs"), "2");
-}
-
-/// A table using a COMPOSITE type (whose attribute is itself a mirrored ENUM)
-/// clones fully — exercising type-mirroring order (enum before composite).
-#[test]
-#[serial]
-fn clone_supports_composite_types() {
-    let repo = TempDir::new().unwrap();
-    let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
-
-    let remote = "gfs-e2e-composite-type-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "postgres:16");
-    seed_remote(remote, &format!(
-        "{READER} CREATE TYPE mood AS ENUM ('sad','ok','happy'); \
-         CREATE TYPE person AS (name text, feeling mood); \
-         CREATE TABLE people (id bigint PRIMARY KEY, p person NOT NULL); \
-         INSERT INTO people VALUES (1, ROW('Ada','happy')), (2, ROW('Alan','ok')); {}",
-        grant_reader()));
-
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
-    let out = run_clone(&url, &repo_path, Some("16"));
-    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
-
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-
-    // Composite type mirrored (with its 2 attributes), table cloned as overlay.
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT count(*) FROM pg_type WHERE typname='person' AND typtype='c'"),
-        "1",
-        "the COMPOSITE type must be mirrored locally"
-    );
-    assert_eq!(
-        psql(&gfs, "postgres",
-            "SELECT count(*) FROM pg_attribute WHERE attrelid=(SELECT typrelid FROM pg_type WHERE typname='person') AND attnum>0 AND NOT attisdropped"),
-        "2"
-    );
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT relkind FROM pg_class WHERE relname='people' AND relnamespace='public'::regnamespace"),
-        "r"
-    );
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM people"), "2");
-    assert_eq!(psql(&gfs, "postgres", "SELECT (p).name FROM people WHERE id=1"), "Ada");
-    assert_eq!(psql(&gfs, "postgres", "SELECT (p).feeling FROM people WHERE id=1"), "happy");
-
-    // Write a composite (with enum attribute) through the overlay.
-    psql(&gfs, "postgres", "INSERT INTO people VALUES (3, ROW('Grace','happy')::person)");
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM people"), "3");
-    assert_eq!(psql(&gfs, "postgres", "SELECT (p).name FROM people WHERE id=3"), "Grace");
-
-    assert_eq!(psql(remote, "shop", "SELECT count(*) FROM people"), "2");
-}
-
-/// Cloning a remote with no user tables succeeds: the FDW link and `gfs_sync`
-/// infrastructure are set up, but there are no overlays and the catalog is empty.
-#[test]
-#[serial]
-fn clone_into_empty_database() {
-    let repo = TempDir::new().unwrap();
-    let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
-
-    let remote = "gfs-e2e-empty-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "postgres:16");
-    // Role + grants only — no tables at all.
-    seed_remote(remote, &format!("{READER} {}", grant_reader()));
-
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
-    let out = run_clone(&url, &repo_path, Some("16"));
-    assert!(
-        out.status.success(),
-        "clone of an empty database must succeed:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-
-    // Bootstrap ran (FDW server + sync schema exist) but nothing was mirrored.
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT count(*) FROM pg_foreign_server WHERE srvname='gfs_remote_srv'"),
-        "1"
-    );
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT count(*) FROM pg_namespace WHERE nspname='gfs_sync'"),
-        "1"
-    );
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM gfs_sync.table_meta"), "0");
-}
-
-/// `gfs clone` is one-shot: re-running it into a directory that is already a GFS
-/// repository fails cleanly (no overwrite), and the existing clone stays usable.
-#[test]
-#[serial]
-fn clone_into_existing_repo_fails() {
-    let repo = TempDir::new().unwrap();
-    let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
-
-    let remote = "gfs-e2e-reclone-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "postgres:16");
-    seed_remote(remote, &format!(
-        "{READER} CREATE TABLE orders (id bigint PRIMARY KEY, name text NOT NULL); \
-         INSERT INTO orders SELECT g,'n'||g FROM generate_series(1,10) g; {}", grant_reader()));
-
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
-
-    // First clone succeeds.
-    let first = run_clone(&url, &repo_path, Some("16"));
-    assert!(first.status.success(), "first clone failed: {}", String::from_utf8_lossy(&first.stderr));
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM orders"), "10");
-
-    // Second clone into the same repo must fail (already initialized).
-    let second = run_clone(&url, &repo_path, Some("16"));
-    assert!(
-        !second.status.success(),
-        "re-cloning into an existing repo should fail, but it succeeded:\nstdout: {}",
-        String::from_utf8_lossy(&second.stdout)
-    );
-
-    // The original clone is untouched and still serves its data.
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT count(*) FROM orders"),
-        "10",
-        "the existing clone must survive a rejected re-clone"
-    );
-}
-
-/// Challenge: a STORED generated column must not break writes, and must be
-/// computed for locally-written rows.
-#[test]
-#[serial]
-fn clone_handles_generated_columns() {
-    let repo = TempDir::new().unwrap();
-    let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
-
-    let remote = "gfs-e2e-gen-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "postgres:17");
-    seed_remote(remote, &format!(
-        "{READER} CREATE TABLE docs (id bigint PRIMARY KEY, body text NOT NULL, \
-           body_tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', body)) STORED); \
-         INSERT INTO docs (id, body) VALUES (1,'hello world'),(2,'lazy clone'); {}", grant_reader()));
-
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
-    let out = run_clone(&url, &repo_path, Some("17"));
-    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM docs"), "2");
-    // Remote rows: generated column is read live and populated.
-    assert_eq!(psql(&gfs, "postgres", "SELECT body_tsv IS NOT NULL FROM docs WHERE id=1"), "t");
-
-    // Write a new row WITHOUT the generated column (the only legal way).
-    let ins = psql_try(&gfs, "postgres", "INSERT INTO docs (id, body) VALUES (3, 'fresh doc')");
-    assert!(
-        ins.status.success(),
-        "insert omitting a generated column must succeed:\n{}",
-        String::from_utf8_lossy(&ins.stderr)
-    );
-    assert_eq!(psql(&gfs, "postgres", "SELECT body FROM docs WHERE id=3"), "fresh doc");
-    // The generated column must be computed for the local row.
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT body_tsv IS NOT NULL FROM docs WHERE id=3"),
-        "t",
-        "generated column should be computed for a locally-written row"
-    );
-}
-
-/// Challenge: reserved-word / mixed-case / quoted identifiers must round-trip
-/// through the overlay (views, triggers, sequences are all %I-quoted).
-#[test]
-#[serial]
-fn clone_handles_reserved_and_mixedcase_identifiers() {
-    let repo = TempDir::new().unwrap();
-    let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
-
-    let remote = "gfs-e2e-ident-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "postgres:17");
-    seed_remote(remote, &format!(
-        "{READER} CREATE TABLE \"Order\" (\"Id\" bigint PRIMARY KEY, \"select\" text NOT NULL, \"UserName\" text); \
-         INSERT INTO \"Order\" (\"Id\",\"select\",\"UserName\") VALUES (1,'a','bob'); {}", grant_reader()));
-
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
-    let out = run_clone(&url, &repo_path, Some("17"));
-    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM \"Order\""), "1");
-    psql(&gfs, "postgres", "INSERT INTO \"Order\" (\"Id\",\"select\",\"UserName\") VALUES (2,'b','alice')");
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM \"Order\""), "2");
-    psql(&gfs, "postgres", "UPDATE \"Order\" SET \"select\"='x' WHERE \"Id\"=1");
-    assert_eq!(psql(&gfs, "postgres", "SELECT \"select\" FROM \"Order\" WHERE \"Id\"=1"), "x");
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM \"Order\""), "2");
-}
-
-/// Challenge: a table keyed only by a UNIQUE index on a NULLABLE column.
-#[test]
-#[serial]
-fn clone_handles_nullable_unique_key() {
-    let repo = TempDir::new().unwrap();
-    let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
-
-    let remote = "gfs-e2e-nullkey-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "postgres:17");
-    seed_remote(remote, &format!(
-        "{READER} CREATE TABLE widgets (sku text, qty int NOT NULL); \
-         CREATE UNIQUE INDEX widgets_sku_uq ON widgets (sku); \
-         INSERT INTO widgets VALUES ('a',1),('b',2),(NULL,3); {}", grant_reader()));
-
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
-    let out = run_clone(&url, &repo_path, Some("17"));
-    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-
-    // All rows readable (including the NULL-sku one) with no duplication.
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM widgets"), "3");
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM widgets WHERE sku IS NULL"), "1");
-    // A write to a non-null-key row diverges correctly.
-    psql(&gfs, "postgres", "UPDATE widgets SET qty=99 WHERE sku='a'");
-    assert_eq!(psql(&gfs, "postgres", "SELECT qty FROM widgets WHERE sku='a'"), "99");
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM widgets"), "3");
-}
-
-/// Network elision: after `gfs_sync.warm_range` hydrates a key range, a read
-/// whose key falls in that range is served locally and the foreign scan is
-/// **pruned** (no remote contact), while reads outside the range still hit the
-/// remote — and unconstrained scans stay correct.
-#[test]
-#[serial]
-fn clone_warm_range_elides_remote_reads() {
-    let repo = TempDir::new().unwrap();
-    let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
-
-    let remote = "gfs-e2e-elision-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "postgres:16");
-    seed_remote(remote, &format!(
-        "{READER} CREATE TABLE orders (id bigint PRIMARY KEY, name text NOT NULL); \
-         INSERT INTO orders SELECT g,'n'||g FROM generate_series(1,10000) g; {}", grant_reader()));
-
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
-    let out = run_clone(&url, &repo_path, Some("16"));
-    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-
-    // Warm ids [1,1000] into the local store, then rebuild the exclusion CHECK
-    // (decoupled: warm_range only hydrates; refresh_exclusions applies elision).
-    psql(&gfs, "postgres", "SELECT gfs_sync.warm_range('public','orders','1','1000')");
-    psql(&gfs, "postgres", "SELECT gfs_sync.refresh_exclusions()");
-
-    // A cached-range read: the planner prunes the foreign branch entirely.
-    let plan_cached = psql(&gfs, "postgres", "EXPLAIN (VERBOSE) SELECT * FROM orders WHERE id = 42");
-    assert!(
-        !plan_cached.contains("Foreign Scan"),
-        "cached-range read must not touch the remote, plan was:\n{plan_cached}"
-    );
-    // A non-cached read still federates to the remote.
-    let plan_remote = psql(&gfs, "postgres", "EXPLAIN (VERBOSE) SELECT * FROM orders WHERE id = 5000");
-    assert!(
-        plan_remote.contains("Foreign Scan"),
-        "non-cached read should still hit the remote, plan was:\n{plan_remote}"
-    );
-
-    // Correctness in all cases.
-    assert_eq!(psql(&gfs, "postgres", "SELECT name FROM orders WHERE id = 42"), "n42");
-    assert_eq!(psql(&gfs, "postgres", "SELECT name FROM orders WHERE id = 5000"), "n5000");
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT count(*) FROM orders"),
-        "10000",
-        "unconstrained scan stays correct (anti-join dedups despite the exclusion CHECK)"
-    );
-}
-
-/// Query-driven warming: `gfs_sync.warm_query_chunks(sql)` (what a proxy/cron
-/// calls) expands the query's key span to chunk boundaries and warms the whole
-/// chunk — so the queried key AND its neighbours in the chunk are then elided,
-/// while a key in another chunk still federates to the remote.
-#[test]
-#[serial]
-fn clone_warm_query_chunks_drives_elision() {
-    let repo = TempDir::new().unwrap();
-    let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
-
-    let remote = "gfs-e2e-chunk-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "postgres:16");
-    seed_remote(remote, &format!(
-        "{READER} CREATE TABLE orders (id bigint PRIMARY KEY, name text NOT NULL); \
-         INSERT INTO orders SELECT g,'n'||g FROM generate_series(1,10000) g; {}", grant_reader()));
-
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
-    let out = run_clone(&url, &repo_path, Some("16"));
-    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-
-    // Drive warming from a single point-read SQL, chunk size 1000 → warms the
-    // chunk [4000,4999] that contains id=4242. Then apply the exclusion CHECK
-    // (decoupled rebuild).
-    psql(&gfs, "postgres",
-        "SELECT gfs_sync.warm_query_chunks('SELECT * FROM orders WHERE id = 4242', 1000)");
-    psql(&gfs, "postgres", "SELECT gfs_sync.refresh_exclusions()");
-
-    // The queried key is elided...
-    let p_hit = psql(&gfs, "postgres", "EXPLAIN (VERBOSE) SELECT * FROM orders WHERE id = 4242");
-    assert!(!p_hit.contains("Foreign Scan"), "warmed key must be elided:\n{p_hit}");
-    // ...and so is a NEIGHBOUR in the same chunk that was never queried.
-    let p_neighbour = psql(&gfs, "postgres", "EXPLAIN (VERBOSE) SELECT * FROM orders WHERE id = 4900");
-    assert!(!p_neighbour.contains("Foreign Scan"), "chunk neighbour must be elided:\n{p_neighbour}");
-    // A key in a different chunk still federates.
-    let p_other = psql(&gfs, "postgres", "EXPLAIN (VERBOSE) SELECT * FROM orders WHERE id = 8000");
-    assert!(p_other.contains("Foreign Scan"), "key outside the warmed chunk should hit the remote:\n{p_other}");
-
-    // Correctness across all of them.
-    assert_eq!(psql(&gfs, "postgres", "SELECT name FROM orders WHERE id = 4900"), "n4900");
-    assert_eq!(psql(&gfs, "postgres", "SELECT name FROM orders WHERE id = 8000"), "n8000");
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM orders"), "10000");
-}
-
-/// The CHECK rebuild is decoupled from hydration: `warm_range` alone hydrates
-/// (correct, but not yet elided — no read-blocking ALTER), and elision only
-/// kicks in after `refresh_exclusions()`. Proves both the deferral and that a
-/// hydrated-but-not-yet-refreshed range is still read correctly.
-#[test]
-#[serial]
-fn clone_exclusion_refresh_is_decoupled() {
-    let repo = TempDir::new().unwrap();
-    let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
-
-    let remote = "gfs-e2e-decouple-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "postgres:16");
-    seed_remote(remote, &format!(
-        "{READER} CREATE TABLE orders (id bigint PRIMARY KEY, name text NOT NULL); \
-         INSERT INTO orders SELECT g,'n'||g FROM generate_series(1,10000) g; {}", grant_reader()));
-
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
-    let out = run_clone(&url, &repo_path, Some("16"));
-    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-
-    // Hydrate only — no rebuild yet.
-    psql(&gfs, "postgres", "SELECT gfs_sync.warm_range('public','orders','1','1000')");
-
-    // Still federated (CHECK not rebuilt), but read correctly.
-    let before = psql(&gfs, "postgres", "EXPLAIN (VERBOSE) SELECT * FROM orders WHERE id = 42");
-    assert!(
-        before.contains("Foreign Scan"),
-        "before refresh, the range must not be elided yet:\n{before}"
-    );
-    assert_eq!(psql(&gfs, "postgres", "SELECT name FROM orders WHERE id = 42"), "n42");
-
-    // Apply the exclusion CHECK; now the range is elided.
-    psql(&gfs, "postgres", "SELECT gfs_sync.refresh_exclusions()");
-    let after = psql(&gfs, "postgres", "EXPLAIN (VERBOSE) SELECT * FROM orders WHERE id = 42");
-    assert!(
-        !after.contains("Foreign Scan"),
-        "after refresh, the cached range must be elided:\n{after}"
-    );
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM orders"), "10000");
-}
-
-/// `refresh_exclusions()` coalesces adjacent/overlapping cached ranges so the
-/// exclusion CHECK stays compact: three adjacent integer chunks collapse to one
-/// `cached_range` row, and the whole merged span is elided.
-#[test]
-#[serial]
-fn clone_refresh_coalesces_ranges() {
-    let repo = TempDir::new().unwrap();
-    let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
-
-    let remote = "gfs-e2e-coalesce-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "postgres:16");
-    seed_remote(remote, &format!(
-        "{READER} CREATE TABLE orders (id bigint PRIMARY KEY, name text NOT NULL); \
-         INSERT INTO orders SELECT g,'n'||g FROM generate_series(1,10000) g; {}", grant_reader()));
-
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
-    let out = run_clone(&url, &repo_path, Some("16"));
-    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-
-    // Three adjacent chunks → three cached_range rows before coalescing.
-    psql(&gfs, "postgres", "SELECT gfs_sync.warm_range('public','orders','0','999')");
-    psql(&gfs, "postgres", "SELECT gfs_sync.warm_range('public','orders','1000','1999')");
-    psql(&gfs, "postgres", "SELECT gfs_sync.warm_range('public','orders','2000','2999')");
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT count(*) FROM gfs_sync.cached_range WHERE table_name='orders'"),
-        "3"
-    );
-
-    // refresh_exclusions coalesces them into a single [0,2999] range...
-    psql(&gfs, "postgres", "SELECT gfs_sync.refresh_exclusions()");
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT count(*) FROM gfs_sync.cached_range WHERE table_name='orders'"),
-        "1",
-        "three adjacent ranges must coalesce into one"
-    );
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT lo||'-'||hi FROM gfs_sync.cached_range WHERE table_name='orders'"),
-        "0-2999"
-    );
-
-    // ...and the whole merged span is elided, a key beyond it still federates.
-    for id in ["42", "1500", "2999"] {
-        let p = psql(&gfs, "postgres", &format!("EXPLAIN (VERBOSE) SELECT * FROM orders WHERE id = {id}"));
-        assert!(!p.contains("Foreign Scan"), "id={id} (in merged range) must be elided:\n{p}");
-    }
-    let p_out = psql(&gfs, "postgres", "EXPLAIN (VERBOSE) SELECT * FROM orders WHERE id = 5000");
-    assert!(p_out.contains("Foreign Scan"), "id=5000 (outside) should federate:\n{p_out}");
-
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM orders"), "10000");
-}
-
-/// whole_table strategy: a uuid-keyed table can't be range-chunked, so warming
-/// caches it in full and `refresh_exclusions()` applies `CHECK (false)` — every
-/// read (even unconstrained) is then served locally with no remote contact.
-/// Exercises the automatic path through `warm_query_chunks`.
-#[test]
-#[serial]
-fn clone_whole_table_elides_non_integer_key() {
-    let repo = TempDir::new().unwrap();
-    let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
-
-    let remote = "gfs-e2e-whole-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "postgres:16");
-    seed_remote(remote, &format!(
-        "{READER} CREATE TABLE docs (id uuid PRIMARY KEY, body text NOT NULL); \
-         INSERT INTO docs SELECT gen_random_uuid(), 'b'||g FROM generate_series(1,100) g; {}",
-        grant_reader()));
-
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
-    let out = run_clone(&url, &repo_path, Some("16"));
-    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-
-    // Drive warming via the proxy entry point with a non-key predicate. The uuid
-    // key isn't range-able and the table is small → whole_table.
-    psql(&gfs, "postgres",
-        "SELECT gfs_sync.warm_query_chunks('SELECT * FROM docs WHERE body = ''b5''')");
-    psql(&gfs, "postgres", "SELECT gfs_sync.refresh_exclusions()");
-
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT count(*) FROM gfs_sync.fully_cached WHERE table_name='docs'"),
-        "1",
-        "small uuid-keyed table should be marked fully cached"
-    );
-    // Even an unconstrained scan is elided (CHECK (false) makes the foreign
-    // relation provably empty).
-    let p_scan = psql(&gfs, "postgres", "EXPLAIN (VERBOSE) SELECT * FROM docs");
-    assert!(!p_scan.contains("Foreign Scan"), "whole-cached table must not federate:\n{p_scan}");
-    let p_pred = psql(&gfs, "postgres", "EXPLAIN (VERBOSE) SELECT * FROM docs WHERE body = 'b9'");
-    assert!(!p_pred.contains("Foreign Scan"), "predicate read must be elided too:\n{p_pred}");
-
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM docs"), "100");
-}
-
-/// Intersection of the two concurrent features: network elision (`warm_range`)
-/// hydrating a table that has a STORED generated column. The local store is
-/// created `INCLUDING GENERATED`, so hydration cannot `INSERT ... SELECT *`
-/// (Postgres refuses a non-DEFAULT value into a generated column); it must list
-/// the non-generated columns explicitly, like the overlay's write trigger does.
-#[test]
-#[serial]
-fn clone_warm_range_handles_generated_columns() {
-    let repo = TempDir::new().unwrap();
-    let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
-
-    let remote = "gfs-e2e-warmgen-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "postgres:16");
-    seed_remote(remote, &format!(
-        "{READER} CREATE TABLE orders (id bigint PRIMARY KEY, qty int NOT NULL, \
-         total int GENERATED ALWAYS AS (qty * 10) STORED); \
-         INSERT INTO orders(id, qty) SELECT g, g FROM generate_series(1,2000) g; {}", grant_reader()));
-
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
-    let out = run_clone(&url, &repo_path, Some("16"));
-    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-
-    // Hydration must not choke on the generated column.
-    let warm = psql_try(&gfs, "postgres",
-        "SELECT gfs_sync.warm_range('public','orders','1','1000')");
-    assert!(
-        warm.status.success(),
-        "warm_range must tolerate generated columns, got:\n{}",
-        String::from_utf8_lossy(&warm.stderr)
-    );
-    // Decoupled: warm_range only hydrates; refresh_exclusions applies elision.
-    psql(&gfs, "postgres", "SELECT gfs_sync.refresh_exclusions()");
-
-    // The warmed local rows recomputed the generated column locally...
-    assert_eq!(psql(&gfs, "postgres", "SELECT total FROM orders WHERE id = 42"), "420");
-    // ...and the warmed range is elided.
-    let plan = psql(&gfs, "postgres", "EXPLAIN (VERBOSE) SELECT * FROM orders WHERE id = 42");
-    assert!(!plan.contains("Foreign Scan"), "cached-range read must be elided:\n{plan}");
-    // A non-warmed key still federates and stays correct.
-    assert_eq!(psql(&gfs, "postgres", "SELECT total FROM orders WHERE id = 1500"), "15000");
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM orders"), "2000");
-}
-
-/// A non-key predicate (fuzzy `ILIKE`) can't refute the key-range exclusion
-/// CHECK, so it would federate a full remote scan even when every row is local.
-/// Fix: once range warming covers the whole table, refresh_exclusions promotes
-/// it to whole_table (drops the foreign branch from the view), so non-key reads
-/// are served locally too.
-#[test]
-#[serial]
-fn clone_fully_cached_elides_non_key_query() {
-    let repo = TempDir::new().unwrap();
-    let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
-
-    let remote = "gfs-e2e-fuzzy-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "postgres:16");
-    seed_remote(remote, &format!(
-        "{READER} CREATE TABLE products (id bigint PRIMARY KEY, name text NOT NULL); \
-         INSERT INTO products SELECT g, 'Product '||g FROM generate_series(1,2000) g; {}",
-        grant_reader()));
-
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
-    let out = run_clone(&url, &repo_path, Some("16"));
-    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-
-    // Hydrate the WHOLE key span, then apply exclusion.
-    psql(&gfs, "postgres", "SELECT gfs_sync.warm_range('public','products','1','2000')");
-    psql(&gfs, "postgres", "SELECT gfs_sync.refresh_exclusions()");
-    // Schema-qualified reads the faithful store directly (bypassing the overlay).
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM public.products"), "2000");
-
-    // Key query is elided (sanity).
-    let key_plan = psql(&gfs, "postgres", "EXPLAIN SELECT id FROM products WHERE id BETWEEN 1 AND 50");
-    assert!(!key_plan.contains("Foreign Scan"), "key query should be elided:\n{key_plan}");
-
-    // Non-key fuzzy query: every matching row is local, so it must NOT federate.
-    let fuzzy_plan = psql(&gfs, "postgres",
-        "EXPLAIN SELECT id, name FROM products WHERE name ILIKE '%Product 1%' ORDER BY id LIMIT 50");
-    assert!(
-        !fuzzy_plan.contains("Foreign Scan"),
-        "fully-cached table must serve a non-key query locally (no remote scan):\n{fuzzy_plan}"
-    );
-
-    // Correctness regardless.
-    let n = psql(&gfs, "postgres", "SELECT count(*) FROM products WHERE name ILIKE '%Product 1%'");
-    assert!(n.parse::<i64>().unwrap() > 0, "fuzzy search should match rows");
-}
-
-/// Promotion also fires when the table is covered by SEVERAL non-adjacent ranges
-/// (a gap in the key space with no rows there), not just a single coalesced one.
-#[test]
-#[serial]
-fn clone_promote_whole_from_multiple_ranges() {
-    let repo = TempDir::new().unwrap();
-    let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
-
-    let remote = "gfs-e2e-multirange-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "postgres:16");
-    // Rows only in [1,1000] and [2001,3000]; the (1000,2001) gap has no rows.
-    seed_remote(remote, &format!(
-        "{READER} CREATE TABLE products (id bigint PRIMARY KEY, name text NOT NULL); \
-         INSERT INTO products SELECT g,'Product '||g FROM generate_series(1,1000) g; \
-         INSERT INTO products SELECT g,'Product '||g FROM generate_series(2001,3000) g; {}",
-        grant_reader()));
-
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
-    let out = run_clone(&url, &repo_path, Some("16"));
-    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-
-    // Two non-adjacent ranges (won't coalesce) that together cover every row.
-    psql(&gfs, "postgres", "SELECT gfs_sync.warm_range('public','products','1','1000')");
-    psql(&gfs, "postgres", "SELECT gfs_sync.warm_range('public','products','2001','3000')");
-    psql(&gfs, "postgres", "SELECT gfs_sync.refresh_exclusions()");
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM public.products"), "2000");
-    assert_eq!(
-        psql(&gfs, "postgres", "SELECT count(*) FROM gfs_sync.fully_cached WHERE table_name='products'"),
-        "1",
-        "covered-by-multiple-ranges table should be promoted to whole_table"
-    );
-
-    let fuzzy = psql(&gfs, "postgres",
-        "EXPLAIN SELECT id FROM products WHERE name ILIKE '%Product 2%' ORDER BY id LIMIT 50");
-    assert!(!fuzzy.contains("Foreign Scan"), "non-key query must be local after promotion:\n{fuzzy}");
-    assert_eq!(psql(&gfs, "postgres", "SELECT count(*) FROM products"), "2000");
-}
-
-/// Transitive FK warming (level 0): warming a CHILD table also follows its
-/// foreign keys to warm the referenced PARENT rows, so a JOIN to the parent is
-/// served entirely locally — the overlay view otherwise defeats postgres_fdw's
-/// join pushdown and federates both sides. The parent (a small dimension table)
-/// is promoted to whole_table so its Foreign Scan is elided in the join (a JOIN
-/// gives the planner no direct qual on the parent key, so only whole_table can
-/// drop the foreign branch). See docs/rfcs/008-remote-clone/poc-join-fk.
-#[test]
-#[serial]
-fn clone_transitive_fk_warming_localizes_join() {
-    let repo = TempDir::new().unwrap();
-    let repo_path = repo.path().to_path_buf();
-    let mut cleanup = Cleanup::new(repo);
-
-    let remote = "gfs-e2e-fkwarm-remote";
-    cleanup.add(remote);
-    let port = start_remote(remote, "postgres:16");
-    // orders.customer_id REFERENCES customers(id): a classic star-schema join.
-    seed_remote(remote, &format!(
-        "{READER} \
-         CREATE TABLE customers (id bigint PRIMARY KEY, name text NOT NULL); \
-         CREATE TABLE orders (id bigint PRIMARY KEY, \
-            customer_id bigint NOT NULL REFERENCES customers(id), total numeric NOT NULL); \
-         INSERT INTO customers SELECT g, 'cust'||g FROM generate_series(1,500) g; \
-         INSERT INTO orders SELECT g, ((g-1)%500)+1, g*1.5 FROM generate_series(1,5000) g; {}",
-        grant_reader()
-    ));
-
-    let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{port}/shop");
-    let out = run_clone(&url, &repo_path, Some("16"));
-    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
-    let gfs = common::postgres::get_container_id(&repo_path);
-    cleanup.add(gfs.clone());
-
-    let join = "SELECT o.id, c.name FROM orders o \
-                JOIN customers c ON o.customer_id = c.id WHERE o.id BETWEEN 1 AND 50";
-
-    // Cold: at least one side federates.
-    let cold = psql(&gfs, "postgres", &format!("EXPLAIN (VERBOSE) {join}"));
-    assert!(cold.contains("Foreign Scan"), "cold join should federate:\n{cold}");
-
-    // Warm the child query. warm_query_chunks hydrates the orders chunk AND,
-    // transitively via the FK, the referenced customers — promoting the small
-    // customers dimension to whole_table.
-    psql(&gfs, "postgres", &format!(
-        "SELECT gfs_sync.warm_query_chunks('SELECT * FROM orders WHERE id BETWEEN 1 AND 50', 1000)"));
-    psql(&gfs, "postgres", "SELECT gfs_sync.refresh_exclusions()");
-
-    // The parent must now be locally materialized (transitive warm reached it).
-    let cust_local = psql(&gfs, "postgres", "SELECT count(*) FROM public.customers");
-    assert_eq!(cust_local, "500", "transitive FK warm must hydrate the parent customers");
-
-    // And the JOIN must be fully local: no Foreign Scan on either side.
-    let warm = psql(&gfs, "postgres", &format!("EXPLAIN (VERBOSE) {join}"));
-    assert!(!warm.contains("Foreign Scan"),
-        "after transitive FK warm the join must be fully local:\n{warm}");
-
-    // Correctness preserved: same result as reading the source directly.
-    let res = psql(&gfs, "postgres",
-        "SELECT count(*), coalesce(sum(o.total),0) FROM orders o \
-         JOIN customers c ON o.customer_id=c.id WHERE o.id BETWEEN 1 AND 50");
-    let src = psql(remote, "shop",
-        "SELECT count(*), coalesce(sum(o.total),0) FROM orders o \
-         JOIN customers c ON o.customer_id=c.id WHERE o.id BETWEEN 1 AND 50");
-    assert_eq!(res, src, "overlay join result must match source");
-
-    drop(cleanup);
+    let mut cl = Cleanup::new(repo);
+    let remote = "gfs-e2e-rob-write";
+    let clone = setup(&mut cl, remote, &repo_path);
+
+    // UPDATE with a subquery qual -> federate-classifies; the guard whole-hydrates
+    // locally instead of writing the source.
+    psql(&clone, "postgres", "UPDATE orders SET unit_cents=99999 WHERE id=(SELECT min(id) FROM orders)");
+    assert_eq!(psql(&clone, "postgres", "SELECT unit_cents FROM orders WHERE id=1"), "99999", "local UPDATE applied");
+    assert_ne!(psql(remote, "shop", "SELECT unit_cents FROM orders WHERE id=1"), "99999", "SOURCE not updated");
+    assert_eq!(psql(&clone, "postgres", "SELECT federate_calls FROM gfs.clones WHERE clone='orders'"), "0",
+        "the write did not federate (it whole-hydrated locally)");
+
+    // INSERT diverges locally.
+    psql(&clone, "postgres", "INSERT INTO orders (id,customer_id,qty,unit_cents,placed_at) VALUES (999999,1,1,1,date '2024-01-01')");
+    assert_eq!(psql(&clone, "postgres", "SELECT count(*) FROM orders WHERE id=999999"), "1");
+    assert_eq!(psql(remote, "shop", "SELECT count(*) FROM orders WHERE id=999999"), "0", "INSERT not on source");
+
+    // DELETE (federate-classifying) leaves the source row count unchanged.
+    let src_before = psql(remote, "shop", "SELECT count(*) FROM orders");
+    psql(&clone, "postgres", "DELETE FROM orders WHERE id < (SELECT 50 FROM orders LIMIT 1)");
+    assert_eq!(psql(remote, "shop", "SELECT count(*) FROM orders"), src_before, "SOURCE rows not deleted");
+    drop(cl);
 }

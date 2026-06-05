@@ -2,8 +2,9 @@
 //!
 //! Flow:
 //!   1. Start a throwaway "remote" Postgres (published port) and seed it read-only.
-//!   2. Run the real `gfs clone` binary: it provisions a local GFS Postgres and
-//!      bootstraps the overlay (FDW + views + copy-on-write triggers).
+//!   2. Run the real `gfs clone` binary on the gfs-postgres image: it provisions a
+//!      local GFS Postgres and bootstraps the planner-hook clone (foreign tables +
+//!      real local tables registered in gfs.clone_source).
 //!   3. Validate, against the cloned database (what an app sees on a direct
 //!      connection): reads are correct, writes diverge locally, the remote is
 //!      untouched.
@@ -51,7 +52,7 @@ fn psql_remote(query: &str) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// Run psql inside the cloned GFS container (DB `postgres`, where the overlay lives).
+/// Run psql inside the cloned GFS container (DB `postgres`).
 fn psql_gfs(container: &str, query: &str) -> String {
     common::postgres::run_psql_select(container, query)
         .trim()
@@ -60,6 +61,14 @@ fn psql_gfs(container: &str, query: &str) -> String {
 
 #[test]
 fn e2e_clone_postgres() {
+    // The planner-hook clone needs the gfs extension image; skip (don't fail) if absent.
+    let img_ok = runtime_command()
+        .args(["image", "inspect", "gfs-postgres:16"])
+        .output().map(|o| o.status.success()).unwrap_or(false);
+    if !img_ok {
+        eprintln!("SKIP: image gfs-postgres:16 absent — build: docker build -t gfs-postgres:16 crates/extensions/gfs");
+        return;
+    }
     let repo = TempDir::new().expect("temp repo");
     let repo_path = repo.path().to_path_buf();
     let mut cleanup = Cleanup {
@@ -75,7 +84,7 @@ fn e2e_clone_postgres() {
             "-e", "POSTGRES_PASSWORD=postgres",
             "-e", "POSTGRES_DB=shop",
             "-p", "127.0.0.1::5432",
-            "postgres:17",
+            "postgres:16",
         ])
         .output()
         .expect("start remote container");
@@ -137,8 +146,10 @@ fn e2e_clone_postgres() {
             "--from",
             &url,
             repo_path.to_str().unwrap(),
+            "--image",
+            "gfs-postgres:16",
             "--database-version",
-            "17",
+            "16",
         ])
         .output()
         .expect("run gfs clone");
@@ -152,42 +163,41 @@ fn e2e_clone_postgres() {
     let gfs_container = common::postgres::get_container_id(&repo_path);
     cleanup.gfs_container = Some(gfs_container.clone());
 
-    // 4. Validate the overlay on the cloned DB (what a direct app connection sees).
-    // Faithful-overlay layout: public.orders is the real faithful table ('r',
-    // carrying the source's constraints/triggers), and the overlay view lives in
-    // gfs_ovl__public.orders ('v'). A bare `orders` read resolves to the overlay
-    // first via the default search_path (gfs_ovl__public, public).
+    // 4. Validate the planner-hook clone on the cloned DB (what a direct app
+    // connection sees). public.orders is a REAL local table ('r') registered in
+    // gfs.clone_source; there is no overlay view and no gfs_sync schema. Reads are
+    // copy-on-read and return the source's data.
     assert_eq!(
         psql_gfs(&gfs_container, "SELECT relkind FROM pg_class WHERE relname='orders' AND relnamespace='public'::regnamespace"),
         "r",
-        "public.orders should be the faithful local table"
+        "public.orders should be the real local table"
     );
     assert_eq!(
-        psql_gfs(&gfs_container, "SELECT relkind FROM pg_class WHERE relname='orders' AND relnamespace='gfs_ovl__public'::regnamespace"),
-        "v",
-        "gfs_ovl__public.orders should be the overlay view"
+        psql_gfs(&gfs_container, "SELECT count(*) FROM pg_namespace WHERE nspname LIKE 'gfs_ovl__%'"),
+        "0",
+        "the removed overlay-view schema must not exist"
     );
     assert_eq!(
-        psql_gfs(&gfs_container, "SELECT count(*) FROM gfs_sync.table_meta WHERE table_name='orders'"),
+        psql_gfs(&gfs_container, "SELECT count(*) FROM gfs.clone_source WHERE relid::text='orders'"),
         "1",
-        "orders should be registered in the sync catalog"
+        "orders should be registered in gfs.clone_source"
     );
     assert_eq!(
         psql_gfs(&gfs_container, "SELECT count(*) FROM orders"),
         "1000",
-        "read through the overlay should match the remote"
+        "copy-on-read should match the remote"
     );
     assert_eq!(
         psql_gfs(&gfs_container, "SELECT customer FROM orders WHERE id=42"),
         "cust_42"
     );
 
-    // Write through the overlay → diverges locally, remote stays read-only.
+    // Local write → diverges locally, remote stays untouched (write-safety guard).
     psql_gfs(&gfs_container, "UPDATE orders SET customer='LOCAL' WHERE id=42");
     assert_eq!(
         psql_gfs(&gfs_container, "SELECT customer FROM orders WHERE id=42"),
         "LOCAL",
-        "local update should be visible through the overlay"
+        "local update should be visible on the clone"
     );
     psql_gfs(&gfs_container, "INSERT INTO orders (id,customer,amount) VALUES (99999,'NEW',1.0)");
     assert_eq!(psql_gfs(&gfs_container, "SELECT count(*) FROM orders"), "1001");
