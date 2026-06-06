@@ -496,7 +496,20 @@ impl DatabaseProvider for PostgresqlProvider {
             sql = bootstrap_sql,
         );
 
-        let command = format!("set -e\n{dump}\n{sanitize}\n{replay}\n{bootstrap}");
+        // Step 1c — wait for the clone to actually ACCEPT QUERIES before replaying
+        // onto it. The engine's port can be open (and the framework's TCP readiness
+        // probe satisfied) while postgres is still starting up, especially under
+        // host load -- replaying then fails with "connection refused". Poll a real
+        // SELECT 1 (same creds as the replay, via the sidecar's PGPASSWORD).
+        let wait_clone = format!(
+            "for i in $(seq 1 120); do if psql -h {host} -p {port} -U {user} -d {db} -c 'SELECT 1' >/dev/null 2>&1; then break; fi; sleep 1; done",
+            host = local.host,
+            port = local.port,
+            user = user,
+            db = db,
+        );
+
+        let command = format!("set -e\n{dump}\n{sanitize}\n{wait_clone}\n{replay}\n{bootstrap}");
 
         Ok(CloneSpec {
             definition: sidecar_definition(self.definition().image, password, "/data"),
