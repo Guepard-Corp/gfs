@@ -17,9 +17,9 @@ use gfs_domain::ports::storage::{
 };
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, PersistentVolumeClaimSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use kube::Client;
 use kube::api::{Api, DeleteParams, DynamicObject, Patch, PatchParams};
 use kube::core::{ApiResource, GroupVersionKind};
-use kube::Client;
 use serde_json::json;
 
 const DEFAULT_NAMESPACE: &str = "gfs";
@@ -153,6 +153,30 @@ impl KubernetesStorage {
         Err(StorageError::Internal(format!(
             "pvc '{name}' did not reach Bound in time"
         )))
+    }
+
+    /// Source PVC recorded in a VolumeSnapshot's `spec.source.persistentVolumeClaimName`.
+    ///
+    /// Identifies which instance's volume (and therefore whose auth state) a
+    /// snapshot was taken from — the restore path uses it to keep the
+    /// advertised credentials truthful when seeding a clone from another
+    /// instance's snapshot.
+    pub async fn snapshot_source_pvc(
+        &self,
+        name: &str,
+    ) -> std::result::Result<Option<String>, StorageError> {
+        let api = self.api_volume_snapshots();
+        let vs = api
+            .get(name)
+            .await
+            .map_err(|e| StorageError::Internal(format!("get volumesnapshot failed: {e}")))?;
+        Ok(vs
+            .data
+            .get("spec")
+            .and_then(|s| s.get("source"))
+            .and_then(|s| s.get("persistentVolumeClaimName"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string))
     }
 
     pub async fn wait_snapshot_ready(&self, name: &str) -> std::result::Result<(), StorageError> {
@@ -368,4 +392,3 @@ impl StoragePort for KubernetesStorage {
         Ok(())
     }
 }
-
