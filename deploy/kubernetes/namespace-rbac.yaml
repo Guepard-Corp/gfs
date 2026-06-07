@@ -18,6 +18,11 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "pods/log", "services", "persistentvolumeclaims"]
     verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  # Per-instance `{instance}-credentials` Secrets: the durable home of the
+  # deploy-time database password (statefulset env resolves via secretKeyRef).
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "patch", "delete"]
   - apiGroups: ["apps"]
     resources: ["statefulsets"]
     verbs: ["get", "list", "watch", "create", "patch", "delete"]

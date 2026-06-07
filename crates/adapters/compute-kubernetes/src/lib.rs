@@ -197,6 +197,13 @@ fn credentials_secret_manifest(
     instance: &str,
     values: &BTreeMap<String, String>,
 ) -> Secret {
+    // Populate `data` directly (not the write-only `stringData`): server-side
+    // apply then owns the exact field the read path consumes, with no
+    // server-side conversion in between.
+    let data: BTreeMap<String, k8s_openapi::ByteString> = values
+        .iter()
+        .map(|(k, v)| (k.clone(), k8s_openapi::ByteString(v.clone().into_bytes())))
+        .collect();
     Secret {
         metadata: ObjectMeta {
             name: Some(credentials_secret_name(instance)),
@@ -204,7 +211,7 @@ fn credentials_secret_manifest(
             labels: Some(labels_for(instance)),
             ..Default::default()
         },
-        string_data: Some(values.clone()),
+        data: Some(data),
         type_: Some("Opaque".to_string()),
         ..Default::default()
     }
@@ -1303,7 +1310,15 @@ mod tests {
         );
         assert_eq!(secret.metadata.namespace.as_deref(), Some("gfs"));
         assert_eq!(secret.type_.as_deref(), Some("Opaque"));
-        assert_eq!(secret.string_data, Some(values));
+        // Write/read symmetry: the manifest populates `data` — the same field
+        // the read path (`decode_secret_values`) consumes — not `stringData`.
+        assert!(secret.string_data.is_none());
+        assert_eq!(
+            decode_secret_values(secret)
+                .get("POSTGRES_PASSWORD")
+                .map(String::as_str),
+            Some("s3cret")
+        );
     }
 
     #[test]
