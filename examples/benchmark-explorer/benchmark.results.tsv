@@ -1,0 +1,2 @@
+# label	scenarios	passed	source_ops	rows_pulled	local_pct  (objective: source_ops DOWN, rows_pulled low, local_pct UP)
+refactored-image	10	14	22	1771155	30

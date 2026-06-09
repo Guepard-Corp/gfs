@@ -1,116 +1,87 @@
-# gfs — benchmarks & validation
+# gfs — benchmark & validation
 
-Two self-contained scripts validate the lazy clone (copy-on-read of an external
-PostgreSQL) and its cost-based router. Run them from the repo root.
+There is **one benchmark** for the lazy clone (copy-on-read of an external
+PostgreSQL) and its cost-based router: the **benchmark explorer**
+(`examples/benchmark-explorer`). It is defined once and driven two ways — a **UI**
+and a **headless** runner — so the interactive demo and the CI check exercise the
+exact same scenarios. A separate **validation suite** (scale / chaos / write-safety)
+covers the harder guarantees.
 
-| Script | Purpose | Time | Data |
-|---|---|---|---|
-| [`benchmark.sh`](benchmark.sh) | Deterministic **router** benchmark + non-regression guard | ~2-3 min | tiny, generated each run |
-| [`tpch_validate.sh`](tpch_validate.sh) | **Multi-table scale** validation (TPC-H) with a **persistent** source | minutes → ~1 h | ~1 GB … ~100 GB+ |
+## The benchmark — `examples/benchmark-explorer`
 
-## Router decision paths these exercise
+One set of scenarios over a real multi-table workload (**TPC-H**), on a persistent
+source (a named Docker volume per scale factor — the slow generate+load happens
+once; only the lazy clone is rebuilt). Both front-ends import the same definitions
+(`server/src/bench.ts`): the scenario SQL, clone provisioning, pinned cost weights,
+and route detection live in one place.
 
-- **P1 range-hydrate** — a query bounding an integer key (`id BETWEEN`) fetches the
-  missing key *range*, then serves local (elision on re-ask).
-- **P2 partial-selective** — a selective non-key predicate on a table *too big to
-  own whole* fetches only the matching *slice* (capped, self-validating).
-- **P3 federate** — joins / aggregates with no key bound are pushed to the source
-  via `postgres_fdw` (computed remotely, nothing materialized locally).
-- Every check asserts **`clone == source`** (correctness), and reports the route.
+```bash
+cd examples/benchmark-explorer
 
-## Prerequisites (one-time)
+SF=1 ./scripts/run.sh        # UI:       http://localhost:8789  (click "Clone the source")
+SF=1 ./scripts/bench.sh      # headless: asserts + writes benchmark.results.tsv, exit 0/1
+```
+
+### Router decision paths it exercises
+
+- **P1 range-hydrate** — a query bounding the integer key (`l_orderkey BETWEEN`)
+  fetches the missing key *range*, then serves local (elision on re-ask).
+- **P2 partial-selective** — a selective non-key predicate (`l_quantity = v`) on a
+  table *too big to own whole* fetches only the matching *slice* (capped,
+  self-validating): 1st touch federates, 2nd fetches the slice, 3rd serves local.
+- **P3 federate** — joins / aggregates with no key bound (Q1/Q3/Q5/Q10) are pushed
+  to the source via `postgres_fdw` (computed remotely, nothing materialized).
+- **P5 temporal** — a `DATE`-keyed window (`o_orderdate BETWEEN`) fetches the time
+  range, then serves local; a too-wide window federates (capped).
+- **convergence** — a federated join becomes **fully local** (zero `Foreign Scan`)
+  after `gfs.warm` materializes its tables — the clone converging to a
+  self-sufficient copy (the transitive-FK-warming case in the planner-hook model).
+
+Every shot asserts **`clone == source`** (correctness) and the **expected route**.
+
+### Headless output
+
+The verdict is `N passed, M failed`. The objective block reports `source_ops`
+(clone→source contacts), `rows_pulled`, and `local_pct`, persists them to
+`examples/benchmark-explorer/benchmark.results.tsv` (append-only, one row per
+`LABEL`), and flags **IMPROVED / REGRESSED** against the previous run — the
+regression guard. Scale up with `SF=10` (~16 GB) / `SF=50` (~100 GB).
+
+### Prerequisites (one-time)
 
 - **Docker**
-- **DuckDB** on `PATH` (`duckdb`) — generates TPC-H data, no `dbgen` build needed
-- **psql 16** (default: `/opt/homebrew/opt/postgresql@16/bin/psql`)
-- the **gfs CLI** at `target/debug/gfs` — build with `cargo build -p gfs-cli`
+- **DuckDB** on `PATH` (`duckdb`) — generates TPC-H, no `dbgen` build
+- **pnpm** (the explorer is a small Node app)
+- the **gfs CLI** at `target/debug/gfs` — `cargo build -p gfs-cli`
 - the **`gfs-postgres:16`** image — `docker build -t gfs-postgres:16 crates/extensions/gfs`
-  (slow, multi-stage; only needed once / after extension changes)
+  (slow, multi-stage; only after extension changes). `scripts/run.sh` /
+  `scripts/bench.sh` build it on first run if absent.
 
 ---
 
-## 1. Router benchmark — `benchmark.sh`
+## Validation suite (separate from the benchmark)
 
-Fast, deterministic. Spins up a seeded source + a real gfs clone, fires scenarios,
-asserts `clone == source`, shows the route per shot, demonstrates cost
-amortization, the prod-protection rate budget, and partial hydration. Persists the
-objective metrics to `benchmark.results.tsv` and compares to the previous run
-(IMPROVED / REGRESSED / same).
+These prove harder guarantees and are **not** the benchmark — run them when
+changing the relevant behavior. They live in `crates/extensions/gfs/`.
 
-```bash
-cd ~/Documents/work/guepard/gfs/gfs
-LABEL=my-run ./crates/extensions/gfs/benchmark.sh
-```
-
-Knobs (env vars): `LABEL` (row label in the results file), `SHOTS=5` (shots per
-scenario), `N_PRODUCTS=50000` / `N_ORDERS=…` (source seed size), `PSQL=…`,
-`GFS_IMAGE=…`, `KEEP=1` (don't tear down the containers).
-
-The verdict line is `N passed, M failed`. The objective section compares
-`source_ops` / `pull%` / `local%` to the last persisted run — that's the
-regression guard.
-
----
-
-## 2. Multi-table scale validation — `tpch_validate.sh`
-
-Generates TPC-H with DuckDB, loads it (with **primary keys** — the clone bootstrap
-only registers tables that have a unique index) into a **persistent** `postgres:16`
-source, then `gfs clone`s it and validates P1/P2/P3 over real joins.
+| Script | Proves | Data |
+|---|---|---|
+| `tpch_validate.sh` | **scale** — P1/P2/P3 over real TPC-H joins at SF1…SF50+, on a persistent source | ~1 GB … ~100 GB+ |
+| `chaos_test.sh` | **graceful degradation** — source down during copy-on-read errors (never a wrong/partial result) + the aggregate load N clones put on one source | small |
+| `write_safety_test.sh` | **write-safety** — a write whose scan would federate is whole-hydrated locally, leaving the source byte-for-byte untouched | reuses TPC-H SF1 |
 
 ```bash
-cd ~/Documents/work/guepard/gfs/gfs
-
-SF=1  ./crates/extensions/gfs/tpch_validate.sh      # fast proof (~1 GB, 6M lineitem)
-SF=10 ./crates/extensions/gfs/tpch_validate.sh      # ~16 GB, 60M lineitem
-SF=50 ./crates/extensions/gfs/tpch_validate.sh      # ~100 GB (long the FIRST time)
+SF=1 ./crates/extensions/gfs/tpch_validate.sh      # scale validation
+CLONES=3 ./crates/extensions/gfs/chaos_test.sh     # fault injection
+./crates/extensions/gfs/write_safety_test.sh       # write guard (after an SF1 source exists)
 ```
-
-### The source is PERSISTENT — you don't rebuild it every time
-
-The TPC-H data lives in a **named Docker volume** (`gfs-tpch-vol-sf<SF>`, one per
-scale factor). The source container is recreated cheaply each run (with analytical
-tuning) **on top of that volume**, so the slow generate+load happens **once**; the
-ephemeral, lazy **clone** is what's rebuilt each run (seconds, regardless of source
-size — that's the whole point of a lazy clone).
-
-```bash
-SF=10 ./crates/extensions/gfs/tpch_validate.sh      # 1st time: builds the source
-SF=10 ./crates/extensions/gfs/tpch_validate.sh      # again: "REUSING ... no rebuild"
-```
-
-### Knobs
-
-| Variable | Effect |
-|---|---|
-| `SF=50` | scale factor (≈ GB of raw data; SF50 ≈ ~100 GB in PostgreSQL) |
-| `REBUILD_SOURCE=1` | force-regenerate the source for this SF |
-| `DROP_SOURCE=1` | delete this SF's source container **and** volume, then exit |
-| `SRC_PORT` / `CLONE_PORT` | default `55610` / `55611` |
-| `GFS_BIN` / `PSQL` / `GFS_IMAGE` | override paths |
-
-### Managing persistent sources
-
-```bash
-docker ps -a --filter name=gfs-tpch-src      # which source DBs exist
-docker volume ls | grep gfs-tpch             # their volumes (data)
-DROP_SOURCE=1 SF=10 ./crates/extensions/gfs/tpch_validate.sh   # remove one
-```
-
-### Reading the output
-
-Each section prints the route (`fetched` / `federated` / `local`) and a
-`PASS clone == source` assertion; the final `Clone state` table shows per-table
-`whole_cached` / `partial_rows` / `rows_fetched` / `federate_calls`. Verdict:
-`N passed, M failed`.
-
----
 
 ## Notes / gotchas baked into the scripts
 
-- **Don't calibrate at this scale.** `gfs.calibrate()` rewrites `net` to measured
+- **Don't calibrate at scale.** `gfs.calibrate()` rewrites `net` to measured
   seconds/byte, which makes big tables *whole-ownable* and collapses the P2 partial
-  niche. `tpch_validate.sh` pins fixed weights and does **not** calibrate.
+  niche. The benchmark and `tpch_validate.sh` pin fixed weights and do **not**
+  calibrate.
 - **Ceiling scales with the data.** The whole-own ceiling is set to `0.1 ×`
   lineitem's whole-own cost, so the big facts stay not-ownable (P2/P3) while a 5%
   slice still fits — a *fixed* ceiling doesn't generalize across scale factors.
@@ -118,12 +89,3 @@ Each section prints the route (`fetched` / `federated` / `local`) and a
   created with `use_remote_estimate 'true'` + `fetch_size '10000'` so joins/
   aggregates are pushed to the source; without it `postgres_fdw` fetches base rows
   over a cursor and joins locally (catastrophic at scale).
-
-## Output files
-
-- `benchmark.results.tsv` — append-only objective metrics per `LABEL` (router
-  benchmark), used for the regression guard.
-
-> The package `README.md` still describes the **old TAM** design; the current
-> implementation is a `planner_hook` + real tables + cost-based router (see
-> `src/lib.rs`). That README needs updating separately.
