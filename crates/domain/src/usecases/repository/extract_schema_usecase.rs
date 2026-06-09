@@ -53,6 +53,12 @@ pub enum ExtractSchemaError {
 pub struct SchemaOutput {
     /// Complete schema metadata including schemas, tables, columns, and relationships.
     pub metadata: DatasourceMetadata,
+    /// Schema-only DDL dump captured from the extraction sidecar's stdout.
+    ///
+    /// Empty when the provider does not emit a `GFS_SCHEMA_DDL` section. Carried
+    /// through stdout (not a mounted file) so it survives runtimes where the
+    /// sidecar runs on a different host than the repository (e.g. Kubernetes).
+    pub schema_sql: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -63,6 +69,8 @@ const DELIM_VERSION: &str = "GFS_SCHEMA_VERSION";
 const DELIM_SCHEMAS: &str = "GFS_SCHEMA_SCHEMAS";
 const DELIM_TABLES: &str = "GFS_SCHEMA_TABLES";
 const DELIM_COLUMNS: &str = "GFS_SCHEMA_COLUMNS";
+/// Optional trailing section carrying the schema-only DDL dump (raw SQL, not JSON).
+const DELIM_DDL: &str = "GFS_SCHEMA_DDL";
 
 // ---------------------------------------------------------------------------
 // Use case
@@ -157,9 +165,14 @@ impl<R: DatabaseProviderRegistry> ExtractSchemaUseCase<R> {
             )));
         }
 
-        // 6. Parse stdout into version, schemas, tables, columns.
-        let (version, schemas, tables, columns) =
-            parse_schema_output(&output.stdout).map_err(ExtractSchemaError::ExtractionFailed)?;
+        // 6. Parse stdout into version, schemas, tables, columns, and DDL.
+        let ParsedSchema {
+            version,
+            schemas,
+            tables,
+            columns,
+            ddl,
+        } = parse_schema_output(&output.stdout).map_err(ExtractSchemaError::ExtractionFailed)?;
 
         // 7. Build metadata.
         let metadata = DatasourceMetadata {
@@ -184,130 +197,106 @@ impl<R: DatabaseProviderRegistry> ExtractSchemaUseCase<R> {
             extensions: None,
         };
 
-        Ok(SchemaOutput { metadata })
+        Ok(SchemaOutput {
+            metadata,
+            schema_sql: ddl,
+        })
     }
 }
 
 /// Parsed schema output from the extraction sidecar.
-type ParseSchemaOutput = (String, Vec<Schema>, Vec<Table>, Vec<Column>);
+#[derive(Debug)]
+struct ParsedSchema {
+    version: String,
+    schemas: Vec<Schema>,
+    tables: Vec<Table>,
+    columns: Vec<Column>,
+    /// Schema-only DDL dump. Empty when the sidecar emits no `GFS_SCHEMA_DDL`
+    /// section.
+    ddl: String,
+}
 
 /// Parse the stdout from the schema extraction sidecar.
 /// Expected format: delimiter lines followed by content until the next delimiter.
-fn parse_schema_output(stdout: &str) -> Result<ParseSchemaOutput, String> {
-    let mut version = String::new();
-    let mut schemas = Vec::new();
-    let mut tables = Vec::new();
-    let mut columns = Vec::new();
+fn parse_schema_output(stdout: &str) -> Result<ParsedSchema, String> {
+    let mut parsed = ParsedSchema {
+        version: String::new(),
+        schemas: Vec::new(),
+        tables: Vec::new(),
+        columns: Vec::new(),
+        ddl: String::new(),
+    };
 
     let mut current_section: Option<&str> = None;
     let mut current_lines: Vec<&str> = Vec::new();
 
     for line in stdout.lines() {
         let trimmed = line.trim();
-        match trimmed {
-            DELIM_VERSION => {
-                flush_section(
-                    current_section,
-                    &current_lines,
-                    &mut version,
-                    &mut schemas,
-                    &mut tables,
-                    &mut columns,
-                )?;
-                current_section = Some("version");
+        let next_section = match trimmed {
+            DELIM_VERSION => Some("version"),
+            DELIM_SCHEMAS => Some("schemas"),
+            DELIM_TABLES => Some("tables"),
+            DELIM_COLUMNS => Some("columns"),
+            DELIM_DDL => Some("ddl"),
+            _ => None,
+        };
+        match next_section {
+            Some(section) => {
+                flush_section(current_section, &current_lines, &mut parsed)?;
+                current_section = Some(section);
                 current_lines.clear();
             }
-            DELIM_SCHEMAS => {
-                flush_section(
-                    current_section,
-                    &current_lines,
-                    &mut version,
-                    &mut schemas,
-                    &mut tables,
-                    &mut columns,
-                )?;
-                current_section = Some("schemas");
-                current_lines.clear();
-            }
-            DELIM_TABLES => {
-                flush_section(
-                    current_section,
-                    &current_lines,
-                    &mut version,
-                    &mut schemas,
-                    &mut tables,
-                    &mut columns,
-                )?;
-                current_section = Some("tables");
-                current_lines.clear();
-            }
-            DELIM_COLUMNS => {
-                flush_section(
-                    current_section,
-                    &current_lines,
-                    &mut version,
-                    &mut schemas,
-                    &mut tables,
-                    &mut columns,
-                )?;
-                current_section = Some("columns");
-                current_lines.clear();
-            }
-            _ => {
+            None => {
                 if current_section.is_some() {
                     current_lines.push(line);
                 }
             }
         }
     }
-    flush_section(
-        current_section,
-        &current_lines,
-        &mut version,
-        &mut schemas,
-        &mut tables,
-        &mut columns,
-    )?;
+    flush_section(current_section, &current_lines, &mut parsed)?;
 
-    if version.is_empty() {
+    if parsed.version.is_empty() {
         return Err("missing schema version in extraction output".to_string());
     }
 
-    Ok((version, schemas, tables, columns))
+    Ok(parsed)
 }
 
 fn flush_section(
     section: Option<&str>,
     lines: &[&str],
-    version: &mut String,
-    schemas: &mut Vec<Schema>,
-    tables: &mut Vec<Table>,
-    columns: &mut Vec<Column>,
+    parsed: &mut ParsedSchema,
 ) -> Result<(), String> {
     let Some(section) = section else {
         return Ok(());
     };
+    // The DDL section is raw SQL: preserve interior blank lines and indentation,
+    // trimming only the leading/trailing whitespace introduced by the delimiters.
+    if section == "ddl" {
+        parsed.ddl = lines.join("\n").trim().to_string();
+        return Ok(());
+    }
     let content = lines.join("\n").trim().to_string();
     if content.is_empty() {
         return Ok(());
     }
     match section {
         "version" => {
-            *version = content.lines().last().unwrap_or("").trim().to_string();
+            parsed.version = content.lines().last().unwrap_or("").trim().to_string();
         }
         "schemas" => {
             let json_str = extract_json(&content)?;
-            *schemas = serde_json::from_str(&json_str)
+            parsed.schemas = serde_json::from_str(&json_str)
                 .map_err(|e| format!("failed to parse schemas: {e}"))?;
         }
         "tables" => {
             let json_str = extract_json(&content)?;
-            *tables = serde_json::from_str(&json_str)
+            parsed.tables = serde_json::from_str(&json_str)
                 .map_err(|e| format!("failed to parse tables: {e}"))?;
         }
         "columns" => {
             let json_str = extract_json(&content)?;
-            *columns = serde_json::from_str(&json_str)
+            parsed.columns = serde_json::from_str(&json_str)
                 .map_err(|e| format!("failed to parse columns: {e}"))?;
         }
         _ => {}
@@ -387,18 +376,27 @@ GFS_SCHEMA_SCHEMAS
 GFS_SCHEMA_TABLES
 [{"id":2,"schema":"public","name":"users","rls_enabled":false,"rls_forced":false,"bytes":0,"size":"0 bytes","live_rows_estimate":0,"dead_rows_estimate":0,"comment":null,"primary_keys":[],"relationships":[]}]
 GFS_SCHEMA_COLUMNS
-[{"id":"public.users.id","table_id":2,"schema":"public","table":"users","name":"id","ordinal_position":1,"data_type":"int4","format":"int4","is_identity":false,"identity_generation":null,"is_generated":false,"is_nullable":false,"is_updatable":true,"is_unique":false,"check":null,"default_value":null,"enums":[],"comment":null}]"#;
+[{"id":"public.users.id","table_id":2,"schema":"public","table":"users","name":"id","ordinal_position":1,"data_type":"int4","format":"int4","is_identity":false,"identity_generation":null,"is_generated":false,"is_nullable":false,"is_updatable":true,"is_unique":false,"check":null,"default_value":null,"enums":[],"comment":null}]
+GFS_SCHEMA_DDL
+CREATE TABLE public.users (
+    id integer NOT NULL
+);"#;
 
-        let (version, schemas, tables, columns) = parse_schema_output(stdout).unwrap();
+        let parsed = parse_schema_output(stdout).unwrap();
 
-        assert_eq!(version, "PostgreSQL 16.0 (Debian 16.0-1.pgdg120+1)");
-        assert_eq!(schemas.len(), 1);
-        assert_eq!(schemas[0].name, "public");
-        assert_eq!(tables.len(), 1);
-        assert_eq!(tables[0].name, "users");
-        assert_eq!(columns.len(), 1);
-        assert_eq!(columns[0].name, "id");
-        assert_eq!(columns[0].table, "users");
+        assert_eq!(parsed.version, "PostgreSQL 16.0 (Debian 16.0-1.pgdg120+1)");
+        assert_eq!(parsed.schemas.len(), 1);
+        assert_eq!(parsed.schemas[0].name, "public");
+        assert_eq!(parsed.tables.len(), 1);
+        assert_eq!(parsed.tables[0].name, "users");
+        assert_eq!(parsed.columns.len(), 1);
+        assert_eq!(parsed.columns[0].name, "id");
+        assert_eq!(parsed.columns[0].table, "users");
+        // The DDL section is captured verbatim, preserving interior newlines.
+        assert_eq!(
+            parsed.ddl,
+            "CREATE TABLE public.users (\n    id integer NOT NULL\n);"
+        );
     }
 
     #[test]
@@ -413,12 +411,14 @@ GFS_SCHEMA_TABLES
 GFS_SCHEMA_COLUMNS
 []"#;
 
-        let (version, schemas, tables, columns) = parse_schema_output(stdout).unwrap();
+        let parsed = parse_schema_output(stdout).unwrap();
 
-        assert_eq!(version, "PostgreSQL 16.0");
-        assert_eq!(schemas.len(), 1);
-        assert!(tables.is_empty());
-        assert!(columns.is_empty());
+        assert_eq!(parsed.version, "PostgreSQL 16.0");
+        assert_eq!(parsed.schemas.len(), 1);
+        assert!(parsed.tables.is_empty());
+        assert!(parsed.columns.is_empty());
+        // No DDL section emitted → empty DDL, not an error.
+        assert!(parsed.ddl.is_empty());
     }
 
     #[test]
@@ -857,7 +857,11 @@ GFS_SCHEMA_SCHEMAS
 GFS_SCHEMA_TABLES
 [{"id":2,"schema":"public","name":"users","rls_enabled":false,"rls_forced":false,"bytes":0,"size":"0 bytes","live_rows_estimate":0,"dead_rows_estimate":0,"comment":null,"primary_keys":[],"relationships":[]}]
 GFS_SCHEMA_COLUMNS
-[{"id":"public.users.id","table_id":2,"schema":"public","table":"users","name":"id","ordinal_position":1,"data_type":"int4","format":"int4","is_identity":false,"identity_generation":null,"is_generated":false,"is_nullable":false,"is_updatable":true,"is_unique":false,"check":null,"default_value":null,"enums":[],"comment":null}]"#;
+[{"id":"public.users.id","table_id":2,"schema":"public","table":"users","name":"id","ordinal_position":1,"data_type":"int4","format":"int4","is_identity":false,"identity_generation":null,"is_generated":false,"is_nullable":false,"is_updatable":true,"is_unique":false,"check":null,"default_value":null,"enums":[],"comment":null}]
+GFS_SCHEMA_DDL
+CREATE TABLE public.users (
+    id integer NOT NULL
+);"#;
 
         let compute = Arc::new(SchemaExtractMockCompute {
             run_task_stdout: sample_stdout.into(),
@@ -897,6 +901,83 @@ GFS_SCHEMA_COLUMNS
         assert_eq!(output.metadata.columns.len(), 1);
         assert_eq!(output.metadata.columns[0].name, "id");
         assert_eq!(output.metadata.columns[0].table, "users");
+        // Regression: the DDL must be captured from the sidecar STDOUT, not a
+        // host file. On Kubernetes the sidecar pod and the repository live on
+        // different nodes, so a mounted file is never readable by gfs — only
+        // stdout crosses. A file-based capture would leave this empty.
+        assert_eq!(
+            output.schema_sql,
+            "CREATE TABLE public.users (\n    id integer NOT NULL\n);"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extract_schema_succeeds_without_ddl_section() {
+        // A provider (e.g. clickhouse) or a degraded dump (pg_dump failed but the
+        // metadata queries succeeded, so the task still exited 0 thanks to
+        // `|| true`) emits NO `GFS_SCHEMA_DDL` section. Extraction must still
+        // succeed with full metadata and an empty DDL — the commit path then
+        // stores a schema object whose hash powers `schema diff` regardless. If
+        // this returned Err, the commit would record no schema (the original
+        // bug).
+        let (_temp, path) = existing_repo_path();
+        write_config(
+            &path,
+            Some(EnvironmentConfig {
+                database_provider: "mock-schema".into(),
+                database_version: "17".into(),
+                database_port: None,
+            }),
+            Some(RuntimeConfig {
+                runtime_provider: "docker".into(),
+                runtime_version: "24".into(),
+                container_name: "gfs-postgres-123".into(),
+            }),
+        );
+
+        let sample_stdout = r#"GFS_SCHEMA_VERSION
+PostgreSQL 16.0
+GFS_SCHEMA_SCHEMAS
+[{"id":1,"name":"public","owner":"postgres"}]
+GFS_SCHEMA_TABLES
+[]
+GFS_SCHEMA_COLUMNS
+[]"#;
+
+        let compute = Arc::new(SchemaExtractMockCompute {
+            run_task_stdout: sample_stdout.into(),
+            run_task_exit_code: 0,
+        });
+        let provider = MockSchemaProvider {
+            schema_spec: Some(SchemaExtractionSpec {
+                definition: ComputeDefinition {
+                    image: "postgres:latest".into(),
+                    env: vec![],
+                    ports: vec![],
+                    data_dir: PathBuf::from("/tmp"),
+                    host_data_dir: None,
+                    user: None,
+                    logs_dir: None,
+                    conf_dir: None,
+                    args: vec![],
+                },
+                command: "echo test".into(),
+            }),
+        };
+        let registry = Arc::new(MockSchemaRegistry {
+            provider: Some(Arc::new(provider)),
+        });
+
+        let output = ExtractSchemaUseCase::new(compute, registry)
+            .run(&path)
+            .await
+            .expect("extraction must succeed even without a DDL section");
+        assert_eq!(output.metadata.version, "PostgreSQL 16.0");
+        assert_eq!(output.metadata.schemas.len(), 1);
+        assert!(
+            output.schema_sql.is_empty(),
+            "missing DDL section yields empty DDL, not an error"
+        );
     }
 
     #[tokio::test]

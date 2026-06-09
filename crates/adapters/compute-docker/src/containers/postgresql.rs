@@ -664,6 +664,16 @@ impl DatabaseProvider for PostgresqlProvider {
 
         // Run schema extraction inside a container (no psql on host required).
         // Output uses delimiters for parsing.
+        //
+        // The trailing `pg_dump … || true` is deliberate: it is the LAST command
+        // in this `sh -c` script (no `set -e`), so its exit status becomes the
+        // task's exit status. The metadata queries above are tolerant; `pg_dump`
+        // is the fragile step (client/server version skew, large schemas, partial
+        // permissions). Without `|| true`, a dump failure would propagate a
+        // non-zero exit and make `ExtractSchemaUseCase` discard the metadata it
+        // already captured — leaving the commit with no stored schema (the exact
+        // bug this path fixes). `|| true` degrades a dump failure to an empty DDL
+        // while keeping metadata-driven `schema show`/`schema diff` working.
         let command = format!(
             r#"echo "GFS_SCHEMA_VERSION"
 PGPASSWORD="{password}" psql -h {host} -p {port} -U {user} -d {db} -t -A -c "SELECT version();"
@@ -681,7 +691,9 @@ echo "GFS_SCHEMA_COLUMNS"
 PGPASSWORD="{password}" psql -h {host} -p {port} -U {user} -d {db} -t -A -c "$(cat <<'COLUMNS_EOF'
 {columns_query}
 COLUMNS_EOF
-)""#,
+)"
+echo "GFS_SCHEMA_DDL"
+PGPASSWORD="{password}" pg_dump -h {host} -p {port} -U {user} -d {db} --schema-only --no-owner --no-privileges || true"#,
             password = password,
             host = params.host,
             port = params.port,
@@ -1006,6 +1018,23 @@ mod tests {
         assert!(spec.command.contains("-h 172.17.0.2"));
         assert!(spec.command.contains("-U myuser"));
         assert!(spec.command.contains("-d mydb"));
+        // The DDL must be dumped to STDOUT (no `-f <file>`) so it survives
+        // runtimes where the sidecar runs on a different host than gfs (k8s).
+        assert!(spec.command.contains("GFS_SCHEMA_DDL"));
+        assert!(spec.command.contains("pg_dump"));
+        assert!(spec.command.contains("--schema-only"));
+        assert!(
+            !spec
+                .command
+                .contains("--schema-only --no-owner --no-privileges -f"),
+            "schema DDL dump must not write to a file"
+        );
+        // The dump must be non-fatal: a pg_dump failure must not nuke the
+        // already-captured metadata (which keeps `schema diff` working).
+        assert!(
+            spec.command.contains("--no-privileges || true"),
+            "schema DDL dump must be non-fatal (|| true)"
+        );
     }
 
     #[test]

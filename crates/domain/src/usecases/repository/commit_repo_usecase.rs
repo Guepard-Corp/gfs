@@ -14,7 +14,6 @@ use crate::ports::database_provider::{ConnectionParams, DatabaseProviderRegistry
 use crate::ports::repository::{Repository, RepositoryError};
 use crate::ports::storage::{SnapshotOptions, StorageError, StoragePort, VolumeId};
 use crate::repo_utils::repo_layout;
-use crate::usecases::repository::export_repo_usecase::ExportRepoUseCase;
 use crate::usecases::repository::extract_schema_usecase::ExtractSchemaUseCase;
 use crate::utils::hash::hash_snapshot;
 
@@ -678,13 +677,23 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
     /// Extract and store schema for the current database state.
     /// Returns the schema hash on success, or None if extraction fails.
     /// This is best-effort - failures are logged but don't fail the commit.
+    ///
+    /// Both the schema metadata and the schema-only DDL are captured from a
+    /// SINGLE extraction sidecar's stdout. Stdout is the only channel that
+    /// survives runtimes where the sidecar runs on a different host than the
+    /// repository (e.g. Kubernetes, where the task pod and `.gfs` live on
+    /// separate nodes): a mounted output file the sidecar writes is never
+    /// readable by the gfs process. Routing the DDL through stdout — instead of
+    /// a second `pg_dump -f <file>` sidecar whose file the host then reads —
+    /// fixes schema history on Kubernetes and halves the per-commit sidecar
+    /// cost (one cold start instead of two).
     async fn extract_and_store_schema(
         &self,
         repo_path: &std::path::Path,
     ) -> Result<String, Box<dyn std::error::Error>> {
         tracing::debug!("Extracting schema for commit");
 
-        // 1. Extract schema metadata using ExtractSchemaUseCase.
+        // Extract schema metadata + DDL via a single ExtractSchemaUseCase run.
         let extract_use_case =
             ExtractSchemaUseCase::new(self.compute.clone(), self.registry.clone());
         let schema_output = extract_use_case.run(repo_path).await.map_err(|e| {
@@ -692,43 +701,20 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
             e
         })?;
 
-        // 2. Export schema DDL using ExportRepoUseCase with "schema" format.
-        let export_use_case = ExportRepoUseCase::new(self.compute.clone(), self.registry.clone());
-        let temp_dir = repo_path.join(".gfs").join("tmp").join(format!(
-            "gfs-schema-{}-{}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-        ));
-        std::fs::create_dir_all(temp_dir.parent().unwrap()).map_err(|e| {
-            tracing::warn!("Failed to create temp directory: {}", e);
-            Box::new(std::io::Error::other(format!(
-                "cannot create temp directory: {}",
-                e
-            ))) as Box<dyn std::error::Error>
-        })?;
-        let export_output = export_use_case
-            .run(repo_path, Some(temp_dir.clone()), "schema")
-            .await
-            .map_err(|e| {
-                tracing::warn!("Schema DDL export failed: {}", e);
-                e
-            })?;
-
-        let schema_sql = std::fs::read_to_string(&export_output.file_path).map_err(|e| {
-            tracing::warn!("Failed to read exported schema DDL: {}", e);
+        // Store schema object in repo. The hash is derived from the metadata
+        // (schema.json); the DDL (schema.sql) is stored alongside for `gfs
+        // schema show --ddl`. An empty DDL is acceptable — `schema show`
+        // (metadata) and `schema diff` operate on the metadata and remain
+        // fully functional.
+        let schema_hash = repo_layout::write_schema_object(
+            repo_path,
+            &schema_output.metadata,
+            &schema_output.schema_sql,
+        )
+        .map_err(|e| {
+            tracing::warn!("Failed to write schema object: {}", e);
             e
         })?;
-
-        // 3. Store schema object in repo.
-        let schema_hash =
-            repo_layout::write_schema_object(repo_path, &schema_output.metadata, &schema_sql)
-                .map_err(|e| {
-                    tracing::warn!("Failed to write schema object: {}", e);
-                    e
-                })?;
-
-        // 4. Cleanup temp directory.
-        let _ = std::fs::remove_dir_all(temp_dir);
 
         tracing::info!("Schema stored with hash: {}", schema_hash);
         Ok(schema_hash)

@@ -543,7 +543,9 @@ echo "GFS_SCHEMA_COLUMNS"
 MYSQL_PWD="{password}" mysql -h {host} -P {port} -u root -D {db} -N -e "$(cat <<'COLUMNS_EOF'
 {columns_query}
 COLUMNS_EOF
-)""#,
+)"
+echo "GFS_SCHEMA_DDL"
+MYSQL_PWD="{password}" mysqldump -h {host} -P {port} -u root --no-data --skip-comments --skip-dump-date {db} || true"#,
             password = password,
             host = params.host,
             port = params.port,

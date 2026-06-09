@@ -125,6 +125,26 @@ fn now_suffix() -> String {
     format!("{}", Utc::now().timestamp_millis())
 }
 
+/// Extract the terminated exit code of a one-shot task pod's container.
+///
+/// Returns `None` when no container has reached a terminated state yet (the
+/// caller then falls back to the pod phase). Task pods created by [`run_task`]
+/// have exactly one container, so the first terminated container's code is
+/// authoritative.
+fn task_container_exit_code(pod: &Pod) -> Option<i32> {
+    pod.status
+        .as_ref()?
+        .container_statuses
+        .as_ref()?
+        .iter()
+        .find_map(|cs| {
+            cs.state
+                .as_ref()
+                .and_then(|state| state.terminated.as_ref())
+                .map(|terminated| terminated.exit_code)
+        })
+}
+
 fn ensure_dns_label(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -1177,7 +1197,11 @@ impl Compute for KubernetesCompute {
             .await
             .map_err(|e| ComputeError::Internal(format!("k8s task pod create failed: {e}")))?;
 
-        // Wait briefly for completion by polling phase.
+        // Wait for completion by polling phase. Track the terminal phase and the
+        // container's terminated exit code so callers (schema extraction, export)
+        // can distinguish success from failure instead of always seeing exit 0.
+        let mut terminal_phase = String::from("Unknown");
+        let mut exit_code: Option<i32> = None;
         for _ in 0..120 {
             let p = pods
                 .get(&name)
@@ -1187,21 +1211,47 @@ impl Compute for KubernetesCompute {
                 .status
                 .as_ref()
                 .and_then(|s| s.phase.as_deref())
-                .unwrap_or("Unknown");
+                .unwrap_or("Unknown")
+                .to_string();
             if phase == "Succeeded" || phase == "Failed" {
+                exit_code = task_container_exit_code(&p);
+                terminal_phase = phase;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
 
-        let log = pods
-            .logs(&name, &kube::api::LogParams::default())
-            .await
-            .unwrap_or_default();
+        // Fetch logs (the only channel that carries sidecar stdout — e.g. schema
+        // DDL — back to the gfs process, which runs on a different node than the
+        // task pod). A log-fetch failure must not masquerade as empty output, so
+        // surface it rather than swallowing it via `unwrap_or_default`.
+        let logs_result = pods.logs(&name, &kube::api::LogParams::default()).await;
         let _ = pods.delete(&name, &DeleteParams::default()).await;
+
+        let stdout = logs_result
+            .map_err(|e| ComputeError::Internal(format!("k8s task pod logs fetch failed: {e}")))?;
+
+        // Derive the exit code: prefer the container's terminated state; fall
+        // back to the pod phase (Failed → 1, Succeeded/Unknown → 0). A pod that
+        // never reached a terminal phase within the poll window is treated as a
+        // timeout failure so the caller does not record an empty schema as valid.
+        let exit_code = match exit_code {
+            Some(code) => code,
+            None => match terminal_phase.as_str() {
+                "Succeeded" => 0,
+                "Failed" => 1,
+                _ => {
+                    return Err(ComputeError::Internal(format!(
+                        "k8s task pod '{name}' did not reach a terminal phase \
+                         (last phase: {terminal_phase})"
+                    )));
+                }
+            },
+        };
+
         Ok(ExecOutput {
-            exit_code: 0,
-            stdout: log,
+            exit_code,
+            stdout,
             stderr: String::new(),
         })
     }
@@ -1235,6 +1285,66 @@ mod tests {
             name: name.to_string(),
             default: default.map(str::to_string),
         }
+    }
+
+    fn pod_with_container_state(state: Option<k8s_openapi::api::core::v1::ContainerState>) -> Pod {
+        use k8s_openapi::api::core::v1::{ContainerStatus, PodStatus};
+        Pod {
+            status: Some(PodStatus {
+                container_statuses: state.map(|s| {
+                    vec![ContainerStatus {
+                        name: "task".into(),
+                        state: Some(s),
+                        ..Default::default()
+                    }]
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn task_exit_code_reads_terminated_state() {
+        use k8s_openapi::api::core::v1::{ContainerState, ContainerStateTerminated};
+        // A failed task (e.g. pg_dump could not connect) must surface its real
+        // non-zero exit code, not a hardcoded 0 that hides the failure.
+        let pod = pod_with_container_state(Some(ContainerState {
+            terminated: Some(ContainerStateTerminated {
+                exit_code: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        assert_eq!(task_container_exit_code(&pod), Some(2));
+    }
+
+    #[test]
+    fn task_exit_code_zero_on_success() {
+        use k8s_openapi::api::core::v1::{ContainerState, ContainerStateTerminated};
+        let pod = pod_with_container_state(Some(ContainerState {
+            terminated: Some(ContainerStateTerminated {
+                exit_code: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        assert_eq!(task_container_exit_code(&pod), Some(0));
+    }
+
+    #[test]
+    fn task_exit_code_none_when_not_terminated() {
+        use k8s_openapi::api::core::v1::ContainerState;
+        // Still running / no status yet → None, so the caller falls back to phase.
+        assert_eq!(
+            task_container_exit_code(&pod_with_container_state(Some(ContainerState::default()))),
+            None
+        );
+        assert_eq!(
+            task_container_exit_code(&pod_with_container_state(None)),
+            None
+        );
+        assert_eq!(task_container_exit_code(&Pod::default()), None);
     }
 
     #[test]

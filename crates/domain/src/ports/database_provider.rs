@@ -150,6 +150,13 @@ pub struct SchemaExtractionSpec {
     pub definition: ComputeDefinition,
     /// Shell command to execute in the sidecar. Output must use delimiters
     /// `GFS_SCHEMA_VERSION`, `GFS_SCHEMA_SCHEMAS`, `GFS_SCHEMA_TABLES`, `GFS_SCHEMA_COLUMNS`.
+    ///
+    /// The command MAY additionally emit a `GFS_SCHEMA_DDL` section carrying the
+    /// schema-only DDL dump. Emitting the DDL through stdout (rather than a
+    /// mounted file) is the only channel that survives runtimes where the task
+    /// sidecar runs on a different host than the gfs process (e.g. Kubernetes,
+    /// where the task pod and the repository live on separate nodes). When the
+    /// section is absent the stored schema object simply carries an empty DDL.
     pub command: String,
 }
 
@@ -397,9 +404,7 @@ pub trait DatabaseProvider: Send + Sync {
     /// sessions are not supported; `sql` must be non-empty.
     fn query_in_instance_command(&self, sql: &str) -> std::result::Result<String, ProviderError> {
         let _ = sql;
-        Err(ProviderError::UnsupportedFormat(
-            "query_in_instance".into(),
-        ))
+        Err(ProviderError::UnsupportedFormat("query_in_instance".into()))
     }
 
     // -----------------------------------------------------------------------
