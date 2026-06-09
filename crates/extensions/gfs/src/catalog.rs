@@ -149,17 +149,18 @@ pub(crate) unsafe fn gfs_is_covered(relid: pg_sys::Oid, lo: i64, hi: i64) -> boo
 }
 
 /// State of a predicate in the catalog: None = never seen; Some((complete,
-/// overflowed)). complete=true -> matching rows fully hydrated (serve local);
-/// overflowed=true -> a prior capped pull found too many matches (not selective ->
-/// federate, never partial again); (false,false) -> a "seen once" second-chance
-/// marker (the next identical touch may partial-hydrate).
-pub(crate) unsafe fn gfs_pred_state(relid: pg_sys::Oid, pred: &str) -> Option<(bool, bool)> {
+/// overflowed, queued)). complete=true -> matching rows fully hydrated (serve
+/// local); overflowed=true -> a prior capped pull found too many matches (not
+/// selective -> federate, never partial again); queued=true -> an async partial
+/// copy is pending in the background (federate meanwhile); (false,false,false) ->
+/// a "seen once" second-chance marker (the next identical touch may partial-hydrate).
+pub(crate) unsafe fn gfs_pred_state(relid: pg_sys::Oid, pred: &str) -> Option<(bool, bool, bool)> {
     if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
         return None;
     }
     let q = CString::new(format!(
-        "SELECT complete::int::text, overflowed::int::text FROM gfs.cached_predicate \
-           WHERE relid::oid = {} AND pred = '{}'",
+        "SELECT complete::int::text, overflowed::int::text, queued::int::text \
+           FROM gfs.cached_predicate WHERE relid::oid = {} AND pred = '{}'",
         u32::from(relid),
         pred.replace('\'', "''")
     ))
@@ -173,10 +174,84 @@ pub(crate) unsafe fn gfs_pred_state(relid: pg_sys::Oid, pred: &str) -> Option<(b
         let td = (*tt).tupdesc;
         let c = spi_text(pg_sys::SPI_getvalue(row, td, 1)).as_deref() == Some("1");
         let o = spi_text(pg_sys::SPI_getvalue(row, td, 2)).as_deref() == Some("1");
-        out = Some((c, o));
+        let q_ = spi_text(pg_sys::SPI_getvalue(row, td, 3)).as_deref() == Some("1");
+        out = Some((c, o, q_));
     }
     pg_sys::SPI_finish();
     out
+}
+
+/// Mark a (seen) predicate as QUEUED for an asynchronous partial copy. Idempotent:
+/// re-enqueueing a queued predicate is a no-op. The background worker will perform
+/// the capped, self-validating hydration and flip it to complete/overflowed.
+pub(crate) unsafe fn gfs_enqueue_partial(relid: pg_sys::Oid, pred: &str) {
+    if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
+        return;
+    }
+    let q = CString::new(format!(
+        "INSERT INTO gfs.cached_predicate(relid, pred, queued) VALUES ({}::oid::regclass, '{}', true) \
+         ON CONFLICT (relid, pred) DO UPDATE SET queued = true \
+           WHERE NOT gfs.cached_predicate.complete AND NOT gfs.cached_predicate.overflowed",
+        u32::from(relid),
+        pred.replace('\'', "''")
+    ))
+    .unwrap();
+    pg_sys::SPI_execute(q.as_ptr(), false, 0);
+    pg_sys::SPI_finish();
+}
+
+/// Pick ONE pending async partial copy for the background worker. A plain snapshot
+/// read with NO row lock: the worker's single-drainer advisory lock already
+/// guarantees no other drainer races for the same job, so a `FOR UPDATE` here would
+/// only add a long-held lock (the copy takes seconds) that deadlocks with regular
+/// query backends touching gfs.clone_source / gfs.cached_predicate in the opposite
+/// order. The job stays `queued` until the copy commits and clears it, so an
+/// aborted attempt is simply re-picked next poll. Returns (relid, predicate), or
+/// None if the queue is empty.
+pub(crate) unsafe fn gfs_claim_copy() -> Option<(pg_sys::Oid, String)> {
+    if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
+        return None;
+    }
+    let q = CString::new(
+        "SELECT relid::oid::int8::text, pred FROM gfs.cached_predicate \
+           WHERE queued AND NOT complete AND NOT overflowed LIMIT 1",
+    )
+    .unwrap();
+    let mut out = None;
+    if pg_sys::SPI_execute(q.as_ptr(), true, 1) == pg_sys::SPI_OK_SELECT as i32
+        && pg_sys::SPI_processed == 1
+    {
+        let tt = pg_sys::SPI_tuptable;
+        let row = *(*tt).vals;
+        let td = (*tt).tupdesc;
+        let oid = spi_text(pg_sys::SPI_getvalue(row, td, 1))
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .filter(|v| *v != 0)
+            .map(pg_sys::Oid::from);
+        let pred = spi_text(pg_sys::SPI_getvalue(row, td, 2));
+        if let (Some(o), Some(p)) = (oid, pred) {
+            out = Some((o, p));
+        }
+    }
+    pg_sys::SPI_finish();
+    out
+}
+
+/// Clear the queued flag for a predicate after its async copy has run (the copy
+/// itself set complete or overflowed). Runs in the worker's job transaction.
+pub(crate) unsafe fn gfs_clear_queued(relid: pg_sys::Oid, pred: &str) {
+    if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
+        return;
+    }
+    let q = CString::new(format!(
+        "UPDATE gfs.cached_predicate SET queued = false \
+           WHERE relid::oid = {} AND pred = '{}'",
+        u32::from(relid),
+        pred.replace('\'', "''")
+    ))
+    .unwrap();
+    pg_sys::SPI_execute(q.as_ptr(), false, 0);
+    pg_sys::SPI_finish();
 }
 
 /// Record a predicate as SEEN (second-chance marker, complete=false) without

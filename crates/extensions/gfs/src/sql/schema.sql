@@ -133,9 +133,13 @@ CREATE TABLE gfs.cached_predicate (
     pred       text     NOT NULL,
     complete   boolean  NOT NULL DEFAULT false,  -- true = matching rows fully hydrated -> serve local
     overflowed boolean  NOT NULL DEFAULT false,  -- true = capped pull overflowed (not selective) -> never partial again
+    queued     boolean  NOT NULL DEFAULT false,  -- true = an ASYNC partial copy is pending in the background -> federate meanwhile
     PRIMARY KEY (relid, pred)
 );
-COMMENT ON TABLE gfs.cached_predicate IS 'Non-key predicates seen by the router: complete=fully hydrated (local), overflowed=too many matches (federate). A bare row (both false) is a second-chance "seen once" marker.';
+COMMENT ON TABLE gfs.cached_predicate IS 'Non-key predicates seen by the router: complete=fully hydrated (local), overflowed=too many matches (federate), queued=async copy pending (federate meanwhile). A bare row (all false) is a second-chance "seen once" marker.';
+-- The async copy worker scans for queued-but-not-yet-done predicates to drain.
+CREATE INDEX cached_predicate_queued_idx ON gfs.cached_predicate (relid)
+    WHERE queued AND NOT complete AND NOT overflowed;
 
 -- Copy-on-write DELETE tombstones: a user DELETE on a clone table records the
 -- deleted row's PRIMARY KEY (as jsonb) here, so later copy-on-read hydration never

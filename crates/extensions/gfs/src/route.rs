@@ -9,14 +9,15 @@ use pgrx::PgList;
 
 use crate::base_plan;
 use crate::catalog::{
-    bump_access, gfs_is_covered, gfs_lookup_clone, gfs_note_pred_seen, gfs_pred_count,
-    gfs_pred_state, gfs_set_no_partial, gfs_throttle,
+    bump_access, gfs_enqueue_partial, gfs_is_covered, gfs_lookup_clone, gfs_note_pred_seen,
+    gfs_pred_count, gfs_pred_state, gfs_set_no_partial, gfs_throttle,
 };
 use crate::federate::swap_clone_rtes_to_foreign;
 use crate::hydrate::do_hydrate;
 use crate::keyrange::extract_key_range;
 use crate::model::{CloneInfo, Hydration};
 use crate::pushdown::deparse_restriction;
+use crate::worker;
 
 struct Ctx {
     hydrations: Vec<Hydration>,       // range/whole fetches for coverable/small tables
@@ -253,10 +254,20 @@ unsafe fn classify_scan(
     //    owned (its matching slice only), keeping a too-big clone partial.
     if let Some(pred) = deparse_restriction(relid, plan, scanrelid, tag) {
         match gfs_pred_state(relid, &pred) {
-            Some((true, _)) => return, // complete -> serve local (0 contact)
-            Some((_, true)) => {
+            Some((true, _, _)) => return, // complete -> serve local (0 contact)
+            Some((_, true, _)) => {
                 // known not-selective (a prior capped pull overflowed) -> federate, no re-probe
                 push_by_cost(ctx, tr, b, tr, h, &info, mk(0, 0, true, s(), s(), 0));
+                return;
+            }
+            Some((_, _, true)) => {
+                // an ASYNC partial copy is already pending in the background -> federate
+                // for an immediate answer; the worker flips it to complete (local) once
+                // the copy commits. Re-kick a drainer (deduped by an advisory lock, so
+                // it's a no-op if one is already running): this self-heals a job that an
+                // earlier worker missed (e.g. spawned before the enqueue committed).
+                worker::spawn();
+                ctx.federate_targets.push(mk(0, 0, true, s(), s(), 0));
                 return;
             }
             None => {
@@ -267,7 +278,7 @@ unsafe fn classify_scan(
                 push_by_cost(ctx, tr, b, tr, h, &info, mk(0, 0, true, s(), s(), 0));
                 return;
             }
-            Some((false, false)) => {} // seen before -> consider partial below
+            Some((false, false, false)) => {} // seen before -> consider partial below
         }
 
         // CONTACT cap / ROW cap / headroom -> PROMOTE: collapse the piecemeal slices
@@ -293,7 +304,14 @@ unsafe fn classify_scan(
         //   estimate can sneak an over-budget slice through. The real pull is then
         //   hard-capped and self-validated in do_hydrate (overflow -> federate).
         if info.w_net * b * cap_rows <= info.w_ceiling {
-            ctx.partials.push(mk(0, 0, false, pred.clone(), pred, cap_rows as i64));
+            // ASYNC partial (previously a synchronous, blocking pull): mark the
+            // predicate queued, kick the background copy worker, and federate THIS
+            // query now for an immediate answer. The worker performs the capped,
+            // self-validating copy off the critical path and flips the predicate to
+            // complete -> future queries serve local. No query ever blocks on it.
+            gfs_enqueue_partial(relid, &pred);
+            worker::spawn();
+            ctx.federate_targets.push(mk(0, 0, true, s(), s(), 0));
         } else {
             push_by_cost(ctx, tr, b, tr, h, &info, mk(0, 0, true, s(), s(), 0)); // slice too big -> federate
         }

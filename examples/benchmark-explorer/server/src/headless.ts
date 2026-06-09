@@ -48,8 +48,8 @@ const SCRIPT: Shot[] = [
   { id: "range",     p: { lo: 1_000_000, hi: 1_000_500 }, expect: "fetched",   why: "first touch fetches the missing key range" },
   { id: "range",     p: { lo: 1_000_000, hi: 1_000_500 }, expect: "local",     why: "re-ask covered range → elision (no source)" },
   { id: "selective", p: { val: 25 },                      expect: "federated", why: "first touch federates (second-chance)" },
-  { id: "selective", p: { val: 25 },                      expect: "partial",   why: "second touch fetches the selective slice (committed predicate → partial)" },
-  { id: "selective", p: { val: 25 },                      expect: "local",     why: "third touch serves local" },
+  // The 2nd/3rd selective touches are async now (see asyncPartial): the 2nd touch
+  // federates instantly and a background worker copies the slice off the hot path.
   { id: "q1",                                             expect: "federated", why: "single-table aggregate pushed to source" },
   { id: "q3",                                             expect: "federated", why: "3-table join pushed to source" },
   { id: "q5",                                             expect: "federated", why: "6-table join pushed to source" },
@@ -84,6 +84,38 @@ async function convergence(): Promise<void> {
     ? ok(`warmed join is fully local  ${C.dim}[${warm.servedFrom}, ${fs} Foreign Scan, ${warm.ms}ms]${C.rst}`)
     : bad(`warmed join still federates (route ${warm.servedFrom}, ${fs} Foreign Scan)`);
   md5(warm.rows) === md5(src.rows) ? ok("warmed join result equals source") : bad("warmed join diverged from source");
+}
+
+// Async partial: a selective predicate's 2nd touch no longer BLOCKS to copy the
+// slice. It federates for an immediate answer and a background worker copies the
+// slice off the critical path; the predicate then converges to local. We assert
+// the instant federate, then poll until the worker has converged it to local and
+// the local result still equals the source.
+async function asyncPartial(): Promise<void> {
+  note("Async partial — 2nd touch federates instantly; a background worker converges it to local");
+  const sql = QUERIES.selective.sql(paramsOf({ val: "25" } as Record<string, string | undefined>));
+
+  const t2 = await runQuery("clone", sql); // 2nd touch (1st was in the SCRIPT) -> enqueue + federate
+  t2.servedFrom === "federated"
+    ? ok(`2nd touch federates instantly, copy deferred  ${C.dim}[${t2.servedFrom}, ${t2.ms}ms]${C.rst}`)
+    : bad(`expected the 2nd touch to federate instantly (async), got ${t2.servedFrom}`);
+
+  const deadline = Date.now() + 30_000;
+  let last = t2.servedFrom;
+  let converged = await runQuery("clone", sql); // re-touch (re-kicks the worker) + observe
+  while (Date.now() < deadline && converged.servedFrom !== "local") {
+    await new Promise((r) => setTimeout(r, 1000));
+    converged = await runQuery("clone", sql);
+    last = converged.servedFrom;
+  }
+  if (converged.servedFrom === "local") {
+    const sr = await runQuery("source", sql);
+    md5(converged.rows) === md5(sr.rows)
+      ? ok(`background copy converged to local, equals source  ${C.dim}[local, ${converged.ms}ms]${C.rst}`)
+      : bad(`converged to local but clone != source (clone ${converged.rowCount} vs source ${sr.rowCount})`);
+  } else {
+    bad(`async copy did not converge to local within 30s (last route: ${last})`);
+  }
 }
 
 // Objective metrics + append-only regression guard.
@@ -128,6 +160,7 @@ async function main(): Promise<void> {
     if (s.expect === "local") localShots++;
   }
 
+  await asyncPartial();
   await convergence();
   await record(localShots, SCRIPT.length);
 

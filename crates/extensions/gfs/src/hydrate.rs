@@ -14,6 +14,16 @@ use crate::model::Hydration;
 /// gets at most this many parallel readers per backfill, to protect prod).
 const PARALLEL_WORKERS_CAP: i64 = 8;
 
+/// Set by the async copy worker (a separate process) so its hydrations skip the
+/// non-essential per-table catalog bookkeeping -- `clone_source.partial_rows` and
+/// `clone_stats` -- that every query also updates (`bump_access` / `bump_federate`).
+/// Touching those shared rows from the worker's separate transaction forms a
+/// row-lock CYCLE with concurrent queries on the same table; skipping them makes the
+/// worker share no lock with foreground queries (the row copy + cached_predicate
+/// completeness, the only correctness-critical writes, still happen). Always false
+/// in normal backends (the synchronous path keeps full bookkeeping).
+pub(crate) static mut DEFER_BOOKKEEPING: bool = false;
+
 /// Record coverage (whole_cached / coalesced range) and refresh planner stats after
 /// a whole/int-range fetch. Shared by the single-statement path and the parallel
 /// backfill. Caller holds an open SPI connection.
@@ -291,7 +301,7 @@ pub(crate) unsafe fn do_hydrate(h: &Hydration) -> bool {
             )
         };
         pg_sys::SPI_execute(CString::new(rec).unwrap().as_ptr(), false, 0);
-        if !overflow {
+        if !overflow && !DEFER_BOOKKEEPING {
             let pr = CString::new(format!(
                 "UPDATE gfs.clone_source SET partial_rows = partial_rows + {} WHERE relid::oid = {}",
                 inserted, u32::from(h.relid)
@@ -378,6 +388,9 @@ pub(crate) unsafe fn do_hydrate(h: &Hydration) -> bool {
 unsafe fn hydrate_finish(h: &Hydration, n: i64) {
     let an = CString::new(format!("ANALYZE {}", h.local_ref)).unwrap();
     pg_sys::SPI_execute(an.as_ptr(), false, 0);
+    if DEFER_BOOKKEEPING {
+        return; // async worker: skip the contended clone_stats write (see DEFER_BOOKKEEPING)
+    }
     let stat = CString::new(format!(
         "UPDATE gfs.clone_stats SET fetch_calls = fetch_calls + 1, \
          rows_fetched = rows_fetched + {}, last_fetch = now() WHERE relid::oid = {}",

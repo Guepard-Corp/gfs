@@ -31,6 +31,7 @@
 //!   • [`federate`] — swap clone RTEs to their foreign tables (postgres_fdw pushdown)
 //!   • [`catalog`]  — SPI catalog lookups / mutators + the prod-protection throttle
 //!   • [`hydrate`]  — the hydration engine (single-statement + parallel dblink fan)
+//!   • [`worker`]   — dynamic background worker that drains async partial copies
 //!   • [`model`]    — descriptors shared across the above
 //!   • `sql/schema.sql` — the catalog + API DDL (loaded via `extension_sql_file!`)
 
@@ -49,6 +50,7 @@ mod keyrange;
 mod model;
 mod pushdown;
 mod route;
+mod worker;
 
 // ===========================================================================
 // Planner hook
