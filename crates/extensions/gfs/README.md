@@ -84,11 +84,26 @@ generated/dropped columns).
 
 ## Files
 
-- `src/lib.rs` — the extension: `planner_hook` router + catalog/API (`extension_sql!`).
+The extension is split into focused modules under `src/` (the planner hook + crate
+root in `lib.rs`, the rest by concern):
+
+| Module | Role |
+|---|---|
+| `src/lib.rs` | crate root: `_PG_init`, the `planner_hook` (`gfs_planner`/`base_plan`), `mod` declarations, and `extension_sql_file!("sql/schema.sql")` |
+| `src/route.rs` | the router — classify each scan, decide local / hydrate / federate |
+| `src/keyrange.rs` | extract `[lo,hi]` range-key bounds + const/operator decoding |
+| `src/pushdown.rs` | deparse a scan's pushable restriction into a remote `WHERE` |
+| `src/federate.rs` | swap clone RTEs to their foreign tables (postgres_fdw pushdown) |
+| `src/catalog.rs` | SPI catalog lookups/mutators + the prod-protection throttle |
+| `src/hydrate.rs` | the hydration engine (single-statement + parallel dblink fan) |
+| `src/model.rs` | descriptors shared across the above |
+| `src/sql/schema.sql` | the catalog + API DDL, loaded verbatim via `extension_sql_file!` |
+
 - `Cargo.toml`, `.cargo/config.toml`, `gfs.control` — pgrx crate config.
 - `Dockerfile` — package into a `postgres:16` image with the extension.
-- `benchmark.sh`, `tpch_validate.sh`, **[`BENCHMARKS.md`](BENCHMARKS.md)** — router
-  benchmark + multi-table scale validation (TPC-H). See `BENCHMARKS.md` to run them.
+- **[`BENCHMARKS.md`](BENCHMARKS.md)** — how to run the benchmark
+  (`examples/benchmark-explorer`, UI or headless) and the validation suite
+  (`tpch_validate.sh` / `chaos_test.sh` / `write_safety_test.sh`).
 - `c-ref/` — the original C/PGXS TAM (reference only; superseded by the hook).
 
 ## Status / hardening before prod
