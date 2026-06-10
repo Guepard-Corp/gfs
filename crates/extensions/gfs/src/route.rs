@@ -9,8 +9,9 @@ use pgrx::PgList;
 
 use crate::base_plan;
 use crate::catalog::{
-    bump_access, gfs_enqueue_partial, gfs_is_covered, gfs_lookup_clone, gfs_note_pred_seen,
-    gfs_pred_count, gfs_pred_state, gfs_set_no_partial, gfs_throttle,
+    bump_access, gfs_enqueue_copy, gfs_enqueue_partial, gfs_is_covered, gfs_lookup_clone,
+    gfs_note_pred_seen, gfs_pred_count, gfs_pred_state, gfs_set_no_partial, gfs_throttle,
+    gfs_time_queued, gfs_whole_queued,
 };
 use crate::federate::swap_clone_rtes_to_foreign;
 use crate::hydrate::do_hydrate;
@@ -207,22 +208,17 @@ unsafe fn classify_scan(
                 return; // already owned (range covered) -> serve local
             }
             if is_time {
-                let cap = (info.w_partial_max_frac * tr).floor().max(1.0) as i64;
-                ctx.partials.push(Hydration {
-                    local_ref: info.local_ref.clone(),
-                    source_ref: info.source_ref.clone(),
-                    collist: info.collist.clone(),
-                    relid,
-                    key_col: info.key_col.clone(),
-                    lo,
-                    hi,
-                    whole: false,
-                    where_sql: String::new(),
-                    pred_key: String::new(),
-                    partial_cap: cap,
-                    time_key: true,
-                    key_type: info.key_type.clone(),
-                });
+                // ASYNC temporal (was a synchronous capped fetch): federate this query
+                // now for an instant answer, and enqueue a background copy of the
+                // [lo,hi] window. The worker pulls the capped slice off the critical
+                // path and records the range (gfs.cached) so future queries inside it
+                // serve local. Skip the enqueue if a queued temporal job already covers
+                // this window (dedup); the query federates either way.
+                if !gfs_time_queued(relid, lo, hi) {
+                    gfs_enqueue_copy(relid, "time", lo, hi);
+                }
+                worker::spawn();
+                ctx.federate_targets.push(mk(0, 0, true, s(), s(), 0));
                 return;
             }
             let span = ((hi - lo).saturating_add(1)).max(0) as f64;
@@ -291,7 +287,15 @@ unsafe fn classify_scan(
         let headroom_ok = (info.partial_rows as f64) + cap_rows <= info.w_promote_frac * tr;
         if contact_cap_hit || row_cap_hit || !headroom_ok {
             if whole_own_cost <= info.w_ceiling {
-                ctx.hydrations.push(mk(0, 0, true, s(), s(), 0)); // forced whole-own (one final contact)
+                // ASYNC promote-to-whole-own (was a synchronous whole-table copy):
+                // federate this query now, and enqueue a background whole-table copy.
+                // The worker owns the table (sets whole_cached) off the critical path,
+                // so future queries serve local. Dedup if one is already queued.
+                if !gfs_whole_queued(relid) {
+                    gfs_enqueue_copy(relid, "whole", 0, 0);
+                }
+                worker::spawn();
+                ctx.federate_targets.push(mk(0, 0, true, s(), s(), 0));
             } else {
                 gfs_set_no_partial(relid);
                 ctx.federate_targets.push(mk(0, 0, true, s(), s(), 0));

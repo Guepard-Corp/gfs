@@ -254,6 +254,124 @@ pub(crate) unsafe fn gfs_clear_queued(relid: pg_sys::Oid, pred: &str) {
     pg_sys::SPI_finish();
 }
 
+// ---------------------------------------------------------------------------
+// gfs.copy_queue: typed async copies (kind='whole' | 'time') for the background
+// worker. The predicate partial stays on gfs.cached_predicate.queued (above),
+// untouched. enqueue/pending-checks are used by the router (Phase B/C); claim/clear
+// are used by the worker.
+// ---------------------------------------------------------------------------
+
+/// Enqueue a typed async copy job. Idempotent on (relid, kind, lo, hi).
+#[allow(dead_code)]
+pub(crate) unsafe fn gfs_enqueue_copy(relid: pg_sys::Oid, kind: &str, lo: i64, hi: i64) {
+    if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
+        return;
+    }
+    let q = CString::new(format!(
+        "INSERT INTO gfs.copy_queue(relid, kind, lo, hi) \
+         VALUES ({}::oid::regclass, '{}', {}, {}) ON CONFLICT DO NOTHING",
+        u32::from(relid),
+        kind.replace('\'', "''"),
+        lo,
+        hi
+    ))
+    .unwrap();
+    pg_sys::SPI_execute(q.as_ptr(), false, 0);
+    pg_sys::SPI_finish();
+}
+
+#[allow(dead_code)]
+unsafe fn copy_queue_exists(sql: &str) -> bool {
+    if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
+        return false;
+    }
+    let q = CString::new(sql).unwrap();
+    let mut yes = false;
+    if pg_sys::SPI_execute(q.as_ptr(), true, 1) == pg_sys::SPI_OK_SELECT as i32
+        && pg_sys::SPI_processed == 1
+    {
+        let tt = pg_sys::SPI_tuptable;
+        let row = *(*tt).vals;
+        let td = (*tt).tupdesc;
+        yes = spi_text(pg_sys::SPI_getvalue(row, td, 1)).as_deref() == Some("1");
+    }
+    pg_sys::SPI_finish();
+    yes
+}
+
+/// True if a whole-table async copy is already queued (router federates, no dup).
+#[allow(dead_code)]
+pub(crate) unsafe fn gfs_whole_queued(relid: pg_sys::Oid) -> bool {
+    copy_queue_exists(&format!(
+        "SELECT EXISTS(SELECT 1 FROM gfs.copy_queue WHERE relid::oid = {} AND kind = 'whole')::int::text",
+        u32::from(relid)
+    ))
+}
+
+/// True if a queued temporal copy already COVERS [lo,hi] (router federates, no dup).
+#[allow(dead_code)]
+pub(crate) unsafe fn gfs_time_queued(relid: pg_sys::Oid, lo: i64, hi: i64) -> bool {
+    copy_queue_exists(&format!(
+        "SELECT EXISTS(SELECT 1 FROM gfs.copy_queue WHERE relid::oid = {} AND kind = 'time' \
+           AND lo <= {} AND hi >= {})::int::text",
+        u32::from(relid),
+        lo,
+        hi
+    ))
+}
+
+/// Pick ONE queued async copy job for the worker (plain snapshot read; the worker's
+/// single-drainer advisory lock means no row lock is needed -- same rationale as
+/// gfs_claim_copy). Returns (relid, kind, lo, hi), or None if the queue is empty.
+pub(crate) unsafe fn gfs_claim_copy_job() -> Option<(pg_sys::Oid, String, i64, i64)> {
+    if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
+        return None;
+    }
+    let q = CString::new(
+        "SELECT relid::oid::int8::text, kind, lo::text, hi::text FROM gfs.copy_queue \
+           ORDER BY enqueued_at LIMIT 1",
+    )
+    .unwrap();
+    let mut out = None;
+    if pg_sys::SPI_execute(q.as_ptr(), true, 1) == pg_sys::SPI_OK_SELECT as i32
+        && pg_sys::SPI_processed == 1
+    {
+        let tt = pg_sys::SPI_tuptable;
+        let row = *(*tt).vals;
+        let td = (*tt).tupdesc;
+        let g = |i| spi_text(pg_sys::SPI_getvalue(row, td, i));
+        let oid = g(1)
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .filter(|v| *v != 0)
+            .map(pg_sys::Oid::from);
+        let kind = g(2);
+        let lo = g(3).and_then(|s| s.trim().parse::<i64>().ok());
+        let hi = g(4).and_then(|s| s.trim().parse::<i64>().ok());
+        if let (Some(o), Some(k), Some(l), Some(hh)) = (oid, kind, lo, hi) {
+            out = Some((o, k, l, hh));
+        }
+    }
+    pg_sys::SPI_finish();
+    out
+}
+
+/// Remove a finished/aborted async copy job. Runs in the worker's job transaction.
+pub(crate) unsafe fn gfs_clear_copy_job(relid: pg_sys::Oid, kind: &str, lo: i64, hi: i64) {
+    if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
+        return;
+    }
+    let q = CString::new(format!(
+        "DELETE FROM gfs.copy_queue WHERE relid::oid = {} AND kind = '{}' AND lo = {} AND hi = {}",
+        u32::from(relid),
+        kind.replace('\'', "''"),
+        lo,
+        hi
+    ))
+    .unwrap();
+    pg_sys::SPI_execute(q.as_ptr(), false, 0);
+    pg_sys::SPI_finish();
+}
+
 /// Record a predicate as SEEN (second-chance marker, complete=false) without
 /// contacting the source -- so its NEXT identical touch is eligible for partial.
 pub(crate) unsafe fn gfs_note_pred_seen(relid: pg_sys::Oid, pred: &str) {

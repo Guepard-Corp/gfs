@@ -53,8 +53,8 @@ const SCRIPT: Shot[] = [
   { id: "q1",                                             expect: "federated", why: "single-table aggregate pushed to source" },
   { id: "q3",                                             expect: "federated", why: "3-table join pushed to source" },
   { id: "q5",                                             expect: "federated", why: "6-table join pushed to source" },
-  { id: "temporal",  p: { from: "1994-01-01", to: "1994-03-31" }, expect: "fetched", why: "temporal window fetched (DATE key)" },
-  { id: "temporal",  p: { from: "1994-02-01", to: "1994-02-15" }, expect: "local",   why: "narrower window inside it → elision" },
+  // Temporal is async now (see asyncTemporal): the window federates instantly and a
+  // background worker copies the date range, after which queries inside it are local.
 ];
 
 // Convergence (the transitive-FK-warming case, planner-hook model): a join
@@ -118,6 +118,35 @@ async function asyncPartial(): Promise<void> {
   }
 }
 
+// Async temporal: a date/timestamp window's first touch federates instantly and a
+// background worker copies the window off the critical path; queries inside it then
+// serve local. Same serve-first model as the selective partial.
+async function asyncTemporal(): Promise<void> {
+  note("Async temporal — window federates instantly; a background worker converges it to local");
+  const win = { from: "1994-01-01", to: "1994-03-31" } as Record<string, string | undefined>;
+  const sql = QUERIES.temporal.sql(paramsOf(win));
+
+  const t = await runQuery("clone", sql); // 1st touch -> enqueue + federate
+  t.servedFrom === "federated"
+    ? ok(`window federates instantly, copy deferred  ${C.dim}[${t.servedFrom}, ${t.ms}ms]${C.rst}`)
+    : bad(`expected the temporal window to federate instantly (async), got ${t.servedFrom}`);
+
+  const deadline = Date.now() + 30_000;
+  let r = await runQuery("clone", sql); // re-touch (re-kicks the worker) + observe
+  while (Date.now() < deadline && r.servedFrom !== "local") {
+    await new Promise((res) => setTimeout(res, 1000));
+    r = await runQuery("clone", sql);
+  }
+  if (r.servedFrom === "local") {
+    const sr = await runQuery("source", sql);
+    md5(r.rows) === md5(sr.rows)
+      ? ok(`background copy converged to local, equals source  ${C.dim}[local, ${r.ms}ms]${C.rst}`)
+      : bad(`converged to local but clone != source (clone ${r.rowCount} vs source ${sr.rowCount})`);
+  } else {
+    bad(`async temporal did not converge to local within 30s (last route: ${r.servedFrom})`);
+  }
+}
+
 // Objective metrics + append-only regression guard.
 async function record(localShots: number, total: number): Promise<void> {
   const clone = connFor("clone");
@@ -161,6 +190,7 @@ async function main(): Promise<void> {
   }
 
   await asyncPartial();
+  await asyncTemporal();
   await convergence();
   await record(localShots, SCRIPT.length);
 

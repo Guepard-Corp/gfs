@@ -141,6 +141,23 @@ COMMENT ON TABLE gfs.cached_predicate IS 'Non-key predicates seen by the router:
 CREATE INDEX cached_predicate_queued_idx ON gfs.cached_predicate (relid)
     WHERE queued AND NOT complete AND NOT overflowed;
 
+-- Async copy queue for the background worker: typed jobs BEYOND the predicate
+-- partial (selective predicates stay on gfs.cached_predicate.queued, untouched).
+--   kind='whole' -> own the whole table (lo/hi unused);
+--   kind='time'  -> capped temporal slice over [lo,hi] (epoch microseconds on the date/timestamp key).
+-- The router enqueues here and federates the query for an instant answer; the worker
+-- performs the copy off the critical path, exactly like the predicate path. A job is
+-- removed once run (completeness is recorded in clone_source.whole_cached / gfs.cached).
+CREATE TABLE gfs.copy_queue (
+    relid       regclass    NOT NULL REFERENCES gfs.clone_source(relid) ON DELETE CASCADE,
+    kind        text        NOT NULL CHECK (kind IN ('whole','time')),
+    lo          bigint      NOT NULL DEFAULT 0,
+    hi          bigint      NOT NULL DEFAULT 0,
+    enqueued_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (relid, kind, lo, hi)
+);
+COMMENT ON TABLE gfs.copy_queue IS 'Pending async copies (kind=whole|time) the background worker drains off the query critical path.';
+
 -- Copy-on-write DELETE tombstones: a user DELETE on a clone table records the
 -- deleted row's PRIMARY KEY (as jsonb) here, so later copy-on-read hydration never
 -- re-fetches/resurrects it. Matched by `to_jsonb(source_row) @> pk`.
@@ -300,4 +317,4 @@ CREATE VIEW gfs.clones AS
      ORDER BY s.relid::text;
 
 GRANT USAGE ON SCHEMA gfs TO PUBLIC;
-GRANT SELECT ON gfs.clone_source, gfs.cached, gfs.cached_predicate, gfs.tombstone, gfs.clone_stats, gfs.cost, gfs.budget, gfs.clones TO PUBLIC;
+GRANT SELECT ON gfs.clone_source, gfs.cached, gfs.cached_predicate, gfs.copy_queue, gfs.tombstone, gfs.clone_stats, gfs.cost, gfs.budget, gfs.clones TO PUBLIC;

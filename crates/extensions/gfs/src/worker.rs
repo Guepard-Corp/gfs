@@ -24,9 +24,12 @@ use pgrx::pg_sys;
 use pgrx::prelude::*;
 use pgrx::PgTryBuilder;
 
-use crate::catalog::{gfs_claim_copy, gfs_clear_queued, gfs_lookup_clone, spi_text};
+use crate::catalog::{
+    gfs_claim_copy, gfs_claim_copy_job, gfs_clear_copy_job, gfs_clear_queued, gfs_lookup_clone,
+    spi_text,
+};
 use crate::hydrate::do_hydrate;
-use crate::model::Hydration;
+use crate::model::{CloneInfo, Hydration};
 
 /// Cluster-wide advisory-lock key ensuring a single copy drainer at a time.
 const GFS_COPY_LOCK_KEY: i64 = 0x6766_7363_6f70_79; // "gfscopy"
@@ -37,7 +40,16 @@ const GRACE_TICKS: u32 = 5;
 /// enqueues an async partial copy. Redundant launches are harmless: the advisory
 /// lock makes a second worker exit at once. Failure (e.g. no free worker slot) is
 /// ignored -- the job stays queued and a later enqueue re-launches a worker.
-pub(crate) fn spawn() {
+pub(crate) unsafe fn spawn() {
+    // Avoid a spawn storm: under concurrency many queries touch the same pending job,
+    // and a worker-per-touch would each connect, lose the dedup, and exit -- wasting
+    // scarce connection slots (clones can run a low max_connections). Probe the drainer
+    // advisory lock first (a connection-free SPI call); only launch a worker when none
+    // is already draining. This keeps the self-heal (re-launch if no drainer) without
+    // the storm.
+    if drainer_running() {
+        return;
+    }
     match BackgroundWorkerBuilder::new("gfs copy worker")
         .set_library("gfs")
         .set_function("gfs_copy_worker_main")
@@ -49,6 +61,39 @@ pub(crate) fn spawn() {
         Ok(_) => debug1!("gfs: copy worker registered (dynamic)"),
         Err(e) => warning!("gfs: copy worker registration failed: {e:?}"),
     }
+}
+
+/// Probe whether a copy drainer is already running, WITHOUT holding the lock: try to
+/// take the worker's advisory lock; if we get it, no worker is running, so release it
+/// immediately (so the worker we launch can take it) and report false. If we cannot
+/// take it, a worker is draining -> report true. Connection-free (runs in the calling
+/// backend's SPI); on any failure it returns false so a needed worker is never blocked.
+unsafe fn drainer_running() -> bool {
+    if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
+        return false;
+    }
+    let q = CString::new(format!(
+        "SELECT pg_try_advisory_lock({})::int::text",
+        GFS_COPY_LOCK_KEY
+    ))
+    .unwrap();
+    let mut got = false;
+    if pg_sys::SPI_execute(q.as_ptr(), false, 1) == pg_sys::SPI_OK_SELECT as i32
+        && pg_sys::SPI_processed == 1
+    {
+        let tt = pg_sys::SPI_tuptable;
+        let row = *(*tt).vals;
+        let td = (*tt).tupdesc;
+        got = spi_text(pg_sys::SPI_getvalue(row, td, 1)).as_deref() == Some("1");
+    }
+    if got {
+        // We took the lock -> no worker was running. Release it so the worker we are
+        // about to launch can acquire it.
+        let u = CString::new(format!("SELECT pg_advisory_unlock({})", GFS_COPY_LOCK_KEY)).unwrap();
+        pg_sys::SPI_execute(u.as_ptr(), false, 0);
+    }
+    pg_sys::SPI_finish();
+    !got
 }
 
 #[pg_guard]
@@ -141,6 +186,19 @@ unsafe fn try_drain_lock() -> bool {
 /// drainers is the single-drainer advisory lock (not a row lock), so this shares no
 /// long-held lock with foreground queries.
 unsafe fn drain_one() -> bool {
+    // (1) typed copy_queue jobs (kind = whole | time) -- drained the same way.
+    if let Some((relid, kind, lo, hi)) = gfs_claim_copy_job() {
+        if let Some(info) = gfs_lookup_clone(relid) {
+            if !info.whole_cached {
+                let hyd = build_copy_hydration(&info, relid, &kind, lo, hi);
+                do_hydrate(&hyd);
+                log!("gfs: async copy done for {} ({} job)", relid_text(relid), kind);
+            }
+        }
+        gfs_clear_copy_job(relid, &kind, lo, hi);
+        return true;
+    }
+    // (2) selective-predicate partial jobs (gfs.cached_predicate.queued).
     let Some((relid, pred)) = gfs_claim_copy() else {
         return false; // queue empty
     };
@@ -175,6 +233,37 @@ unsafe fn drain_one() -> bool {
     }
     gfs_clear_queued(relid, &pred); // leave only complete/overflowed set
     true
+}
+
+/// Build the Hydration descriptor for a typed copy_queue job: `whole` -> own the
+/// whole table; `time` -> a capped temporal slice over [lo,hi] (epoch micros). Same
+/// fields the synchronous router path would have built.
+unsafe fn build_copy_hydration(
+    info: &CloneInfo,
+    relid: pg_sys::Oid,
+    kind: &str,
+    lo: i64,
+    hi: i64,
+) -> Hydration {
+    let is_time = kind == "time";
+    let cap = (info.w_partial_max_frac * info.source_rows.max(0) as f64)
+        .floor()
+        .max(1.0) as i64;
+    Hydration {
+        local_ref: info.local_ref.clone(),
+        source_ref: info.source_ref.clone(),
+        collist: info.collist.clone(),
+        relid,
+        key_col: info.key_col.clone(),
+        lo,
+        hi,
+        whole: kind == "whole",
+        where_sql: String::new(),
+        pred_key: String::new(),
+        partial_cap: if is_time { cap } else { 0 },
+        time_key: is_time,
+        key_type: info.key_type.clone(),
+    }
 }
 
 /// Best-effort relid -> text for log lines.
