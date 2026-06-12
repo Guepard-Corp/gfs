@@ -108,10 +108,15 @@ Human-readable output goes to stderr when `--json` is set; stdout is pure JSON.
 
 ```bash
 export GUEPARD_LOGIN_EMAIL=… GUEPARD_LOGIN_PASSWORD=…
-./gfs/scripts/multipass-remote-e2e.sh
+./gfs/scripts/multipass-remote-e2e.sh          # smoke
+./gfs/scripts/multipass-remote-agent-e2e.sh  # full agent parity
 ```
 
-Verifies VCS with dummy data, pause/resume, autoscaler `:9090/health`, and destroy.
+Agent e2e covers login (password + token), `remote show`/`nodes`, init, status,
+query, commit, log, checkout, branch list, schema extract/diff, compute
+start/stop, and destroy. Branch create on primary deployments is expected to
+fail (linear history); branch delete, `schema show`, and `compute logs` are
+unsupported on remote.
 
 ## Env reference
 

@@ -293,60 +293,51 @@ impl ConsoleClient {
         revision: &str,
         create_branch: Option<&str>,
     ) -> Result<Value> {
-        // Node-level route: CP async checkout returns a database row (no `commit`
-        // field). Deployment-scoped route treats that as failure (502).
+        if create_branch.is_some() {
+            let db = self.get_deployment(remote.deployment_id()).await?;
+            let deployment_type = db
+                .get("deploymentType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("repository");
+            if deployment_type == "repository" {
+                bail!(
+                    "branch create is not supported on primary deployments (linear history); create a clone deployment first"
+                );
+            }
+        }
+
+        // CP rejects checkout while the row is transitional (409 conflict).
+        self.wait_compute_running(remote, DEPLOY_READY_TIMEOUT).await?;
+
         let url = format!(
-            "{}/nodes/{}/databases/{}/checkout",
+            "{}/deployments/{}/checkout",
             self.api_engine(),
-            remote.node_id,
-            remote.cp_database_id()
+            remote.deployment_id()
         );
         let mut body = serde_json::json!({ "revision": revision });
         if let Some(b) = create_branch {
             body["create_branch"] = Value::String(b.to_string());
         }
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(180);
-        loop {
-            match self.post_json(&url, &body).await {
-                Ok(val) => {
-                    if let Some(err) = val.get("error").and_then(|v| v.as_str()) {
-                        if is_transitional_cp_error(err) && std::time::Instant::now() < deadline {
-                            self.wait_compute_running(remote, deadline).await?;
-                            continue;
-                        }
-                        bail!("checkout failed: {err}");
-                    }
-                    if val.get("commit").is_some() {
-                        return Ok(val);
-                    }
-                    self.wait_compute_running(remote, deadline).await?;
-                    return Ok(serde_json::json!({
-                        "commit": revision,
-                        "branch": val.get("branch"),
-                        "async": true,
-                    }));
-                }
-                Err(e) => {
-                    let msg = e.to_string();
-                    if is_transitional_cp_error(&msg) && std::time::Instant::now() < deadline {
-                        self.wait_compute_running(remote, deadline).await?;
-                        continue;
-                    }
-                    return Err(e);
-                }
-            }
+        let val = self.post_json(&url, &body).await?;
+        if val.get("commit").and_then(|v| v.as_str()).is_none() {
+            bail!("checkout response missing commit hash");
         }
+
+        // Checkout reprovisions the instance; wait until serving again.
+        self.wait_compute_running(remote, DEPLOY_READY_TIMEOUT).await?;
+        Ok(val)
     }
 
     async fn wait_compute_running(
         &self,
         remote: &RemoteConfig,
-        deadline: std::time::Instant,
+        timeout: Duration,
     ) -> Result<()> {
+        let deadline = std::time::Instant::now() + timeout;
         loop {
             if std::time::Instant::now() > deadline {
-                bail!("timed out waiting for compute to reach running after checkout");
+                bail!("timed out waiting for compute to reach running");
             }
             let status = self.deployment_status(remote.deployment_id()).await?;
             let compute = status
@@ -599,14 +590,6 @@ pub fn auth_from_env() -> Result<ConsoleAuth> {
     bail!(
         "no console auth: set GUEPARD_ACCESS_TOKEN or run `gfs login` (stores ~/.config/guepard/credentials.toml)"
     )
-}
-
-fn is_transitional_cp_error(msg: &str) -> bool {
-    let lower = msg.to_ascii_lowercase();
-    lower.contains("starting")
-        || lower.contains("stopping")
-        || lower.contains("conflict")
-        || lower.contains("retry once")
 }
 
 pub fn block_direct_kubernetes_env() -> Result<()> {

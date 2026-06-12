@@ -1418,7 +1418,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-compute-kubernetes"
-version = "0.2.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1446,7 +1446,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-console-remote"
-version = "0.2.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "gfs-domain",
@@ -1536,7 +1536,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-storage-kubernetes"
-version = "0.2.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "async-trait",

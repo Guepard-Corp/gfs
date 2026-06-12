@@ -29,9 +29,28 @@ async fn deploy_commit_and_log_use_bearer_and_deployment_routes() {
         .mount(&server)
         .await;
 
+    Mock::given(method("GET"))
+        .and(path("/api/engine/deployments/dep-1/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "computeStatus": "running",
+            "cpStatus": "running",
+            "live": true
+        })))
+        .mount(&server)
+        .await;
+
     Mock::given(method("POST"))
         .and(path("/api/engine/deployments/dep-1/commit"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "commit": "abc123" })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/engine/deployments/dep-1/checkout"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "commit": "abc123",
+            "branch": null
+        })))
         .mount(&server)
         .await;
 
@@ -62,6 +81,9 @@ async fn deploy_commit_and_log_use_bearer_and_deployment_routes() {
 
     let log = client.log(&remote, 5).await.unwrap();
     assert!(log.is_array());
+
+    let co = client.checkout(&remote, "abc123", None).await.unwrap();
+    assert_eq!(co["commit"], "abc123");
 }
 
 #[tokio::test]
