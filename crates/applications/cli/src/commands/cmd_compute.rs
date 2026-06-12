@@ -62,6 +62,11 @@ pub async fn run(path: Option<PathBuf>, action: ComputeAction, json_output: bool
         return handle_config(path, key, value, json_output);
     }
     let repo_path = path.clone().unwrap_or_else(get_repo_dir);
+
+    if super::remote_support::is_remote_repo(&repo_path)? {
+        return run_remote(path, action, json_output).await;
+    }
+
     let repository: Arc<dyn gfs_domain::ports::repository::Repository> =
         Arc::new(gfs_domain::adapters::gfs_repository::GfsRepository::new());
     let compute = compute_for_repo(&repository, &repo_path).await?;
@@ -543,4 +548,29 @@ async fn container_data_dir(
         .ok()?
         .map(|p| p.to_string_lossy().into_owned())?;
     Some(host_path)
+}
+
+async fn run_remote(
+    path: Option<PathBuf>,
+    action: ComputeAction,
+    json_output: bool,
+) -> Result<()> {
+    use super::cmd_remote_compute;
+    use super::cmd_remote_status;
+
+    match action {
+        ComputeAction::Start { .. } => cmd_remote_compute::start(path, json_output).await,
+        ComputeAction::Stop { .. } | ComputeAction::Pause { .. } => {
+            cmd_remote_compute::stop(path, json_output).await
+        }
+        ComputeAction::Unpause { .. } | ComputeAction::Restart { .. } => {
+            cmd_remote_compute::start(path, json_output).await
+        }
+        ComputeAction::Status { .. } => {
+            let _ = cmd_remote_status::run(path, json_output).await?;
+            Ok(())
+        }
+        ComputeAction::Logs { .. } => cmd_remote_compute::unsupported("logs").await,
+        ComputeAction::Config { .. } => unreachable!(),
+    }
 }

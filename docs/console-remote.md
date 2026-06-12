@@ -5,72 +5,127 @@ Use the console API instead of `KUBECONFIG` on your laptop. k3s runs only on the
 ## Flow
 
 ```
-gfs CLI  →  guepard-console /api/engine/*  →  CP :8000  →  NATS  →  guepard-node (DP)  →  GFS + k3s
+gfs CLI  →  guepard-console /api/engine/* + /api/databases/*  →  CP :8000  →  DP
 ```
 
-## Setup
+Call the **console**, not CP directly — it owns Supabase rows, port assignment, and `cpDatabaseId`.
+
+## Multipass quickstart
 
 ```bash
-export GUEPARD_CONSOLE_URL=http://<cp-public-ip>:32298
-export GUEPARD_SUPABASE_URL=https://<project>.supabase.co
-export GUEPARD_SUPABASE_ANON_KEY=<anon-key>
+source data-platform-v3/infra/multipass/.rendered/dev.env
+
+export GUEPARD_CONSOLE_URL="http://${DP_IP}:32298"   # NodePort, not CP :8000
+export GUEPARD_SUPABASE_URL="http://127.0.0.1:18786"
+export GUEPARD_SUPABASE_ANON_KEY=<from console server env>
 
 gfs login --email you@example.com --password '...'
-# or: export GUEPARD_ACCESS_TOKEN=<user-api-token>
+# agent/CI:
+gfs login --token "$JWT"
 
-export GUEPARD_ENGINE_NODE_ID=ip-10-0-1-57-...
-gfs init --remote --provider postgres --version 17 --remote-node "$GUEPARD_ENGINE_NODE_ID"
+export GUEPARD_ENGINE_NODE_ID=<from dev.env or `gfs remote nodes --json`>
+gfs init --remote --json "$REPO_DIR" \
+  --database-provider postgres --database-version 17 \
+  --remote-node "$GUEPARD_ENGINE_NODE_ID"
+
+# lifecycle (note: --path goes on `compute`, before the subcommand)
+gfs compute --path "$REPO_DIR" stop
+gfs remote destroy --path "$REPO_DIR"
 ```
 
-Writes `.gfs/config.toml` with `runtime_provider = "guepard"` and a `[remote]` block (`console_url`, `org`, `node_id`, `database_id`).
+`gfs init --remote` polls until the deployment is **running** and returns JSON:
 
-## Commands (remote repo)
+```json
+{
+  "deployment_id": "<supabase-uuid>",
+  "database_id": "<cpDatabaseId>",
+  "connection": { ... },
+  "status": { "computeStatus": "running" }
+}
+```
 
-| Command | Behavior |
-|---------|----------|
-| `gfs commit` | `POST /api/engine/nodes/:nid/databases/:dbId/commit` |
-| `gfs log` | `GET .../log` |
-| `gfs checkout` | `POST .../checkout` (use `-b` for new branch via API) |
-| `gfs init --remote` | `POST /api/engine/deployments` |
+Repo config (`.gfs/config.toml`):
 
-## Env
+- `runtime_provider = "guepard"`
+- `[remote]`: `console_url`, `deployment_id`, `node_id`, `database_id` (CP id)
+
+## Auth
+
+| Method | Command |
+|--------|---------|
+| Password | `gfs login --email … --password …` |
+| Agent/CI | `gfs login --token <jwt>` or `export GUEPARD_ACCESS_TOKEN=…` |
+
+Persisted in `~/.config/guepard/credentials.toml`:
+
+```toml
+access_token = "..."
+console_url = "http://10.x.x.x:32298"
+supabase_url = "http://127.0.0.1:18786"
+supabase_anon_key = "..."
+```
+
+Global config (same file):
+
+```bash
+gfs config --global remote.console_url http://10.x.x.x:32298
+gfs remote show --json
+gfs remote nodes --json
+```
+
+Resolution order: env (`GUEPARD_*`) → credentials file → error.
+
+## Command parity
+
+| Command | Local (docker/k8s) | Remote |
+|---------|-------------------|--------|
+| `init` | local container | `init --remote` + async deploy poll |
+| `status` | container status | deployment status + connection |
+| `query` | psql/mysql client | console query API |
+| `commit` / `log` / `checkout` | local VCS | deployment-scoped console routes |
+| `log --graph` | local graph | CP graph proxy |
+| `branch` | local refs | log + checkout create_branch |
+| `schema extract` | sidecar | `schema/show` |
+| `schema diff` | local objects | console `schema/diff` |
+| `compute start/stop` | docker/k8s | deployment start/stop |
+| `compute logs` | container logs | not supported |
+
+Local `gfs init` + docker/k8s workflows are **unchanged** — remote is opt-in.
+
+## Agent recipe
+
+```bash
+gfs login --token "$TOKEN"
+export GUEPARD_CONSOLE_URL=http://<console-host>:32298
+gfs init --remote --json --database-provider postgres --database-version 17 \
+  --remote-node "$NODE_ID" | tee init.json
+gfs commit --json -m "snapshot" --path "$REPO"
+```
+
+Human-readable output goes to stderr when `--json` is set; stdout is pure JSON.
+
+## E2E
+
+```bash
+export GUEPARD_LOGIN_EMAIL=… GUEPARD_LOGIN_PASSWORD=…
+./gfs/scripts/multipass-remote-e2e.sh
+```
+
+Verifies VCS with dummy data, pause/resume, autoscaler `:9090/health`, and destroy.
+
+## Env reference
 
 | Variable | Purpose |
 |----------|---------|
 | `GUEPARD_CONSOLE_URL` | Console base (no trailing `/api`) |
-| `GUEPARD_ACCESS_TOKEN` | User API token (Bearer) |
-| `GUEPARD_SUPABASE_URL` + `GUEPARD_SUPABASE_ANON_KEY` | For `gfs login` |
+| `GUEPARD_ACCESS_TOKEN` | Bearer JWT |
+| `GUEPARD_SUPABASE_URL` + `GUEPARD_SUPABASE_ANON_KEY` | `gfs login` |
 | `GUEPARD_ENGINE_NODE_ID` | Default node for `gfs init --remote` |
-| `GFS_RUNTIME_PROVIDER=guepard` | Same as `--remote` / `console` / `remote` |
-
-Credentials file: `~/.config/guepard/credentials.toml` (from `gfs login`).
 
 ## Not supported on laptop
 
-- `KUBECONFIG` + cluster mutations when `runtime_provider` is `guepard` / `console` / `remote`
-- Direct k3s API from developer machine (use SSM on DP for ops/debug)
-
-## Auth smoke (dev CP)
-
-```bash
-export GUEPARD_CONSOLE_URL=http://44.245.9.188:32298
-export GUEPARD_SUPABASE_URL=https://eapqlfgxmtjehkdmqrvi.supabase.co
-export GUEPARD_SUPABASE_ANON_KEY=<from-apps-server-env-not-git>
-
-gfs login --email <user> --password '<password>'
-# or export GUEPARD_ACCESS_TOKEN=<user-api-token>
-
-gfs init --remote --provider postgres --version 17 \
-  --remote-node ip-10-0-1-57-0d5dce3039d44177a4544b28cd424e83
-```
+- `KUBECONFIG` when `runtime_provider` is `guepard` / `console` / `remote`
+- Direct CP `:8000` from gfs CLI
+- Interactive `gfs query` in remote mode
 
 Never commit Supabase keys, service role keys, or passwords.
-
-## Known issues (2026-05-25)
-
-| Error | Meaning |
-|-------|---------|
-| `instance not found: gfs-pg-...` | Commit against old `database_id`; run `gfs init --remote` again |
-| `volume not found: .../.gfs/workspaces/main/0/data` | DP repo not initialized for that id — track in data-platform-v3 |
-
-See local `docs/k3s-architecture.md` (untracked in git) and guepard-console `docs/runbooks/aws-dev-environment-inventory.md`.

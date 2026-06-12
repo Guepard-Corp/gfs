@@ -31,7 +31,12 @@ pub async fn run(
     switch: bool,
     json_output: bool,
 ) -> Result<()> {
-    let repo_path = path.unwrap_or_else(get_repo_dir);
+    let repo_path = path.clone().unwrap_or_else(get_repo_dir);
+
+    if super::remote_support::is_remote_repo(&repo_path)? {
+        return super::cmd_remote_branch::run(path, name, start_point, delete, switch, json_output)
+            .await;
+    }
 
     if let Some(ref branch_name) = delete {
         return delete_branch(&repo_path, branch_name, json_output);

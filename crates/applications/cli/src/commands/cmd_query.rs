@@ -28,8 +28,13 @@ pub async fn run(
     path: Option<PathBuf>,
     database: Option<String>,
     query: Option<String>,
+    json_output: bool,
 ) -> Result<()> {
-    let repo_path = path.unwrap_or_else(get_repo_dir);
+    let repo_path = path.clone().unwrap_or_else(get_repo_dir);
+
+    if super::remote_support::is_remote_repo(&repo_path)? {
+        return super::cmd_remote_query::run(path, database, query, json_output).await;
+    }
 
     // Load config to get provider name and container name
     let config =

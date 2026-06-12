@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use gfs_console_remote::{auth_from_env, block_direct_kubernetes_env, ConsoleClient};
+use gfs_console_remote::{auth_from_env, block_direct_kubernetes_env, resolve_console_url, ConsoleClient};
 use gfs_domain::model::config::{GfsConfig, RemoteConfig};
 
 pub fn is_remote_repo(repo_path: &Path) -> Result<bool> {
@@ -24,6 +24,6 @@ pub fn require_remote_config(repo_path: &Path) -> Result<(GfsConfig, RemoteConfi
 pub fn console_client_for_repo(repo_path: &Path) -> Result<ConsoleClient> {
     let (_cfg, remote) = require_remote_config(repo_path)?;
     let auth = auth_from_env()?;
-    let base = std::env::var("GUEPARD_CONSOLE_URL").unwrap_or(remote.console_url);
+    let base = resolve_console_url().unwrap_or(remote.console_url);
     ConsoleClient::new(base, auth)
 }

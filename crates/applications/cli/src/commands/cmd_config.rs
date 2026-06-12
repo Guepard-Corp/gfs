@@ -22,6 +22,9 @@ const KEY_USER_EMAIL: &str = "user.email";
 const KEY_STORAGE_COMPRESSION: &str = "storage.compression";
 const KEY_STORAGE_REFLINK: &str = "storage.reflink";
 const KEY_TELEMETRY_ENABLED: &str = "telemetry.enabled";
+const KEY_REMOTE_CONSOLE_URL: &str = "remote.console_url";
+const KEY_REMOTE_SUPABASE_URL: &str = "remote.supabase_url";
+const KEY_REMOTE_SUPABASE_ANON_KEY: &str = "remote.supabase_anon_key";
 
 const SUPPORTED_KEYS: &[&str] = &[
     KEY_USER_NAME,
@@ -29,6 +32,15 @@ const SUPPORTED_KEYS: &[&str] = &[
     KEY_STORAGE_COMPRESSION,
     KEY_STORAGE_REFLINK,
     KEY_TELEMETRY_ENABLED,
+    KEY_REMOTE_CONSOLE_URL,
+    KEY_REMOTE_SUPABASE_URL,
+    KEY_REMOTE_SUPABASE_ANON_KEY,
+];
+
+const REMOTE_GLOBAL_KEYS: &[&str] = &[
+    KEY_REMOTE_CONSOLE_URL,
+    KEY_REMOTE_SUPABASE_URL,
+    KEY_REMOTE_SUPABASE_ANON_KEY,
 ];
 
 /// Run `gfs config [--global] [--path <dir>] <key> [<value>]`.
@@ -97,7 +109,8 @@ fn get(repo_path: &std::path::Path, key: &str) -> Result<()> {
             .as_ref()
             .map(|s| s.enable_reflink.to_string())
             .unwrap_or_default(),
-        KEY_TELEMETRY_ENABLED => {
+        KEY_TELEMETRY_ENABLED | KEY_REMOTE_CONSOLE_URL | KEY_REMOTE_SUPABASE_URL
+        | KEY_REMOTE_SUPABASE_ANON_KEY => {
             anyhow::bail!(
                 "'{}' is a global-only setting; use --global to read it",
                 key
@@ -260,6 +273,13 @@ fn get_global(key: &str) -> Result<()> {
         KEY_TELEMETRY_ENABLED => {
             println!("{}", settings.telemetry);
         }
+        KEY_REMOTE_CONSOLE_URL | KEY_REMOTE_SUPABASE_URL | KEY_REMOTE_SUPABASE_ANON_KEY => {
+            let out = gfs_console_remote::get_remote_config_value(key)?
+                .unwrap_or_default();
+            if !out.is_empty() {
+                print!("{out}");
+            }
+        }
         _ => {
             anyhow::bail!(
                 "unsupported config key '{}'; supported: {:?}",
@@ -273,6 +293,11 @@ fn get_global(key: &str) -> Result<()> {
 }
 
 fn set_global(key: &str, value: &str) -> Result<()> {
+    if REMOTE_GLOBAL_KEYS.contains(&key) {
+        gfs_console_remote::set_remote_config_value(key, value)?;
+        return Ok(());
+    }
+
     match key {
         KEY_USER_NAME | KEY_USER_EMAIL => {}
         KEY_TELEMETRY_ENABLED => {

@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use gfs_console_remote::{auth_from_env, block_direct_kubernetes_env, ConsoleClient};
+use gfs_console_remote::{
+    auth_from_env, block_direct_kubernetes_env, resolve_console_url, ConsoleClient,
+};
 use gfs_domain::model::config::{
     EnvironmentConfig, GfsConfig, RemoteConfig, RuntimeConfig, UserConfig,
 };
@@ -34,8 +36,7 @@ pub async fn init_remote(
         .filter(|s| !s.trim().is_empty())
         .context("set --remote-node or GUEPARD_ENGINE_NODE_ID")?;
 
-    let console_url = std::env::var("GUEPARD_CONSOLE_URL")
-        .context("GUEPARD_CONSOLE_URL is required for remote init")?;
+    let console_url = resolve_console_url().map_err(|e| std::io::Error::other(e.to_string()))?;
     let auth = auth_from_env().map_err(|e| std::io::Error::other(e.to_string()))?;
     let client = ConsoleClient::new(console_url.clone(), auth)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -45,13 +46,20 @@ pub async fn init_remote(
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-    let database_id = deploy
+    let deployment_id = deploy
         .deployment
         .get("id")
         .and_then(|v| v.as_str())
         .context("deployment id missing in console response")
         .map_err(|e| std::io::Error::other(e.to_string()))?
         .to_string();
+
+    let ready = client
+        .wait_deployment_ready_default(&deployment_id)
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+    let cp_database_id = ready.cp_database_id;
 
     let target_path = path.unwrap_or_else(get_repo_dir);
     let gfs_dir = target_path.join(GFS_DIR);
@@ -78,13 +86,14 @@ pub async fn init_remote(
         runtime: Some(RuntimeConfig {
             runtime_provider: "guepard".into(),
             runtime_version: "1".into(),
-            container_name: database_id.clone(),
+            container_name: deployment_id.clone(),
         }),
         storage: None,
         remote: Some(RemoteConfig {
             console_url,
+            deployment_id: Some(deployment_id.clone()),
             node_id,
-            database_id: database_id.clone(),
+            database_id: cp_database_id.clone(),
             project: "default".into(),
         }),
     };
@@ -97,20 +106,40 @@ pub async fn init_remote(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "path": target_path.display().to_string(),
-                "database_id": database_id,
+                "deployment_id": deployment_id,
+                "database_id": cp_database_id,
+                "connection": ready.connection.get("connection_info"),
+                "status": ready.status,
                 "engine": deploy.engine,
                 "remote": true,
             }))?
         );
     } else {
         println!(
-            "  {} Remote GFS repo at {} (database {})",
+            "  {} Remote GFS repo at {} (deployment {})",
             green("✓"),
             cyan(target_path.display().to_string()),
-            cyan(&database_id)
+            cyan(&deployment_id)
         );
-        println!("    {:<16} {}", dimmed("Console"), config.remote.as_ref().map(|r| r.console_url.as_str()).unwrap_or(""));
-        println!("    {:<16} {}", dimmed("Node"), config.remote.as_ref().map(|r| r.node_id.as_str()).unwrap_or(""));
+        println!("    {:<16} {}", dimmed("CP database"), cyan(&cp_database_id));
+        println!(
+            "    {:<16} {}",
+            dimmed("Console"),
+            config
+                .remote
+                .as_ref()
+                .map(|r| r.console_url.as_str())
+                .unwrap_or("")
+        );
+        println!(
+            "    {:<16} {}",
+            dimmed("Node"),
+            config
+                .remote
+                .as_ref()
+                .map(|r| r.node_id.as_str())
+                .unwrap_or("")
+        );
     }
     Ok(())
 }

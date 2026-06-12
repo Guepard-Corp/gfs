@@ -39,10 +39,26 @@ pub struct RuntimeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteConfig {
     pub console_url: String,
+    /// Supabase deployment UUID. Omitted in legacy repos (same as `database_id`).
+    #[serde(default)]
+    pub deployment_id: Option<String>,
     pub node_id: String,
+    /// CP `cpDatabaseId` (engine row). Legacy repos stored the deployment UUID here.
     pub database_id: String,
     #[serde(default = "default_remote_project")]
     pub project: String,
+}
+
+impl RemoteConfig {
+    /// Supabase deployment UUID for deployment-scoped console routes.
+    pub fn deployment_id(&self) -> &str {
+        self.deployment_id.as_deref().unwrap_or(&self.database_id)
+    }
+
+    /// CP engine database id for thin node-level VCS proxy routes.
+    pub fn cp_database_id(&self) -> &str {
+        &self.database_id
+    }
 }
 
 fn default_remote_project() -> String {

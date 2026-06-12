@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::json;
 
 use super::remote_support::{console_client_for_repo, require_remote_config};

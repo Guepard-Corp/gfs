@@ -135,6 +135,19 @@ pub enum McpAction {
     Version,
 }
 
+#[derive(Subcommand)]
+pub enum RemoteAction {
+    /// Show persisted remote auth/config (token redacted)
+    Show,
+    /// List engine nodes visible to the authenticated account
+    Nodes,
+    /// Destroy the remote deployment backing this repo
+    Destroy {
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // Proxy daemon subcommands (used by commands)
 // ---------------------------------------------------------------------------
@@ -263,6 +276,15 @@ enum TopLevel {
         email: Option<String>,
         #[arg(long, env = "GUEPARD_LOGIN_PASSWORD")]
         password: Option<String>,
+        /// Agent/CI: store a JWT directly (no password grant)
+        #[arg(long, env = "GUEPARD_ACCESS_TOKEN")]
+        token: Option<String>,
+    },
+
+    /// Remote console profile introspection (auth URLs, list nodes)
+    Remote {
+        #[command(subcommand)]
+        action: RemoteAction,
     },
 
     /// Lazily clone a read-only remote database (copy-on-read; data fetched on first read)
@@ -585,6 +607,7 @@ fn command_name(cmd: &TopLevel) -> &'static str {
         TopLevel::Compute { .. } => "compute",
         TopLevel::Mcp { .. } => "mcp",
         TopLevel::Login { .. } => "login",
+        TopLevel::Remote { .. } => "remote",
         TopLevel::Version => "version",
     }
 }
@@ -617,7 +640,10 @@ where
     // Skip telemetry for Version and Mcp (MCP tracks its own events)
     let skip_telemetry = matches!(
         cli.command,
-        TopLevel::Version | TopLevel::Mcp { .. } | TopLevel::Login { .. }
+        TopLevel::Version
+            | TopLevel::Mcp { .. }
+            | TopLevel::Login { .. }
+            | TopLevel::Remote { .. }
     );
     let cmd_name = command_name(&cli.command);
     let telemetry = TelemetryClient::new();
@@ -662,9 +688,27 @@ where
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
                 Ok(0)
             }
-            TopLevel::Login { email, password } => {
-                commands::cmd_login::run(email, password).await?;
+            TopLevel::Login {
+                email,
+                password,
+                token,
+            } => {
+                commands::cmd_login::run(email, password, token).await?;
                 Ok(0)
+            }
+            TopLevel::Remote { action } => match action {
+                RemoteAction::Show => {
+                    commands::cmd_remote::show(json_output).await?;
+                    Ok(0)
+                }
+                RemoteAction::Nodes => {
+                    commands::cmd_remote::nodes(json_output).await?;
+                    Ok(0)
+                }
+                RemoteAction::Destroy { path } => {
+                    commands::cmd_remote_compute::destroy(path, json_output).await?;
+                    Ok(0)
+                }
             }
             TopLevel::Commit {
                 message,
@@ -761,7 +805,7 @@ where
                 database,
                 query,
             } => {
-                commands::cmd_query::run(path, database, query).await?;
+                commands::cmd_query::run(path, database, query, json_output).await?;
                 Ok(0)
             }
             TopLevel::Schema { action } => match action {
@@ -770,7 +814,7 @@ where
                     output,
                     compact,
                 } => {
-                    commands::cmd_schema::run_extract(path, output, compact).await?;
+                    commands::cmd_schema::run_extract(path, output, compact, json_output).await?;
                     Ok(0)
                 }
                 SchemaAction::Show {
