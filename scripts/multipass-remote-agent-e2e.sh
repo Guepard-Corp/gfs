@@ -81,9 +81,11 @@ rm -rf "$E2E_DIR"
 mkdir -p "$E2E_DIR"
 
 step "init --remote --json"
-INIT_JSON="$("$GFS" --json init --remote "$E2E_DIR" \
+INIT_ARGS=(--json init --remote "$E2E_DIR" \
   --database-provider postgres --database-version 17 \
-  --remote-node "$NID")"
+  --remote-node "$NID")
+[[ -n "${GUEPARD_PROJECT:-}" ]] && INIT_ARGS+=(--project "$GUEPARD_PROJECT")
+INIT_JSON="$("$GFS" "${INIT_ARGS[@]}")"
 echo "$INIT_JSON" | jq -e '.deployment_id and .database_id and .connection' >/dev/null \
   || fail "init json incomplete"
 DEPLOY_ID="$(echo "$INIT_JSON" | jq -r '.deployment_id')"

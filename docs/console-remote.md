@@ -26,6 +26,8 @@ gfs login --token "$JWT"
 export GUEPARD_ENGINE_NODE_ID=<from dev.env or `gfs remote nodes --json`>
 gfs init --remote --json "$REPO_DIR" \
   --database-provider postgres --database-version 17 \
+  --project personal-7c22db51-default \
+  --database-name my-db \
   --remote-node "$GUEPARD_ENGINE_NODE_ID"
 
 # lifecycle (note: --path goes on `compute`, before the subcommand)
@@ -126,6 +128,7 @@ unsupported on remote.
 | `GUEPARD_ACCESS_TOKEN` | Bearer JWT |
 | `GUEPARD_SUPABASE_URL` + `GUEPARD_SUPABASE_ANON_KEY` | `gfs login` |
 | `GUEPARD_ENGINE_NODE_ID` | Default node for `gfs init --remote` |
+| `GUEPARD_PROJECT` | Console project slug (`/prj/{slug}/databases` in UI) |
 
 ## Not supported on laptop
 

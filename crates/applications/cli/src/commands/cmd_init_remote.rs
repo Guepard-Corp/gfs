@@ -20,6 +20,7 @@ pub async fn init_remote(
     database_version: Option<String>,
     engine_node_id: Option<String>,
     name: Option<String>,
+    project: Option<String>,
     credentials: DatabaseCredentials,
     json_output: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -41,8 +42,19 @@ pub async fn init_remote(
     let client = ConsoleClient::new(console_url.clone(), auth)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
+    let project_id = project
+        .or_else(|| std::env::var("GUEPARD_PROJECT").ok())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "default".to_string());
+
     let deploy = client
-        .deploy_database(&node_id, provider, version, name.as_deref(), "default")
+        .deploy_database(
+            &node_id,
+            provider,
+            version,
+            name.as_deref(),
+            &project_id,
+        )
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
@@ -94,7 +106,7 @@ pub async fn init_remote(
             deployment_id: Some(deployment_id.clone()),
             node_id,
             database_id: cp_database_id.clone(),
-            project: "default".into(),
+            project: project_id.clone(),
         }),
     };
     config
@@ -108,6 +120,7 @@ pub async fn init_remote(
                 "path": target_path.display().to_string(),
                 "deployment_id": deployment_id,
                 "database_id": cp_database_id,
+                "project": project_id,
                 "connection": ready.connection.get("connection_info"),
                 "status": ready.status,
                 "engine": deploy.engine,
@@ -139,6 +152,11 @@ pub async fn init_remote(
                 .as_ref()
                 .map(|r| r.node_id.as_str())
                 .unwrap_or("")
+        );
+        println!(
+            "    {:<16} {}",
+            dimmed("Project"),
+            cyan(&project_id)
         );
     }
     Ok(())

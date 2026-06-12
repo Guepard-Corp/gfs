@@ -28,6 +28,7 @@ pub async fn init(
     json_output: bool,
     remote: bool,
     remote_node: Option<String>,
+    project: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::trace!("Initializing Guepard environment at: {:?}", path);
 
@@ -52,7 +53,8 @@ pub async fn init(
             database_provider,
             database_version,
             remote_node,
-            None,
+            credentials.name.clone(),
+            project,
             credentials,
             json_output,
         )

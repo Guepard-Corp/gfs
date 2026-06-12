@@ -268,6 +268,10 @@ enum TopLevel {
         /// Engine node id for remote init (or set GUEPARD_ENGINE_NODE_ID)
         #[arg(long, env = "GUEPARD_ENGINE_NODE_ID")]
         remote_node: Option<String>,
+
+        /// Console project slug (UI path /prj/{slug}/…; or set GUEPARD_PROJECT)
+        #[arg(long, env = "GUEPARD_PROJECT")]
+        project: Option<String>,
     },
 
     /// Sign in to console (Supabase password → ~/.config/guepard/credentials.toml)
@@ -667,6 +671,7 @@ where
                 database_name,
                 remote,
                 remote_node,
+                project,
             } => {
                 let credentials =
                     gfs_domain::usecases::repository::init_repo_usecase::DatabaseCredentials {
@@ -683,6 +688,7 @@ where
                     json_output,
                     remote,
                     remote_node,
+                    project,
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
