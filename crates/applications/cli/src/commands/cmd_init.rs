@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use gfs_compute_docker::DockerCompute;
 use gfs_compute_docker::containers;
+use gfs_compute_k8s::K8sCompute;
 use gfs_domain::adapters::gfs_repository::GfsRepository;
 use gfs_domain::ports::compute::Compute;
 use gfs_domain::ports::database_provider::InMemoryDatabaseProviderRegistry;
@@ -22,6 +23,7 @@ pub async fn init(
     database_version: Option<String>,
     database_port: Option<u16>,
     credentials: DatabaseCredentials,
+    runtime_provider: String,
     json_output: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::trace!("Initializing Guepard environment at: {:?}", path);
@@ -32,9 +34,7 @@ pub async fn init(
 
     let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
     let compute: Option<Arc<dyn Compute>> = if database_provider.is_some() {
-        Some(Arc::new(
-            DockerCompute::new().map_err(|e| std::io::Error::other(e.to_string()))?,
-        ))
+        Some(build_compute(&runtime_provider).await?)
     } else {
         None
     };
@@ -56,7 +56,9 @@ pub async fn init(
         .await?;
 
     let mut connection_string: Option<String> = None;
-    if has_provider && let Some(compute) = compute.clone() {
+    if has_provider
+        && let Some(compute) = compute.clone()
+    {
         let status_uc = StatusRepoUseCase::new(repository, compute, registry);
         if let Ok(status) = status_uc.run(&target_path).await {
             connection_string = status
@@ -73,6 +75,7 @@ pub async fn init(
                 "branch": "main",
                 "config": ".gfs/config.toml",
                 "provider": provider_display,
+                "runtime_provider": runtime_provider,
                 "connection_string": connection_string,
             }))?
         );
@@ -88,10 +91,35 @@ pub async fn init(
         if let Some(ref provider) = provider_display {
             println!("    {:<16} {}", dimmed("Provider"), cyan(provider));
         }
+        if runtime_provider != "docker" {
+            println!(
+                "    {:<16} {}",
+                dimmed("Runtime"),
+                cyan(runtime_provider.as_str())
+            );
+        }
         if let Some(ref c) = connection_string {
             println!("    {:<16} {}", dimmed("Connection"), cyan(c));
         }
     }
 
     Ok(())
+}
+
+async fn build_compute(
+    runtime_provider: &str,
+) -> Result<Arc<dyn Compute>, Box<dyn std::error::Error + Send + Sync>> {
+    match runtime_provider {
+        "k8s" => {
+            let c = K8sCompute::new().await.map_err(|e| {
+                std::io::Error::other(format!("failed to connect to Kubernetes: {e}"))
+            })?;
+            Ok(Arc::new(c))
+        }
+        _ => {
+            let c = DockerCompute::new()
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            Ok(Arc::new(c))
+        }
+    }
 }

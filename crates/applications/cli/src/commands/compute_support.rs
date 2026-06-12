@@ -4,6 +4,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use gfs_compute_docker::DockerCompute;
+use gfs_compute_k8s::K8sCompute;
+use gfs_domain::model::config::GfsConfig;
 use gfs_domain::ports::compute::{
     Compute, ComputeDefinition, ComputeError, ExecOutput, InstanceConnectionInfo, InstanceId,
     InstanceStatus, LogEntry, LogsOptions, StartOptions,
@@ -114,20 +116,61 @@ impl Compute for NoopCompute {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Runtime selection
+// ---------------------------------------------------------------------------
+
+/// Build a [`Compute`] adapter from the `runtime_provider` stored in `.gfs/config.toml`.
+///
+/// - `"k8s"` → [`K8sCompute`]
+/// - `"docker"` / `"podman"` / anything else → [`DockerCompute`]
+/// - missing / empty provider string → [`NoopCompute`]
+async fn build_compute(provider: Option<&str>) -> Result<Arc<dyn Compute>> {
+    match provider {
+        Some(p) if p == "k8s" => {
+            let c = K8sCompute::new()
+                .await
+                .context("failed to connect to Kubernetes cluster")?;
+            Ok(Arc::new(c))
+        }
+        Some(_) => {
+            let c = DockerCompute::new()
+                .context("failed to connect to Docker/Podman daemon (is it running?)")?;
+            Ok(Arc::new(c))
+        }
+        None => Ok(Arc::new(NoopCompute)),
+    }
+}
+
+/// Select the right compute adapter for a repository by reading its runtime config.
+/// Use this when you already have a `Repository` port handy.
 pub async fn compute_for_repo(
     repository: &Arc<dyn Repository>,
     repo_path: &Path,
 ) -> Result<Arc<dyn Compute>> {
-    let has_runtime = repository
-        .get_runtime_config(repo_path)
-        .await?
-        .is_some_and(|runtime| !runtime.container_name.trim().is_empty());
+    let runtime = repository.get_runtime_config(repo_path).await?;
+    let provider = runtime.as_ref().and_then(|r| {
+        if r.container_name.trim().is_empty() {
+            None
+        } else {
+            Some(r.runtime_provider.as_str())
+        }
+    });
+    build_compute(provider).await
+}
 
-    if has_runtime {
-        Ok(Arc::new(DockerCompute::new().context(
-            "failed to connect to Docker/Podman daemon (is your container runtime running?)",
-        )?))
-    } else {
-        Ok(Arc::new(NoopCompute))
-    }
+/// Select the right compute adapter by loading the GFS config from `repo_path` directly.
+/// Use this in CLI commands that don't have a `Repository` object.
+pub async fn compute_for_path(repo_path: &Path) -> Result<Arc<dyn Compute>> {
+    let config = GfsConfig::load(repo_path).ok();
+    let provider = config.as_ref().and_then(|c| {
+        c.runtime.as_ref().and_then(|r| {
+            if r.container_name.trim().is_empty() {
+                None
+            } else {
+                Some(r.runtime_provider.as_str())
+            }
+        })
+    });
+    build_compute(provider).await
 }
