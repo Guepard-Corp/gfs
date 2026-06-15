@@ -456,7 +456,7 @@ impl DatabaseProvider for PostgresqlProvider {
             .map(|s| format!(" -n {}", shell_single_quote(s)))
             .collect::<String>();
         let dump = format!(
-            "PGPASSWORD={rpass} pg_dump -h {rhost} -p {rport} -U {ruser} -d {rdb} --schema-only --no-owner --no-privileges{schemas} -f /tmp/gfs_faithful.sql",
+            "PGCONNECT_TIMEOUT=15 PGPASSWORD={rpass} pg_dump -h {rhost} -p {rport} -U {ruser} -d {rdb} --schema-only --no-owner --no-privileges{schemas} -f /tmp/gfs_faithful.sql",
             rpass = shell_single_quote(&remote.password),
             rhost = remote.host,
             rport = remote.port,
@@ -502,14 +502,14 @@ impl DatabaseProvider for PostgresqlProvider {
         // host load -- replaying then fails with "connection refused". Poll a real
         // SELECT 1 (same creds as the replay, via the sidecar's PGPASSWORD).
         let wait_clone = format!(
-            "for i in $(seq 1 120); do if psql -h {host} -p {port} -U {user} -d {db} -c 'SELECT 1' >/dev/null 2>&1; then break; fi; sleep 1; done",
+            "for i in $(seq 1 120); do if PGCONNECT_TIMEOUT=5 psql -h {host} -p {port} -U {user} -d {db} -c 'SELECT 1' >/dev/null 2>&1; then break; fi; sleep 1; done",
             host = local.host,
             port = local.port,
             user = user,
             db = db,
         );
 
-        let command = format!("set -e\n{dump}\n{sanitize}\n{wait_clone}\n{replay}\n{bootstrap}");
+        let command = format!("set -e\nexport PGCONNECT_TIMEOUT=15\n{wait_clone}\n{dump}\n{sanitize}\n{replay}\n{bootstrap}");
 
         Ok(CloneSpec {
             definition: sidecar_definition(self.definition().image, password, "/data"),

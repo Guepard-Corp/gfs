@@ -1128,13 +1128,20 @@ impl Compute for KubernetesCompute {
         id: &InstanceId,
         compute_port: u16,
     ) -> Result<InstanceConnectionInfo> {
-        // Task pods run in-cluster; they must reach the DB via Service DNS, not
-        // NodePort / external host (see get_connection_info when GFS_K8S_EXPOSE_NODEPORT=1).
+        // Task pods run in-cluster (not via NodePort / external host). Prefer the
+        // Service ClusterIP over DNS: on split k3s server/agent nodes, agent pods
+        // often cannot resolve *.svc.cluster.local while kube-proxy still routes
+        // ClusterIPs correctly.
         let svc_name = Self::svc_name(&id.0);
-        let cluster_host = format!("{svc_name}.{}.svc.cluster.local", self.namespace);
+        let svc = self.get_service(&id.0).await?;
+        let host = svc
+            .spec
+            .and_then(|spec| spec.cluster_ip)
+            .filter(|ip| !ip.is_empty() && ip != "None")
+            .unwrap_or_else(|| format!("{svc_name}.{}.svc.cluster.local", self.namespace));
         let env = self.pod_env_for_instance(id).await;
         Ok(InstanceConnectionInfo {
-            host: cluster_host,
+            host,
             port: compute_port,
             env,
         })
@@ -1190,6 +1197,8 @@ impl Compute for KubernetesCompute {
                     ]),
                     ..Default::default()
                 }],
+                node_selector: k8s_schedule_node_name()
+                    .map(|name| BTreeMap::from([("kubernetes.io/hostname".to_string(), name)])),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1204,7 +1213,8 @@ impl Compute for KubernetesCompute {
         // can distinguish success from failure instead of always seeing exit 0.
         let mut terminal_phase = String::from("Unknown");
         let mut exit_code: Option<i32> = None;
-        for _ in 0..120 {
+        // Clone bootstrap: wait for local DB (up to 120s) + pg_dump remote + FDW setup.
+        for _ in 0..360 {
             let p = pods
                 .get(&name)
                 .await
@@ -1215,6 +1225,15 @@ impl Compute for KubernetesCompute {
                 .and_then(|s| s.phase.as_deref())
                 .unwrap_or("Unknown")
                 .to_string();
+            if let Some(code) = task_container_exit_code(&p) {
+                exit_code = Some(code);
+                terminal_phase = if code == 0 {
+                    "Succeeded".to_string()
+                } else {
+                    "Failed".to_string()
+                };
+                break;
+            }
             if phase == "Succeeded" || phase == "Failed" {
                 exit_code = task_container_exit_code(&p);
                 terminal_phase = phase;
