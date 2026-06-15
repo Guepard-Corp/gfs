@@ -13,7 +13,7 @@ use gfs_domain::ports::database_provider::{
 const NAME: &str = "postgres";
 
 /// Default PostgreSQL image (official image, current LTS-alpine).
-const DEFAULT_IMAGE: &str = "postgres:latest";
+const DEFAULT_IMAGE: &str = "gfs-postgres:16";
 
 /// Path inside the container where PostgreSQL stores data (PGDATA).
 const CONTAINER_DATA_DIR: &str = "/var/lib/postgresql/data";

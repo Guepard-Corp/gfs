@@ -399,6 +399,7 @@ impl KubernetesCompute {
         let container = Container {
             name: "db".to_string(),
             image: Some(def.image.clone()),
+            image_pull_policy: Some("IfNotPresent".to_string()),
             env: Some(env),
             ports: Some(container_ports),
             volume_mounts: Some(mounts),
@@ -1180,6 +1181,7 @@ impl Compute for KubernetesCompute {
                 containers: vec![Container {
                     name: "task".to_string(),
                     image: Some(definition.image.clone()),
+                    image_pull_policy: Some("IfNotPresent".to_string()),
                     env: Some(env),
                     command: Some(vec![
                         "sh".to_string(),

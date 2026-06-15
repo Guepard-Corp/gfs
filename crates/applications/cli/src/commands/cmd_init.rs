@@ -29,6 +29,9 @@ pub async fn init(
     remote: bool,
     remote_node: Option<String>,
     project: Option<String>,
+    image: Option<String>,
+    platform: Option<String>,
+    labels: std::collections::BTreeMap<String, String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::trace!("Initializing Guepard environment at: {:?}", path);
 
@@ -69,7 +72,9 @@ pub async fn init(
                     .map_err(|e| std::io::Error::other(e.to_string()))?,
             )),
             _ => Some(Arc::new(
-                DockerCompute::new().map_err(|e| std::io::Error::other(e.to_string()))?,
+                DockerCompute::new()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?
+                    .with_platform(platform),
             )),
         }
     } else {

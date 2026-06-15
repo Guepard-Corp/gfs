@@ -125,6 +125,8 @@ pub struct GfsConfig {
     #[serde(default)]
     pub storage: Option<StorageConfig>,
     #[serde(default)]
+    pub compute: Option<ComputeConfig>,
+    #[serde(default)]
     pub remote: Option<RemoteConfig>,
 }
 

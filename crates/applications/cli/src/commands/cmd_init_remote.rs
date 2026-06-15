@@ -101,6 +101,7 @@ pub async fn init_remote(
             container_name: deployment_id.clone(),
         }),
         storage: None,
+        compute: None,
         remote: Some(RemoteConfig {
             console_url,
             deployment_id: Some(deployment_id.clone()),

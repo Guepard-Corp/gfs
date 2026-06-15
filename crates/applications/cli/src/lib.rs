@@ -612,6 +612,7 @@ fn command_name(cmd: &TopLevel) -> &'static str {
         TopLevel::Mcp { .. } => "mcp",
         TopLevel::Login { .. } => "login",
         TopLevel::Remote { .. } => "remote",
+        TopLevel::Proxy { .. } => "proxy",
         TopLevel::Version => "version",
     }
 }
@@ -689,6 +690,30 @@ where
                     remote,
                     remote_node,
                     project,
+                    None,
+                    None,
+                    Default::default(),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+                Ok(0)
+            }
+            TopLevel::Clone {
+                from,
+                path,
+                database_version,
+                image,
+                platform,
+                port,
+            } => {
+                commands::cmd_clone::clone(
+                    from,
+                    path,
+                    database_version,
+                    image,
+                    platform,
+                    port,
+                    json_output,
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("{}", e))?;

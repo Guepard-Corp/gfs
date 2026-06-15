@@ -76,6 +76,7 @@ gfs-storage-file           = { path = "crates/adapters/storage-file" }
 gfs-storage-kubernetes     = { path = "crates/adapters/storage-kubernetes" }
 gfs-compute-docker         = { path = "crates/adapters/compute-docker" }
 gfs-compute-kubernetes     = { path = "crates/adapters/compute-kubernetes" }
+gfs-cli                    = { path = "crates/applications/cli" }
 gfs-console-remote         = { path = "crates/adapters/console-remote" }
 gfs-mcp                    = { path = "crates/applications/mcp" }
 
