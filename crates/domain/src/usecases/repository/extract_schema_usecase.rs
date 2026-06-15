@@ -15,7 +15,6 @@ use crate::model::config::GfsConfig;
 use crate::model::datasource::{Column, DatasourceMetadata, Schema, Table};
 use crate::ports::compute::{Compute, ComputeError, InstanceId};
 use crate::ports::database_provider::{ConnectionParams, DatabaseProviderRegistry};
-use crate::usecases::repository::task_image::task_image_for_version;
 
 // ---------------------------------------------------------------------------
 // Error
@@ -130,20 +129,22 @@ impl<R: DatabaseProviderRegistry> ExtractSchemaUseCase<R> {
 
         let instance_id = InstanceId(container_name);
 
-        // 3. Get connection info for the sidecar (container IP, reachable from linked task).
+        // 3. Connection env (credentials, db name) from the running container. The
+        //    command runs *inside* that container via `exec`, so it reaches the
+        //    database on 127.0.0.1 rather than the container's network IP.
         let conn_info = self
             .compute
             .get_task_connection_info(&instance_id, provider.default_port())
             .await?;
 
         let params = ConnectionParams {
-            host: conn_info.host,
+            host: "127.0.0.1".to_string(),
             port: conn_info.port,
             env: conn_info.env,
         };
 
-        // 4. Get schema extraction spec (runs in container, no host tools required).
-        let mut spec = provider
+        // 4. Get schema extraction spec (a shell command emitting delimited output).
+        let spec = provider
             .schema_extraction_spec(&params)
             .map_err(|e| ExtractSchemaError::ExtractionFailed(e.to_string()))?
             .ok_or_else(|| {
@@ -153,17 +154,13 @@ impl<R: DatabaseProviderRegistry> ExtractSchemaUseCase<R> {
                 ))
             })?;
 
-        // Channel the sidecar task image to the database's actual version rather
-        // than the provider's default tag, mirroring deploy/checkout. Without
-        // this, schema/commit task pods would use the provider default image
-        // (e.g. `gfs-postgres:16`) regardless of the deployed Postgres version.
-        spec.definition.image = task_image_for_version(&spec.definition.image, &config);
-
-        // 5. Run the schema extraction task linked to the database container.
-        let output = self
-            .compute
-            .run_task(&spec.definition, &spec.command, Some(&instance_id))
-            .await?;
+        // 5. Run the command via `exec` inside the running database container
+        //    instead of spawning a throwaway sidecar. The DB image already ships
+        //    the client tools the command needs (psql, pg_dump), so no separate
+        //    container, image pull, or network linking is required. The
+        //    task-image-versioning retag from `main` applied only to the sidecar
+        //    image, which `exec` no longer creates, so it is intentionally dropped.
+        let output = self.compute.exec(&instance_id, &spec.command, None).await?;
 
         if output.exit_code != 0 {
             return Err(ExtractSchemaError::QueryFailed(format!(
@@ -607,6 +604,18 @@ GFS_SCHEMA_COLUMNS
                 exit_code: self.run_task_exit_code,
                 stdout: self.run_task_stdout.clone(),
                 stderr: "task failed".into(),
+            })
+        }
+        async fn exec(
+            &self,
+            _: &InstanceId,
+            _: &str,
+            _: Option<&str>,
+        ) -> crate::ports::compute::Result<ExecOutput> {
+            Ok(ExecOutput {
+                exit_code: self.run_task_exit_code,
+                stdout: self.run_task_stdout.clone(),
+                stderr: "exec failed".into(),
             })
         }
     }
