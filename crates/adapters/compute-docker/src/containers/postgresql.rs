@@ -725,6 +725,9 @@ pub fn register(registry: &impl DatabaseProviderRegistry) -> Result<()> {
 /// `build_clone_bootstrap_sql`.
 const CLONE_BOOTSTRAP_TMPL: &str = include_str!("clone_bootstrap.sql");
 
+/// SQL run after a snapshot-seeded clone when `fetch_remote_source=false`.
+pub const LAZY_CLONE_DETACH_REMOTE_SQL: &str = include_str!("detach_remote.sql");
+
 /// Escape a value for use inside a single-quoted SQL string literal.
 fn sql_lit(s: &str) -> String {
     s.replace('\'', "''")
