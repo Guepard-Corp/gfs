@@ -39,6 +39,7 @@ fn resolve_id(path: Option<PathBuf>, action: &ComputeAction) -> Result<String> {
         ComputeAction::Unpause { id } => id.as_deref(),
         ComputeAction::Logs { id, .. } => id.as_deref(),
         ComputeAction::Config { .. } => return Ok(String::new()),
+        ComputeAction::Reprovision => return Ok(String::new()),
     };
     if let Some(id) = id_from_action {
         return Ok(id.to_string());
@@ -58,6 +59,9 @@ fn resolve_id(path: Option<PathBuf>, action: &ComputeAction) -> Result<String> {
 pub async fn run(path: Option<PathBuf>, action: ComputeAction, json_output: bool) -> Result<()> {
     if let ComputeAction::Config { ref key, ref value } = action {
         return handle_config(path, key, value, json_output);
+    }
+    if let ComputeAction::Reprovision = action {
+        return handle_reprovision(path, json_output).await;
     }
     let compute = DockerCompute::new().map_err(|e| anyhow::anyhow!("{e}"))?;
     let id = resolve_id(path.clone(), &action)?;
@@ -101,6 +105,127 @@ fn handle_config(path: Option<PathBuf>, key: &str, value: &str, json_output: boo
         }
         _ => anyhow::bail!("unknown config key '{}'; supported keys: db.port", key),
     }
+}
+
+async fn handle_reprovision(path: Option<PathBuf>, json_output: bool) -> Result<()> {
+    let repo_path = path.unwrap_or_else(get_repo_dir);
+    let compute = DockerCompute::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (new_id, status) = reprovision(&compute, &repo_path).await?;
+    let data_dir = container_data_dir(&compute, &new_id, Some(repo_path.clone())).await;
+    if json_output {
+        print_status_json(
+            &status,
+            data_dir.as_deref(),
+            Some(&repo_path),
+            Some("reprovision"),
+        )?;
+    } else {
+        println!("{} Compute reprovisioned", green("✓"));
+        print_status(&status, data_dir.as_deref(), Some(&repo_path));
+    }
+    Ok(())
+}
+async fn reprovision(
+    compute: &DockerCompute,
+    repo_path: &std::path::Path,
+) -> Result<(InstanceId, InstanceStatus)> {
+    let config = GfsConfig::load(repo_path).context("not a gfs repository")?;
+
+    let environment = config
+        .environment
+        .as_ref()
+        .context("no database configured (run gfs init --database-provider ... first)")?;
+
+    let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
+    gfs_compute_docker::containers::register_all(registry.as_ref())
+        .context("register providers")?;
+    let provider = registry
+        .get(&environment.database_provider)
+        .context(format!(
+            "unknown provider: {}",
+            environment.database_provider
+        ))?;
+
+    let active = repo_layout::get_active_workspace_data_dir(repo_path)
+        .context("could not find active workspace data directory")?;
+    let active_str = active.to_string_lossy().into_owned();
+
+    let mut definition = provider.definition_with_overrides(&config.compute_params());
+    if !environment.database_version.is_empty() {
+        let base = definition
+            .image
+            .split(':')
+            .next()
+            .unwrap_or(&definition.image);
+        definition.image = format!("{}:{}", base, environment.database_version);
+    }
+    definition.host_data_dir = Some(active.clone());
+
+    // Set host user
+    #[cfg(unix)]
+    {
+        match current_user::current_user_uid_gid() {
+            Some(uid_gid) => definition.user = Some(uid_gid),
+            None => tracing::warn!("could not determine host uid:gid"),
+        }
+    }
+
+    // Fix ownership via ephemeral root container (mirrors pre_start_repair_data_dir)
+    let compute_data_path = provider
+        .definition()
+        .data_dir
+        .to_string_lossy()
+        .into_owned();
+    let repair_target = definition
+        .user
+        .clone()
+        .or_else(|| provider.data_dir_owner().map(str::to_string));
+    if let Some(ref target) = repair_target {
+        let escaped = compute_data_path.replace('\'', "'\"'\"'");
+        let cmd = format!("chown -R {target} '{escaped}' && chmod -R 0700 '{escaped}'");
+        let mut repair_def = definition.clone();
+        repair_def.user = Some("0:0".to_string());
+        if let Err(e) = compute.run_task(&repair_def, &cmd, None).await {
+            tracing::warn!("failed to repair data dir ownership: {e}");
+        }
+    }
+
+    // Provision new container
+    let new_id = compute
+        .provision(&definition)
+        .await
+        .context("failed to provision new container")?;
+    let status = compute
+        .start(&new_id, Default::default())
+        .await
+        .context("failed to start reprovisioned container")?;
+
+    // Update config with new container name
+    let runtime = compute
+        .describe_runtime()
+        .await
+        .unwrap_or(RuntimeDescriptor {
+            provider: "docker".to_string(),
+            version: "24".to_string(),
+        });
+    repo_layout::update_runtime_config(
+        repo_path,
+        RuntimeConfig {
+            runtime_provider: runtime.provider,
+            runtime_version: runtime.version,
+            container_name: new_id.0.clone(),
+        },
+    )
+    .context("failed to update config")?;
+
+    println!(
+        "  {} Reprovisioned container {} using existing data at {}",
+        green("→"),
+        new_id.0,
+        active_str
+    );
+
+    Ok((new_id, status))
 }
 
 // ---------------------------------------------------------------------------
@@ -196,7 +321,7 @@ async fn dispatch(
         }
 
         ComputeAction::Config { .. } => unreachable!("Config is handled before dispatch"),
-
+        ComputeAction::Reprovision => unreachable!("Reprovision is handled before dispatch"),
         ComputeAction::Logs {
             tail,
             since,
@@ -500,12 +625,21 @@ async fn just_start_or_restart(
     instance_id: &InstanceId,
     restart: bool,
 ) -> Result<(InstanceId, InstanceStatus)> {
-    let status = if restart {
-        compute.restart(instance_id).await?
+    let result = if restart {
+        compute.restart(instance_id).await
     } else {
-        compute.start(instance_id, Default::default()).await?
+        compute.start(instance_id, Default::default()).await
     };
-    Ok((instance_id.clone(), status))
+    match result {
+        Ok(status) => Ok((instance_id.clone(), status)),
+        Err(gfs_domain::ports::compute::ComputeError::NotFound(_)) => {
+            anyhow::bail!(
+                "instance not found: '{}' — try `gfs compute reprovision` to recover",
+                instance_id.0
+            )
+        }
+        Err(e) => Err(anyhow::Error::from(e)),
+    }
 }
 
 fn paths_differ(a: &str, b: &str) -> bool {

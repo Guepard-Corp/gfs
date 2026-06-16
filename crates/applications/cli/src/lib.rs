@@ -115,6 +115,10 @@ pub enum ComputeAction {
         /// Value to set
         value: String,
     },
+    /// Reprovision a lost container using existing workspace data.
+    /// Use after a PC restart or container crash when
+    /// `gfs compute start` fails with 'instance not found'.
+    Reprovision,
 }
 
 // ---------------------------------------------------------------------------
