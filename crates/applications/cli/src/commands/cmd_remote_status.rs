@@ -44,13 +44,21 @@ pub async fn run(path: Option<PathBuf>, json_output: bool) -> Result<i32> {
             "stopped" => yellow(compute_status),
             _ => red(compute_status),
         };
-        println!("{} {}", bold("Remote deployment"), cyan(remote.deployment_id()));
+        println!(
+            "{} {}",
+            bold("Remote deployment"),
+            cyan(remote.deployment_id())
+        );
         println!("  {:<18} {}", dimmed("Compute"), color_status);
-        println!("  {:<18} {}", dimmed("CP database"), remote.cp_database_id());
-        if let Some(info) = connection.get("connection_info") {
-            if !info.is_null() {
-                println!("  {:<18} {}", dimmed("Connection"), info);
-            }
+        println!(
+            "  {:<18} {}",
+            dimmed("CP database"),
+            remote.cp_database_id()
+        );
+        if let Some(info) = connection.get("connection_info")
+            && !info.is_null()
+        {
+            println!("  {:<18} {}", dimmed("Connection"), info);
         }
     }
 

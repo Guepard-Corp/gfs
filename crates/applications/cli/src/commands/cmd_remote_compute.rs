@@ -41,11 +41,7 @@ enum LifecycleOp {
     Stop,
 }
 
-async fn run_lifecycle(
-    path: Option<PathBuf>,
-    op: LifecycleOp,
-    json_output: bool,
-) -> Result<()> {
+async fn run_lifecycle(path: Option<PathBuf>, op: LifecycleOp, json_output: bool) -> Result<()> {
     let repo_path = path.unwrap_or_else(get_repo_dir);
     let client = console_client_for_repo(&repo_path)?;
     let (_cfg, remote) = require_remote_config(&repo_path)?;
@@ -63,7 +59,12 @@ async fn run_lifecycle(
             LifecycleOp::Start => "started",
             LifecycleOp::Stop => "stopped",
         };
-        println!("{} deployment {} {}", green("✓"), cyan(deployment_id), label);
+        println!(
+            "{} deployment {} {}",
+            green("✓"),
+            cyan(deployment_id),
+            label
+        );
     }
     Ok(())
 }

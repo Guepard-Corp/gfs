@@ -109,7 +109,9 @@ fn get(repo_path: &std::path::Path, key: &str) -> Result<()> {
             .as_ref()
             .map(|s| s.enable_reflink.to_string())
             .unwrap_or_default(),
-        KEY_TELEMETRY_ENABLED | KEY_REMOTE_CONSOLE_URL | KEY_REMOTE_SUPABASE_URL
+        KEY_TELEMETRY_ENABLED
+        | KEY_REMOTE_CONSOLE_URL
+        | KEY_REMOTE_SUPABASE_URL
         | KEY_REMOTE_SUPABASE_ANON_KEY => {
             anyhow::bail!(
                 "'{}' is a global-only setting; use --global to read it",
@@ -274,8 +276,7 @@ fn get_global(key: &str) -> Result<()> {
             println!("{}", settings.telemetry);
         }
         KEY_REMOTE_CONSOLE_URL | KEY_REMOTE_SUPABASE_URL | KEY_REMOTE_SUPABASE_ANON_KEY => {
-            let out = gfs_console_remote::get_remote_config_value(key)?
-                .unwrap_or_default();
+            let out = gfs_console_remote::get_remote_config_value(key)?.unwrap_or_default();
             if !out.is_empty() {
                 print!("{out}");
             }

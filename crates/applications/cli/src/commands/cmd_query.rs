@@ -57,8 +57,7 @@ pub async fn run(
     let compute = compute_for_repo(&repository, &repo_path).await?;
 
     let registry_impl = InMemoryDatabaseProviderRegistry::new();
-    containers::register_all(&registry_impl)
-        .context("failed to register database providers")?;
+    containers::register_all(&registry_impl).context("failed to register database providers")?;
     let registry = Arc::new(registry_impl);
 
     let is_k8s = runtime

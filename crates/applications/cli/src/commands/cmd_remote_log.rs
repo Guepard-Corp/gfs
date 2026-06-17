@@ -48,14 +48,14 @@ fn print_log_human(value: &Value) {
             .and_then(|v| v.as_str())
             .unwrap_or("?");
         let short = if hash.len() >= 7 { &hash[..7] } else { hash };
-        let msg = entry
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let msg = entry.get("message").and_then(|v| v.as_str()).unwrap_or("");
         println!("{} {}", cyan(short), dimmed(msg));
     }
 }
 
 fn print_graph_human(value: &Value) {
-    println!("{}", serde_json::to_string_pretty(value).unwrap_or_default());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).unwrap_or_default()
+    );
 }

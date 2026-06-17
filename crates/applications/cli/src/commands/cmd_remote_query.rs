@@ -43,11 +43,7 @@ fn print_query_human(value: &Value) {
     let columns = value
         .get("columns")
         .and_then(|v| v.as_array())
-        .map(|cols| {
-            cols.iter()
-                .filter_map(|c| c.as_str())
-                .collect::<Vec<_>>()
-        })
+        .map(|cols| cols.iter().filter_map(|c| c.as_str()).collect::<Vec<_>>())
         .unwrap_or_default();
 
     if !columns.is_empty() {

@@ -46,15 +46,18 @@ impl<R: DatabaseProviderRegistry> ExecuteQueryUseCase<R> {
     }
 
     /// Run `sql` inside the database container/pod for the repo at `path`.
-    pub async fn run(&self, path: &Path, sql: &str) -> Result<ExecuteQueryOutput, ExecuteQueryError> {
+    pub async fn run(
+        &self,
+        path: &Path,
+        sql: &str,
+    ) -> Result<ExecuteQueryOutput, ExecuteQueryError> {
         if sql.trim().is_empty() {
             return Err(ExecuteQueryError::Unsupported(
                 "empty SQL is not supported via repo.query".into(),
             ));
         }
 
-        let config =
-            GfsConfig::load(path).map_err(|e| ExecuteQueryError::Config(e.to_string()))?;
+        let config = GfsConfig::load(path).map_err(|e| ExecuteQueryError::Config(e.to_string()))?;
 
         let provider_name = config
             .environment
@@ -131,8 +134,9 @@ mod tests {
         InstanceStatus, LogsOptions, PortMapping, StartOptions,
     };
     use crate::ports::database_provider::{
-        ConnectionParams, DatabaseProvider, DatabaseProviderRegistry, InMemoryDatabaseProviderRegistry,
-        ProviderError, Result as RegistryResult, SIGTERM, SupportedFeature,
+        ConnectionParams, DatabaseProvider, DatabaseProviderRegistry,
+        InMemoryDatabaseProviderRegistry, ProviderError, Result as RegistryResult, SIGTERM,
+        SupportedFeature,
     };
     use tempfile::TempDir;
 
@@ -343,7 +347,10 @@ mod tests {
         ) -> std::result::Result<std::process::Command, ProviderError> {
             Ok(std::process::Command::new("true"))
         }
-        fn query_in_instance_command(&self, sql: &str) -> std::result::Result<String, ProviderError> {
+        fn query_in_instance_command(
+            &self,
+            sql: &str,
+        ) -> std::result::Result<String, ProviderError> {
             Ok(format!("mock-exec-query: {sql}"))
         }
     }
@@ -380,9 +387,7 @@ mod tests {
         let (_temp, repo_path) = repo_with_config("mock-query", "pg-test-1");
 
         let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
-        registry
-            .register(Arc::new(MockQueryProvider))
-            .unwrap();
+        registry.register(Arc::new(MockQueryProvider)).unwrap();
 
         let compute = Arc::new(QueryMockCompute {
             stdout: " ?column? \n----------\n        1\n(1 row)\n".into(),
@@ -404,9 +409,7 @@ mod tests {
         let (_temp, repo_path) = repo_with_config("mock-query", "pg-test-2");
 
         let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
-        registry
-            .register(Arc::new(MockQueryProvider))
-            .unwrap();
+        registry.register(Arc::new(MockQueryProvider)).unwrap();
 
         let compute = Arc::new(QueryMockCompute {
             exit_code: 1,

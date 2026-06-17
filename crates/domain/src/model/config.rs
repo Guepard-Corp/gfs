@@ -140,8 +140,7 @@ impl GfsConfig {
             .as_ref()
             .map(|r| r.runtime_provider.trim().to_ascii_lowercase())
             .unwrap_or_default();
-        matches!(provider.as_str(), "guepard" | "console" | "remote")
-            && self.remote.is_some()
+        matches!(provider.as_str(), "guepard" | "console" | "remote") && self.remote.is_some()
     }
 
     pub fn load(repo_path: &Path) -> Result<Self, RepoError> {

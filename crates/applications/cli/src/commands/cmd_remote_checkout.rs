@@ -27,17 +27,17 @@ pub async fn checkout(
     };
 
     let result = client
-        .checkout(
-            &remote,
-            &revision,
-            create_branch.as_deref(),
-        )
+        .checkout(&remote, &revision, create_branch.as_deref())
         .await?;
 
     if json_output {
         println!("{}", json!({ "revision": revision, "result": result }));
     } else {
-        println!("{} checked out {} on remote engine", green("✓"), cyan(&revision));
+        println!(
+            "{} checked out {} on remote engine",
+            green("✓"),
+            cyan(&revision)
+        );
     }
     Ok(())
 }

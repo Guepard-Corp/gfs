@@ -97,9 +97,7 @@ impl ConsoleClient {
             .request(method, url)
             .header("Authorization", self.bearer());
         if let Some(b) = body {
-            req = req
-                .header("Content-Type", "application/json")
-                .json(b);
+            req = req.header("Content-Type", "application/json").json(b);
         }
         let res = req.send().await.context("console API request")?;
         let status = res.status();
@@ -214,39 +212,37 @@ impl ConsoleClient {
             let connection_info = conn.get("connection_info");
             let has_connection = connection_info.is_some_and(|v| !v.is_null());
 
-            if compute == "running" && has_connection {
-                if let Some(cp_id) = cp_database_id {
-                    return Ok(DeploymentReady {
-                        deployment_id: deployment_id.to_string(),
-                        cp_database_id: cp_id,
-                        connection: conn,
-                        status,
-                    });
-                }
+            if compute == "running"
+                && has_connection
+                && let Some(cp_id) = cp_database_id
+            {
+                return Ok(DeploymentReady {
+                    deployment_id: deployment_id.to_string(),
+                    cp_database_id: cp_id,
+                    connection: conn,
+                    status,
+                });
             }
 
             tokio::time::sleep(DEPLOY_POLL_INTERVAL).await;
         }
     }
 
-    pub async fn wait_deployment_ready_default(&self, deployment_id: &str) -> Result<DeploymentReady> {
+    pub async fn wait_deployment_ready_default(
+        &self,
+        deployment_id: &str,
+    ) -> Result<DeploymentReady> {
         self.wait_deployment_ready(deployment_id, DEPLOY_READY_TIMEOUT)
             .await
     }
 
     pub async fn start_deployment(&self, deployment_id: &str) -> Result<Value> {
-        let url = format!(
-            "{}/deployments/{deployment_id}/start",
-            self.api_engine()
-        );
+        let url = format!("{}/deployments/{deployment_id}/start", self.api_engine());
         self.post_json(&url, &serde_json::json!({})).await
     }
 
     pub async fn stop_deployment(&self, deployment_id: &str) -> Result<Value> {
-        let url = format!(
-            "{}/deployments/{deployment_id}/stop",
-            self.api_engine()
-        );
+        let url = format!("{}/deployments/{deployment_id}/stop", self.api_engine());
         self.post_json(&url, &serde_json::json!({})).await
     }
 
@@ -307,7 +303,8 @@ impl ConsoleClient {
         }
 
         // CP rejects checkout while the row is transitional (409 conflict).
-        self.wait_compute_running(remote, DEPLOY_READY_TIMEOUT).await?;
+        self.wait_compute_running(remote, DEPLOY_READY_TIMEOUT)
+            .await?;
 
         let url = format!(
             "{}/deployments/{}/checkout",
@@ -325,15 +322,12 @@ impl ConsoleClient {
         }
 
         // Checkout reprovisions the instance; wait until serving again.
-        self.wait_compute_running(remote, DEPLOY_READY_TIMEOUT).await?;
+        self.wait_compute_running(remote, DEPLOY_READY_TIMEOUT)
+            .await?;
         Ok(val)
     }
 
-    async fn wait_compute_running(
-        &self,
-        remote: &RemoteConfig,
-        timeout: Duration,
-    ) -> Result<()> {
+    async fn wait_compute_running(&self, remote: &RemoteConfig, timeout: Duration) -> Result<()> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             if std::time::Instant::now() > deadline {
@@ -404,7 +398,10 @@ pub fn credentials_path() -> Result<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
         .context("cannot determine home directory")?;
-    Ok(home.join(".config").join("guepard").join("credentials.toml"))
+    Ok(home
+        .join(".config")
+        .join("guepard")
+        .join("credentials.toml"))
 }
 
 pub fn load_credentials_file() -> Option<CredentialsFile> {
@@ -424,33 +421,33 @@ pub fn save_credentials(creds: &CredentialsFile) -> Result<()> {
 }
 
 pub fn merge_env_into_credentials(file: &mut CredentialsFile) {
-    if let Ok(url) = std::env::var("GUEPARD_CONSOLE_URL") {
-        if !url.trim().is_empty() {
-            file.console_url = Some(url.trim_end_matches('/').to_string());
-        }
+    if let Ok(url) = std::env::var("GUEPARD_CONSOLE_URL")
+        && !url.trim().is_empty()
+    {
+        file.console_url = Some(url.trim_end_matches('/').to_string());
     }
-    if let Ok(url) = std::env::var("GUEPARD_SUPABASE_URL") {
-        if !url.trim().is_empty() {
-            file.supabase_url = Some(url.trim_end_matches('/').to_string());
-        }
+    if let Ok(url) = std::env::var("GUEPARD_SUPABASE_URL")
+        && !url.trim().is_empty()
+    {
+        file.supabase_url = Some(url.trim_end_matches('/').to_string());
     }
-    if let Ok(key) = std::env::var("GUEPARD_SUPABASE_ANON_KEY") {
-        if !key.trim().is_empty() {
-            file.supabase_anon_key = Some(key.trim().to_string());
-        }
+    if let Ok(key) = std::env::var("GUEPARD_SUPABASE_ANON_KEY")
+        && !key.trim().is_empty()
+    {
+        file.supabase_anon_key = Some(key.trim().to_string());
     }
 }
 
 pub fn resolve_console_url() -> Result<String> {
-    if let Ok(url) = std::env::var("GUEPARD_CONSOLE_URL") {
-        if !url.trim().is_empty() {
-            return Ok(url.trim_end_matches('/').to_string());
-        }
+    if let Ok(url) = std::env::var("GUEPARD_CONSOLE_URL")
+        && !url.trim().is_empty()
+    {
+        return Ok(url.trim_end_matches('/').to_string());
     }
-    if let Some(file) = load_credentials_file() {
-        if let Some(url) = file.console_url.filter(|s| !s.trim().is_empty()) {
-            return Ok(url.trim_end_matches('/').to_string());
-        }
+    if let Some(file) = load_credentials_file()
+        && let Some(url) = file.console_url.filter(|s| !s.trim().is_empty())
+    {
+        return Ok(url.trim_end_matches('/').to_string());
     }
     bail!(
         "console URL not set: export GUEPARD_CONSOLE_URL or run `gfs config --global remote.console_url <url>`"
@@ -488,7 +485,9 @@ pub fn resolve_supabase_config() -> Result<SupabaseConfig> {
                     .map(|s| s.to_string())
             })
         })
-        .context("set GUEPARD_SUPABASE_ANON_KEY or `gfs config --global remote.supabase_anon_key`")?;
+        .context(
+            "set GUEPARD_SUPABASE_ANON_KEY or `gfs config --global remote.supabase_anon_key`",
+        )?;
 
     Ok(SupabaseConfig {
         url: url.trim_end_matches('/').to_string(),
@@ -518,9 +517,7 @@ pub fn get_remote_config_value(key: &str) -> Result<Option<String>> {
     match key {
         "remote.console_url" => Ok(resolve_console_url().ok()),
         "remote.supabase_url" => Ok(resolve_supabase_config().ok().map(|c| c.url)),
-        "remote.supabase_anon_key" => Ok(resolve_supabase_config()
-            .ok()
-            .map(|c| c.anon_key)),
+        "remote.supabase_anon_key" => Ok(resolve_supabase_config().ok().map(|c| c.anon_key)),
         _ => bail!("unsupported remote config key: {key}"),
     }
 }
@@ -573,18 +570,20 @@ pub async fn login_with_password(
 }
 
 pub fn auth_from_env() -> Result<ConsoleAuth> {
-    if let Ok(token) = std::env::var("GUEPARD_ACCESS_TOKEN") {
-        if !token.trim().is_empty() {
-            return Ok(ConsoleAuth {
-                access_token: token.trim().to_string(),
-            });
-        }
+    if let Ok(token) = std::env::var("GUEPARD_ACCESS_TOKEN")
+        && !token.trim().is_empty()
+    {
+        return Ok(ConsoleAuth {
+            access_token: token.trim().to_string(),
+        });
     }
 
-    if let Some(file) = load_credentials_file() {
-        if let Some(token) = file.access_token.filter(|t| !t.trim().is_empty()) {
-            return Ok(ConsoleAuth { access_token: token });
-        }
+    if let Some(file) = load_credentials_file()
+        && let Some(token) = file.access_token.filter(|t| !t.trim().is_empty())
+    {
+        return Ok(ConsoleAuth {
+            access_token: token,
+        });
     }
 
     bail!(

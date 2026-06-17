@@ -68,10 +68,7 @@ async fn list_branches(repo_path: &std::path::Path, json_output: bool) -> Result
         } else {
             "  ".to_string()
         };
-        let name = b
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
+        let name = b.get("name").and_then(|v| v.as_str()).unwrap_or("?");
         println!("{}{}", marker, cyan(name));
     }
     Ok(())
@@ -114,10 +111,10 @@ fn extract_branches(log: &Value) -> Vec<Value> {
         }
     }
 
-    if out.is_empty() {
-        if let Some(head) = log.get("head").and_then(|v| v.as_str()) {
-            out.push(json!({ "name": "main", "commit": head, "current": true }));
-        }
+    if out.is_empty()
+        && let Some(head) = log.get("head").and_then(|v| v.as_str())
+    {
+        out.push(json!({ "name": "main", "commit": head, "current": true }));
     }
     out
 }

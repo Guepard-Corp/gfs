@@ -529,7 +529,9 @@ impl DatabaseProvider for PostgresqlProvider {
             db = db,
         );
 
-        let command = format!("set -e\nexport PGCONNECT_TIMEOUT=15\n{wait_clone}\n{dump}\n{sanitize}\n{replay}\n{bootstrap}");
+        let command = format!(
+            "set -e\nexport PGCONNECT_TIMEOUT=15\n{wait_clone}\n{dump}\n{sanitize}\n{replay}\n{bootstrap}"
+        );
 
         Ok(CloneSpec {
             definition: sidecar_definition(self.definition().image, password, "/data"),
@@ -1057,7 +1059,7 @@ mod tests {
         };
         let spec = provider.schema_extraction_spec(&params).unwrap();
         let spec = spec.expect("postgres provider supports schema extraction");
-        assert_eq!(spec.definition.image, "postgres:latest");
+        assert_eq!(spec.definition.image, "gfs-postgres:16");
         assert!(spec.command.contains("GFS_SCHEMA_VERSION"));
         assert!(spec.command.contains("GFS_SCHEMA_SCHEMAS"));
         assert!(spec.command.contains("GFS_SCHEMA_TABLES"));

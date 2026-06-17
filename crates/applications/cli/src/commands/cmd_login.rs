@@ -21,13 +21,7 @@ pub async fn run(
         .or_else(|| std::env::var("GUEPARD_LOGIN_PASSWORD").ok())
         .context("pass --password or set GUEPARD_LOGIN_PASSWORD")?;
 
-    login_with_password(
-        &supabase.url,
-        &supabase.anon_key,
-        &email,
-        &password,
-    )
-    .await?;
+    login_with_password(&supabase.url, &supabase.anon_key, &email, &password).await?;
     eprintln!("logged in; token saved to ~/.config/guepard/credentials.toml");
     Ok(())
 }

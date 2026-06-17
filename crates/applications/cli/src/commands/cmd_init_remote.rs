@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use gfs_console_remote::{
-    auth_from_env, block_direct_kubernetes_env, resolve_console_url, ConsoleClient,
+    ConsoleClient, auth_from_env, block_direct_kubernetes_env, resolve_console_url,
 };
 use gfs_domain::model::config::{
     EnvironmentConfig, GfsConfig, RemoteConfig, RuntimeConfig, UserConfig,
@@ -14,6 +14,7 @@ use serde_json::json;
 use crate::cli_utils::get_repo_dir;
 use crate::output::{cyan, dimmed, green};
 
+#[allow(clippy::too_many_arguments)]
 pub async fn init_remote(
     path: Option<PathBuf>,
     database_provider: Option<String>,
@@ -48,13 +49,7 @@ pub async fn init_remote(
         .unwrap_or_else(|| "default".to_string());
 
     let deploy = client
-        .deploy_database(
-            &node_id,
-            provider,
-            version,
-            name.as_deref(),
-            &project_id,
-        )
+        .deploy_database(&node_id, provider, version, name.as_deref(), &project_id)
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
@@ -136,7 +131,11 @@ pub async fn init_remote(
             cyan(target_path.display().to_string()),
             cyan(&deployment_id)
         );
-        println!("    {:<16} {}", dimmed("CP database"), cyan(&cp_database_id));
+        println!(
+            "    {:<16} {}",
+            dimmed("CP database"),
+            cyan(&cp_database_id)
+        );
         println!(
             "    {:<16} {}",
             dimmed("Console"),
@@ -155,11 +154,7 @@ pub async fn init_remote(
                 .map(|r| r.node_id.as_str())
                 .unwrap_or("")
         );
-        println!(
-            "    {:<16} {}",
-            dimmed("Project"),
-            cyan(&project_id)
-        );
+        println!("    {:<16} {}", dimmed("Project"), cyan(&project_id));
     }
     Ok(())
 }

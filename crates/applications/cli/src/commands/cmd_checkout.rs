@@ -8,14 +8,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use gfs_compute_kubernetes::KubernetesCompute;
+use gfs_compute_kubernetes::checkout::restore_database_volume_from_snapshot;
 use gfs_domain::adapters::gfs_repository::GfsRepository;
 use gfs_domain::model::config::GfsConfig;
 use gfs_domain::ports::compute::Compute;
 use gfs_domain::ports::database_provider::InMemoryDatabaseProviderRegistry;
 use gfs_domain::ports::repository::Repository;
 use gfs_domain::usecases::repository::checkout_repo_usecase::CheckoutRepoUseCase;
-use gfs_compute_kubernetes::checkout::restore_database_volume_from_snapshot;
-use gfs_compute_kubernetes::KubernetesCompute;
 use serde_json::json;
 
 use super::compute_support::compute_for_repo;

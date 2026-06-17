@@ -14,9 +14,11 @@ pub fn parse_postgres_url(url: &str) -> Result<RemoteSource, ParseRemoteSourceEr
     let rest = url
         .strip_prefix("postgres://")
         .or_else(|| url.strip_prefix("postgresql://"))
-        .ok_or_else(|| ParseRemoteSourceError::Invalid(
-            "remote URL must start with postgres:// or postgresql://".into(),
-        ))?;
+        .ok_or_else(|| {
+            ParseRemoteSourceError::Invalid(
+                "remote URL must start with postgres:// or postgresql://".into(),
+            )
+        })?;
 
     let (rest, query) = match rest.split_once('?') {
         Some((r, q)) => (r, Some(q)),
@@ -41,7 +43,9 @@ pub fn parse_postgres_url(url: &str) -> Result<RemoteSource, ParseRemoteSourceEr
     };
 
     let (hostport, dbname) = hostpart.split_once('/').ok_or_else(|| {
-        ParseRemoteSourceError::Invalid("remote URL must include a database name (.../dbname)".into())
+        ParseRemoteSourceError::Invalid(
+            "remote URL must include a database name (.../dbname)".into(),
+        )
     })?;
     if dbname.is_empty() {
         return Err(ParseRemoteSourceError::Invalid(
@@ -114,9 +118,8 @@ mod tests {
 
     #[test]
     fn defaults_port_and_parses_schemas() {
-        let r =
-            parse_postgres_url("postgresql://bob@localhost/analytics?schema=reporting,staging")
-                .unwrap();
+        let r = parse_postgres_url("postgresql://bob@localhost/analytics?schema=reporting,staging")
+            .unwrap();
         assert_eq!(r.port, 5432);
         assert_eq!(r.password, "");
         assert_eq!(

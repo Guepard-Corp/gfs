@@ -6,8 +6,8 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gfs_compute_docker::containers;
 use gfs_compute_docker::DockerCompute;
+use gfs_compute_docker::containers;
 use gfs_domain::model::config::{EnvironmentConfig, GfsConfig, RuntimeConfig};
 use gfs_domain::ports::database_provider::InMemoryDatabaseProviderRegistry;
 use gfs_domain::usecases::repository::execute_query_usecase::ExecuteQueryUseCase;
@@ -41,6 +41,7 @@ fn write_repo(path: &std::path::Path, container: &str) {
             container_name: container.into(),
         }),
         storage: None,
+        compute: None,
         remote: None,
     };
     config.save(path).expect("save config");

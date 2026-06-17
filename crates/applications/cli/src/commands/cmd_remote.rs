@@ -1,5 +1,5 @@
 use anyhow::Result;
-use gfs_console_remote::{auth_from_env, remote_config_show, resolve_console_url, ConsoleClient};
+use gfs_console_remote::{ConsoleClient, auth_from_env, remote_config_show, resolve_console_url};
 
 pub async fn show(json_output: bool) -> Result<()> {
     let creds = remote_config_show()?;
@@ -21,6 +21,7 @@ pub async fn nodes(json_output: bool) -> Result<()> {
     let base = resolve_console_url()?;
     let client = ConsoleClient::new(base, auth)?;
     let nodes = client.list_nodes().await?;
+    #[allow(clippy::if_same_then_else)]
     if json_output {
         println!("{}", serde_json::to_string_pretty(&nodes)?);
     } else {

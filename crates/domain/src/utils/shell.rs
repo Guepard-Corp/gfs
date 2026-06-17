@@ -9,7 +9,5 @@ pub fn sql_heredoc_body(delimiter: &str, sql: &str) -> Result<String, ProviderEr
             "SQL must not contain delimiter '{delimiter}'"
         )));
     }
-    Ok(format!(
-        "$(cat <<'{delimiter}'\n{sql}\n{delimiter}\n)"
-    ))
+    Ok(format!("$(cat <<'{delimiter}'\n{sql}\n{delimiter}\n)"))
 }

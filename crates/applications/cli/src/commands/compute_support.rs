@@ -138,11 +138,11 @@ pub async fn compute_for_repo(
                     "guepard remote repository: VCS runs via console API (gfs commit/log/checkout), not local compute"
                 );
             }
-            "kubernetes" | "k8s" | "k3s" => Ok(Arc::new(
-                KubernetesCompute::new(None)
-                    .await
-                    .context("failed to connect to Kubernetes (check KUBECONFIG / k3s)")?,
-            )),
+            "kubernetes" | "k8s" | "k3s" => {
+                Ok(Arc::new(KubernetesCompute::new(None).await.context(
+                    "failed to connect to Kubernetes (check KUBECONFIG / k3s)",
+                )?))
+            }
             _ => Ok(Arc::new(DockerCompute::new().context(
                 "failed to connect to Docker/Podman daemon (is your container runtime running?)",
             )?)),

@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
 use super::remote_support::{console_client_for_repo, require_remote_config};
 use crate::cli_utils::get_repo_dir;
 use crate::output::{cyan, green};
+use anyhow::{Result, bail};
 
 pub async fn run_extract(path: Option<PathBuf>, json_output: bool) -> Result<()> {
     let repo_path = path.unwrap_or_else(get_repo_dir);
@@ -11,6 +11,7 @@ pub async fn run_extract(path: Option<PathBuf>, json_output: bool) -> Result<()>
     let (_cfg, remote) = require_remote_config(&repo_path)?;
     let result = client.schema_show(&remote).await?;
 
+    #[allow(clippy::if_same_then_else)]
     if json_output {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {

@@ -1,4 +1,4 @@
-use gfs_console_remote::{auth_from_env, ConsoleAuth, ConsoleClient};
+use gfs_console_remote::{ConsoleAuth, ConsoleClient, auth_from_env};
 use gfs_domain::model::config::RemoteConfig;
 use serde_json::json;
 use wiremock::matchers::{header, method, path, query_param};

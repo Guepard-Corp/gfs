@@ -645,10 +645,7 @@ where
     // Skip telemetry for Version and Mcp (MCP tracks its own events)
     let skip_telemetry = matches!(
         cli.command,
-        TopLevel::Version
-            | TopLevel::Mcp { .. }
-            | TopLevel::Login { .. }
-            | TopLevel::Remote { .. }
+        TopLevel::Version | TopLevel::Mcp { .. } | TopLevel::Login { .. } | TopLevel::Remote { .. }
     );
     let cmd_name = command_name(&cli.command);
     let telemetry = TelemetryClient::new();
@@ -740,7 +737,7 @@ where
                     commands::cmd_remote_compute::destroy(path, json_output).await?;
                     Ok(0)
                 }
-            }
+            },
             TopLevel::Commit {
                 message,
                 path,

@@ -45,12 +45,7 @@ pub async fn init(
         .trim()
         .to_ascii_lowercase();
 
-    if remote
-        || matches!(
-            runtime_provider.as_str(),
-            "guepard" | "console" | "remote"
-        )
-    {
+    if remote || matches!(runtime_provider.as_str(), "guepard" | "console" | "remote") {
         return super::cmd_init_remote::init_remote(
             Some(target_path),
             database_provider,
@@ -102,15 +97,14 @@ pub async fn init(
 
     // Kubernetes runtime: ensure mount_point is set to PVC name so commits snapshot PVCs
     // instead of trying to snapshot a host filesystem path.
-    if has_provider && matches!(runtime_provider.as_str(), "kubernetes" | "k8s" | "k3s") {
-        if let Ok(mut cfg) = GfsConfig::load(&target_path) {
-            if cfg.mount_point.as_deref().unwrap_or("").trim().is_empty() {
-                if let Some(rt) = cfg.runtime.as_ref() {
-                    cfg.mount_point = Some(format!("{}-data", rt.container_name.trim()));
-                    let _ = cfg.save(&target_path);
-                }
-            }
-        }
+    if has_provider
+        && matches!(runtime_provider.as_str(), "kubernetes" | "k8s" | "k3s")
+        && let Ok(mut cfg) = GfsConfig::load(&target_path)
+        && cfg.mount_point.as_deref().unwrap_or("").trim().is_empty()
+        && let Some(rt) = cfg.runtime.as_ref()
+    {
+        cfg.mount_point = Some(format!("{}-data", rt.container_name.trim()));
+        let _ = cfg.save(&target_path);
     }
 
     let mut connection_string: Option<String> = None;

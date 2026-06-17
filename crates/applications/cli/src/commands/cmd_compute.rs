@@ -128,25 +128,28 @@ async fn dispatch_dyn(
 
     match action {
         ComputeAction::Status { .. } => {
-            let status = compute.status(&instance_id).await.map_err(anyhow::Error::from)?;
+            let status = compute
+                .status(&instance_id)
+                .await
+                .map_err(anyhow::Error::from)?;
             // Only Docker compute can report bind-mount host paths; k8s returns None.
             let data_dir: Option<&str> = None;
             if json_output {
-                print_status_json(&status, data_dir.as_deref(), path.as_ref(), None)?;
+                print_status_json(&status, data_dir, path.as_ref(), None)?;
             } else {
-                print_status(&status, data_dir.as_deref(), path.as_ref());
+                print_status(&status, data_dir, path.as_ref());
             }
         }
 
         ComputeAction::Start { .. } => {
-            let repo_path = path.clone().unwrap_or_else(get_repo_dir);
+            let _repo_path = path.clone().unwrap_or_else(get_repo_dir);
             let status = compute.start(&instance_id, Default::default()).await?;
             let data_dir: Option<&str> = None;
             if json_output {
-                print_status_json(&status, data_dir.as_deref(), path.as_ref(), Some("start"))?;
+                print_status_json(&status, data_dir, path.as_ref(), Some("start"))?;
             } else {
                 println!("{} Compute started", green("✓"));
-                print_status(&status, data_dir.as_deref(), path.as_ref());
+                print_status(&status, data_dir, path.as_ref());
             }
         }
 
@@ -167,10 +170,10 @@ async fn dispatch_dyn(
             let status = compute.restart(&instance_id).await?;
             let data_dir: Option<&str> = None;
             if json_output {
-                print_status_json(&status, data_dir.as_deref(), path.as_ref(), Some("restart"))?;
+                print_status_json(&status, data_dir, path.as_ref(), Some("restart"))?;
             } else {
                 println!("{} Compute restarted", green("✓"));
-                print_status(&status, data_dir.as_deref(), path.as_ref());
+                print_status(&status, data_dir, path.as_ref());
             }
         }
 
@@ -406,6 +409,7 @@ fn truncate_id(id: &str) -> String {
 /// If the container exists and its data bind does not match the active workspace, recreate it
 /// (stop, remove, provision with current active workspace, start, update config). Otherwise start or restart the existing container.
 /// When `restart_if_same` is true (e.g. for `gfs compute restart`), calls restart instead of start when bind matches.
+#[allow(dead_code)]
 async fn start_restart_or_recreate(
     compute: &DockerCompute,
     instance_id: &InstanceId,
@@ -500,6 +504,7 @@ async fn start_restart_or_recreate(
     Ok((new_id, status))
 }
 
+#[allow(dead_code)]
 async fn just_start_or_restart(
     compute: &DockerCompute,
     instance_id: &InstanceId,
@@ -513,6 +518,7 @@ async fn just_start_or_restart(
     Ok((instance_id.clone(), status))
 }
 
+#[allow(dead_code)]
 fn paths_differ(a: &str, b: &str) -> bool {
     let a = std::path::Path::new(a);
     let b = std::path::Path::new(b);
@@ -523,6 +529,7 @@ fn paths_differ(a: &str, b: &str) -> bool {
 }
 
 /// Resolve the container's data bind host path from repo config (database provider) and Docker inspect.
+#[allow(dead_code)]
 async fn container_data_dir(
     compute: &DockerCompute,
     instance_id: &InstanceId,
@@ -550,11 +557,7 @@ async fn container_data_dir(
     Some(host_path)
 }
 
-async fn run_remote(
-    path: Option<PathBuf>,
-    action: ComputeAction,
-    json_output: bool,
-) -> Result<()> {
+async fn run_remote(path: Option<PathBuf>, action: ComputeAction, json_output: bool) -> Result<()> {
     use super::cmd_remote_compute;
     use super::cmd_remote_status;
 
