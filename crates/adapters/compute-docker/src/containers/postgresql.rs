@@ -12,8 +12,12 @@ use gfs_domain::ports::database_provider::{
 
 const NAME: &str = "postgres";
 
-/// Default PostgreSQL image (official image, current LTS-alpine).
-const DEFAULT_IMAGE: &str = "gfs-postgres:16";
+/// Default PostgreSQL image. The tag here is only a fallback base — every
+/// provisioning and sidecar-task site re-tags it with the repository's
+/// configured `database_version` (see `task_image_for_version`, deploy, and
+/// checkout), so the effective image follows the user's chosen PG version,
+/// defaulting to the supported `17`.
+const DEFAULT_IMAGE: &str = "gfs-postgres:17";
 
 /// Path inside the container where PostgreSQL stores data (PGDATA).
 const CONTAINER_DATA_DIR: &str = "/var/lib/postgresql/data";

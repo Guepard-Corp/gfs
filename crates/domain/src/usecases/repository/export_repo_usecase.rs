@@ -186,6 +186,13 @@ impl<R: DatabaseProviderRegistry> ExportRepoUseCase<R> {
         std::fs::create_dir_all(&output_dir)
             .map_err(|e| ExportRepoError::Config(format!("cannot create output dir: {e}")))?;
         spec.definition.host_data_dir = Some(output_dir.clone());
+        // Channel the sidecar image to the database's configured version rather
+        // than the provider's hardcoded default tag.
+        spec.definition.image =
+            crate::usecases::repository::task_image::task_image_for_version(
+                &spec.definition.image,
+                &config,
+            );
 
         // 6. Run the export sidecar linked to the database instance.
         let output = self
@@ -478,6 +485,7 @@ mod tests {
             environment: Some(env.clone()),
             runtime: Some(runtime.clone()),
             storage: None,
+            compute: None,
             remote: None,
         };
         config.save(dir).unwrap();
@@ -552,6 +560,7 @@ mod tests {
                 container_name: "c1".into(),
             }),
             storage: None,
+            compute: None,
             remote: None,
         };
         config.save(dir.path()).unwrap();
@@ -586,6 +595,7 @@ mod tests {
                 container_name: "".into(),
             }),
             storage: None,
+            compute: None,
             remote: None,
         };
         config.save(dir.path()).unwrap();

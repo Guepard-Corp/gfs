@@ -8,3 +8,4 @@ pub mod import_repo_usecase;
 pub mod init_repo_usecase;
 pub mod log_repo_usecase;
 pub mod status_repo_usecase;
+mod task_image;

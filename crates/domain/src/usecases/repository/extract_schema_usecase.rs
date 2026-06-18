@@ -15,6 +15,7 @@ use crate::model::config::GfsConfig;
 use crate::model::datasource::{Column, DatasourceMetadata, Schema, Table};
 use crate::ports::compute::{Compute, ComputeError, InstanceId};
 use crate::ports::database_provider::{ConnectionParams, DatabaseProviderRegistry};
+use crate::usecases::repository::task_image::task_image_for_version;
 
 // ---------------------------------------------------------------------------
 // Error
@@ -142,7 +143,7 @@ impl<R: DatabaseProviderRegistry> ExtractSchemaUseCase<R> {
         };
 
         // 4. Get schema extraction spec (runs in container, no host tools required).
-        let spec = provider
+        let mut spec = provider
             .schema_extraction_spec(&params)
             .map_err(|e| ExtractSchemaError::ExtractionFailed(e.to_string()))?
             .ok_or_else(|| {
@@ -151,6 +152,12 @@ impl<R: DatabaseProviderRegistry> ExtractSchemaUseCase<R> {
                     provider_name
                 ))
             })?;
+
+        // Channel the sidecar task image to the database's actual version rather
+        // than the provider's default tag, mirroring deploy/checkout. Without
+        // this, schema/commit task pods would use the provider default image
+        // (e.g. `gfs-postgres:16`) regardless of the deployed Postgres version.
+        spec.definition.image = task_image_for_version(&spec.definition.image, &config);
 
         // 5. Run the schema extraction task linked to the database container.
         let output = self
@@ -362,6 +369,7 @@ mod tests {
             environment: env,
             runtime,
             storage: None,
+            compute: None,
             remote: None,
         };
         config.save(path).expect("save config");
@@ -951,6 +959,7 @@ GFS_SCHEMA_COLUMNS
         let provider = MockSchemaProvider {
             schema_spec: Some(SchemaExtractionSpec {
                 definition: ComputeDefinition {
+                    labels: Default::default(),
                     image: "postgres:latest".into(),
                     env: vec![],
                     ports: vec![],

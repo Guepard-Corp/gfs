@@ -297,6 +297,7 @@ mod tests {
         }
         fn definition(&self) -> ComputeDefinition {
             ComputeDefinition {
+                labels: Default::default(),
                 image: "mock:latest".into(),
                 env: vec![],
                 ports: vec![PortMapping {
@@ -367,6 +368,7 @@ mod tests {
                 container_name: container.into(),
             }),
             storage: None,
+            compute: None,
             remote: None,
         };
         config.save(&path).expect("save config");

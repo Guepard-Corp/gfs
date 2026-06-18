@@ -238,6 +238,13 @@ impl<R: DatabaseProviderRegistry> ImportRepoUseCase<R> {
         }
 
         spec.definition.host_data_dir = Some(staging_dir.clone());
+        // Channel the sidecar image to the database's configured version rather
+        // than the provider's hardcoded default tag.
+        spec.definition.image =
+            crate::usecases::repository::task_image::task_image_for_version(
+                &spec.definition.image,
+                &config,
+            );
 
         // 6. Run the import sidecar linked to the database instance.
         let output = self
@@ -580,6 +587,7 @@ mod tests {
             environment: Some(env.clone()),
             runtime: Some(runtime.clone()),
             storage: None,
+            compute: None,
             remote: None,
         };
         config.save(dir).unwrap();
