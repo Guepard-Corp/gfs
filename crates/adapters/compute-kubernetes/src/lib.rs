@@ -712,7 +712,12 @@ impl KubernetesCompute {
         if !env.is_empty() {
             return env;
         }
-        if let Ok(out) = self.exec(id, "printenv POSTGRES_PASSWORD", None).await {
+        if let Ok(Ok(out)) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.exec(id, "printenv POSTGRES_PASSWORD", None),
+        )
+        .await
+        {
             let pw = out.stdout.trim();
             if out.exit_code == 0 && !pw.is_empty() {
                 return vec![("POSTGRES_PASSWORD".to_string(), pw.to_string())];

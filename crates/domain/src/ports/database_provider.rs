@@ -453,6 +453,22 @@ pub trait DatabaseProvider: Send + Sync {
     // Lazy clone (RFC 008)
     // -----------------------------------------------------------------------
 
+    /// Whether RFC-008 lazy clone (external read-through) is supported.
+    fn supports_lazy_clone(&self) -> bool {
+        false
+    }
+
+    /// Shell commands run inside the instance via [`Compute::exec`] to detach a
+    /// snapshot-seeded lazy clone from its remote source (`fetch_remote_source=false`).
+    fn lazy_clone_detach_in_instance_commands(
+        &self,
+    ) -> std::result::Result<Vec<String>, ProviderError> {
+        let _ = self;
+        Err(ProviderError::UnsupportedFormat(
+            "lazy clone detach not supported by this provider".into(),
+        ))
+    }
+
     /// Build a sidecar spec that bootstraps a lazy (copy-on-read) clone of a
     /// read-only `remote` database inside the local GFS database.
     ///
