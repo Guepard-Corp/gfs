@@ -1190,6 +1190,7 @@ mod tests {
                 database_provider: "postgres".into(),
                 database_version: "17".into(),
                 database_port: None,
+                display_name: None,
             }))
         }
         async fn get_user_config(

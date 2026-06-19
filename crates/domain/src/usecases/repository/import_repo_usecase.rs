@@ -600,6 +600,7 @@ mod tests {
             database_provider: "postgres".into(),
             database_version: "17".into(),
             database_port: None,
+            display_name: None,
         };
         let runtime = RuntimeConfig {
             runtime_provider: "docker".into(),
@@ -629,6 +630,7 @@ mod tests {
             database_provider: "postgres".into(),
             database_version: "17".into(),
             database_port: None,
+            display_name: None,
         };
         let runtime = RuntimeConfig {
             runtime_provider: "docker".into(),
@@ -656,6 +658,7 @@ mod tests {
             database_provider: "postgres".into(),
             database_version: "17".into(),
             database_port: None,
+            display_name: None,
         };
         let runtime = RuntimeConfig {
             runtime_provider: "docker".into(),
@@ -681,6 +684,7 @@ mod tests {
             database_provider: "postgres".into(),
             database_version: "17".into(),
             database_port: None,
+            display_name: None,
         };
         let runtime = RuntimeConfig {
             runtime_provider: "docker".into(),

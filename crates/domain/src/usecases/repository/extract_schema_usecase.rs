@@ -785,6 +785,7 @@ GFS_SCHEMA_COLUMNS
                 database_provider: "unknown-provider".into(),
                 database_version: "17".into(),
                 database_port: None,
+                display_name: None,
             }),
             Some(RuntimeConfig {
                 runtime_provider: "docker".into(),
@@ -819,6 +820,7 @@ GFS_SCHEMA_COLUMNS
                 database_provider: "mock-schema".into(),
                 database_version: "17".into(),
                 database_port: None,
+                display_name: None,
             }),
             Some(RuntimeConfig {
                 runtime_provider: "docker".into(),
@@ -859,6 +861,7 @@ GFS_SCHEMA_COLUMNS
                 database_provider: "mock-schema".into(),
                 database_version: "17".into(),
                 database_port: None,
+                display_name: None,
             }),
             Some(RuntimeConfig {
                 runtime_provider: "docker".into(),
@@ -944,6 +947,7 @@ CREATE TABLE public.users (
                 database_provider: "mock-schema".into(),
                 database_version: "17".into(),
                 database_port: None,
+                display_name: None,
             }),
             Some(RuntimeConfig {
                 runtime_provider: "docker".into(),
@@ -1007,6 +1011,7 @@ GFS_SCHEMA_COLUMNS
                 database_provider: "mock-schema".into(),
                 database_version: "17".into(),
                 database_port: None,
+                display_name: None,
             }),
             Some(RuntimeConfig {
                 runtime_provider: "docker".into(),
