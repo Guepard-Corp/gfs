@@ -94,6 +94,7 @@ pub async fn init_remote(
             database_provider: provider.to_string(),
             database_version: version.to_string(),
             database_port: None,
+            display_name: None,
         }),
         runtime: Some(RuntimeConfig {
             runtime_provider: "guepard".into(),

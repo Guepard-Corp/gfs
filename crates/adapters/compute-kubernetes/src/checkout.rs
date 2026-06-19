@@ -256,6 +256,7 @@ pub async fn reprovision_after_pvc_restore<R: DatabaseProviderRegistry>(
                 database_provider: provider_name,
                 database_version,
                 database_port: Some(conn.port),
+                display_name: None,
             });
         }
         let _ = updated.save(repo_path);

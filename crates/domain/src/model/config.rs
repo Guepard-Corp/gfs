@@ -25,6 +25,9 @@ pub struct EnvironmentConfig {
     pub database_version: String,
     #[serde(default)]
     pub database_port: Option<u16>,
+    /// Console-provided deployment label (`deployment_request.label_name`).
+    #[serde(default)]
+    pub display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -258,6 +261,7 @@ mod tests {
                 database_provider: "postgres".into(),
                 database_version: "17".into(),
                 database_port: Some(5432),
+                display_name: Some("my-db".into()),
             }),
             runtime: Some(RuntimeConfig {
                 runtime_provider: "docker".into(),
@@ -282,6 +286,10 @@ mod tests {
         assert_eq!(
             loaded.environment.as_ref().unwrap().database_port,
             Some(5432)
+        );
+        assert_eq!(
+            loaded.environment.as_ref().unwrap().display_name.as_deref(),
+            Some("my-db")
         );
         assert_eq!(loaded.runtime.as_ref().unwrap().container_name, "c1");
         assert_eq!(

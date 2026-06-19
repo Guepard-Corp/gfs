@@ -93,7 +93,8 @@ pub async fn init(
             database_provider,
             database_version,
             database_port,
-            credentials,
+            DatabaseCredentials::default(),
+            None,
             image,
             labels,
         )

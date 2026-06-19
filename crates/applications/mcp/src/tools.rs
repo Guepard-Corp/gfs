@@ -858,6 +858,7 @@ async fn do_init(args: &serde_json::Value) -> Result<CallToolResult, McpError> {
             None,
             DatabaseCredentials::default(),
             None,
+            None,
             Default::default(),
         )
         .await
