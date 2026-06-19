@@ -90,7 +90,11 @@ pub async fn clone(
         false,
         None,
         None,
-        image.or_else(|| Some("gfs-postgres:16".to_string())),
+        // No explicit `--image`: pass `None` so `init` channels the resolved
+        // `version` onto the provider's default base (`gfs-postgres:<version>`).
+        // Hardcoding an image here pins the tag and bypasses channeling, so a
+        // clone of a v17 remote would wrongly provision pg16.
+        image,
         platform,
         labels,
     )
