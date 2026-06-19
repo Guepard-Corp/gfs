@@ -1041,8 +1041,15 @@ impl Compute for KubernetesCompute {
                     Ok(a) => break a,
                     Err(e) if attempt < 5 => {
                         attempt += 1;
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        tracing::debug!("k8s exec upgrade retry {attempt}/5: {e}");
+                        // Exponential backoff (200ms, 400ms, 800ms, …) instead of a
+                        // flat 2s. The upgrade rejection right after a pod reports
+                        // Ready is almost always transient and clears in well under
+                        // a second, so a short first retry avoids adding a fixed ~2s
+                        // tail to the common case while still backing off if the
+                        // failure genuinely persists.
+                        let backoff = std::time::Duration::from_millis(200u64 << (attempt - 1));
+                        tokio::time::sleep(backoff).await;
+                        tracing::debug!("k8s exec upgrade retry {attempt}/5 in {backoff:?}: {e}");
                     }
                     Err(e) => {
                         return Err(ComputeError::Internal(format!("k8s exec failed: {e}")));

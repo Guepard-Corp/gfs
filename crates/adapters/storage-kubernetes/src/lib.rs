@@ -202,7 +202,12 @@ impl KubernetesStorage {
         // external-provisioner (the clone PVC stays Pending until then), so this only
         // moves the reconcile lag off the commit hot path into the rare checkout path.
         // ZFS VolumeSnapshots on dev k3s can take >60s under load.
-        for _ in 0..900 {
+        //
+        // Poll at 100ms: the snapshotHandle lands at ~0.7s, so a coarser interval
+        // adds avg ~half-interval of dead wait after the data is already captured.
+        // A `watch` would be marginally tighter but the granularity is a small
+        // fraction of the snapshot cost, so the simpler bounded poll is kept.
+        for _ in 0..1800 {
             let vs = api
                 .get(name)
                 .await
@@ -229,7 +234,7 @@ impl KubernetesStorage {
             {
                 return Ok(());
             }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         Err(StorageError::Internal(format!(
             "volumesnapshot '{name}' was not captured in time"
