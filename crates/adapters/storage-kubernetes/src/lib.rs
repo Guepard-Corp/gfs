@@ -57,6 +57,10 @@ fn volume_snapshot_gvk() -> GroupVersionKind {
     GroupVersionKind::gvk("snapshot.storage.k8s.io", "v1", "VolumeSnapshot")
 }
 
+fn volume_snapshot_content_gvk() -> GroupVersionKind {
+    GroupVersionKind::gvk("snapshot.storage.k8s.io", "v1", "VolumeSnapshotContent")
+}
+
 fn snapshot_hash_from_label(label: Option<&str>) -> Option<String> {
     // commit use case passes label as a destination path:
     //   .../.gfs/snapshots/<2>/<62>
@@ -105,6 +109,13 @@ impl KubernetesStorage {
         let gvk = volume_snapshot_gvk();
         let ar = ApiResource::from_gvk(&gvk);
         Api::namespaced_with(self.client.clone(), &self.namespace, &ar)
+    }
+
+    /// VolumeSnapshotContents are cluster-scoped; used to read `snapshotHandle`.
+    fn api_volume_snapshot_contents(&self) -> Api<DynamicObject> {
+        let gvk = volume_snapshot_content_gvk();
+        let ar = ApiResource::from_gvk(&gvk);
+        Api::all_with(self.client.clone(), &ar)
     }
 
     /// Delete a PVC if it exists (best-effort; waits for removal).
@@ -181,25 +192,47 @@ impl KubernetesStorage {
 
     pub async fn wait_snapshot_ready(&self, name: &str) -> std::result::Result<(), StorageError> {
         let api = self.api_volume_snapshots();
+        let contents = self.api_volume_snapshot_contents();
+        // `readyToUse` is the external-snapshotter's *final* status flip; on OpenEBS
+        // ZFS it lags the actual snapshot by ~1.6s (measured: snapshotHandle ~0.7s,
+        // readyToUse ~2.3s). Return as soon as the bound VolumeSnapshotContent reports
+        // a `snapshotHandle` — that means the CSI driver already created the
+        // copy-on-write snapshot, so the data is captured and a later
+        // clone-from-snapshot is valid. The clone path waits for `readyToUse` via the
+        // external-provisioner (the clone PVC stays Pending until then), so this only
+        // moves the reconcile lag off the commit hot path into the rare checkout path.
         // ZFS VolumeSnapshots on dev k3s can take >60s under load.
-        for _ in 0..360 {
+        for _ in 0..900 {
             let vs = api
                 .get(name)
                 .await
                 .map_err(|e| StorageError::Internal(format!("get volumesnapshot failed: {e}")))?;
-            let ready = vs
-                .data
-                .get("status")
+            let status = vs.data.get("status");
+            let ready = status
                 .and_then(|s| s.get("readyToUse"))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             if ready {
                 return Ok(());
             }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // Fast path: the snapshot's data is captured once its content has a handle.
+            if let Some(content_name) = status
+                .and_then(|s| s.get("boundVolumeSnapshotContentName"))
+                .and_then(|v| v.as_str())
+                && let Ok(content) = contents.get(content_name).await
+                && content
+                    .data
+                    .get("status")
+                    .and_then(|s| s.get("snapshotHandle"))
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|h| !h.is_empty())
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
         Err(StorageError::Internal(format!(
-            "volumesnapshot '{name}' did not become readyToUse in time"
+            "volumesnapshot '{name}' was not captured in time"
         )))
     }
 }
