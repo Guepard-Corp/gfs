@@ -152,6 +152,11 @@ pub struct ExecOutput {
 pub struct ComputeCapabilities {
     pub supports_stream_snapshot: bool,
     pub supports_exec_as_root: bool,
+    /// `true` when `pause()` does not freeze the database, so a read-only exec
+    /// (e.g. schema extraction) may run concurrently with the snapshot without
+    /// observing or perturbing an in-flight freeze. Defaults to `false`, which
+    /// forces the safe, strictly-sequential commit path.
+    pub db_live_during_snapshot: bool,
 }
 
 /// Human-readable description of the connected container runtime.
@@ -312,6 +317,7 @@ pub trait Compute: Send + Sync {
         Ok(ComputeCapabilities {
             supports_stream_snapshot: false,
             supports_exec_as_root: false,
+            db_live_during_snapshot: false,
         })
     }
 

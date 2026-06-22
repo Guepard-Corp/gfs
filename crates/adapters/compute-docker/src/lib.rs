@@ -711,6 +711,9 @@ impl Compute for DockerCompute {
         Ok(ComputeCapabilities {
             supports_stream_snapshot: true,
             supports_exec_as_root: true,
+            // Docker `pause()` freezes the container/database, so schema
+            // extraction must run strictly before the snapshot.
+            db_live_during_snapshot: false,
         })
     }
 

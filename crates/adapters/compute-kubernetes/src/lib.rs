@@ -1008,6 +1008,10 @@ impl Compute for KubernetesCompute {
         Ok(ComputeCapabilities {
             supports_stream_snapshot: false,
             supports_exec_as_root: false,
+            // Kubernetes `pause()` is a structural no-op (`PauseUnsupported`):
+            // the database stays live during the PVC snapshot, so read-only
+            // schema extraction can safely overlap it.
+            db_live_during_snapshot: true,
         })
     }
 

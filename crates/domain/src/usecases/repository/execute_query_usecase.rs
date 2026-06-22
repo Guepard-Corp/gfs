@@ -276,6 +276,7 @@ mod tests {
             Ok(ComputeCapabilities {
                 supports_stream_snapshot: false,
                 supports_exec_as_root: true,
+                db_live_during_snapshot: false,
             })
         }
         async fn exec(
