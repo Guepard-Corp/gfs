@@ -17,9 +17,6 @@ pub(crate) fn task_image_for_version(default_image: &str, config: &GfsConfig) ->
         .map(|e| e.database_version.clone())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "17".to_string());
-    let base = default_image
-        .split(':')
-        .next()
-        .unwrap_or(default_image);
+    let base = default_image.split(':').next().unwrap_or(default_image);
     format!("{base}:{version}")
 }

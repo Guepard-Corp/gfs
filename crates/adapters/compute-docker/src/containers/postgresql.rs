@@ -192,7 +192,10 @@ fn sidecar_definition(image: String, password: &str, data_dir: &str) -> ComputeD
 
 impl PostgresqlProvider {
     /// Single-line `psql -c` for k8s exec (stdin=false); heredocs hang there.
-    fn psql_inline_instance_command(&self, sql: &str) -> std::result::Result<String, ProviderError> {
+    fn psql_inline_instance_command(
+        &self,
+        sql: &str,
+    ) -> std::result::Result<String, ProviderError> {
         let escaped = sql.replace('\\', "\\\\").replace('"', "\\\"");
         Ok(format!(
             r#"PGPASSWORD="${{POSTGRES_PASSWORD:-postgres}}" psql -h 127.0.0.1 -U "${{POSTGRES_USER:-postgres}}" -d "${{POSTGRES_DB:-postgres}}" -v ON_ERROR_STOP=1 -c "{escaped}""#
