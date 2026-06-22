@@ -34,6 +34,7 @@ fn write_repo(path: &std::path::Path, container: &str) {
             database_provider: "postgres".into(),
             database_version: "17".into(),
             database_port: None,
+            display_name: None,
         }),
         runtime: Some(RuntimeConfig {
             runtime_provider: "docker".into(),
