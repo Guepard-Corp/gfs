@@ -670,6 +670,22 @@ impl KubernetesCompute {
                 exit_code: None,
             };
         };
+        // A pod scaled to zero (replicas=0) keeps phase=Running throughout its
+        // termination grace period. Surface a pod that is being deleted as
+        // Stopping, not Running, so callers don't mistake a terminating pod for a
+        // live instance — this is what lets the data-plane auto-resume re-scale a
+        // db whose previous op just re-paused it, instead of skipping the wake
+        // (which left replicas=0 and hung the next op waiting for a pod that
+        // would never be created).
+        if pod.metadata.deletion_timestamp.is_some() {
+            return InstanceStatus {
+                id: instance.clone(),
+                state: InstanceState::Stopping,
+                pid: None,
+                started_at: None,
+                exit_code: None,
+            };
+        }
         let phase = pod
             .status
             .as_ref()
