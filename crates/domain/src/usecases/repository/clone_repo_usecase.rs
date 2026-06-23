@@ -186,11 +186,10 @@ impl<R: DatabaseProviderRegistry> CloneRepoUseCase<R> {
         let mut spec = provider
             .clone_bootstrap_spec(&local, &remote)
             .map_err(|e| CloneRepoError::Unsupported(e.to_string()))?;
-        spec.definition.image =
-            crate::usecases::repository::task_image::task_image_for_version(
-                &spec.definition.image,
-                &config,
-            );
+        spec.definition.image = crate::usecases::repository::task_image::task_image_for_version(
+            &spec.definition.image,
+            &config,
+        );
 
         // 5. Run the bootstrap sidecar linked to the local database instance.
         let output = self

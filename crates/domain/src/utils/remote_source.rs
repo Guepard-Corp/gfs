@@ -131,10 +131,9 @@ mod tests {
 
     #[test]
     fn parses_sslmode_query_param() {
-        let r = parse_postgres_url(
-            "postgres://alice:s3cret@db.example.com:6543/shop?sslmode=require",
-        )
-        .unwrap();
+        let r =
+            parse_postgres_url("postgres://alice:s3cret@db.example.com:6543/shop?sslmode=require")
+                .unwrap();
         assert_eq!(r.sslmode.as_deref(), Some("require"));
     }
 }

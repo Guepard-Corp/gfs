@@ -147,12 +147,14 @@ fn task_container_exit_code(pod: &Pod) -> Option<i32> {
 
 async fn fetch_task_pod_logs(pods: &kube::Api<Pod>, name: &str) -> String {
     for previous in [false, true] {
-        let mut lp = kube::api::LogParams::default();
-        lp.previous = previous;
-        if let Ok(logs) = pods.logs(name, &lp).await {
-            if !logs.is_empty() {
-                return logs;
-            }
+        let lp = kube::api::LogParams {
+            previous,
+            ..Default::default()
+        };
+        if let Ok(logs) = pods.logs(name, &lp).await
+            && !logs.is_empty()
+        {
+            return logs;
         }
     }
     String::new()
