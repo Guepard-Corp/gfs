@@ -78,6 +78,14 @@ pub fn parse_postgres_url(url: &str) -> Result<RemoteSource, ParseRemoteSourceEr
         })
         .unwrap_or_default();
 
+    let sslmode = query.and_then(|q| {
+        q.split('&').find_map(|kv| {
+            kv.strip_prefix("sslmode=")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        })
+    });
+
     Ok(RemoteSource {
         host,
         port,
@@ -85,6 +93,7 @@ pub fn parse_postgres_url(url: &str) -> Result<RemoteSource, ParseRemoteSourceEr
         user,
         password,
         schemas,
+        sslmode,
     })
 }
 
@@ -114,5 +123,15 @@ mod tests {
             r.schemas,
             vec!["reporting".to_string(), "staging".to_string()]
         );
+        assert!(r.sslmode.is_none());
+    }
+
+    #[test]
+    fn parses_sslmode_query_param() {
+        let r = parse_postgres_url(
+            "postgres://alice:s3cret@db.example.com:6543/shop?sslmode=require",
+        )
+        .unwrap();
+        assert_eq!(r.sslmode.as_deref(), Some("require"));
     }
 }

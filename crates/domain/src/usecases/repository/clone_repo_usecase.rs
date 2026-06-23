@@ -91,6 +91,12 @@ impl<R: DatabaseProviderRegistry> CloneRepoUseCase<R> {
             name: "PGPASSWORD".into(),
             default: Some(remote.password.clone()),
         }];
+        if let Some(sslmode) = &remote.sslmode {
+            def.env.push(EnvVar {
+                name: "PGSSLMODE".into(),
+                default: Some(sslmode.clone()),
+            });
+        }
         def.ports = vec![];
         def.host_data_dir = None;
         def.user = None;
@@ -193,9 +199,18 @@ impl<R: DatabaseProviderRegistry> CloneRepoUseCase<R> {
             .await?;
 
         if output.exit_code != 0 {
+            let stderr = output.stderr.trim();
+            let stdout = output.stdout.trim();
+            let detail = if stderr.is_empty() {
+                stdout.to_string()
+            } else if stdout.is_empty() {
+                stderr.to_string()
+            } else {
+                format!("{stderr}\n{stdout}")
+            };
             return Err(CloneRepoError::TaskFailed {
                 exit_code: output.exit_code,
-                stderr: output.stderr,
+                stderr: detail,
             });
         }
 

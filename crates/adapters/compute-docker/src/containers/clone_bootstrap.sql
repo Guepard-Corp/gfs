@@ -32,7 +32,7 @@ CREATE SERVER gfs_remote_srv
   -- a federated multi-table query at scale (a 6-table join over 60M rows took 41
   -- min instead of pushing the whole join to the source and returning ~5 rows).
   -- fetch_size raises the cursor batch for the cases that still aren't pushed.
-  OPTIONS (host '__RHOST__', port '__RPORT__', dbname '__RDB__',
+  OPTIONS (host '__RHOST__', port '__RPORT__', dbname '__RDB__'__RSSLMODE_OPT__,
            use_remote_estimate 'true', fetch_size '10000');
 
 -- FOR PUBLIC so any local role (not just the one that ran the bootstrap) can

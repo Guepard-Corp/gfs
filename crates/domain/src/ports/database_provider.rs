@@ -178,6 +178,8 @@ pub struct RemoteSource {
     /// Remote schemas to mirror (e.g. `["public"]`). Empty means "all
     /// non-system schemas", discovered at bootstrap time.
     pub schemas: Vec<String>,
+    /// libpq `sslmode` for remote connections (`require`, `verify-full`, …).
+    pub sslmode: Option<String>,
 }
 
 /// Sidecar spec that bootstraps a lazy clone inside the local GFS database.

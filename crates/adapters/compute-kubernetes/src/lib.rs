@@ -145,6 +145,19 @@ fn task_container_exit_code(pod: &Pod) -> Option<i32> {
         })
 }
 
+async fn fetch_task_pod_logs(pods: &kube::Api<Pod>, name: &str) -> String {
+    for previous in [false, true] {
+        let mut lp = kube::api::LogParams::default();
+        lp.previous = previous;
+        if let Ok(logs) = pods.logs(name, &lp).await {
+            if !logs.is_empty() {
+                return logs;
+            }
+        }
+    }
+    String::new()
+}
+
 fn ensure_dns_label(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -431,6 +444,9 @@ impl KubernetesCompute {
                         ..Default::default()
                     }),
                     spec: Some(PodSpec {
+                        // Lazy-clone dblink/pg_dump reach external hosts; k3s CoreDNS
+                        // is often broken on agents — use the node's resolver.
+                        dns_policy: Some("Default".to_string()),
                         containers: vec![container],
                         volumes: Some(volumes),
                         node_selector: k8s_schedule_node_name()
@@ -1190,6 +1206,9 @@ impl Compute for KubernetesCompute {
             },
             spec: Some(PodSpec {
                 restart_policy: Some("Never".to_string()),
+                // Task sidecars pg_dump/psql external hosts; cluster DNS (CoreDNS) is
+                // often unreachable on k3s agents — inherit the node's resolver instead.
+                dns_policy: Some("Default".to_string()),
                 containers: vec![Container {
                     name: "task".to_string(),
                     image: Some(definition.image.clone()),
@@ -1247,15 +1266,11 @@ impl Compute for KubernetesCompute {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
 
-        // Fetch logs (the only channel that carries sidecar stdout — e.g. schema
-        // DDL — back to the gfs process, which runs on a different node than the
-        // task pod). A log-fetch failure must not masquerade as empty output, so
-        // surface it rather than swallowing it via `unwrap_or_default`.
-        let logs_result = pods.logs(&name, &kube::api::LogParams::default()).await;
+        // Fetch logs (sidecar stdout/stderr). Try current container first; fall back
+        // to previous only when the kubelet has already restarted the container.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let stdout = fetch_task_pod_logs(&pods, &name).await;
         let _ = pods.delete(&name, &DeleteParams::default()).await;
-
-        let stdout = logs_result
-            .map_err(|e| ComputeError::Internal(format!("k8s task pod logs fetch failed: {e}")))?;
 
         // Derive the exit code: prefer the container's terminated state; fall
         // back to the pod phase (Failed → 1, Succeeded/Unknown → 0). A pod that

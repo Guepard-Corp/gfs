@@ -469,8 +469,14 @@ impl DatabaseProvider for PostgresqlProvider {
             .iter()
             .map(|s| format!(" -n {}", shell_single_quote(s)))
             .collect::<String>();
+        let ssl_env = remote
+            .sslmode
+            .as_ref()
+            .map(|m| format!("PGSSLMODE={} ", shell_single_quote(m)))
+            .unwrap_or_default();
         let dump = format!(
-            "PGCONNECT_TIMEOUT=15 PGPASSWORD={rpass} pg_dump -h {rhost} -p {rport} -U {ruser} -d {rdb} --schema-only --no-owner --no-privileges{schemas} -f /tmp/gfs_faithful.sql",
+            "{ssl_env}PGCONNECT_TIMEOUT=15 PGPASSWORD={rpass} pg_dump -h {rhost} -p {rport} -U {ruser} -d {rdb} --schema-only --no-owner --no-privileges{schemas} -f /tmp/gfs_faithful.sql",
+            ssl_env = ssl_env,
             rpass = shell_single_quote(&remote.password),
             rhost = remote.host,
             rport = remote.port,
@@ -777,10 +783,19 @@ fn sql_lit(s: &str) -> String {
 fn build_clone_bootstrap_sql(remote: &RemoteSource) -> String {
     // dblink connection string, used only for read-only introspection of the
     // remote (schema/table/key discovery).
-    let conn = format!(
+    let mut conn = format!(
         "host={} port={} dbname={} user={} password={}",
         remote.host, remote.port, remote.dbname, remote.user, remote.password,
     );
+    if let Some(sslmode) = &remote.sslmode {
+        conn.push_str(&format!(" sslmode={sslmode}"));
+    }
+
+    let sslmode_opt = remote
+        .sslmode
+        .as_ref()
+        .map(|m| format!(", sslmode '{}'", sql_lit(m)))
+        .unwrap_or_default();
 
     // SQL array literal of schemas to mirror, or NULL meaning "all user schemas".
     let schemas_array = if remote.schemas.is_empty() {
@@ -802,6 +817,7 @@ fn build_clone_bootstrap_sql(remote: &RemoteSource) -> String {
         .replace("__RDB__", &sql_lit(&remote.dbname))
         .replace("__RUSER__", &sql_lit(&remote.user))
         .replace("__RPASS__", &sql_lit(&remote.password))
+        .replace("__RSSLMODE_OPT__", &sslmode_opt)
         .replace("__CONN__", &sql_lit(&conn))
         .replace("__SCHEMAS_ARRAY__", &schemas_array)
 }
@@ -1154,6 +1170,7 @@ mod tests {
             user: "reader".into(),
             password: "p@ss".into(),
             schemas: vec!["public".into()],
+            sslmode: None,
         }
     }
 
@@ -1202,11 +1219,21 @@ mod tests {
             "__RDB__",
             "__RUSER__",
             "__RPASS__",
+            "__RSSLMODE_OPT__",
             "__CONN__",
             "__SCHEMAS_ARRAY__",
         ] {
             assert!(!sql.contains(ph), "leftover placeholder: {ph}");
         }
+    }
+
+    #[test]
+    fn clone_bootstrap_sql_propagates_sslmode() {
+        let mut remote = sample_remote();
+        remote.sslmode = Some("require".into());
+        let sql = build_clone_bootstrap_sql(&remote);
+        assert!(sql.contains(", sslmode 'require'"));
+        assert!(sql.contains("password=p@ss sslmode=require"));
     }
 
     #[test]
