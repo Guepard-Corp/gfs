@@ -146,16 +146,23 @@ fn task_container_exit_code(pod: &Pod) -> Option<i32> {
 }
 
 async fn fetch_task_pod_logs(pods: &kube::Api<Pod>, name: &str) -> String {
+    // Requesting `previous=true` for a container that never restarted returns an
+    // expected error ("previous terminated container not found"), so only the
+    // last genuine fetch failure is surfaced — and only when no logs were read.
+    let mut last_error = None;
     for previous in [false, true] {
         let lp = kube::api::LogParams {
             previous,
             ..Default::default()
         };
-        if let Ok(logs) = pods.logs(name, &lp).await
-            && !logs.is_empty()
-        {
-            return logs;
+        match pods.logs(name, &lp).await {
+            Ok(logs) if !logs.is_empty() => return logs,
+            Ok(_) => {}
+            Err(e) => last_error = Some(e),
         }
+    }
+    if let Some(e) = last_error {
+        tracing::warn!("k8s task pod '{name}' log fetch failed: {e}");
     }
     String::new()
 }
