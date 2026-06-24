@@ -53,6 +53,40 @@ fn now_suffix() -> String {
     format!("{}", Utc::now().timestamp_millis())
 }
 
+/// Best-effort real disk usage for a ZFS-backed PV, as `(size_bytes, used_bytes)`.
+///
+/// OpenEBS ZFS LocalPV provisions each PV as a dataset named `<pool>/<pv-name>`
+/// on the **local** node, so usage is read by shelling `zfs` on the host this
+/// adapter runs on. This assumes the single-node topology where the data-plane
+/// daemon is co-located with the ZFS pool (it is); on any other layout the
+/// dataset won't resolve and the caller falls back to `0` rather than erroring.
+/// `size_bytes` is `used + available` (the effective per-volume capacity under
+/// its quota); `used_bytes` is the live consumption including snapshots.
+async fn zfs_dataset_usage(pv_name: &str) -> Option<(u64, u64)> {
+    let output = tokio::process::Command::new("zfs")
+        .args(["list", "-Hp", "-o", "name,used,available"])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let suffix = format!("/{pv_name}");
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut cols = line.split('\t');
+        let Some(name) = cols.next() else { continue };
+        if !name.ends_with(&suffix) {
+            continue;
+        }
+        let Some(used) = cols.next().and_then(|s| s.parse::<u64>().ok()) else {
+            continue;
+        };
+        let available = cols.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        return Some((used.saturating_add(available), used));
+    }
+    None
+}
+
 fn volume_snapshot_gvk() -> GroupVersionKind {
     GroupVersionKind::gvk("snapshot.storage.k8s.io", "v1", "VolumeSnapshot")
 }
@@ -406,12 +440,20 @@ impl StoragePort for KubernetesStorage {
         } else {
             MountStatus::Unknown
         };
+        // Real consumption lives in the node-local ZFS dataset backing this PV,
+        // not in any core k8s API field. Resolve PVC -> PV name -> dataset and
+        // read it; degrade to 0 if the PV is unbound or zfs can't be reached.
+        let pv_name = pvc.spec.as_ref().and_then(|s| s.volume_name.clone());
+        let (size_bytes, used_bytes) = match pv_name.as_deref() {
+            Some(pv) if !pv.is_empty() => zfs_dataset_usage(pv).await.unwrap_or((0, 0)),
+            _ => (0, 0),
+        };
         Ok(VolumeStatus {
             id: id.clone(),
             mount_point: None,
             status,
-            size_bytes: 0,
-            used_bytes: 0,
+            size_bytes,
+            used_bytes,
         })
     }
 
