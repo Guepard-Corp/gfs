@@ -1062,7 +1062,7 @@ mod tests {
         };
         let spec = provider.schema_extraction_spec(&params).unwrap();
         let spec = spec.expect("postgres provider supports schema extraction");
-        assert_eq!(spec.definition.image, "gfs-postgres:16");
+        assert_eq!(spec.definition.image, "gfs-postgres:17");
         assert!(spec.command.contains("GFS_SCHEMA_VERSION"));
         assert!(spec.command.contains("GFS_SCHEMA_SCHEMAS"));
         assert!(spec.command.contains("GFS_SCHEMA_TABLES"));
