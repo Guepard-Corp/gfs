@@ -280,7 +280,7 @@ $$;
 -- the source, even aggregates).
 CREATE FUNCTION gfs.warm(local regclass)
 RETURNS bigint LANGUAGE plpgsql AS $$
-DECLARE src text; cols text; ov text; n bigint;
+DECLARE src text; cols text; ov text; n bigint; old_srr text;
 BEGIN
     SELECT source_ref INTO src FROM gfs.clone_source WHERE relid = local;
     IF src IS NULL OR to_regclass(src) IS NULL THEN
@@ -294,6 +294,13 @@ BEGIN
     SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_attribute
                               WHERE attrelid = local AND attidentity = 'a')
                 THEN 'OVERRIDING SYSTEM VALUE ' ELSE '' END INTO ov;
+    -- Warming replays the SOURCE's already-computed rows, so a replayed INSERT trigger
+    -- must NOT fire on them (it would re-mutate the row or re-run side effects, diverging
+    -- the clone from the source). Copy in the 'replica' role -- how logical replication
+    -- applies rows, skipping user triggers -- then restore the prior role (SET LOCAL, so
+    -- it also resets at txn end) so later writes fire their triggers normally.
+    old_srr := current_setting('session_replication_role');
+    PERFORM set_config('session_replication_role', 'replica', true);
     -- Exclude locally-deleted rows so warming never resurrects a copy-on-write DELETE.
     EXECUTE format('INSERT INTO %s (%s) %sSELECT %s FROM %s s
                     WHERE NOT EXISTS (SELECT 1 FROM gfs.tombstone tb
@@ -301,6 +308,7 @@ BEGIN
                     ON CONFLICT DO NOTHING',
                    local::text, cols, ov, cols, src, local::text);
     GET DIAGNOSTICS n = ROW_COUNT;
+    PERFORM set_config('session_replication_role', old_srr, true);
     EXECUTE format('ANALYZE %s', local::text);
     UPDATE gfs.clone_source SET whole_cached = true WHERE relid = local;
     UPDATE gfs.clone_stats

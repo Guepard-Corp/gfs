@@ -235,6 +235,32 @@ unsafe fn try_parallel_backfill(h: &Hydration, has_tomb: bool, overriding: &str)
     Some(total)
 }
 
+/// Read the current `session_replication_role` (origin | replica | local). Caller
+/// holds an open SPI connection.
+unsafe fn spi_repl_role() -> String {
+    let q = CString::new("SELECT current_setting('session_replication_role')").unwrap();
+    if pg_sys::SPI_execute(q.as_ptr(), true, 1) == pg_sys::SPI_OK_SELECT as i32
+        && pg_sys::SPI_processed == 1
+    {
+        let tt = pg_sys::SPI_tuptable;
+        let row = *(*tt).vals;
+        spi_text(pg_sys::SPI_getvalue(row, (*tt).tupdesc, 1)).unwrap_or_else(|| "origin".into())
+    } else {
+        "origin".into()
+    }
+}
+
+/// Set `session_replication_role`. Only the three legal enum values are accepted;
+/// anything else falls back to 'origin' (defensive). Caller holds an open SPI connection.
+unsafe fn spi_set_repl_role(v: &str) {
+    let val = match v {
+        "replica" | "local" | "origin" => v,
+        _ => "origin",
+    };
+    let q = CString::new(format!("SET session_replication_role = {}", val)).unwrap();
+    pg_sys::SPI_execute(q.as_ptr(), false, 0);
+}
+
 /// Fetch a hydration into the local table. Returns true when the slice/table is
 /// COMPLETE (safe to serve local); returns false ONLY for a PARTIAL pull that
 /// overflowed its cap (too many matches -> not selective -> caller must federate,
@@ -247,6 +273,16 @@ pub(crate) unsafe fn do_hydrate(h: &Hydration) -> bool {
         // failure -> safe (true).
         return h.where_sql.is_empty() && !h.time_key;
     }
+
+    // Copy-on-read replays the SOURCE's already-computed rows, so a replayed INSERT
+    // trigger must NOT fire on them again -- it would re-mutate the row (e.g. append or
+    // re-stamp) or re-run side effects (audit/cascade), diverging the clone from the
+    // source. Apply the rows in the 'replica' role -- exactly how logical replication
+    // loads data, skipping user triggers -- then restore the prior role before every
+    // return so the caller's OWN writes in the same transaction still fire their
+    // triggers normally.
+    let prior_srr = spi_repl_role();
+    spi_set_repl_role("replica");
 
     // Exclude copy-on-write DELETE tombstones so hydration never resurrects a local
     // DELETE -- only when this table has tombstones (the no-deletes case stays
@@ -336,6 +372,7 @@ pub(crate) unsafe fn do_hydrate(h: &Hydration) -> bool {
             pg_sys::SPI_execute(pr.as_ptr(), false, 0);
         }
         hydrate_finish(h, inserted);
+        spi_set_repl_role(&prior_srr);
         pg_sys::SPI_finish();
         return !overflow;
     }
@@ -377,6 +414,7 @@ pub(crate) unsafe fn do_hydrate(h: &Hydration) -> bool {
             pg_sys::SPI_execute(nr.as_ptr(), false, 0);
         }
         hydrate_finish(h, inserted);
+        spi_set_repl_role(&prior_srr);
         pg_sys::SPI_finish();
         return !overflow;
     }
@@ -387,6 +425,7 @@ pub(crate) unsafe fn do_hydrate(h: &Hydration) -> bool {
     // idempotent, so a fallback after a partial fan is safe.
     if let Some(n) = try_parallel_backfill(h, !excl.is_empty(), overriding) {
         record_whole_or_range(h, n);
+        spi_set_repl_role(&prior_srr);
         pg_sys::SPI_finish();
         return true;
     }
@@ -405,6 +444,7 @@ pub(crate) unsafe fn do_hydrate(h: &Hydration) -> bool {
     let rc = pg_sys::SPI_execute(q.as_ptr(), false, 0);
     let n = if rc == pg_sys::SPI_OK_INSERT as i32 { pg_sys::SPI_processed as i64 } else { 0 };
     record_whole_or_range(h, n);
+    spi_set_repl_role(&prior_srr);
     pg_sys::SPI_finish();
     true
 }
