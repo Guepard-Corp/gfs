@@ -280,7 +280,7 @@ $$;
 -- the source, even aggregates).
 CREATE FUNCTION gfs.warm(local regclass)
 RETURNS bigint LANGUAGE plpgsql AS $$
-DECLARE src text; cols text; n bigint;
+DECLARE src text; cols text; ov text; n bigint;
 BEGIN
     SELECT source_ref INTO src FROM gfs.clone_source WHERE relid = local;
     IF src IS NULL OR to_regclass(src) IS NULL THEN
@@ -289,12 +289,17 @@ BEGIN
     SELECT string_agg(quote_ident(attname), ', ' ORDER BY attnum) INTO cols
       FROM pg_attribute
      WHERE attrelid = local AND attnum > 0 AND NOT attisdropped AND attgenerated = '';
+    -- A GENERATED ALWAYS AS IDENTITY column rejects an explicit value on a plain
+    -- INSERT; OVERRIDING SYSTEM VALUE lets us copy the source's own key faithfully.
+    SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_attribute
+                              WHERE attrelid = local AND attidentity = 'a')
+                THEN 'OVERRIDING SYSTEM VALUE ' ELSE '' END INTO ov;
     -- Exclude locally-deleted rows so warming never resurrects a copy-on-write DELETE.
-    EXECUTE format('INSERT INTO %s (%s) SELECT %s FROM %s s
+    EXECUTE format('INSERT INTO %s (%s) %sSELECT %s FROM %s s
                     WHERE NOT EXISTS (SELECT 1 FROM gfs.tombstone tb
                                        WHERE tb.relid = %L::regclass AND to_jsonb(s) @> tb.pk)
                     ON CONFLICT DO NOTHING',
-                   local::text, cols, cols, src, local::text);
+                   local::text, cols, ov, cols, src, local::text);
     GET DIAGNOSTICS n = ROW_COUNT;
     EXECUTE format('ANALYZE %s', local::text);
     UPDATE gfs.clone_source SET whole_cached = true WHERE relid = local;

@@ -55,6 +55,27 @@ unsafe fn spi_cell1() -> Option<String> {
     spi_text(pg_sys::SPI_getvalue(row, (*tt).tupdesc, 1))
 }
 
+/// `OVERRIDING SYSTEM VALUE ` when the local clone table has a GENERATED ALWAYS AS
+/// IDENTITY column, else empty. Such a column rejects an explicit value on a plain
+/// INSERT, so every hydration INSERT must carry this clause to write the SOURCE's
+/// own key value (a faithful copy keeps the source key, never a fresh local
+/// sequence value). Identity columns are `attidentity = 'a'` (always); `'d'` (by
+/// default) already accepts explicit values without the clause, so only `'a'` needs
+/// it. Caller holds an open SPI connection.
+unsafe fn overriding_clause(local_ref: &str) -> &'static str {
+    let q = CString::new(format!(
+        "SELECT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid = '{}'::regclass AND attidentity = 'a')::int::text",
+        local_ref.replace('\'', "''")
+    ))
+    .unwrap();
+    if pg_sys::SPI_execute(q.as_ptr(), true, 1) == pg_sys::SPI_OK_SELECT as i32
+        && spi_cell1().as_deref() == Some("1")
+    {
+        return "OVERRIDING SYSTEM VALUE ";
+    }
+    ""
+}
+
 /// Fan a large whole/int-range backfill over N concurrent dblink scans against the
 /// source -- CTID-block partitioning for a whole table (no usable key -> heap scan),
 /// key-range split for an int range (indexed key) -- instead of one FDW cursor. The
@@ -65,7 +86,7 @@ unsafe fn spi_cell1() -> Option<String> {
 /// ON CONFLICT DO NOTHING, so a fallback after a partial fan is idempotent/harmless.
 /// Read-only on the source; no replication slot. dblink reuses the existing FDW
 /// server `gfs_remote_srv` (+ its PUBLIC user mapping) -- no new connstr/secret.
-unsafe fn try_parallel_backfill(h: &Hydration, has_tomb: bool) -> Option<i64> {
+unsafe fn try_parallel_backfill(h: &Hydration, has_tomb: bool, overriding: &str) -> Option<i64> {
     // --- knobs + source size estimate + dblink availability (one row) ---
     let q = CString::new(format!(
         "SELECT x.parallel_workers::text, x.parallel_min_pages::text, x.parallel_min_frac::text, \
@@ -202,8 +223,8 @@ unsafe fn try_parallel_backfill(h: &Hydration, has_tomb: bool) -> Option<i64> {
     for k in 0..m {
         let conn = format!("gfs_bf_{}_{}", u32::from(h.relid), k);
         let ins = CString::new(format!(
-            "INSERT INTO {l} ({c}) SELECT {c} FROM dblink_get_result('{conn}') AS t({cd}) WHERE true{excl} ON CONFLICT DO NOTHING",
-            l = h.local_ref, c = h.collist, conn = conn, cd = coldef, excl = excl_t
+            "INSERT INTO {l} ({c}) {ov}SELECT {c} FROM dblink_get_result('{conn}') AS t({cd}) WHERE true{excl} ON CONFLICT DO NOTHING",
+            l = h.local_ref, c = h.collist, conn = conn, cd = coldef, excl = excl_t, ov = overriding
         )).unwrap();
         if pg_sys::SPI_execute(ins.as_ptr(), false, 0) == pg_sys::SPI_OK_INSERT as i32 {
             total += pg_sys::SPI_processed as i64;
@@ -256,6 +277,11 @@ pub(crate) unsafe fn do_hydrate(h: &Hydration) -> bool {
         }
     };
 
+    // A GENERATED ALWAYS AS IDENTITY column rejects an explicit value on a plain
+    // INSERT; every materialization INSERT below carries this clause (when present)
+    // so the source's own key value is copied faithfully, not regenerated locally.
+    let overriding = overriding_clause(&h.local_ref);
+
     // PARTIAL: pull the matching slice with a HARD cap and self-validate against
     // REALITY (not an estimate). One source contact. `matched` (LIMIT cap+1) tells
     // us whether the source had MORE than the cap of matching rows: if so the slice
@@ -266,9 +292,9 @@ pub(crate) unsafe fn do_hydrate(h: &Hydration) -> bool {
         let cap = h.partial_cap.max(0);
         let sql = format!(
             "WITH picked AS (SELECT {c} FROM {s} WHERE {w}{excl} LIMIT {lim}), \
-                  ins AS (INSERT INTO {l} ({c}) SELECT {c} FROM picked ON CONFLICT DO NOTHING RETURNING 1) \
+                  ins AS (INSERT INTO {l} ({c}) {ov}SELECT {c} FROM picked ON CONFLICT DO NOTHING RETURNING 1) \
              SELECT (SELECT count(*) FROM picked)::int8::text, (SELECT count(*) FROM ins)::int8::text",
-            c = h.collist, s = src, w = h.where_sql, excl = excl, l = h.local_ref, lim = cap + 1
+            c = h.collist, s = src, w = h.where_sql, excl = excl, l = h.local_ref, lim = cap + 1, ov = overriding
         );
         let q = CString::new(sql).unwrap();
         let (mut matched, mut inserted) = (0i64, 0i64);
@@ -330,9 +356,9 @@ pub(crate) unsafe fn do_hydrate(h: &Hydration) -> bool {
         let where_clause = if conds.is_empty() { "true".to_string() } else { conds.join(" AND ") };
         let sql = format!(
             "WITH picked AS (SELECT {c} FROM {s} WHERE {w}{excl} LIMIT {lim}), \
-                  ins AS (INSERT INTO {l} ({c}) SELECT {c} FROM picked ON CONFLICT DO NOTHING RETURNING 1) \
+                  ins AS (INSERT INTO {l} ({c}) {ov}SELECT {c} FROM picked ON CONFLICT DO NOTHING RETURNING 1) \
              SELECT (SELECT count(*) FROM picked)::int8::text, (SELECT count(*) FROM ins)::int8::text",
-            c = h.collist, s = src, w = where_clause, excl = excl, l = h.local_ref, lim = cap + 1
+            c = h.collist, s = src, w = where_clause, excl = excl, l = h.local_ref, lim = cap + 1, ov = overriding
         );
         let q = CString::new(sql).unwrap();
         let (mut matched, mut inserted) = (0i64, 0i64);
@@ -359,20 +385,20 @@ pub(crate) unsafe fn do_hydrate(h: &Hydration) -> bool {
     // split via concurrent dblink scans); fall back to one FDW statement on any
     // ineligibility or setup failure. ON CONFLICT DO NOTHING keeps both paths
     // idempotent, so a fallback after a partial fan is safe.
-    if let Some(n) = try_parallel_backfill(h, !excl.is_empty()) {
+    if let Some(n) = try_parallel_backfill(h, !excl.is_empty(), overriding) {
         record_whole_or_range(h, n);
         pg_sys::SPI_finish();
         return true;
     }
     let sql = if h.whole {
         format!(
-            "INSERT INTO {l} ({c}) SELECT {c} FROM {s} WHERE true{excl} ON CONFLICT DO NOTHING",
-            l = h.local_ref, c = h.collist, s = src, excl = excl
+            "INSERT INTO {l} ({c}) {ov}SELECT {c} FROM {s} WHERE true{excl} ON CONFLICT DO NOTHING",
+            l = h.local_ref, c = h.collist, s = src, excl = excl, ov = overriding
         )
     } else {
         format!(
-            "INSERT INTO {l} ({c}) SELECT {c} FROM {s} WHERE {k} BETWEEN {lo} AND {hi}{excl} ON CONFLICT DO NOTHING",
-            l = h.local_ref, c = h.collist, s = src, k = h.key_col, lo = h.lo, hi = h.hi, excl = excl
+            "INSERT INTO {l} ({c}) {ov}SELECT {c} FROM {s} WHERE {k} BETWEEN {lo} AND {hi}{excl} ON CONFLICT DO NOTHING",
+            l = h.local_ref, c = h.collist, s = src, k = h.key_col, lo = h.lo, hi = h.hi, excl = excl, ov = overriding
         )
     };
     let q = CString::new(sql).unwrap();
