@@ -280,7 +280,7 @@ $$;
 -- the source, even aggregates).
 CREATE FUNCTION gfs.warm(local regclass)
 RETURNS bigint LANGUAGE plpgsql AS $$
-DECLARE src text; cols text; ov text; n bigint; old_srr text; srcfrom text; rqual text; cdef text;
+DECLARE src text; cols text; ov text; n bigint; old_srr text; srcfrom text; rqual text; cdef text; oc text; arb text;
 BEGIN
     SELECT source_ref INTO src FROM gfs.clone_source WHERE relid = local;
     IF src IS NULL OR to_regclass(src) IS NULL THEN
@@ -318,6 +318,28 @@ BEGIN
     SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_attribute
                               WHERE attrelid = local AND attidentity = 'a')
                 THEN 'OVERRIDING SYSTEM VALUE ' ELSE '' END INTO ov;
+    -- Target-less ON CONFLICT is refused when the table has a DEFERRABLE unique or
+    -- exclusion constraint (they cannot arbitrate) -- warming would error. Name an
+    -- explicit arbiter instead: a non-deferrable, non-partial, non-expression unique
+    -- index (primary key preferred). Re-pulled source rows match on ANY unique
+    -- index, so one arbiter is enough to keep warming idempotent.
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = local
+                AND contype IN ('p','u','x') AND condeferrable) THEN
+        SELECT '(' || string_agg(quote_ident(a.attname), ', ' ORDER BY k.ord) || ')' INTO arb
+          FROM pg_index i
+          JOIN LATERAL unnest(i.indkey::int[]) WITH ORDINALITY AS k(attnum, ord) ON true
+          JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+         WHERE i.indrelid = local AND i.indisunique AND i.indimmediate
+           AND i.indpred IS NULL AND 0 <> ALL (i.indkey::int[])
+         GROUP BY i.indexrelid, i.indisprimary, i.indnkeyatts
+         ORDER BY i.indisprimary DESC, i.indnkeyatts ASC, i.indexrelid LIMIT 1;
+        IF arb IS NULL THEN
+            RAISE EXCEPTION 'gfs.warm: % has only DEFERRABLE unique constraints -- no usable ON CONFLICT arbiter', local;
+        END IF;
+        oc := format('ON CONFLICT %s DO NOTHING', arb);
+    ELSE
+        oc := 'ON CONFLICT DO NOTHING';
+    END IF;
     -- Warming replays the SOURCE's already-computed rows, so a replayed INSERT trigger
     -- must NOT fire on them (it would re-mutate the row or re-run side effects, diverging
     -- the clone from the source). Copy in the 'replica' role -- how logical replication
@@ -329,8 +351,8 @@ BEGIN
     EXECUTE format('INSERT INTO %s (%s) %sSELECT %s FROM %s
                     WHERE NOT EXISTS (SELECT 1 FROM gfs.tombstone tb
                                        WHERE tb.relid = %L::regclass AND to_jsonb(s) @> tb.pk)
-                    ON CONFLICT DO NOTHING',
-                   local::text, cols, ov, cols, srcfrom, local::text);
+                    %s',
+                   local::text, cols, ov, cols, srcfrom, local::text, oc);
     GET DIAGNOSTICS n = ROW_COUNT;
     PERFORM set_config('session_replication_role', old_srr, true);
     EXECUTE format('ANALYZE %s', local::text);

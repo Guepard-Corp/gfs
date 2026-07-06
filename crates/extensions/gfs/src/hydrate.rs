@@ -127,6 +127,53 @@ unsafe fn local_coldef(local_ref: &str) -> Option<String> {
     spi_cell1().filter(|s| !s.is_empty())
 }
 
+/// `ON CONFLICT ... DO NOTHING` clause for hydration inserts into `h.local_ref`.
+/// The target-less form asks Postgres to consider EVERY unique/exclusion constraint
+/// as a potential arbiter, and it refuses outright when any of them is DEFERRABLE
+/// ("ON CONFLICT does not support deferrable unique constraints/exclusion
+/// constraints as arbiters") -- the hydration insert would error and every read of
+/// the table would fail. For such tables, name an explicit arbiter: the columns of
+/// a non-deferrable (indimmediate), non-partial, non-expression unique index,
+/// preferring the primary key (registration guarantees one exists -- the bootstrap
+/// keycol query requires indimmediate). Hydration only needs to dedupe re-pulls of
+/// already-hydrated keys, and a re-pulled source row matches on ANY unique index,
+/// so a single arbiter suffices. Caller holds an open SPI connection.
+unsafe fn conflict_clause(h: &Hydration) -> String {
+    let lref = h.local_ref.replace('\'', "''");
+    let q = CString::new(format!(
+        "SELECT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid = '{}'::regclass \
+           AND contype IN ('p','u','x') AND condeferrable)::int::text",
+        lref
+    ))
+    .unwrap();
+    if pg_sys::SPI_execute(q.as_ptr(), true, 1) != pg_sys::SPI_OK_SELECT as i32
+        || spi_cell1().as_deref() != Some("1")
+    {
+        return "ON CONFLICT DO NOTHING".into(); // common case: nothing deferrable
+    }
+    let a = CString::new(format!(
+        "SELECT '(' || string_agg(quote_ident(a.attname), ', ' ORDER BY k.ord) || ')' \
+           FROM pg_index i \
+           JOIN LATERAL unnest(i.indkey::int[]) WITH ORDINALITY AS k(attnum, ord) ON true \
+           JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum \
+          WHERE i.indrelid = '{}'::regclass AND i.indisunique AND i.indimmediate \
+            AND i.indpred IS NULL AND 0 <> ALL (i.indkey::int[]) \
+          GROUP BY i.indexrelid, i.indisprimary, i.indnkeyatts \
+          ORDER BY i.indisprimary DESC, i.indnkeyatts ASC, i.indexrelid LIMIT 1",
+        lref
+    ))
+    .unwrap();
+    if pg_sys::SPI_execute(a.as_ptr(), true, 1) == pg_sys::SPI_OK_SELECT as i32 {
+        if let Some(cols) = spi_cell1() {
+            return format!("ON CONFLICT {} DO NOTHING", cols);
+        }
+    }
+    pgrx::error!(
+        "gfs: {} has only DEFERRABLE unique constraints -- no usable ON CONFLICT arbiter for copy-on-read",
+        h.local_ref
+    );
+}
+
 /// FROM clause (aliased `src`) reading the source rows for `h`. Normal case: the
 /// registered foreign table (postgres_fdw pushes the caller's WHERE down). For an
 /// inheritance parent (`only`) postgres_fdw is unusable -- it cannot deparse ONLY, so
@@ -164,7 +211,7 @@ unsafe fn src_from(h: &Hydration, only: bool, remote_where: &str, remote_limit: 
 /// ON CONFLICT DO NOTHING, so a fallback after a partial fan is idempotent/harmless.
 /// Read-only on the source; no replication slot. dblink reuses the existing FDW
 /// server `gfs_remote_srv` (+ its PUBLIC user mapping) -- no new connstr/secret.
-unsafe fn try_parallel_backfill(h: &Hydration, has_tomb: bool, overriding: &str, only: bool) -> Option<i64> {
+unsafe fn try_parallel_backfill(h: &Hydration, has_tomb: bool, overriding: &str, only: bool, conflict: &str) -> Option<i64> {
     // --- knobs + source size estimate + dblink availability (one row) ---
     let q = CString::new(format!(
         "SELECT x.parallel_workers::text, x.parallel_min_pages::text, x.parallel_min_frac::text, \
@@ -278,8 +325,8 @@ unsafe fn try_parallel_backfill(h: &Hydration, has_tomb: bool, overriding: &str,
     for k in 0..m {
         let conn = format!("gfs_bf_{}_{}", u32::from(h.relid), k);
         let ins = CString::new(format!(
-            "INSERT INTO {l} ({c}) {ov}SELECT {c} FROM dblink_get_result('{conn}') AS t({cd}) WHERE true{excl} ON CONFLICT DO NOTHING",
-            l = h.local_ref, c = h.collist, conn = conn, cd = coldef, excl = excl_t, ov = overriding
+            "INSERT INTO {l} ({c}) {ov}SELECT {c} FROM dblink_get_result('{conn}') AS t({cd}) WHERE true{excl} {oc}",
+            l = h.local_ref, c = h.collist, conn = conn, cd = coldef, excl = excl_t, ov = overriding, oc = conflict
         )).unwrap();
         if pg_sys::SPI_execute(ins.as_ptr(), false, 0) == pg_sys::SPI_OK_INSERT as i32 {
             total += pg_sys::SPI_processed as i64;
@@ -346,6 +393,10 @@ pub(crate) unsafe fn do_hydrate(h: &Hydration) -> bool {
     // inheritance scan would serve every child row TWICE.
     let only = local_has_children(h.relid);
 
+    // Dedup clause for every hydration insert below (explicit arbiter when the
+    // table has a DEFERRABLE unique/exclusion constraint -- see conflict_clause).
+    let conflict = conflict_clause(h);
+
     // Exclude copy-on-write DELETE tombstones so hydration never resurrects a local
     // DELETE -- only when this table has tombstones (the no-deletes case stays
     // zero-overhead). `src` aliases the source so `to_jsonb(src)` builds the row.
@@ -390,9 +441,9 @@ pub(crate) unsafe fn do_hydrate(h: &Hydration) -> bool {
         let src = src_from(h, only, &h.where_sql, cap + 1);
         let sql = format!(
             "WITH picked AS (SELECT {c} FROM {s} WHERE {w}{excl} LIMIT {lim}), \
-                  ins AS (INSERT INTO {l} ({c}) {ov}SELECT {c} FROM picked ON CONFLICT DO NOTHING RETURNING 1) \
+                  ins AS (INSERT INTO {l} ({c}) {ov}SELECT {c} FROM picked {oc} RETURNING 1) \
              SELECT (SELECT count(*) FROM picked)::int8::text, (SELECT count(*) FROM ins)::int8::text",
-            c = h.collist, s = src, w = h.where_sql, excl = excl, l = h.local_ref, lim = cap + 1, ov = overriding
+            c = h.collist, s = src, w = h.where_sql, excl = excl, l = h.local_ref, lim = cap + 1, ov = overriding, oc = conflict
         );
         let q = CString::new(sql).unwrap();
         let (mut matched, mut inserted) = (0i64, 0i64);
@@ -456,9 +507,9 @@ pub(crate) unsafe fn do_hydrate(h: &Hydration) -> bool {
         let src = src_from(h, only, &where_clause, cap + 1);
         let sql = format!(
             "WITH picked AS (SELECT {c} FROM {s} WHERE {w}{excl} LIMIT {lim}), \
-                  ins AS (INSERT INTO {l} ({c}) {ov}SELECT {c} FROM picked ON CONFLICT DO NOTHING RETURNING 1) \
+                  ins AS (INSERT INTO {l} ({c}) {ov}SELECT {c} FROM picked {oc} RETURNING 1) \
              SELECT (SELECT count(*) FROM picked)::int8::text, (SELECT count(*) FROM ins)::int8::text",
-            c = h.collist, s = src, w = where_clause, excl = excl, l = h.local_ref, lim = cap + 1, ov = overriding
+            c = h.collist, s = src, w = where_clause, excl = excl, l = h.local_ref, lim = cap + 1, ov = overriding, oc = conflict
         );
         let q = CString::new(sql).unwrap();
         let (mut matched, mut inserted) = (0i64, 0i64);
@@ -486,7 +537,7 @@ pub(crate) unsafe fn do_hydrate(h: &Hydration) -> bool {
     // split via concurrent dblink scans); fall back to one FDW statement on any
     // ineligibility or setup failure. ON CONFLICT DO NOTHING keeps both paths
     // idempotent, so a fallback after a partial fan is safe.
-    if let Some(n) = try_parallel_backfill(h, !excl.is_empty(), overriding, only) {
+    if let Some(n) = try_parallel_backfill(h, !excl.is_empty(), overriding, only, &conflict) {
         record_whole_or_range(h, n);
         spi_set_repl_role(&prior_srr);
         pg_sys::SPI_finish();
@@ -494,14 +545,14 @@ pub(crate) unsafe fn do_hydrate(h: &Hydration) -> bool {
     }
     let sql = if h.whole {
         format!(
-            "INSERT INTO {l} ({c}) {ov}SELECT {c} FROM {s} WHERE true{excl} ON CONFLICT DO NOTHING",
-            l = h.local_ref, c = h.collist, s = src_from(h, only, "", 0), excl = excl, ov = overriding
+            "INSERT INTO {l} ({c}) {ov}SELECT {c} FROM {s} WHERE true{excl} {oc}",
+            l = h.local_ref, c = h.collist, s = src_from(h, only, "", 0), excl = excl, ov = overriding, oc = conflict
         )
     } else {
         let range_w = format!("{} BETWEEN {} AND {}", h.key_col, h.lo, h.hi);
         format!(
-            "INSERT INTO {l} ({c}) {ov}SELECT {c} FROM {s} WHERE {w}{excl} ON CONFLICT DO NOTHING",
-            l = h.local_ref, c = h.collist, s = src_from(h, only, &range_w, 0), w = range_w, excl = excl, ov = overriding
+            "INSERT INTO {l} ({c}) {ov}SELECT {c} FROM {s} WHERE {w}{excl} {oc}",
+            l = h.local_ref, c = h.collist, s = src_from(h, only, &range_w, 0), w = range_w, excl = excl, ov = overriding, oc = conflict
         )
     };
     let q = CString::new(sql).unwrap();

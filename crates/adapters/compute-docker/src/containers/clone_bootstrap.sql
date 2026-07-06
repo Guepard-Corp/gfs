@@ -345,7 +345,8 @@ END
 $fn$;
 
 -- Bug B safeguard: a source table with no usable unique key is skipped by the keycol
--- query in clone() (it needs a unique, non-partial, non-expression index), so it is
+-- query in clone() (it needs a unique, non-deferrable, non-partial, non-expression
+-- index -- a DEFERRABLE-only table cannot arbitrate the hydration inserts), so it is
 -- never registered for copy-on-read and would be a SILENT empty heap on the clone
 -- (data loss, no error). Assert every ordinary (non-partition) source table is locally
 -- present AND registered; any gap RAISEs (fatal under ON_ERROR_STOP), naming the table.
@@ -372,7 +373,7 @@ BEGIN
     IF to_regclass(fq) IS NULL THEN
       problems := problems || format('%s (missing locally)', fq);
     ELSIF NOT EXISTS (SELECT 1 FROM gfs.clone_source WHERE relid = fq::regclass) THEN
-      problems := problems || format('%s (no usable unique key -> not registered for copy-on-read; would silently return no rows)', fq);
+      problems := problems || format('%s (no usable unique key -- needs a unique, non-deferrable, non-partial, non-expression index -> not registered for copy-on-read; would silently return no rows)', fq);
     END IF;
   END LOOP;
   IF array_length(problems, 1) > 0 THEN
@@ -486,7 +487,7 @@ BEGIN
         JOIN pg_class c     ON c.oid = i.indrelid
         JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname IN (%s) AND c.relkind = 'r'
-          AND i.indisunique AND i.indpred IS NULL AND 0 <> ALL (i.indkey::int[])
+          AND i.indisunique AND i.indimmediate AND i.indpred IS NULL AND 0 <> ALL (i.indkey::int[])
       ) s WHERE rn = 1
     $q$, schlist)) AS r(nsp text, tab text, keycols text[])
   LOOP
