@@ -76,6 +76,84 @@ unsafe fn overriding_clause(local_ref: &str) -> &'static str {
     ""
 }
 
+/// True when the local clone table is a plain-table inheritance parent (pg_inherits,
+/// relkind 'r'). The clone replays the source schema, so this equals "the SOURCE
+/// table has INHERITS children". Declarative-partition parents (relkind 'p') are
+/// excluded: they hold no rows of their own and route inserts to partitions, so they
+/// keep the existing paths. Caller holds an open SPI connection.
+unsafe fn local_has_children(relid: pg_sys::Oid) -> bool {
+    let q = CString::new(format!(
+        "SELECT EXISTS(SELECT 1 FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhparent \
+          WHERE i.inhparent = {} AND c.relkind = 'r')::int::text",
+        u32::from(relid)
+    ))
+    .unwrap();
+    pg_sys::SPI_execute(q.as_ptr(), true, 1) == pg_sys::SPI_OK_SELECT as i32
+        && spi_cell1().as_deref() == Some("1")
+}
+
+/// Real source-side `schema.table` (quoted) behind the foreign table `fref`; None
+/// when `fref` is not a foreign table. Caller holds an open SPI connection.
+unsafe fn remote_qualified(fref: &str) -> Option<String> {
+    let fq = CString::new(format!(
+        "SELECT quote_ident(COALESCE((SELECT option_value FROM pg_options_to_table(ft.ftoptions) WHERE option_name = 'schema_name'), n.nspname)), \
+                quote_ident(COALESCE((SELECT option_value FROM pg_options_to_table(ft.ftoptions) WHERE option_name = 'table_name'), c.relname)) \
+           FROM pg_foreign_table ft JOIN pg_class c ON c.oid = ft.ftrelid JOIN pg_namespace n ON n.oid = c.relnamespace \
+          WHERE ft.ftrelid = '{}'::regclass",
+        fref.replace('\'', "''")
+    )).unwrap();
+    if pg_sys::SPI_execute(fq.as_ptr(), true, 1) != pg_sys::SPI_OK_SELECT as i32 || pg_sys::SPI_processed != 1 {
+        return None;
+    }
+    let tt = pg_sys::SPI_tuptable;
+    let row = *(*tt).vals;
+    let td = (*tt).tupdesc;
+    let sch = spi_text(pg_sys::SPI_getvalue(row, td, 1))?;
+    let tbl = spi_text(pg_sys::SPI_getvalue(row, td, 2))?;
+    Some(format!("{}.{}", sch, tbl))
+}
+
+/// Typed column list of `local_ref` (non-dropped, non-generated, attnum order), for
+/// use as a dblink result-set definition. Caller holds an open SPI connection.
+unsafe fn local_coldef(local_ref: &str) -> Option<String> {
+    let cq = CString::new(format!(
+        "SELECT string_agg(quote_ident(attname) || ' ' || format_type(atttypid, atttypmod), ', ' ORDER BY attnum) \
+           FROM pg_attribute WHERE attrelid = '{}'::regclass AND attnum > 0 AND NOT attisdropped AND attgenerated = ''",
+        local_ref.replace('\'', "''")
+    )).unwrap();
+    if pg_sys::SPI_execute(cq.as_ptr(), true, 1) != pg_sys::SPI_OK_SELECT as i32 {
+        return None;
+    }
+    spi_cell1().filter(|s| !s.is_empty())
+}
+
+/// FROM clause (aliased `src`) reading the source rows for `h`. Normal case: the
+/// registered foreign table (postgres_fdw pushes the caller's WHERE down). For an
+/// inheritance parent (`only`) postgres_fdw is unusable -- it cannot deparse ONLY, so
+/// its remote scan would include child rows, which the clone's own inheritance scan
+/// then reads AGAIN from the hydrated children (every child row served twice). Read
+/// through dblink with an explicit `FROM ONLY` instead, embedding the caller's
+/// predicate and cap (a dblink rowset gets no pushdown; without them a partial
+/// hydration would transfer the parent's whole own heap). The caller's local
+/// WHERE/LIMIT re-apply over the rowset, harmlessly idempotent.
+unsafe fn src_from(h: &Hydration, only: bool, remote_where: &str, remote_limit: i64) -> String {
+    if !only {
+        return format!("{} src", h.source_ref);
+    }
+    let Some(qual) = remote_qualified(&h.source_ref) else {
+        pgrx::error!("gfs: no foreign table behind {} (inheritance parent needs an ONLY-fetch)", h.local_ref);
+    };
+    let Some(coldef) = local_coldef(&h.local_ref) else {
+        pgrx::error!("gfs: no usable columns on {} (inheritance parent needs an ONLY-fetch)", h.local_ref);
+    };
+    let w = if remote_where.is_empty() { "true" } else { remote_where };
+    let lim = if remote_limit > 0 { format!(" LIMIT {}", remote_limit) } else { String::new() };
+    format!(
+        "dblink('gfs_remote_srv', $gfsq$SELECT {} FROM ONLY {} WHERE {}{}$gfsq$) AS src({})",
+        h.collist, qual, w, lim, coldef
+    )
+}
+
 /// Fan a large whole/int-range backfill over N concurrent dblink scans against the
 /// source -- CTID-block partitioning for a whole table (no usable key -> heap scan),
 /// key-range split for an int range (indexed key) -- instead of one FDW cursor. The
@@ -86,7 +164,7 @@ unsafe fn overriding_clause(local_ref: &str) -> &'static str {
 /// ON CONFLICT DO NOTHING, so a fallback after a partial fan is idempotent/harmless.
 /// Read-only on the source; no replication slot. dblink reuses the existing FDW
 /// server `gfs_remote_srv` (+ its PUBLIC user mapping) -- no new connstr/secret.
-unsafe fn try_parallel_backfill(h: &Hydration, has_tomb: bool, overriding: &str) -> Option<i64> {
+unsafe fn try_parallel_backfill(h: &Hydration, has_tomb: bool, overriding: &str, only: bool) -> Option<i64> {
     // --- knobs + source size estimate + dblink availability (one row) ---
     let q = CString::new(format!(
         "SELECT x.parallel_workers::text, x.parallel_min_pages::text, x.parallel_min_frac::text, \
@@ -124,37 +202,14 @@ unsafe fn try_parallel_backfill(h: &Hydration, has_tomb: bool, overriding: &str)
         }
     }
 
-    // --- real source-side schema.table behind the foreign table (quoted) ---
-    let fq = CString::new(format!(
-        "SELECT quote_ident(COALESCE((SELECT option_value FROM pg_options_to_table(ft.ftoptions) WHERE option_name = 'schema_name'), n.nspname)), \
-                quote_ident(COALESCE((SELECT option_value FROM pg_options_to_table(ft.ftoptions) WHERE option_name = 'table_name'), c.relname)) \
-           FROM pg_foreign_table ft JOIN pg_class c ON c.oid = ft.ftrelid JOIN pg_namespace n ON n.oid = c.relnamespace \
-          WHERE ft.ftrelid = '{}'::regclass",
-        h.source_ref.replace('\'', "''")
-    )).unwrap();
-    if pg_sys::SPI_execute(fq.as_ptr(), true, 1) != pg_sys::SPI_OK_SELECT as i32 || pg_sys::SPI_processed != 1 {
-        return None;
-    }
-    let tt = pg_sys::SPI_tuptable;
-    let row = *(*tt).vals;
-    let td = (*tt).tupdesc;
-    let sch = spi_text(pg_sys::SPI_getvalue(row, td, 1))?;
-    let tbl = spi_text(pg_sys::SPI_getvalue(row, td, 2))?;
-    let src_qual = format!("{}.{}", sch, tbl);
+    // --- real source-side schema.table behind the foreign table (quoted). An
+    // inheritance parent scans ONLY its own heap: its children backfill themselves,
+    // and both split modes stay valid (ctid ranges address the parent's own heap;
+    // key ranges filter the parent's own rows). ---
+    let src_qual = format!("{}{}", if only { "ONLY " } else { "" }, remote_qualified(&h.source_ref)?);
 
     // --- typed column list for dblink_get_result (same types as the local table) ---
-    let cq = CString::new(format!(
-        "SELECT string_agg(quote_ident(attname) || ' ' || format_type(atttypid, atttypmod), ', ' ORDER BY attnum) \
-           FROM pg_attribute WHERE attrelid = '{}'::regclass AND attnum > 0 AND NOT attisdropped AND attgenerated = ''",
-        h.local_ref.replace('\'', "''")
-    )).unwrap();
-    if pg_sys::SPI_execute(cq.as_ptr(), true, 1) != pg_sys::SPI_OK_SELECT as i32 {
-        return None;
-    }
-    let coldef = spi_cell1()?;
-    if coldef.is_empty() {
-        return None;
-    }
+    let coldef = local_coldef(&h.local_ref)?;
 
     // --- partition predicates ---
     let preds: Vec<String> = if h.whole {
@@ -284,10 +339,16 @@ pub(crate) unsafe fn do_hydrate(h: &Hydration) -> bool {
     let prior_srr = spi_repl_role();
     spi_set_repl_role("replica");
 
+    // Inheritance parent (the schema replay mirrors the source's INHERITS
+    // hierarchy): every fetch below must read ONLY the parent's own rows -- the
+    // children hydrate themselves through their own registrations, so a fetch that
+    // included them would land child rows in the parent's heap and the clone's
+    // inheritance scan would serve every child row TWICE.
+    let only = local_has_children(h.relid);
+
     // Exclude copy-on-write DELETE tombstones so hydration never resurrects a local
     // DELETE -- only when this table has tombstones (the no-deletes case stays
     // zero-overhead). `src` aliases the source so `to_jsonb(src)` builds the row.
-    let src = format!("{} src", h.source_ref);
     let excl = {
         let q = CString::new(format!(
             "SELECT EXISTS(SELECT 1 FROM gfs.tombstone WHERE relid::oid = {})::int::text",
@@ -326,6 +387,7 @@ pub(crate) unsafe fn do_hydrate(h: &Hydration) -> bool {
     // subset (no completeness is claimed for them), so they are harmless.
     if !h.where_sql.is_empty() {
         let cap = h.partial_cap.max(0);
+        let src = src_from(h, only, &h.where_sql, cap + 1);
         let sql = format!(
             "WITH picked AS (SELECT {c} FROM {s} WHERE {w}{excl} LIMIT {lim}), \
                   ins AS (INSERT INTO {l} ({c}) {ov}SELECT {c} FROM picked ON CONFLICT DO NOTHING RETURNING 1) \
@@ -391,6 +453,7 @@ pub(crate) unsafe fn do_hydrate(h: &Hydration) -> bool {
             conds.push(format!("{} <= {}", h.key_col, time_recon(h.hi, &h.key_type)));
         }
         let where_clause = if conds.is_empty() { "true".to_string() } else { conds.join(" AND ") };
+        let src = src_from(h, only, &where_clause, cap + 1);
         let sql = format!(
             "WITH picked AS (SELECT {c} FROM {s} WHERE {w}{excl} LIMIT {lim}), \
                   ins AS (INSERT INTO {l} ({c}) {ov}SELECT {c} FROM picked ON CONFLICT DO NOTHING RETURNING 1) \
@@ -423,7 +486,7 @@ pub(crate) unsafe fn do_hydrate(h: &Hydration) -> bool {
     // split via concurrent dblink scans); fall back to one FDW statement on any
     // ineligibility or setup failure. ON CONFLICT DO NOTHING keeps both paths
     // idempotent, so a fallback after a partial fan is safe.
-    if let Some(n) = try_parallel_backfill(h, !excl.is_empty(), overriding) {
+    if let Some(n) = try_parallel_backfill(h, !excl.is_empty(), overriding, only) {
         record_whole_or_range(h, n);
         spi_set_repl_role(&prior_srr);
         pg_sys::SPI_finish();
@@ -432,12 +495,13 @@ pub(crate) unsafe fn do_hydrate(h: &Hydration) -> bool {
     let sql = if h.whole {
         format!(
             "INSERT INTO {l} ({c}) {ov}SELECT {c} FROM {s} WHERE true{excl} ON CONFLICT DO NOTHING",
-            l = h.local_ref, c = h.collist, s = src, excl = excl, ov = overriding
+            l = h.local_ref, c = h.collist, s = src_from(h, only, "", 0), excl = excl, ov = overriding
         )
     } else {
+        let range_w = format!("{} BETWEEN {} AND {}", h.key_col, h.lo, h.hi);
         format!(
-            "INSERT INTO {l} ({c}) {ov}SELECT {c} FROM {s} WHERE {k} BETWEEN {lo} AND {hi}{excl} ON CONFLICT DO NOTHING",
-            l = h.local_ref, c = h.collist, s = src, k = h.key_col, lo = h.lo, hi = h.hi, excl = excl, ov = overriding
+            "INSERT INTO {l} ({c}) {ov}SELECT {c} FROM {s} WHERE {w}{excl} ON CONFLICT DO NOTHING",
+            l = h.local_ref, c = h.collist, s = src_from(h, only, &range_w, 0), w = range_w, excl = excl, ov = overriding
         )
     };
     let q = CString::new(sql).unwrap();

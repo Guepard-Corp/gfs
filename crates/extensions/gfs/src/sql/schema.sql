@@ -280,7 +280,7 @@ $$;
 -- the source, even aggregates).
 CREATE FUNCTION gfs.warm(local regclass)
 RETURNS bigint LANGUAGE plpgsql AS $$
-DECLARE src text; cols text; ov text; n bigint; old_srr text;
+DECLARE src text; cols text; ov text; n bigint; old_srr text; srcfrom text; rqual text; cdef text;
 BEGIN
     SELECT source_ref INTO src FROM gfs.clone_source WHERE relid = local;
     IF src IS NULL OR to_regclass(src) IS NULL THEN
@@ -289,6 +289,30 @@ BEGIN
     SELECT string_agg(quote_ident(attname), ', ' ORDER BY attnum) INTO cols
       FROM pg_attribute
      WHERE attrelid = local AND attnum > 0 AND NOT attisdropped AND attgenerated = '';
+    -- Inheritance parent (mirrored from the source by the schema replay): warm ONLY
+    -- its own rows. postgres_fdw cannot deparse ONLY (the foreign scan would include
+    -- child rows, which the clone's inheritance scan then reads AGAIN from the warmed
+    -- children), so read through dblink with an explicit FROM ONLY against the real
+    -- source-side table behind the foreign table.
+    IF EXISTS (SELECT 1 FROM pg_inherits i JOIN pg_class pc ON pc.oid = i.inhparent
+                WHERE i.inhparent = local AND pc.relkind = 'r') THEN
+        SELECT format('%I.%I',
+                      COALESCE((SELECT option_value FROM pg_options_to_table(ft.ftoptions) WHERE option_name = 'schema_name'), n.nspname),
+                      COALESCE((SELECT option_value FROM pg_options_to_table(ft.ftoptions) WHERE option_name = 'table_name'), c.relname))
+          INTO rqual
+          FROM pg_foreign_table ft
+          JOIN pg_class c ON c.oid = ft.ftrelid
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE ft.ftrelid = to_regclass(src);
+        SELECT string_agg(quote_ident(attname) || ' ' || format_type(atttypid, atttypmod), ', ' ORDER BY attnum)
+          INTO cdef
+          FROM pg_attribute
+         WHERE attrelid = local AND attnum > 0 AND NOT attisdropped AND attgenerated = '';
+        srcfrom := format('dblink(''gfs_remote_srv'', %L) AS s(%s)',
+                          format('SELECT %s FROM ONLY %s', cols, rqual), cdef);
+    ELSE
+        srcfrom := src || ' s';
+    END IF;
     -- A GENERATED ALWAYS AS IDENTITY column rejects an explicit value on a plain
     -- INSERT; OVERRIDING SYSTEM VALUE lets us copy the source's own key faithfully.
     SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_attribute
@@ -302,11 +326,11 @@ BEGIN
     old_srr := current_setting('session_replication_role');
     PERFORM set_config('session_replication_role', 'replica', true);
     -- Exclude locally-deleted rows so warming never resurrects a copy-on-write DELETE.
-    EXECUTE format('INSERT INTO %s (%s) %sSELECT %s FROM %s s
+    EXECUTE format('INSERT INTO %s (%s) %sSELECT %s FROM %s
                     WHERE NOT EXISTS (SELECT 1 FROM gfs.tombstone tb
                                        WHERE tb.relid = %L::regclass AND to_jsonb(s) @> tb.pk)
                     ON CONFLICT DO NOTHING',
-                   local::text, cols, ov, cols, src, local::text);
+                   local::text, cols, ov, cols, srcfrom, local::text);
     GET DIAGNOSTICS n = ROW_COUNT;
     PERFORM set_config('session_replication_role', old_srr, true);
     EXECUTE format('ANALYZE %s', local::text);

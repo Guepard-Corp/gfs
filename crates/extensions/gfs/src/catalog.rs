@@ -144,6 +144,31 @@ pub(crate) unsafe fn bump_access(relid: pg_sys::Oid) {
     pg_sys::SPI_finish();
 }
 
+/// True when `relid` is a plain-table inheritance parent (pg_inherits, relkind 'r').
+/// The clone's schema replay mirrors the source's INHERITS hierarchy, so this equals
+/// "the source table has INHERITS children". Own SPI connection (planner-hook safe).
+pub(crate) unsafe fn gfs_has_children(relid: pg_sys::Oid) -> bool {
+    if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
+        return false;
+    }
+    let q = CString::new(format!(
+        "SELECT EXISTS(SELECT 1 FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhparent \
+          WHERE i.inhparent = {} AND c.relkind = 'r')::int::text",
+        u32::from(relid)
+    ))
+    .unwrap();
+    let mut has = false;
+    if pg_sys::SPI_execute(q.as_ptr(), true, 1) == pg_sys::SPI_OK_SELECT as i32
+        && pg_sys::SPI_processed == 1
+    {
+        let tt = pg_sys::SPI_tuptable;
+        let row = *(*tt).vals;
+        has = spi_text(pg_sys::SPI_getvalue(row, (*tt).tupdesc, 1)).as_deref() == Some("1");
+    }
+    pg_sys::SPI_finish();
+    has
+}
+
 pub(crate) unsafe fn gfs_source_oid(relid: pg_sys::Oid) -> Option<pg_sys::Oid> {
     if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
         return None;
