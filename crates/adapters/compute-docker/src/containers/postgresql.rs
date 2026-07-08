@@ -79,6 +79,14 @@ impl PostgresqlProvider {
     fn default_args_impl() -> Vec<DatabaseProviderArg> {
         vec![
             DatabaseProviderArg {
+                // Listen on all interfaces so the container is reachable via the
+                // k8s Service/NodePort (and Docker port mapping). Without this a
+                // fresh initdb defaults to localhost, so the pod runs healthy but
+                // the CP's connection to the NodePort times out (deploy 500).
+                name: "-c".into(),
+                value: "listen_addresses=*".into(),
+            },
+            DatabaseProviderArg {
                 name: "-c".into(),
                 value: "shared_buffers=32MB".into(),
             },
@@ -921,7 +929,10 @@ mod tests {
         let def = provider.definition();
         assert_eq!(def.args.len(), args.len() * 2);
         assert_eq!(def.args.first(), Some(&"-c".to_string()));
-        assert_eq!(def.args.get(1), Some(&"shared_buffers=32MB".to_string()));
+        // First tuning value binds the listener so the container is reachable via
+        // the k8s Service/NodePort (a fresh initdb otherwise defaults to localhost).
+        assert_eq!(def.args.get(1), Some(&"listen_addresses=*".to_string()));
+        assert!(def.args.contains(&"shared_buffers=32MB".to_string()));
     }
 
     #[test]
