@@ -21,9 +21,9 @@ use gfs_domain::ports::compute::{
 };
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::{
-    Container, EnvVarSource, PersistentVolumeClaim, PersistentVolumeClaimSpec, Pod, PodSpec,
-    PodTemplateSpec, Secret, SecretKeySelector, Service, ServicePort, ServiceSpec, Volume,
-    VolumeMount,
+    Container, EnvVarSource, PersistentVolumeClaim, PersistentVolumeClaimSpec, Pod,
+    PodSecurityContext, PodSpec, PodTemplateSpec, Secret, SecretKeySelector, Service, ServicePort,
+    ServiceSpec, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use kube::api::{AttachParams, DeleteParams, ListParams, Patch, PatchParams, PostParams};
@@ -456,6 +456,16 @@ impl KubernetesCompute {
                         // Lazy-clone dblink/pg_dump reach external hosts; k3s CoreDNS
                         // is often broken on agents — use the node's resolver.
                         dns_policy: Some("Default".to_string()),
+                        // Run as root so the postgres entrypoint can chown its data dir on
+                        // a freshly-provisioned (root-owned) PVC, then drop to the postgres
+                        // user itself. The image bakes in USER postgres (uid 100), which
+                        // cannot chown the volume — initdb then fails with
+                        // "could not change permissions of directory". This mirrors how the
+                        // official/supabase postgres images are meant to be run.
+                        security_context: Some(PodSecurityContext {
+                            run_as_user: Some(0),
+                            ..Default::default()
+                        }),
                         containers: vec![container],
                         volumes: Some(volumes),
                         node_selector: k8s_schedule_node_name()
