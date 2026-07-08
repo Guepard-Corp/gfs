@@ -15,9 +15,10 @@
 # build, ~10-20 min). The extension itself is validated locally via
 # `cargo pgrx install`; this recipe just packages it into an image.
 ARG PG_VERSION=17
+ARG BASE_IMAGE=postgres:17
 
 # ---- build stage: compile the pgrx extension against this image's postgres ----
-FROM postgres:${PG_VERSION} AS build
+FROM ${BASE_IMAGE} AS build
 ARG PG_VERSION
 RUN set -eux; \
     apt-get update; \
@@ -41,7 +42,7 @@ RUN cargo pgrx install --release --no-default-features --features pg${PG_VERSION
     --pg-config "$(which pg_config)"
 
 # ---- runtime stage: stock postgres + the installed extension files -----------
-FROM postgres:${PG_VERSION}
+FROM ${BASE_IMAGE}
 ARG PG_VERSION
 COPY --from=build /usr/share/postgresql/${PG_VERSION}/extension/gfs.control \
                   /usr/share/postgresql/${PG_VERSION}/extension/gfs--0.0.1.sql \
