@@ -410,7 +410,13 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
             // no ref points to it.
             let (schema_res, snapshot_res) = tokio::join!(
                 self.maybe_extract_schema(&path, &runtime_config, &environment),
-                self.take_snapshot(&path, &runtime_config, &environment, mount_point),
+                self.take_snapshot(
+                    &path,
+                    &runtime_config,
+                    &environment,
+                    mount_point,
+                    db_live_during_snapshot,
+                ),
             );
             (schema_res, snapshot_res?)
         } else {
@@ -420,7 +426,13 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                 .maybe_extract_schema(&path, &runtime_config, &environment)
                 .await;
             let snapshot_hash = self
-                .take_snapshot(&path, &runtime_config, &environment, mount_point)
+                .take_snapshot(
+                    &path,
+                    &runtime_config,
+                    &environment,
+                    mount_point,
+                    db_live_during_snapshot,
+                )
                 .await?;
             (schema_res, snapshot_hash)
         };
@@ -494,6 +506,7 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
         runtime_config: &Option<RuntimeConfig>,
         environment: &Option<EnvironmentConfig>,
         mount_point: Option<String>,
+        db_live_during_snapshot: bool,
     ) -> Result<String, CommitRepoError> {
         // 3. Prepare the database container for snapshotting (if present).
         let mut unpause_guard: Option<UnpauseGuard> = None;
@@ -536,7 +549,25 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                         paused_instance_id = Some(instance_id);
                     }
                     Err(ComputeError::PauseUnsupported(ref e)) => {
-                        if !unfrozen_snapshot_allowed() {
+                        if db_live_during_snapshot {
+                            // This runtime intentionally snapshots a *live* database
+                            // (`db_live_during_snapshot`) because its storage takes an
+                            // atomic, point-in-time snapshot — e.g. Kubernetes + a ZFS
+                            // CSI `VolumeSnapshot`. Combined with the CHECKPOINT already
+                            // issued by `prepare_for_snapshot`, that atomic snapshot is
+                            // crash-consistent WITHOUT freezing: on restore Postgres
+                            // heals any in-flight page write via WAL full-page-writes,
+                            // exactly as after a crash. So `pause()` being unsupported is
+                            // expected here, not an error — and the unfrozen-copy risk
+                            // guarded below only applies to NON-atomic, file-level copies
+                            // (a can't-freeze runtime on file storage), never to this one.
+                            tracing::debug!(
+                                instance = %instance_id,
+                                "pause unsupported but runtime snapshots live via an atomic \
+                                 storage snapshot (CHECKPOINT + atomic snapshot is \
+                                 crash-consistent); proceeding without freeze"
+                            );
+                        } else if !unfrozen_snapshot_allowed() {
                             return Err(CommitRepoError::Compute(ComputeError::PauseUnsupported(
                                 format!(
                                     "{e}. Refusing to snapshot an unfrozen database: \
@@ -552,15 +583,16 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                                      WAL replay on restore"
                                 ),
                             )));
+                        } else {
+                            tracing::warn!(
+                                error = %e,
+                                instance = %instance_id,
+                                "container pause unavailable (cgroup v1 or rootless runtime); \
+                                 proceeding with UNFROZEN snapshot per GFS_ALLOW_UNFROZEN_SNAPSHOT — \
+                                 snapshot is NOT crash-consistent and may contain torn pages and \
+                                 half-applied WAL; restore may require manual recovery"
+                            );
                         }
-                        tracing::warn!(
-                            error = %e,
-                            instance = %instance_id,
-                            "container pause unavailable (cgroup v1 or rootless runtime); \
-                             proceeding with UNFROZEN snapshot per GFS_ALLOW_UNFROZEN_SNAPSHOT — \
-                             snapshot is NOT crash-consistent and may contain torn pages and \
-                             half-applied WAL; restore may require manual recovery"
-                        );
                         // No unpause guard: nothing was paused.
                     }
                     Err(e) => return Err(CommitRepoError::Compute(e)),
@@ -1021,6 +1053,9 @@ mod tests {
         /// When set, `pause()` returns `ComputeError::Internal` with this message
         /// instead of succeeding (simulates cgroup v1 / rootless Podman).
         pause_fails_with: Option<String>,
+        /// Reported via `capabilities()`. `true` models an atomic-snapshot runtime
+        /// (e.g. Kubernetes + ZFS `VolumeSnapshot`) that snapshots a live database.
+        db_live_during_snapshot: bool,
     }
 
     impl Default for MockCompute {
@@ -1033,6 +1068,7 @@ mod tests {
                 stream_snapshot_fail_message: Mutex::new(None),
                 stream_snapshot_calls: AtomicUsize::new(0),
                 pause_fails_with: None,
+                db_live_during_snapshot: false,
             }
         }
     }
@@ -1099,6 +1135,15 @@ mod tests {
             _: LogsOptions,
         ) -> crate::ports::compute::Result<Vec<LogEntry>> {
             Ok(vec![])
+        }
+        async fn capabilities(
+            &self,
+        ) -> crate::ports::compute::Result<crate::ports::compute::ComputeCapabilities> {
+            Ok(crate::ports::compute::ComputeCapabilities {
+                supports_stream_snapshot: false,
+                supports_exec_as_root: false,
+                db_live_during_snapshot: self.db_live_during_snapshot,
+            })
         }
         async fn pause(&self, id: &InstanceId) -> crate::ports::compute::Result<InstanceStatus> {
             if let Some(ref msg) = self.pause_fails_with {
@@ -1993,6 +2038,69 @@ mod tests {
         assert!(
             !*compute.unpaused.lock().unwrap(),
             "unpause must not be called when pause was never issued"
+        );
+    }
+
+    /// Kubernetes (and any runtime reporting `db_live_during_snapshot`) takes an
+    /// atomic storage snapshot — a CSI/ZFS `VolumeSnapshot` — that is
+    /// crash-consistent WITHOUT a write-freeze (CHECKPOINT + atomic snapshot;
+    /// Postgres heals torn pages via WAL full-page-writes on restore). So
+    /// `pause()` returning `PauseUnsupported` there is EXPECTED, and the commit
+    /// must proceed WITHOUT `GFS_ALLOW_UNFROZEN_SNAPSHOT` — unlike the
+    /// podman/cgroup-v1 file-copy case, which still refuses.
+    #[tokio::test]
+    async fn commit_proceeds_when_pause_unsupported_on_atomic_snapshot_runtime() {
+        let compute = Arc::new(MockCompute {
+            state: InstanceState::Running,
+            pause_fails_with: Some(
+                "pause is not supported for kubernetes runtime (instance 'gfs-pg-1')".into(),
+            ),
+            db_live_during_snapshot: true,
+            ..Default::default()
+        });
+        let repo = MockRepository {
+            commit_hash: "k8scommit".into(),
+            current_commit: "prev".into(),
+            mount_point: Some("/vol/main".into()),
+            runtime_config: Some(RuntimeConfig {
+                runtime_provider: "kubernetes".into(),
+                runtime_version: "1.30".into(),
+                container_name: "gfs-pg-1".into(),
+            }),
+            environment: Some(EnvironmentConfig {
+                database_provider: "mock-db".into(),
+                database_version: "17".into(),
+                database_port: None,
+                display_name: None,
+            }),
+            ..Default::default()
+        };
+        let storage = Arc::new(MockStorage::new("snap-k8s"));
+        let registry = Arc::new(MockRegistry);
+
+        let uc = CommitRepoUseCase::new(Arc::new(repo), compute.clone(), storage, registry);
+        let result = uc
+            .run(
+                existing_repo_path(),
+                "k8s atomic snapshot commit".into(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "atomic-snapshot runtime must commit without a freeze or the opt-in flag; got: {result:?}"
+        );
+        assert!(
+            !*compute.paused.lock().unwrap(),
+            "pause must not be marked — the runtime reported it unsupported"
+        );
+        assert!(
+            !*compute.unpaused.lock().unwrap(),
+            "unpause must not be called when nothing was paused"
         );
     }
 
