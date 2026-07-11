@@ -100,21 +100,37 @@ BEGIN
     IF fref IS NULL THEN RETURN (SELECT c FROM gfs.cost c LIMIT 1); END IF;
     SELECT prod_load INTO pl FROM gfs.cost LIMIT 1;
 
-    t0 := clock_timestamp();
+    -- Warm the postgres_fdw connection first. The first remote call pays a one-time
+    -- connect + TLS handshake cost (often ~1s); measuring latency on it would inflate
+    -- the baseline so far that the later data probe's (duration - lat) underflows to
+    -- ~0 and the link looks free (issue #112). Discard this call's timing.
     EXECUTE format('SELECT 1 FROM %s LIMIT 1', fref);
+
+    t0 := clock_timestamp();
+    EXECUTE format('SELECT 1 FROM %s LIMIT 1', fref);   -- latency: warm round-trip
     t1 := clock_timestamp();
     lat := GREATEST(extract(epoch FROM t1 - t0), 1e-6);
 
-    t0 := clock_timestamp();                                   -- pull `sample` rows
-    EXECUTE format('SELECT count(*) FROM (SELECT * FROM %s LIMIT %s) s', fref, sample);
+    -- Pull `sample` rows of REAL column data over the link and time it. We must
+    -- reference every column or postgres_fdw column-prunes the foreign scan down to
+    -- `SELECT NULL FROM <src> LIMIT n`, transferring nothing and mismeasuring the
+    -- link as ~free (issue #112). Casting the whole row to text forces all columns
+    -- onto the wire; sum(octet_length(...)) is a cheap local sink the FDW cannot
+    -- push down past the LIMIT, so the timing reflects an actual download.
+    t0 := clock_timestamp();                                   -- pull `sample` rows (real bytes)
+    EXECUTE format('SELECT sum(octet_length(t::text)) FROM (SELECT * FROM %s LIMIT %s) t', fref, sample);
     t1 := clock_timestamp();
-    net_s := GREATEST(extract(epoch FROM t1 - t0) - lat, 1e-9) / GREATEST(sample * b, 1);
+    net_s := GREATEST(extract(epoch FROM t1 - t0) - lat, 0) / GREATEST(sample * b, 1);
+    net_s := GREATEST(net_s, 1e-10);   -- floor at a sane minimum (~10 GB/s); a degenerate
+                                       -- probe must never report the link as ~free and
+                                       -- stampede whole-table copies over a slow link.
 
     t0 := clock_timestamp();                                   -- source scans up to `sample` rows
     EXECUTE format('SELECT count(*) FROM (SELECT 1 FROM %s LIMIT %s) s', fref, sample);
     t1 := clock_timestamp();
     scanned := LEAST(sample::bigint, tr);
-    src_s := GREATEST(extract(epoch FROM t1 - t0) - lat, 1e-9) / GREATEST(scanned, 1);
+    src_s := GREATEST(extract(epoch FROM t1 - t0) - lat, 0) / GREATEST(scanned, 1);
+    src_s := GREATEST(src_s, 1e-9);    -- floor: the source never scans a row in < ~1ns.
 
     UPDATE gfs.cost SET net = net_s, source = src_s * pl, negligible = lat
       RETURNING * INTO r;
