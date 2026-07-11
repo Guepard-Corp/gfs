@@ -272,6 +272,25 @@ BEGIN
     EXCEPTION WHEN others THEN srows := 0; sbytes := 100;
     END;
 
+    -- A remote estimate of <= 1 row almost always means the SOURCE table was never
+    -- ANALYZEd (its reltuples is stale), NOT that it is genuinely tiny. Trusting it
+    -- makes the router treat a million-row table as negligible and whole-copy it on
+    -- first read over a slow link -- the same failure class as issue #112, from stale
+    -- stats instead of a bad probe. Get the REAL size with count(*), which postgres_fdw
+    -- pushes down to the source (one round-trip, no data transfer). Bound it with a
+    -- timeout so a giant un-analyzed table cannot stall the clone; on timeout/error
+    -- assume "large" so the router federates rather than eagerly copies.
+    IF srows <= 1 THEN
+        BEGIN
+            SET LOCAL statement_timeout = '30s';
+            EXECUTE format('SELECT count(*) FROM %s', source_ref) INTO srows;
+            srows := GREATEST(srows, 0);
+            SET LOCAL statement_timeout = '0';
+        EXCEPTION WHEN others THEN
+            srows := 100000000;   -- couldn't measure -> assume large (federate, never copy on first touch)
+        END;
+    END IF;
+
     INSERT INTO gfs.clone_source(relid, source_ref, key_col, chunk_kind, source_rows, row_bytes)
          VALUES (local, source_ref, key_col, kind, srows, sbytes)
     ON CONFLICT (relid)
