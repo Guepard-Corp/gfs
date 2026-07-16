@@ -100,21 +100,37 @@ BEGIN
     IF fref IS NULL THEN RETURN (SELECT c FROM gfs.cost c LIMIT 1); END IF;
     SELECT prod_load INTO pl FROM gfs.cost LIMIT 1;
 
-    t0 := clock_timestamp();
+    -- Warm the postgres_fdw connection first. The first remote call pays a one-time
+    -- connect + TLS handshake cost (often ~1s); measuring latency on it would inflate
+    -- the baseline so far that the later data probe's (duration - lat) underflows to
+    -- ~0 and the link looks free (issue #112). Discard this call's timing.
     EXECUTE format('SELECT 1 FROM %s LIMIT 1', fref);
+
+    t0 := clock_timestamp();
+    EXECUTE format('SELECT 1 FROM %s LIMIT 1', fref);   -- latency: warm round-trip
     t1 := clock_timestamp();
     lat := GREATEST(extract(epoch FROM t1 - t0), 1e-6);
 
-    t0 := clock_timestamp();                                   -- pull `sample` rows
-    EXECUTE format('SELECT count(*) FROM (SELECT * FROM %s LIMIT %s) s', fref, sample);
+    -- Pull `sample` rows of REAL column data over the link and time it. We must
+    -- reference every column or postgres_fdw column-prunes the foreign scan down to
+    -- `SELECT NULL FROM <src> LIMIT n`, transferring nothing and mismeasuring the
+    -- link as ~free (issue #112). Casting the whole row to text forces all columns
+    -- onto the wire; sum(octet_length(...)) is a cheap local sink the FDW cannot
+    -- push down past the LIMIT, so the timing reflects an actual download.
+    t0 := clock_timestamp();                                   -- pull `sample` rows (real bytes)
+    EXECUTE format('SELECT sum(octet_length(t::text)) FROM (SELECT * FROM %s LIMIT %s) t', fref, sample);
     t1 := clock_timestamp();
-    net_s := GREATEST(extract(epoch FROM t1 - t0) - lat, 1e-9) / GREATEST(sample * b, 1);
+    net_s := GREATEST(extract(epoch FROM t1 - t0) - lat, 0) / GREATEST(sample * b, 1);
+    net_s := GREATEST(net_s, 1e-10);   -- floor at a sane minimum (~10 GB/s); a degenerate
+                                       -- probe must never report the link as ~free and
+                                       -- stampede whole-table copies over a slow link.
 
     t0 := clock_timestamp();                                   -- source scans up to `sample` rows
     EXECUTE format('SELECT count(*) FROM (SELECT 1 FROM %s LIMIT %s) s', fref, sample);
     t1 := clock_timestamp();
     scanned := LEAST(sample::bigint, tr);
-    src_s := GREATEST(extract(epoch FROM t1 - t0) - lat, 1e-9) / GREATEST(scanned, 1);
+    src_s := GREATEST(extract(epoch FROM t1 - t0) - lat, 0) / GREATEST(scanned, 1);
+    src_s := GREATEST(src_s, 1e-9);    -- floor: the source never scans a row in < ~1ns.
 
     UPDATE gfs.cost SET net = net_s, source = src_s * pl, negligible = lat
       RETURNING * INTO r;
@@ -255,6 +271,25 @@ BEGIN
         BEGIN EXECUTE format('ALTER FOREIGN TABLE %s OPTIONS (DROP use_remote_estimate)', source_ref); EXCEPTION WHEN others THEN NULL; END;
     EXCEPTION WHEN others THEN srows := 0; sbytes := 100;
     END;
+
+    -- A remote estimate of <= 1 row almost always means the SOURCE table was never
+    -- ANALYZEd (its reltuples is stale), NOT that it is genuinely tiny. Trusting it
+    -- makes the router treat a million-row table as negligible and whole-copy it on
+    -- first read over a slow link -- the same failure class as issue #112, from stale
+    -- stats instead of a bad probe. Get the REAL size with count(*), which postgres_fdw
+    -- pushes down to the source (one round-trip, no data transfer). Bound it with a
+    -- timeout so a giant un-analyzed table cannot stall the clone; on timeout/error
+    -- assume "large" so the router federates rather than eagerly copies.
+    IF srows <= 1 THEN
+        BEGIN
+            SET LOCAL statement_timeout = '30s';
+            EXECUTE format('SELECT count(*) FROM %s', source_ref) INTO srows;
+            srows := GREATEST(srows, 0);
+            SET LOCAL statement_timeout = '0';
+        EXCEPTION WHEN others THEN
+            srows := 100000000;   -- couldn't measure -> assume large (federate, never copy on first touch)
+        END;
+    END IF;
 
     INSERT INTO gfs.clone_source(relid, source_ref, key_col, chunk_kind, source_rows, row_bytes)
          VALUES (local, source_ref, key_col, kind, srows, sbytes)
