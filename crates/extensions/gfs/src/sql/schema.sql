@@ -280,7 +280,7 @@ $$;
 -- the source, even aggregates).
 CREATE FUNCTION gfs.warm(local regclass)
 RETURNS bigint LANGUAGE plpgsql AS $$
-DECLARE src text; cols text; n bigint;
+DECLARE src text; cols text; ov text; n bigint; old_srr text; srcfrom text; rqual text; cdef text; oc text; arb text;
 BEGIN
     SELECT source_ref INTO src FROM gfs.clone_source WHERE relid = local;
     IF src IS NULL OR to_regclass(src) IS NULL THEN
@@ -289,13 +289,72 @@ BEGIN
     SELECT string_agg(quote_ident(attname), ', ' ORDER BY attnum) INTO cols
       FROM pg_attribute
      WHERE attrelid = local AND attnum > 0 AND NOT attisdropped AND attgenerated = '';
+    -- Inheritance parent (mirrored from the source by the schema replay): warm ONLY
+    -- its own rows. postgres_fdw cannot deparse ONLY (the foreign scan would include
+    -- child rows, which the clone's inheritance scan then reads AGAIN from the warmed
+    -- children), so read through dblink with an explicit FROM ONLY against the real
+    -- source-side table behind the foreign table.
+    IF EXISTS (SELECT 1 FROM pg_inherits i JOIN pg_class pc ON pc.oid = i.inhparent
+                WHERE i.inhparent = local AND pc.relkind = 'r') THEN
+        SELECT format('%I.%I',
+                      COALESCE((SELECT option_value FROM pg_options_to_table(ft.ftoptions) WHERE option_name = 'schema_name'), n.nspname),
+                      COALESCE((SELECT option_value FROM pg_options_to_table(ft.ftoptions) WHERE option_name = 'table_name'), c.relname))
+          INTO rqual
+          FROM pg_foreign_table ft
+          JOIN pg_class c ON c.oid = ft.ftrelid
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE ft.ftrelid = to_regclass(src);
+        SELECT string_agg(quote_ident(attname) || ' ' || format_type(atttypid, atttypmod), ', ' ORDER BY attnum)
+          INTO cdef
+          FROM pg_attribute
+         WHERE attrelid = local AND attnum > 0 AND NOT attisdropped AND attgenerated = '';
+        srcfrom := format('dblink(''gfs_remote_srv'', %L) AS s(%s)',
+                          format('SELECT %s FROM ONLY %s', cols, rqual), cdef);
+    ELSE
+        srcfrom := src || ' s';
+    END IF;
+    -- A GENERATED ALWAYS AS IDENTITY column rejects an explicit value on a plain
+    -- INSERT; OVERRIDING SYSTEM VALUE lets us copy the source's own key faithfully.
+    SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_attribute
+                              WHERE attrelid = local AND attidentity = 'a')
+                THEN 'OVERRIDING SYSTEM VALUE ' ELSE '' END INTO ov;
+    -- Target-less ON CONFLICT is refused when the table has a DEFERRABLE unique or
+    -- exclusion constraint (they cannot arbitrate) -- warming would error. Name an
+    -- explicit arbiter instead: a non-deferrable, non-partial, non-expression unique
+    -- index (primary key preferred). Re-pulled source rows match on ANY unique
+    -- index, so one arbiter is enough to keep warming idempotent.
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = local
+                AND contype IN ('p','u','x') AND condeferrable) THEN
+        SELECT '(' || string_agg(quote_ident(a.attname), ', ' ORDER BY k.ord) || ')' INTO arb
+          FROM pg_index i
+          JOIN LATERAL unnest(i.indkey::int[]) WITH ORDINALITY AS k(attnum, ord) ON true
+          JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+         WHERE i.indrelid = local AND i.indisunique AND i.indimmediate
+           AND i.indpred IS NULL AND 0 <> ALL (i.indkey::int[])
+         GROUP BY i.indexrelid, i.indisprimary, i.indnkeyatts
+         ORDER BY i.indisprimary DESC, i.indnkeyatts ASC, i.indexrelid LIMIT 1;
+        IF arb IS NULL THEN
+            RAISE EXCEPTION 'gfs.warm: % has only DEFERRABLE unique constraints -- no usable ON CONFLICT arbiter', local;
+        END IF;
+        oc := format('ON CONFLICT %s DO NOTHING', arb);
+    ELSE
+        oc := 'ON CONFLICT DO NOTHING';
+    END IF;
+    -- Warming replays the SOURCE's already-computed rows, so a replayed INSERT trigger
+    -- must NOT fire on them (it would re-mutate the row or re-run side effects, diverging
+    -- the clone from the source). Copy in the 'replica' role -- how logical replication
+    -- applies rows, skipping user triggers -- then restore the prior role (SET LOCAL, so
+    -- it also resets at txn end) so later writes fire their triggers normally.
+    old_srr := current_setting('session_replication_role');
+    PERFORM set_config('session_replication_role', 'replica', true);
     -- Exclude locally-deleted rows so warming never resurrects a copy-on-write DELETE.
-    EXECUTE format('INSERT INTO %s (%s) SELECT %s FROM %s s
+    EXECUTE format('INSERT INTO %s (%s) %sSELECT %s FROM %s
                     WHERE NOT EXISTS (SELECT 1 FROM gfs.tombstone tb
                                        WHERE tb.relid = %L::regclass AND to_jsonb(s) @> tb.pk)
-                    ON CONFLICT DO NOTHING',
-                   local::text, cols, cols, src, local::text);
+                    %s',
+                   local::text, cols, ov, cols, srcfrom, local::text, oc);
     GET DIAGNOSTICS n = ROW_COUNT;
+    PERFORM set_config('session_replication_role', old_srr, true);
     EXECUTE format('ANALYZE %s', local::text);
     UPDATE gfs.clone_source SET whole_cached = true WHERE relid = local;
     UPDATE gfs.clone_stats

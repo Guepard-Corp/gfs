@@ -242,6 +242,212 @@ BEGIN
 END
 $fn$;
 
+-- Replicate each local sequence's CURRENT POSITION from the source. The faithful
+-- schema replay (`pg_dump --schema-only`) emits `CREATE SEQUENCE` but NOT the
+-- sequence position (`setval` lives in pg_dump's data section, which a schema-only
+-- dump omits), so every local sequence restarts at its initial value (typically 1).
+-- A source serial/identity/standalone sequence advanced past its start would then
+-- hand out values that COLLIDE with rows already materialized on the clone. For
+-- each local sequence (relkind='S' — catches serial-owned, identity-owned, and
+-- standalone sequences) we read the matching source sequence's `last_value` and
+-- `is_called` straight off the sequence relation via dblink (NOT pg_sequences,
+-- whose last_value is NULL/permission-sensitive) and setval() the local one to
+-- match. Per-sequence failures warn loudly rather than abort: a clone with one
+-- un-synced sequence is recoverable; an aborted clone is not. A sequence absent on
+-- the source (local-only) is simply skipped.
+CREATE OR REPLACE FUNCTION gfs_sync.replicate_sequences(p_conn text, p_schemas text[])
+RETURNS void
+LANGUAGE plpgsql AS $fn$
+DECLARE
+  seqrec record;
+  src    record;
+  fq     text;
+BEGIN
+  FOR seqrec IN
+    SELECT n.nspname::text AS nsp, c.relname::text AS seq
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind = 'S' AND n.nspname = ANY (p_schemas)
+  LOOP
+    fq := format('%I.%I', seqrec.nsp, seqrec.seq);
+    BEGIN
+      -- Read the source sequence's current state directly off the relation. A
+      -- regclass cast on the source guards a sequence that exists locally but not
+      -- remotely: dblink raises, we catch and skip below.
+      SELECT * INTO src FROM dblink(p_conn, format(
+          'SELECT last_value, is_called FROM %s', fq))
+        AS r(last_value bigint, is_called boolean);
+      IF src.last_value IS NOT NULL THEN
+        PERFORM setval(fq::regclass, src.last_value, src.is_called);
+      END IF;
+    EXCEPTION WHEN others THEN
+      RAISE WARNING 'gfs: could not replicate sequence value for % (%): inserts on the clone may collide with materialized rows', fq, SQLERRM;
+    END;
+  END LOOP;
+END
+$fn$;
+
+-- Safeguard: a partitioned table must NEVER be silently dropped from the clone.
+-- A partitioned PARENT (relkind='p') holds no rows and is skipped by the table
+-- enumeration and the copy-on-read registration (both relkind='r'); it needs no
+-- registration of its own because the faithful replay re-creates it and a query on
+-- the parent prunes to its leaf partitions. Each LEAF partition (relkind='r') is an
+-- ordinary table that the relkind='r' path above imports and registers like any
+-- other table — that is how copy-on-read is wired for partitions. The risk is a
+-- leaf that does NOT round-trip: it has no usable unique key (so the keycol query
+-- skips it), or it failed to import / replay. The current code would leave that
+-- leaf as an empty, unregistered local heap and the clone would silently return no
+-- rows for that slice of the partitioned table. This function enumerates the
+-- SOURCE's partitioned tables and their leaf partitions (pg_partition_tree, so it
+-- also covers multi-level subpartitions), then asserts every leaf is locally
+-- present AND registered as a copy-on-read clone. Any gap RAISEs (fatal under
+-- ON_ERROR_STOP) naming the offending partitioned table, so a partitioned table is
+-- never silently dropped — it either round-trips fully or fails the clone loudly.
+CREATE OR REPLACE FUNCTION gfs_sync.verify_partitions(p_conn text, p_schemas text[])
+RETURNS void
+LANGUAGE plpgsql AS $fn$
+DECLARE
+  schlist  text;
+  leaf     record;
+  leaf_fq  text;
+  problems text[] := ARRAY[]::text[];
+BEGIN
+  schlist := (SELECT string_agg(quote_literal(x), ', ') FROM unnest(p_schemas) AS x);
+
+  FOR leaf IN SELECT * FROM dblink(p_conn, format($q$
+      SELECT pn.nspname::text AS parent_nsp, pc.relname::text AS parent_tab,
+             ln.nspname::text AS leaf_nsp,   lc.relname::text AS leaf_tab
+      FROM pg_class pc
+      JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+      CROSS JOIN LATERAL pg_partition_tree(pc.oid) pt
+      JOIN pg_class lc     ON lc.oid = pt.relid AND pt.isleaf
+      JOIN pg_namespace ln ON ln.oid = lc.relnamespace
+      WHERE pc.relkind = 'p' AND pn.nspname IN (%s)
+    $q$, schlist)) AS r(parent_nsp text, parent_tab text, leaf_nsp text, leaf_tab text)
+  LOOP
+    leaf_fq := format('%I.%I', leaf.leaf_nsp, leaf.leaf_tab);
+    IF to_regclass(leaf_fq) IS NULL THEN
+      problems := problems || format('%I.%I (partition %s missing locally)',
+                    leaf.parent_nsp, leaf.parent_tab, leaf_fq);
+    ELSIF NOT EXISTS (
+      SELECT 1 FROM gfs.clone_source WHERE relid = leaf_fq::regclass
+    ) THEN
+      problems := problems || format('%I.%I (partition %s not registered for copy-on-read; it likely lacks a usable unique key)',
+                    leaf.parent_nsp, leaf.parent_tab, leaf_fq);
+    END IF;
+  END LOOP;
+
+  IF array_length(problems, 1) > 0 THEN
+    RAISE EXCEPTION 'gfs: partitioned table(s) did not fully round-trip onto the clone: %. Refusing to leave them silently empty.',
+      array_to_string(problems, '; ');
+  END IF;
+END
+$fn$;
+
+-- Bug B safeguard: a source table with no usable unique key is skipped by the keycol
+-- query in clone() (it needs a unique, non-deferrable, non-partial, non-expression
+-- index -- a DEFERRABLE-only table cannot arbitrate the hydration inserts), so it is
+-- never registered for copy-on-read and would be a SILENT empty heap on the clone
+-- (data loss, no error). Assert every ordinary (non-partition) source table is locally
+-- present AND registered; any gap RAISEs (fatal under ON_ERROR_STOP), naming the table.
+-- Leaf partitions are covered by verify_partitions. NOTE: until keyless whole-table
+-- hydration lands in the gfs extension, a primary-key-less table fails the clone loudly
+-- here rather than silently losing its rows.
+CREATE OR REPLACE FUNCTION gfs_sync.verify_tables_registered(p_conn text, p_schemas text[])
+RETURNS void
+LANGUAGE plpgsql AS $fn$
+DECLARE
+  schlist  text;
+  t        record;
+  fq       text;
+  problems text[] := ARRAY[]::text[];
+BEGIN
+  schlist := (SELECT string_agg(quote_literal(x), ', ') FROM unnest(p_schemas) AS x);
+  FOR t IN SELECT * FROM dblink(p_conn, format($q$
+      SELECT n.nspname::text AS nsp, c.relname::text AS tab
+      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE c.relkind = 'r' AND NOT c.relispartition AND n.nspname IN (%s)
+    $q$, schlist)) AS r(nsp text, tab text)
+  LOOP
+    fq := format('%I.%I', t.nsp, t.tab);
+    IF to_regclass(fq) IS NULL THEN
+      problems := problems || format('%s (missing locally)', fq);
+    ELSIF NOT EXISTS (SELECT 1 FROM gfs.clone_source WHERE relid = fq::regclass) THEN
+      problems := problems || format('%s (no usable unique key -- needs a unique, non-deferrable, non-partial, non-expression index -> not registered for copy-on-read; would silently return no rows)', fq);
+    END IF;
+  END LOOP;
+  IF array_length(problems, 1) > 0 THEN
+    RAISE EXCEPTION 'gfs: source table(s) did not register for copy-on-read onto the clone: %. Refusing to leave them silently empty.',
+      array_to_string(problems, '; ');
+  END IF;
+END
+$fn$;
+
+-- Bug C: the faithful pg_dump replay re-creates materialized views but leaves them
+-- unpopulated, so reading one errors "has not been populated". Refresh each local
+-- matview now that its base tables are registered for copy-on-read (the refresh reads
+-- the base tables, hydrating them). Two passes so a matview defined over another matview
+-- can still populate; a final failure warns rather than aborting the clone.
+CREATE OR REPLACE FUNCTION gfs_sync.refresh_matviews(p_schemas text[])
+RETURNS void
+LANGUAGE plpgsql AS $fn$
+DECLARE
+  mv       record;
+  base     record;
+  pass     int := 0;
+  progress boolean := true;
+BEGIN
+  -- Progress-based multi-pass (bounded): a matview built on another matview
+  -- populates on a later pass once its dependency has. Stop as soon as a pass
+  -- populates nothing new; cap at 20 as a termination backstop. (A fixed 2 passes
+  -- only covers a single level of matview-on-matview; the progress loop covers
+  -- arbitrarily deep chains.)
+  WHILE progress AND pass < 20 LOOP
+    progress := false;
+    pass := pass + 1;
+    FOR mv IN
+      SELECT schemaname, matviewname,
+             format('%I.%I', schemaname, matviewname)::regclass AS oid
+      FROM pg_matviews
+      WHERE schemaname = ANY(p_schemas) AND NOT ispopulated
+    LOOP
+      BEGIN
+        -- A matview on a lazy clone reads copy-on-read base tables that are not yet
+        -- materialized at bootstrap, so a bare REFRESH populates it from ZERO rows
+        -- (ispopulated=t but empty -- silently wrong). Fully materialize every
+        -- registered clone table this matview depends on (gfs.warm = committed FDW
+        -- copy; covers direct bases AND partition leaves) BEFORE the REFRESH so it
+        -- computes over real data.
+        FOR base IN
+          SELECT DISTINCT cs.relid::regclass AS rel
+          FROM pg_depend d
+          JOIN pg_rewrite rw ON rw.oid = d.objid AND rw.ev_class = mv.oid
+          JOIN gfs.clone_source cs
+            ON cs.relid = d.refobjid
+            OR cs.relid IN (SELECT inhrelid FROM pg_inherits WHERE inhparent = d.refobjid)
+          WHERE d.refclassid = 'pg_class'::regclass AND d.refobjid <> mv.oid
+        LOOP
+          PERFORM gfs.warm(base.rel);
+        END LOOP;
+        EXECUTE format('REFRESH MATERIALIZED VIEW %I.%I', mv.schemaname, mv.matviewname);
+        progress := true;   -- populated one; a later pass may now unblock a dependent
+      EXCEPTION WHEN OTHERS THEN
+        NULL;  -- not yet (e.g. a dependency matview still empty); retried next pass
+      END;
+    END LOOP;
+  END LOOP;
+  -- Anything still unpopulated after the loop warns loudly (base unavailable or the
+  -- definition failed) but does NOT abort the clone -- that matview just keeps the
+  -- pre-fix "REFRESH it manually" behavior.
+  FOR mv IN
+    SELECT schemaname, matviewname FROM pg_matviews
+    WHERE schemaname = ANY(p_schemas) AND NOT ispopulated
+  LOOP
+    RAISE WARNING 'gfs: could not populate materialized view %.% (REFRESH it manually)', mv.schemaname, mv.matviewname;
+  END LOOP;
+END
+$fn$;
+
 CREATE OR REPLACE FUNCTION gfs_sync.clone(p_conn text, p_schemas text[])
 RETURNS void
 LANGUAGE plpgsql AS $fn$
@@ -281,7 +487,7 @@ BEGIN
         JOIN pg_class c     ON c.oid = i.indrelid
         JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname IN (%s) AND c.relkind = 'r'
-          AND i.indisunique AND i.indpred IS NULL AND 0 <> ALL (i.indkey::int[])
+          AND i.indisunique AND i.indimmediate AND i.indpred IS NULL AND 0 <> ALL (i.indkey::int[])
       ) s WHERE rn = 1
     $q$, schlist)) AS r(nsp text, tab text, keycols text[])
   LOOP
@@ -292,6 +498,25 @@ BEGIN
     -- aborted.
     PERFORM gfs_sync.build_clone(rec.nsp, rec.tab, rec.keycols);
   END LOOP;
+
+  -- Inherit each local sequence's current position from the source so the clone
+  -- does not restart serial/identity/standalone sequences at 1 and collide with
+  -- already-materialized rows. Runs after the tables (and their owned sequences)
+  -- exist from the faithful replay.
+  PERFORM gfs_sync.replicate_sequences(p_conn, target_schemas);
+
+  -- Bug B safeguard: every ordinary source table must register for copy-on-read; a
+  -- table with no usable unique key would otherwise be a silent empty heap. Fail loud.
+  PERFORM gfs_sync.verify_tables_registered(p_conn, target_schemas);
+
+  -- Fail loudly if any partitioned table did not fully round-trip (a leaf missing
+  -- locally or not registered for copy-on-read), so a partitioned table is never
+  -- silently dropped from the clone. Runs last, after every table is registered.
+  PERFORM gfs_sync.verify_partitions(p_conn, target_schemas);
+
+  -- Bug C: populate materialized views (created empty by the faithful replay) now that
+  -- their base tables are registered for copy-on-read.
+  PERFORM gfs_sync.refresh_matviews(target_schemas);
 END
 $fn$;
 
