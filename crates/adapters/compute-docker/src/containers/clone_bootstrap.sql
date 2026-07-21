@@ -534,3 +534,16 @@ EXCEPTION WHEN others THEN
   RAISE NOTICE 'gfs: cost calibration skipped (%)', SQLERRM;
 END
 $cal$;
+
+-- Record where the source is right now (WAL position + per-table write counters).
+-- A copy-on-read clone is only a consistent point in time while the source holds
+-- still; this baseline is what lets gfs.source_changed() / gfs.source_drift()
+-- later tell the user the source moved instead of silently serving a torn view.
+-- Best-effort: a clone without a baseline still works, it just cannot detect drift.
+DO $drift$
+BEGIN
+  PERFORM gfs.capture_source_baseline();
+EXCEPTION WHEN others THEN
+  RAISE NOTICE 'gfs: source drift baseline not captured (%)', SQLERRM;
+END
+$drift$;
