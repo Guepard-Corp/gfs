@@ -143,40 +143,96 @@ COMMENT ON FUNCTION gfs.calibrate(int) IS
 -- SOURCE DRIFT GUARD ---------------------------------------------------------
 -- A copy-on-read clone fetches each table the FIRST time it is read, so tables
 -- arrive at different moments. That is only safe while the source holds still.
--- If the source is written to during the clone's life, the clone ends up mixing
--- tables captured at different points in time (already-fetched data is frozen at
--- fetch time; not-yet-fetched data reflects later writes), producing a state that
--- never existed at the source: e.g. 1,000,000 orders but payments for 1,050,000.
+-- If the source is written to during the clone's life, the clone mixes tables
+-- captured at different points in time, producing a state that never existed at
+-- the source (e.g. 1,000,000 orders but payments for 1,050,000).
 --
--- Postgres cannot cheaply serve "this table AS OF clone time" for a clone that
--- lives for days, so we cannot PREVENT this on a live primary. What we can do
--- reliably is DETECT it and say so, instead of silently serving mismatched data.
--- We record where the source was at clone time and compare on demand.
+-- Postgres cannot cheaply serve "this table AS OF clone time" for a long-lived
+-- clone, so this cannot be PREVENTED on a live primary. It can be DETECTED.
+-- Everything below is OBSERVATION ONLY: it never touches the read path, so it
+-- cannot change the result of any query.
+--
+-- Detection uses three signals, with deliberately different trust levels:
+--   * WAL position   -- NEVER misses a change (safe), but cannot attribute it.
+--   * write counters -- attribute change to a table, but MISS truncate/rewrite.
+--   * schema digests -- the only way to see DDL (it moves no row counter).
+-- Hence the load-bearing rule: WAL moved but nothing attributed means
+-- "changed, unattributed" and every materialized table is suspect. It must
+-- never be read as "nothing changed".
 CREATE TABLE gfs.source_baseline (
-    lsn         text        NOT NULL,   -- source WAL position at clone time
+    lsn         text        NOT NULL,   -- source WAL position when captured
     captured_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 COMMENT ON TABLE gfs.source_baseline IS 'Where the source was when this clone was created (drift detection)';
 
 CREATE TABLE gfs.source_table_baseline (
-    relid  regclass PRIMARY KEY REFERENCES gfs.clone_source(relid) ON DELETE CASCADE,
-    writes bigint NOT NULL       -- source n_tup_ins+upd+del at clone time
+    relid    regclass PRIMARY KEY REFERENCES gfs.clone_source(relid) ON DELETE CASCADE,
+    writes   bigint NOT NULL DEFAULT 0,  -- n_tup_ins+upd+del on the source
+    live_tup bigint NOT NULL DEFAULT 0,  -- n_live_tup: catches TRUNCATE, which moves no counter
+    src_fp   text,                       -- digest of the SOURCE table's columns
+    ft_fp    text,                       -- digest of our FOREIGN TABLE declaration
+    loc_fp   text                        -- digest of our LOCAL table
 );
-COMMENT ON TABLE gfs.source_table_baseline IS 'Per-table source write counters at clone time (drift detection)';
+COMMENT ON TABLE gfs.source_table_baseline IS 'Per-table source counters + schema digests at clone time';
 
--- Map each clone table to its real name ON THE SOURCE, taken from the foreign
--- table's own options rather than the gfs_remote_<schema> naming convention.
+-- Map each clone table to its real name ON THE SOURCE, from the foreign table's
+-- own options rather than the gfs_remote_<schema> naming convention.
 CREATE VIEW gfs.source_map AS
 SELECT cs.relid,
+       to_regclass(cs.source_ref) AS ftrel,
        (SELECT option_value FROM pg_options_to_table(ft.ftoptions) WHERE option_name = 'schema_name') AS src_schema,
        (SELECT option_value FROM pg_options_to_table(ft.ftoptions) WHERE option_name = 'table_name')  AS src_table
   FROM gfs.clone_source cs
   JOIN pg_foreign_table ft ON ft.ftrelid = to_regclass(cs.source_ref);
 COMMENT ON VIEW gfs.source_map IS 'clone table -> its schema/table name on the source';
 
--- Current source WAL position. Works on a primary or a standby. dblink connects
--- by FOREIGN SERVER NAME, reusing gfs_remote_srv + the PUBLIC user mapping, so no
--- credentials are duplicated here. Requires no superuser rights on the source.
+-- Column digest of ANY local relation (local table or foreign table). The SAME
+-- formula is evaluated on the source inside gfs.source_probe(), so the three
+-- digests are directly comparable.
+CREATE FUNCTION gfs.relation_fp(p_rel regclass) RETURNS text LANGUAGE sql STABLE AS $$
+    SELECT md5(string_agg(a.attname || ':' || format_type(a.atttypid, a.atttypmod)
+                          || ':' || a.attnotnull::text, ',' ORDER BY a.attnum))
+      FROM pg_attribute a
+     WHERE a.attrelid = p_rel AND a.attnum > 0 AND NOT a.attisdropped;
+$$;
+COMMENT ON FUNCTION gfs.relation_fp(regclass) IS 'Column digest of a relation (comparable across clone and source)';
+
+-- ONE round trip returning WAL position + per-table counters + schema digests.
+-- It is a single statement, so all three are read from ONE source snapshot: a
+-- verdict assembled from separate round trips would be internally inconsistent
+-- (the source can move between them). dblink connects by FOREIGN SERVER NAME,
+-- reusing gfs_remote_srv + the PUBLIC mapping, so no credentials are duplicated
+-- and no superuser rights on the source are needed.
+CREATE FUNCTION gfs.source_probe() RETURNS jsonb LANGUAGE plpgsql AS $$
+DECLARE t text;
+BEGIN
+    SELECT probe INTO t FROM dblink('gfs_remote_srv', $q$
+      SELECT json_build_object(
+        'lsn', (CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn()
+                     ELSE pg_current_wal_lsn() END)::text,
+        'tables', COALESCE((SELECT json_agg(x) FROM (
+              SELECT schemaname AS s, relname AS r,
+                     (n_tup_ins + n_tup_upd + n_tup_del)::bigint AS w,
+                     n_live_tup::bigint AS l
+                FROM pg_stat_user_tables) x), '[]'::json),
+        'schema', COALESCE((SELECT json_agg(y) FROM (
+              SELECT n.nspname AS s, c.relname AS r,
+                     md5(string_agg(a.attname || ':' || format_type(a.atttypid, a.atttypmod)
+                                    || ':' || a.attnotnull::text, ',' ORDER BY a.attnum)) AS fp
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+               WHERE c.relkind IN ('r','p')
+                 AND n.nspname NOT IN ('pg_catalog','information_schema')
+               GROUP BY 1,2) y), '[]'::json)
+      )::text
+    $q$) AS d(probe text);
+    RETURN t::jsonb;
+END;
+$$;
+COMMENT ON FUNCTION gfs.source_probe() IS 'One round trip: source WAL position, per-table counters and schema digests, from a single snapshot';
+
+-- Current source WAL position. The cheap signal, used by gfs.source_changed().
 CREATE FUNCTION gfs.source_lsn() RETURNS text LANGUAGE plpgsql AS $$
 DECLARE l text;
 BEGIN
@@ -186,35 +242,38 @@ BEGIN
     RETURN l;
 END;
 $$;
-COMMENT ON FUNCTION gfs.source_lsn() IS 'Current WAL position of the source (via dblink over gfs_remote_srv)';
+COMMENT ON FUNCTION gfs.source_lsn() IS 'Current WAL position of the source (cheap change signal)';
 
 -- Record where the source is now. Called once at clone time by the bootstrap.
 CREATE FUNCTION gfs.capture_source_baseline() RETURNS void LANGUAGE plpgsql AS $$
+DECLARE p jsonb;
 BEGIN
-    DELETE FROM gfs.source_baseline;
-    INSERT INTO gfs.source_baseline(lsn) VALUES (gfs.source_lsn());
+    p := gfs.source_probe();
 
-    -- One round-trip for every table's write counters, matched to our registered
-    -- tables by (schema, table). A table missing from the source's stats view
-    -- baselines at 0, which is still a valid starting point for a delta.
+    DELETE FROM gfs.source_baseline;
+    INSERT INTO gfs.source_baseline(lsn) VALUES (p->>'lsn');
+
     DELETE FROM gfs.source_table_baseline;
-    INSERT INTO gfs.source_table_baseline(relid, writes)
-    SELECT m.relid, COALESCE(s.writes, 0)
+    INSERT INTO gfs.source_table_baseline(relid, writes, live_tup, src_fp, ft_fp, loc_fp)
+    SELECT m.relid,
+           COALESCE(st.w, 0), COALESCE(st.l, 0), sc.fp,
+           gfs.relation_fp(m.ftrel), gfs.relation_fp(m.relid)
       FROM gfs.source_map m
-      LEFT JOIN dblink('gfs_remote_srv',
-                'SELECT schemaname, relname, (n_tup_ins + n_tup_upd + n_tup_del)::bigint
-                   FROM pg_stat_user_tables')
-                AS s(schemaname text, relname text, writes bigint)
-        ON s.schemaname = m.src_schema AND s.relname = m.src_table;
+      LEFT JOIN LATERAL (
+            SELECT (e->>'w')::bigint AS w, (e->>'l')::bigint AS l
+              FROM jsonb_array_elements(p->'tables') e
+             WHERE e->>'s' = m.src_schema AND e->>'r' = m.src_table) st ON true
+      LEFT JOIN LATERAL (
+            SELECT e->>'fp' AS fp
+              FROM jsonb_array_elements(p->'schema') e
+             WHERE e->>'s' = m.src_schema AND e->>'r' = m.src_table) sc ON true;
 END;
 $$;
-COMMENT ON FUNCTION gfs.capture_source_baseline() IS
-  'Record the source WAL position + per-table write counters at clone time';
+COMMENT ON FUNCTION gfs.capture_source_baseline() IS 'Record the source WAL position, per-table counters and schema digests at clone time';
 
--- Cheap yes/no: has the source moved at all since this clone was created? One
--- tiny round-trip. FALSE is a hard guarantee (the WAL position is unchanged, so
--- nothing was written); TRUE means something changed, use gfs.source_drift() to
--- see which tables. NULL means we have no baseline to compare against.
+-- Cheap yes/no: has the source moved at all? One tiny round trip. FALSE is a
+-- hard guarantee (the WAL position is unchanged, so nothing was written); NULL
+-- means we have no baseline to compare against.
 CREATE FUNCTION gfs.source_changed() RETURNS boolean LANGUAGE plpgsql AS $$
 DECLARE base text;
 BEGIN
@@ -223,50 +282,95 @@ BEGIN
     RETURN gfs.source_lsn() IS DISTINCT FROM base;
 END;
 $$;
-COMMENT ON FUNCTION gfs.source_changed() IS
-  'TRUE if the source has been written to since this clone was created (FALSE is a guarantee it has not)';
+COMMENT ON FUNCTION gfs.source_changed() IS 'TRUE if the source was written to since clone time (FALSE is a guarantee it was not)';
 
--- Which tables changed on the source since clone time, and by how much. Returns
--- no rows when the source is provably untouched. A NEGATIVE new_writes means the
--- source's stats counters were reset, so the delta is unknowable: treat that as
--- "changed, amount unknown" rather than as a decrease.
+-- What changed on the source since clone time, and of what kind.
+--   kind='data'            row counters or live-row count moved
+--   kind='schema'          the source table's columns changed since clone time
+--   kind='schema_mismatch' our foreign table no longer matches the source, so
+--                          queries REFERENCING the differing columns will ERROR
+--                          (measured: count(*) still works, SELECT * does not)
+--   kind='unattributed' the WAL moved but no table accounts for it (TRUNCATE,
+--                        VACUUM FULL, DDL elsewhere) -- every materialized
+--                        table must be treated as suspect
+-- Returns no rows when the source is provably untouched.
 CREATE FUNCTION gfs.source_drift()
-RETURNS TABLE(src_table text, writes_at_clone bigint, writes_now bigint, new_writes bigint)
+RETURNS TABLE(kind text, src_table text, detail text)
 LANGUAGE plpgsql AS $$
-DECLARE base text; cur text; hits int;
+DECLARE base text; p jsonb; cur text; attributed int := 0;
 BEGIN
     SELECT lsn INTO base FROM gfs.source_baseline LIMIT 1;
     IF base IS NULL THEN
-        RAISE WARNING 'gfs: no source baseline recorded; cannot tell whether the source changed since clone time';
+        RAISE WARNING 'gfs: no source baseline recorded; cannot tell whether the source changed';
         RETURN;
     END IF;
-    cur := gfs.source_lsn();
+
+    p   := gfs.source_probe();
+    cur := p->>'lsn';
     IF cur IS NOT DISTINCT FROM base THEN
-        RETURN;   -- source provably untouched: the clone is a consistent point in time
+        RETURN;   -- provably untouched: this clone is a consistent point in time
     END IF;
 
-    RETURN QUERY
-    SELECT m.src_schema || '.' || m.src_table,
-           b.writes,
-           COALESCE(s.writes, 0),
-           COALESCE(s.writes, 0) - b.writes
-      FROM gfs.source_table_baseline b
-      JOIN gfs.source_map m ON m.relid = b.relid
-      LEFT JOIN dblink('gfs_remote_srv',
-                'SELECT schemaname, relname, (n_tup_ins + n_tup_upd + n_tup_del)::bigint
-                   FROM pg_stat_user_tables')
-                AS s(schemaname text, relname text, writes bigint)
-        ON s.schemaname = m.src_schema AND s.relname = m.src_table
-     WHERE COALESCE(s.writes, 0) <> b.writes
-     ORDER BY COALESCE(s.writes, 0) - b.writes DESC;
+    CREATE TEMP TABLE IF NOT EXISTS gfs_drift_now (
+        kind text, src_table text, detail text) ON COMMIT DROP;
+    DELETE FROM gfs_drift_now;
 
-    GET DIAGNOSTICS hits = ROW_COUNT;
-    RAISE WARNING 'gfs: the source has changed since this clone was created (WAL % -> %, % table(s) written). This clone may mix data from different points in time; tables already materialized are frozen at fetch time while unfetched tables will reflect the newer source.',
-        base, cur, hits;
+    INSERT INTO gfs_drift_now(kind, src_table, detail)
+    SELECT d.kind, q.tbl, d.detail FROM (
+        SELECT m.src_schema || '.' || m.src_table AS tbl,
+               b.writes, b.live_tup, b.src_fp,
+               COALESCE(st.w, 0) AS w_now, COALESCE(st.l, 0) AS l_now,
+               sc.fp AS fp_now,
+               gfs.relation_fp(m.ftrel) AS ft_fp_now
+          FROM gfs.source_table_baseline b
+          JOIN gfs.source_map m ON m.relid = b.relid
+          LEFT JOIN LATERAL (
+                SELECT (e->>'w')::bigint AS w, (e->>'l')::bigint AS l
+                  FROM jsonb_array_elements(p->'tables') e
+                 WHERE e->>'s' = m.src_schema AND e->>'r' = m.src_table) st ON true
+          LEFT JOIN LATERAL (
+                SELECT e->>'fp' AS fp
+                  FROM jsonb_array_elements(p->'schema') e
+                 WHERE e->>'s' = m.src_schema AND e->>'r' = m.src_table) sc ON true
+    ) q
+    CROSS JOIN LATERAL (VALUES
+        ('data',
+         CASE WHEN q.w_now <> q.writes OR q.l_now <> q.live_tup
+              THEN format('writes %s -> %s, live rows %s -> %s',
+                          q.writes, q.w_now, q.live_tup, q.l_now) END),
+        ('schema',
+         CASE WHEN q.fp_now IS DISTINCT FROM q.src_fp
+              THEN 'the source table''s columns changed since clone time' END),
+        -- NOTE (measured): a column mismatch does NOT break federation wholesale.
+        -- postgres_fdw only sends the columns a query actually references, so
+        -- count(*) still succeeds while SELECT * or any reference to a changed
+        -- column fails with 'column ... does not exist'. Degradation is partial.
+        ('schema_mismatch',
+         CASE WHEN q.fp_now IS DISTINCT FROM q.ft_fp_now
+              THEN 'our foreign table no longer matches the source: queries referencing the differing columns will ERROR (queries touching none of them still work)' END)
+    ) AS d(kind, detail)
+    WHERE d.detail IS NOT NULL;
+
+    -- Only BASELINE-RELATIVE findings explain this WAL movement. 'schema_mismatch'
+    -- is a STANDING hazard (source vs our foreign table), which persists across
+    -- checks and would otherwise mask a genuinely unattributed change.
+    SELECT count(*) INTO attributed FROM gfs_drift_now g WHERE g.kind IN ('data','schema');
+
+    IF attributed = 0 THEN
+        -- WAL moved but nothing accounts for it. TRUNCATE and table rewrites
+        -- move no row counter, so this is NOT "nothing changed": treat every
+        -- materialized table as suspect. Failing safe is the whole point.
+        INSERT INTO gfs_drift_now(kind, src_table, detail)
+        VALUES ('unattributed', '(all materialized tables)',
+                format('source moved (WAL %s -> %s) but no table accounts for it; treat every copied table as suspect', base, cur));
+    END IF;
+
+    RAISE WARNING 'gfs: the source changed since this clone was created (WAL % -> %). This clone may mix data from different points in time.', base, cur;
+    RETURN QUERY SELECT g.kind, g.src_table, g.detail FROM gfs_drift_now g ORDER BY g.kind, g.src_table;
 END;
 $$;
 COMMENT ON FUNCTION gfs.source_drift() IS
-  'Tables written on the source since clone time (empty = source untouched); warns when the clone may be a torn view';
+  'What changed on the source since clone time (empty = untouched); kinds: data, schema, unfederatable, unattributed';
 
 CREATE TABLE gfs.cached (
     relid regclass NOT NULL REFERENCES gfs.clone_source(relid) ON DELETE CASCADE,
