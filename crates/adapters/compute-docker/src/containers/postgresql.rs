@@ -649,12 +649,16 @@ impl DatabaseProvider for PostgresqlProvider {
 
     fn drop_role_command(&self, username: &str) -> std::result::Result<String, ProviderError> {
         let ident = pg_quote_ident(username)?;
-        // `DROP OWNED BY` first: it removes the role's grants — including the
-        // `ALTER DEFAULT PRIVILEGES` entries a preset created — and objects it
-        // owns, so `DROP ROLE` no longer fails with "objects depend on it".
+        // Non-destructive drop. `REASSIGN OWNED` first hands every object the
+        // role owns (tables, sequences, …) to the management role executing this
+        // — so dropping a user NEVER deletes its data, unlike a bare
+        // `DROP OWNED`/cascade. `DROP OWNED` then clears what's left: the role's
+        // granted privileges and the `ALTER DEFAULT PRIVILEGES` entries a preset
+        // created (it now owns no objects, so nothing is destroyed). `DROP ROLE`
+        // then succeeds instead of failing with "objects depend on it".
         // Transactional so a partial drop can't leave a half-removed role.
         self.query_in_instance_command(&format!(
-            "BEGIN;\nDROP OWNED BY {ident};\nDROP ROLE {ident};\nCOMMIT;"
+            "BEGIN;\nREASSIGN OWNED BY {ident} TO CURRENT_USER;\nDROP OWNED BY {ident};\nDROP ROLE {ident};\nCOMMIT;"
         ))
     }
 
@@ -1265,10 +1269,19 @@ mod tests {
         let provider = PostgresqlProvider::new();
         let drop = provider.drop_role_command("app_ro").unwrap();
         assert!(
+            drop.contains(r#"REASSIGN OWNED BY "app_ro" TO CURRENT_USER;"#),
+            "must reassign owned objects before dropping so no data is destroyed"
+        );
+        assert!(
             drop.contains(r#"DROP OWNED BY "app_ro";"#),
-            "must clean up grants first"
+            "must clean up grants after reassigning objects"
         );
         assert!(drop.contains(r#"DROP ROLE "app_ro";"#));
+        // REASSIGN must precede DROP OWNED, else owned tables would be destroyed.
+        assert!(
+            drop.find("REASSIGN OWNED").unwrap() < drop.find("DROP OWNED").unwrap(),
+            "REASSIGN must run before DROP OWNED"
+        );
         assert!(provider.drop_role_command("bad name").is_err());
         let alter = provider.alter_password_command("app_ro", "new'pw").unwrap();
         assert!(alter.contains(r#"ALTER ROLE "app_ro" WITH PASSWORD 'new''pw';"#));
