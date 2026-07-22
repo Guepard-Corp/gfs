@@ -374,8 +374,14 @@ COMMENT ON FUNCTION gfs.source_drift() IS
 
 -- SYNC POLICY + DRIFT STATE ---------------------------------------------------
 -- Policy knobs for staying in step with the source. Single row, same pattern as
--- gfs.cost / gfs.budget: a hot switch, no redeploy. `gfs config clone.autopull`
--- writes .gfs/config.toml (durable intent) AND this row (the live setting).
+-- gfs.cost / gfs.budget: a hot switch, no redeploy.
+--
+-- Set directly today, e.g. UPDATE gfs.sync_policy SET autopull = true. There is
+-- deliberately no CLI wrapper yet: a `gfs config clone.autopull` would have to
+-- write BOTH .gfs/config.toml (durable intent, survives container recreation)
+-- and this row (the live setting the worker actually reads, since the worker
+-- runs inside the database and cannot read the repo's config file). Tracked in
+-- https://github.com/Guepard-Corp/gfs/issues/133.
 CREATE TABLE gfs.sync_policy (
     autopull           boolean  NOT NULL DEFAULT false,      -- follow the source automatically
     autopull_interval  interval NOT NULL DEFAULT '5 min',    -- how often the worker pulls
