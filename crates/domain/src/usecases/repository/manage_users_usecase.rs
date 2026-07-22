@@ -29,6 +29,9 @@ pub enum ManageUsersError {
     #[error("user management not supported by provider: {0}")]
     Unsupported(String),
 
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+
     #[error("compute: {0}")]
     Compute(String),
 
@@ -98,10 +101,11 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
 
     /// Create a login role (optionally with a preset).
     pub async fn create_role(&self, path: &Path, spec: &RoleSpec) -> Result<(), ManageUsersError> {
+        require_password(&spec.password)?;
         let (provider, container) = self.resolve(path)?;
         let command = provider
             .create_role_command(spec)
-            .map_err(|e| ManageUsersError::Unsupported(e.to_string()))?;
+            .map_err(map_provider_err)?;
         expect_success(self.run(&container, &command).await?)
     }
 
@@ -112,10 +116,11 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
         username: &str,
         password: &str,
     ) -> Result<(), ManageUsersError> {
+        require_password(password)?;
         let (provider, container) = self.resolve(path)?;
         let command = provider
             .alter_password_command(username, password)
-            .map_err(|e| ManageUsersError::Unsupported(e.to_string()))?;
+            .map_err(map_provider_err)?;
         expect_success(self.run(&container, &command).await?)
     }
 
@@ -124,7 +129,7 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
         let (provider, container) = self.resolve(path)?;
         let command = provider
             .drop_role_command(username)
-            .map_err(|e| ManageUsersError::Unsupported(e.to_string()))?;
+            .map_err(map_provider_err)?;
         expect_success(self.run(&container, &command).await?)
     }
 
@@ -138,16 +143,14 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
         let (provider, container) = self.resolve(path)?;
         let command = provider
             .apply_preset_command(username, preset)
-            .map_err(|e| ManageUsersError::Unsupported(e.to_string()))?;
+            .map_err(map_provider_err)?;
         expect_success(self.run(&container, &command).await?)
     }
 
     /// List login roles (never a password).
     pub async fn list_roles(&self, path: &Path) -> Result<Vec<RoleInfo>, ManageUsersError> {
         let (provider, container) = self.resolve(path)?;
-        let command = provider
-            .list_roles_command()
-            .map_err(|e| ManageUsersError::Unsupported(e.to_string()))?;
+        let command = provider.list_roles_command().map_err(map_provider_err)?;
         let output = self.run(&container, &command).await?;
         if output.exit_code != 0 {
             return Err(fail(output));
@@ -175,6 +178,27 @@ fn fail(output: ExecOutput) -> ManageUsersError {
     ManageUsersError::Failed {
         exit_code: output.exit_code,
         message,
+    }
+}
+
+/// Reject an empty password — a login role with no password is a footgun.
+fn require_password(password: &str) -> Result<(), ManageUsersError> {
+    if password.is_empty() {
+        Err(ManageUsersError::InvalidInput(
+            "password must not be empty".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Map a provider error to the right domain error: validation failures (bad
+/// identifier, delimiter collision) are `InvalidInput`, not `Unsupported`.
+fn map_provider_err(e: crate::ports::database_provider::ProviderError) -> ManageUsersError {
+    use crate::ports::database_provider::ProviderError;
+    match e {
+        ProviderError::InvalidParams(m) => ManageUsersError::InvalidInput(m),
+        other => ManageUsersError::Unsupported(other.to_string()),
     }
 }
 
@@ -533,5 +557,23 @@ mod tests {
         let (uc, _c) = use_case(MockCompute::default(), /* support_users */ false);
         let err = uc.drop_role(&repo, "alice").await.unwrap_err();
         assert!(matches!(err, ManageUsersError::Unsupported(_)));
+    }
+
+    #[tokio::test]
+    async fn empty_password_is_rejected() {
+        let (_temp, repo) = repo_with_config("pg-c1");
+        let (uc, _c) = use_case(MockCompute::default(), true);
+        let err = uc
+            .create_role(
+                &repo,
+                &RoleSpec {
+                    username: "alice".into(),
+                    password: String::new(),
+                    preset: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ManageUsersError::InvalidInput(_)));
     }
 }
