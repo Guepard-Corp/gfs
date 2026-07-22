@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use gfs_domain::model::db_user::{RolePreset, RoleSpec};
 use gfs_domain::ports::compute::{ComputeDefinition, EnvVar, PortMapping};
 use gfs_domain::ports::database_provider::{
     CloneSpec, ConnectionParams, DataFormat, DatabaseProvider, DatabaseProviderArg,
@@ -615,6 +616,68 @@ impl DatabaseProvider for PostgresqlProvider {
     }
 
     // -----------------------------------------------------------------------
+    // User / role management (`gfs user`)
+    // -----------------------------------------------------------------------
+
+    fn create_role_command(&self, spec: &RoleSpec) -> std::result::Result<String, ProviderError> {
+        let ident = pg_quote_ident(&spec.username)?;
+        // NOSUPERUSER / NOCREATEROLE: client roles are never privileged (fixes
+        // v2 escalation). Password via a quoted literal — never bare (v2 gap #3).
+        let mut sql = format!(
+            "CREATE ROLE {ident} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '{}';",
+            sql_lit(&spec.password)
+        );
+        if let Some(preset) = spec.preset {
+            sql.push('\n');
+            sql.push_str(&pg_preset_sql(&ident, preset));
+        }
+        // Wrap in a transaction so create+grants are atomic (fixes v2 partial-state).
+        self.query_in_instance_command(&format!("BEGIN;\n{sql}\nCOMMIT;"))
+    }
+
+    fn alter_password_command(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> std::result::Result<String, ProviderError> {
+        let ident = pg_quote_ident(username)?;
+        self.query_in_instance_command(&format!(
+            "ALTER ROLE {ident} WITH PASSWORD '{}';",
+            sql_lit(password)
+        ))
+    }
+
+    fn drop_role_command(&self, username: &str) -> std::result::Result<String, ProviderError> {
+        let ident = pg_quote_ident(username)?;
+        self.query_in_instance_command(&format!("DROP ROLE {ident};"))
+    }
+
+    fn list_roles_command(&self) -> std::result::Result<String, ProviderError> {
+        // `-tA` (tuples-only, unaligned) → clean JSON on stdout. `left(rolname,3)`
+        // filters system `pg_*` roles without LIKE-escape fragility; the private
+        // `guepard-admin` management role is never listed.
+        const DELIM: &str = "GFS_SQL_EOF";
+        let sql = "SELECT COALESCE(json_agg(json_build_object('username', rolname, 'can_login', rolcanlogin, 'is_superuser', rolsuper) ORDER BY rolname), '[]'::json) \
+                   FROM pg_roles WHERE left(rolname, 3) <> 'pg_' AND rolname <> 'guepard-admin';";
+        let body = gfs_domain::utils::shell::sql_heredoc_body(DELIM, sql)?;
+        Ok(format!(
+            r#"PGPASSWORD="${{POSTGRES_PASSWORD:-postgres}}" psql -h 127.0.0.1 -U "${{POSTGRES_USER:-postgres}}" -d "${{POSTGRES_DB:-postgres}}" -tA -v ON_ERROR_STOP=1 -c "{body}""#
+        ))
+    }
+
+    fn apply_preset_command(
+        &self,
+        username: &str,
+        preset: RolePreset,
+    ) -> std::result::Result<String, ProviderError> {
+        let ident = pg_quote_ident(username)?;
+        self.query_in_instance_command(&format!(
+            "BEGIN;\n{}\nCOMMIT;",
+            pg_preset_sql(&ident, preset)
+        ))
+    }
+
+    // -----------------------------------------------------------------------
     // Schema Extraction
     // -----------------------------------------------------------------------
 
@@ -791,6 +854,71 @@ const CLONE_BOOTSTRAP_TMPL: &str = include_str!("clone_bootstrap.sql");
 /// Escape a value for use inside a single-quoted SQL string literal.
 fn sql_lit(s: &str) -> String {
     s.replace('\'', "''")
+}
+
+/// Validate a database identifier and wrap it in double quotes for SQL.
+/// Rejects anything outside `[A-Za-z0-9_]{1,63}` — closes the identifier
+/// injection surface (v2 gap #3). Non-empty, ASCII alnum + underscore only.
+fn pg_quote_ident(ident: &str) -> std::result::Result<String, ProviderError> {
+    let valid = !ident.is_empty()
+        && ident.len() <= 63
+        && ident
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    if valid {
+        Ok(format!("\"{ident}\""))
+    } else {
+        Err(ProviderError::InvalidParams(format!(
+            "invalid database identifier: {ident:?}"
+        )))
+    }
+}
+
+/// The allow-listed grant bundle for `preset`, applied to the already-quoted
+/// role `ident` on schema `public`. Semicolon-terminated; the caller wraps the
+/// bundle in a transaction. `ALTER DEFAULT PRIVILEGES` covers future objects.
+fn pg_preset_sql(ident: &str, preset: RolePreset) -> String {
+    let mut s = format!("GRANT USAGE ON SCHEMA public TO {ident};\n");
+    match preset {
+        RolePreset::Readonly => {
+            s.push_str(&format!(
+                "GRANT SELECT ON ALL TABLES IN SCHEMA public TO {ident};\n"
+            ));
+            s.push_str(&format!(
+                "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO {ident};"
+            ));
+        }
+        RolePreset::Readwrite => {
+            s.push_str(&format!(
+                "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {ident};\n"
+            ));
+            s.push_str(&format!(
+                "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {ident};\n"
+            ));
+            s.push_str(&format!(
+                "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {ident};\n"
+            ));
+            s.push_str(&format!(
+                "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO {ident};"
+            ));
+        }
+        RolePreset::Admin => {
+            s.push_str(&format!("GRANT CREATE ON SCHEMA public TO {ident};\n"));
+            s.push_str(&format!(
+                "GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO {ident};\n"
+            ));
+            s.push_str(&format!(
+                "GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO {ident};\n"
+            ));
+            s.push_str(&format!(
+                "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL PRIVILEGES ON TABLES TO {ident};\n"
+            ));
+            s.push_str(&format!(
+                "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL PRIVILEGES ON SEQUENCES TO {ident};"
+            ));
+        }
+    }
+    s
 }
 
 /// Build the bootstrap SQL run inside the local GFS database to set up a lazy
@@ -1081,6 +1209,76 @@ mod tests {
         assert!(cmd_db.contains("-d 'myapp'"));
         assert!(!cmd_db.contains("${POSTGRES_DB"));
         assert!(!cmd.starts_with("psql postgresql://"));
+    }
+
+    #[test]
+    fn create_role_command_is_hardened() {
+        use gfs_domain::model::db_user::{RolePreset, RoleSpec};
+        let provider = PostgresqlProvider::new();
+        let spec = RoleSpec {
+            username: "app_rw".into(),
+            password: "p'wd".into(),
+            preset: Some(RolePreset::Readwrite),
+        };
+        let cmd = provider.create_role_command(&spec).expect("cmd");
+        assert!(
+            cmd.contains(r#"CREATE ROLE "app_rw" WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE"#)
+        );
+        assert!(
+            cmd.contains("PASSWORD 'p''wd'"),
+            "password literal must double the quote"
+        );
+        assert!(
+            cmd.contains("BEGIN;"),
+            "create+grants must be transactional"
+        );
+        assert!(
+            cmd.contains("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public")
+        );
+    }
+
+    #[test]
+    fn create_role_rejects_bad_username() {
+        use gfs_domain::model::db_user::RoleSpec;
+        let provider = PostgresqlProvider::new();
+        for bad in ["bad name", "drop;--", "", "a\"b", "x'; DROP ROLE y; --"] {
+            let spec = RoleSpec {
+                username: bad.into(),
+                password: "x".into(),
+                preset: None,
+            };
+            assert!(
+                provider.create_role_command(&spec).is_err(),
+                "must reject username {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn drop_and_alter_password_quote_identifier_and_literal() {
+        let provider = PostgresqlProvider::new();
+        assert!(
+            provider
+                .drop_role_command("app_ro")
+                .unwrap()
+                .contains(r#"DROP ROLE "app_ro";"#)
+        );
+        assert!(provider.drop_role_command("bad name").is_err());
+        let alter = provider.alter_password_command("app_ro", "new'pw").unwrap();
+        assert!(alter.contains(r#"ALTER ROLE "app_ro" WITH PASSWORD 'new''pw';"#));
+    }
+
+    #[test]
+    fn list_roles_command_uses_ta_json_and_excludes_admin() {
+        let provider = PostgresqlProvider::new();
+        let cmd = provider.list_roles_command().expect("cmd");
+        assert!(
+            cmd.contains("-tA"),
+            "list must use tuples-only unaligned output"
+        );
+        assert!(cmd.contains("json_agg"));
+        assert!(cmd.contains("rolname <> 'guepard-admin'"));
+        assert!(cmd.contains("left(rolname, 3) <> 'pg_'"));
     }
 
     #[test]

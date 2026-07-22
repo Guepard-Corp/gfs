@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
+use crate::model::db_user::{RolePreset, RoleSpec};
 use crate::ports::compute::ComputeDefinition;
 
 // ---------------------------------------------------------------------------
@@ -413,6 +414,55 @@ pub trait DatabaseProvider: Send + Sync {
     ) -> std::result::Result<String, ProviderError> {
         let _ = (sql, database);
         Err(ProviderError::UnsupportedFormat("query_in_instance".into()))
+    }
+
+    // -----------------------------------------------------------------------
+    // User / role management (`gfs user`)
+    // -----------------------------------------------------------------------
+    //
+    // Each returns a full shell command to run **inside** the instance via
+    // [`crate::ports::compute::Compute::exec`] (loopback client, container admin
+    // env creds) — the same shape as `query_in_instance_command`. The password
+    // and identifiers must be validated + quoted by the implementation. Default
+    // impls report the feature as unsupported so non-implementing providers cost
+    // nothing.
+
+    /// In-instance command that creates a login role from `spec`.
+    fn create_role_command(&self, spec: &RoleSpec) -> std::result::Result<String, ProviderError> {
+        let _ = spec;
+        Err(ProviderError::UnsupportedFormat("create_role".into()))
+    }
+
+    /// In-instance command that sets/rotates `username`'s password.
+    fn alter_password_command(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> std::result::Result<String, ProviderError> {
+        let _ = (username, password);
+        Err(ProviderError::UnsupportedFormat("alter_password".into()))
+    }
+
+    /// In-instance command that drops `username`.
+    fn drop_role_command(&self, username: &str) -> std::result::Result<String, ProviderError> {
+        let _ = username;
+        Err(ProviderError::UnsupportedFormat("drop_role".into()))
+    }
+
+    /// In-instance command that lists login roles as JSON (parsed into
+    /// [`crate::model::db_user::RoleInfo`]). Never includes a password.
+    fn list_roles_command(&self) -> std::result::Result<String, ProviderError> {
+        Err(ProviderError::UnsupportedFormat("list_roles".into()))
+    }
+
+    /// In-instance command that applies `preset`'s privilege bundle to `username`.
+    fn apply_preset_command(
+        &self,
+        username: &str,
+        preset: RolePreset,
+    ) -> std::result::Result<String, ProviderError> {
+        let _ = (username, preset);
+        Err(ProviderError::UnsupportedFormat("apply_preset".into()))
     }
 
     // -----------------------------------------------------------------------
