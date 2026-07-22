@@ -67,6 +67,46 @@ pub enum SchemaAction {
 }
 
 // ---------------------------------------------------------------------------
+// User subcommands (`gfs user`)
+// ---------------------------------------------------------------------------
+
+#[derive(Subcommand)]
+pub enum UserAction {
+    /// Create a login user, optionally with a role preset
+    Create {
+        /// Username (letters, digits, underscore; up to 63 chars)
+        username: String,
+        /// Role preset: readonly | readwrite | admin
+        #[arg(long)]
+        preset: Option<String>,
+        /// Password (a strong one is generated and shown once if omitted)
+        #[arg(long)]
+        password: Option<String>,
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    /// List database users
+    List {
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    /// Drop a user
+    Drop {
+        username: String,
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    /// Set / rotate a user's password
+    SetPassword {
+        username: String,
+        #[arg(long)]
+        password: Option<String>,
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+}
+
+// ---------------------------------------------------------------------------
 // Compute subcommands (used by commands)
 // ---------------------------------------------------------------------------
 
@@ -500,6 +540,12 @@ enum TopLevel {
         action: SchemaAction,
     },
 
+    /// Manage database users/roles (create, list, drop, set-password)
+    User {
+        #[command(subcommand)]
+        action: UserAction,
+    },
+
     /// Print the CLI version
     Version,
 }
@@ -577,6 +623,7 @@ fn command_name(cmd: &TopLevel) -> &'static str {
         TopLevel::Status { .. } => "status",
         TopLevel::Query { .. } => "query",
         TopLevel::Schema { .. } => "schema",
+        TopLevel::User { .. } => "user",
         TopLevel::Storage { .. } => "storage",
         TopLevel::Compute { .. } => "compute",
         TopLevel::Mcp { .. } => "mcp",
@@ -806,6 +853,35 @@ where
                     let no_color = no_color || color == ColorMode::Never;
                     commands::cmd_schema::run_diff(commit1, commit2, path, pretty, json, no_color)
                         .await
+                }
+            },
+            TopLevel::User { action } => match action {
+                UserAction::Create {
+                    username,
+                    preset,
+                    password,
+                    path,
+                } => {
+                    commands::cmd_user::run_create(path, username, preset, password, json_output)
+                        .await?;
+                    Ok(0)
+                }
+                UserAction::List { path } => {
+                    commands::cmd_user::run_list(path, json_output).await?;
+                    Ok(0)
+                }
+                UserAction::Drop { username, path } => {
+                    commands::cmd_user::run_drop(path, username, json_output).await?;
+                    Ok(0)
+                }
+                UserAction::SetPassword {
+                    username,
+                    password,
+                    path,
+                } => {
+                    commands::cmd_user::run_set_password(path, username, password, json_output)
+                        .await?;
+                    Ok(0)
                 }
             },
             TopLevel::Storage { action } => {
