@@ -26,6 +26,7 @@ use pgrx::PgTryBuilder;
 
 use crate::catalog::{
     gfs_claim_copy, gfs_claim_copy_job, gfs_clear_copy_job, gfs_clear_queued, gfs_lookup_clone,
+    gfs_run_upkeep,
     spi_text,
 };
 use crate::hydrate::do_hydrate;
@@ -188,6 +189,16 @@ unsafe fn try_drain_lock() -> bool {
 unsafe fn drain_one() -> bool {
     // (1) typed copy_queue jobs (kind = whole | time) -- drained the same way.
     if let Some((relid, kind, lo, hi)) = gfs_claim_copy_job() {
+        // Source-sync upkeep: not a copy, so it never goes through do_hydrate.
+        // `resync` is the autopull unit of work -- it runs HERE, off the query
+        // that noticed the drift, because TRUNCATE needs a lock that cannot be
+        // taken on a table the current query is reading.
+        if kind == "resync" || kind == "driftcheck" {
+            gfs_run_upkeep(relid, &kind);
+            log!("gfs: {} done for {}", kind, relid_text(relid));
+            gfs_clear_copy_job(relid, &kind, lo, hi);
+            return true;
+        }
         if let Some(info) = gfs_lookup_clone(relid) {
             if !info.whole_cached {
                 let hyd = build_copy_hydration(&info, relid, &kind, lo, hi);

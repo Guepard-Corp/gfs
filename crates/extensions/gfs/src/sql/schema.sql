@@ -474,11 +474,57 @@ BEGIN
         RETURN NEXT;
     END LOOP;
 
-    -- Re-anchor: everything above was reconciled against this snapshot.
-    PERFORM gfs.capture_source_baseline();
+    -- Re-anchor ONLY what we actually reset. capture_source_baseline() would
+    -- rewrite EVERY table's baseline, including the diverged ones we just
+    -- refused to touch -- silently marking an unresolved conflict as "in sync".
     PERFORM gfs.refresh_drift_state();
 END;
 $$;
+
+-- Reset ONE table to "never fetched" and re-anchor ONLY its baseline, so the
+-- lazy path owns it again from the next read. This is what the background
+-- worker runs for an autopull; gfs.pull() is the same thing done by hand for
+-- every stale table at once.
+--
+-- It must run OUTSIDE the query that noticed the drift: TRUNCATE needs an
+-- ACCESS EXCLUSIVE lock, which cannot be taken on a table the current query is
+-- already reading.
+CREATE FUNCTION gfs.resync_table(p_relid regclass) RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE p jsonb; m record;
+BEGIN
+    IF gfs.relation_diverged_sql(p_relid) THEN
+        RETURN false;   -- local writes: a conflict, never resolved automatically
+    END IF;
+
+    EXECUTE format('TRUNCATE ONLY %s', p_relid::regclass);  -- ONLY: keep inheritance children
+    DELETE FROM gfs.cached           WHERE relid = p_relid;
+    DELETE FROM gfs.cached_predicate WHERE relid = p_relid;
+    UPDATE gfs.clone_source
+       SET whole_cached = false, partial_rows = 0, no_partial = false, access_count = 0
+     WHERE relid = p_relid;
+
+    -- re-anchor THIS table only
+    SELECT * INTO m FROM gfs.source_map WHERE relid = p_relid;
+    p := gfs.source_probe();
+    UPDATE gfs.source_table_baseline b
+       SET writes   = COALESCE((SELECT (e->>'w')::bigint FROM jsonb_array_elements(p->'tables') e
+                                 WHERE e->>'s' = m.src_schema AND e->>'r' = m.src_table), 0),
+           live_tup = COALESCE((SELECT (e->>'l')::bigint FROM jsonb_array_elements(p->'tables') e
+                                 WHERE e->>'s' = m.src_schema AND e->>'r' = m.src_table), 0),
+           src_fp   = (SELECT e->>'fp' FROM jsonb_array_elements(p->'schema') e
+                        WHERE e->>'s' = m.src_schema AND e->>'r' = m.src_table),
+           ft_fp    = gfs.relation_fp(m.ftrel),
+           loc_fp   = gfs.relation_fp(p_relid)
+     WHERE b.relid = p_relid;
+
+    INSERT INTO gfs.drift_state(relid, drifted, reason, checked_at)
+    VALUES (p_relid, false, NULL, clock_timestamp())
+    ON CONFLICT (relid) DO UPDATE
+        SET drifted = false, reason = NULL, checked_at = clock_timestamp();
+    RETURN true;
+END;
+$$;
+COMMENT ON FUNCTION gfs.resync_table(regclass) IS 'Reset one table to never-fetched and re-anchor its baseline (the autopull unit of work)';
 COMMENT ON FUNCTION gfs.pull(boolean) IS 'Reset stale tables to "never fetched" so the lazy path refetches them; skips tables with local writes';
 
 -- Does this table have local writes or tombstones? (mirrors relation_diverged in
@@ -518,13 +564,13 @@ CREATE INDEX cached_predicate_queued_idx ON gfs.cached_predicate (relid)
 -- removed once run (completeness is recorded in clone_source.whole_cached / gfs.cached).
 CREATE TABLE gfs.copy_queue (
     relid       regclass    NOT NULL REFERENCES gfs.clone_source(relid) ON DELETE CASCADE,
-    kind        text        NOT NULL CHECK (kind IN ('whole','time')),
+    kind        text        NOT NULL CHECK (kind IN ('whole','time','resync','driftcheck')),
     lo          bigint      NOT NULL DEFAULT 0,
     hi          bigint      NOT NULL DEFAULT 0,
     enqueued_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (relid, kind, lo, hi)
 );
-COMMENT ON TABLE gfs.copy_queue IS 'Pending async copies (kind=whole|time) the background worker drains off the query critical path.';
+COMMENT ON TABLE gfs.copy_queue IS 'Pending async work (kind=whole|time|resync|driftcheck) the background worker drains off the query critical path.';
 
 -- Copy-on-write DELETE tombstones: a user DELETE on a clone table records the
 -- deleted row's PRIMARY KEY (as jsonb) here, so later copy-on-read hydration never

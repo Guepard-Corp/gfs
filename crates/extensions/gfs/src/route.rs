@@ -11,7 +11,7 @@ use crate::base_plan;
 use crate::catalog::{
     bump_access, gfs_enqueue_copy, gfs_enqueue_partial, gfs_is_covered, gfs_lookup_clone,
     gfs_note_pred_seen, gfs_pred_count, gfs_pred_state, gfs_set_no_partial, gfs_throttle,
-    gfs_mark_local_write, gfs_time_queued, gfs_whole_queued, relation_diverged,
+    gfs_mark_local_write, gfs_sync_flags, gfs_time_queued, gfs_whole_queued, relation_diverged,
 };
 use crate::federate::swap_clone_rtes_to_foreign;
 use crate::hydrate::do_hydrate;
@@ -227,6 +227,25 @@ unsafe fn classify_scan(
     // When `drifted` is false this is a no-op and every path below behaves
     // exactly as before, which is what confines the blast radius of this change.
     let stale = info.drifted && !relation_diverged(relid);
+
+    // QUERY-TRIGGERED UPKEEP. Both are enqueue+spawn: they never block this query
+    // and the hook itself does no network I/O. An idle clone therefore costs
+    // nothing, because no queries means no checks.
+    //   * verdict older than check_interval -> re-check drift in the background
+    //   * stale AND autopull on             -> queue a resync that puts the table
+    //                                          back on the lazy path, so federation
+    //                                          is a short bridge and not a permanent
+    //                                          state (always federating defeats the
+    //                                          point of having a clone at all)
+    let (autopull, verdict_stale) = gfs_sync_flags(relid);
+    if verdict_stale {
+        gfs_enqueue_copy(relid, "driftcheck", 0, 0);
+        worker::spawn();
+    }
+    if stale && autopull {
+        gfs_enqueue_copy(relid, "resync", 0, 0);
+        worker::spawn();
+    }
 
     if info.whole_cached && !stale {
         return; // owned and still matches the source -> serve local

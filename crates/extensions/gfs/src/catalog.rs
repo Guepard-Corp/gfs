@@ -135,6 +135,55 @@ pub(crate) unsafe fn gfs_lookup_clone(relid: pg_sys::Oid) -> Option<CloneInfo> {
     out
 }
 
+/// (autopull_on, verdict_is_stale_dated) for this table, in ONE local query.
+/// The planner hook calls this on a scan, so it must never touch the network:
+/// both answers come from local catalog tables.
+pub(crate) unsafe fn gfs_sync_flags(relid: pg_sys::Oid) -> (bool, bool) {
+    if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
+        return (false, false);
+    }
+    let q = CString::new(format!(
+        "SELECT p.autopull::int::text, \
+                COALESCE((SELECT (d.checked_at < clock_timestamp() - p.check_interval) \
+                            FROM gfs.drift_state d WHERE d.relid::oid = {}), true)::int::text \
+           FROM gfs.sync_policy p LIMIT 1",
+        u32::from(relid)
+    ))
+    .unwrap();
+    let mut out = (false, false);
+    if pg_sys::SPI_execute(q.as_ptr(), true, 1) == pg_sys::SPI_OK_SELECT as i32
+        && pg_sys::SPI_processed == 1
+    {
+        let tt = pg_sys::SPI_tuptable;
+        let row = *(*tt).vals;
+        let td = (*tt).tupdesc;
+        out = (
+            spi_text(pg_sys::SPI_getvalue(row, td, 1)).as_deref() == Some("1"),
+            spi_text(pg_sys::SPI_getvalue(row, td, 2)).as_deref() == Some("1"),
+        );
+    }
+    pg_sys::SPI_finish();
+    out
+}
+
+/// Run one unit of async upkeep for the background worker. `resync` puts a single
+/// table back on the lazy path (truncate + clear cached state + re-anchor just that
+/// table); `driftcheck` recomputes the stale verdicts. Both are plain SQL so the
+/// logic lives next to the catalog it mutates.
+pub(crate) unsafe fn gfs_run_upkeep(relid: pg_sys::Oid, kind: &str) {
+    if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
+        return;
+    }
+    let sql = match kind {
+        "resync" => format!("SELECT gfs.resync_table({}::oid::regclass)", u32::from(relid)),
+        _ => "SELECT gfs.refresh_drift_state()".to_string(),
+    };
+    if let Ok(q) = CString::new(sql) {
+        pg_sys::SPI_execute(q.as_ptr(), false, 0);
+    }
+    pg_sys::SPI_finish();
+}
+
 /// Increment the per-table access counter (drives the amortization horizon H).
 pub(crate) unsafe fn bump_access(relid: pg_sys::Oid) {
     if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
