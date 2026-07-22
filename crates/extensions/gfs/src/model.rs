@@ -41,4 +41,6 @@ pub(crate) struct CloneInfo {
     pub(crate) w_partial_max_frac: f64,  // max slice fraction + hard pull cap
     pub(crate) w_promote_frac: f64,      // cumulative-pull fraction that auto-promotes to whole-own
     pub(crate) w_max_partial_preds: i64, // max distinct partial predicates (contacts) before promote
+    pub(crate) drifted: bool,     // the SOURCE changed this table since we copied it: the local
+                                  // copy is stale, so it must not be served (see classify_scan)
 }

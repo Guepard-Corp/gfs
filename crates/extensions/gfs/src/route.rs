@@ -217,8 +217,19 @@ unsafe fn classify_scan(
         return;
     }
     bump_access(relid);
-    if info.whole_cached {
-        return; // owned -> serve local
+
+    // SOURCE DRIFT GATE. `drifted` means the SOURCE changed this table since we
+    // copied it, so our local rows are stale and serving them would silently
+    // return data that no longer exists upstream. A DIVERGED table (local
+    // writes/tombstones) is excluded: the source lacks our writes, so federating
+    // it would lose them -- that is a conflict, and it keeps serving local.
+    //
+    // When `drifted` is false this is a no-op and every path below behaves
+    // exactly as before, which is what confines the blast radius of this change.
+    let stale = info.drifted && !relation_diverged(relid);
+
+    if info.whole_cached && !stale {
+        return; // owned and still matches the source -> serve local
     }
 
     let b = info.row_bytes.max(1) as f64; // bytes/row
@@ -240,6 +251,18 @@ unsafe fn classify_scan(
         time_key: false,
         key_type: info.key_type.clone(),
     };
+
+    // 0. STALE -> ask the SOURCE. This must precede every local-serving path
+    //    below (whole_cached above, range elision and predicate completeness
+    //    further down): each of those would otherwise answer from rows we
+    //    already know are out of date. Federating is correct by construction,
+    //    costs O(query) instead of O(table), moves no data and takes no locks,
+    //    so it is safe to decide here, mid-plan. `gfs.pull()` later resets the
+    //    table to "never fetched" and the lazy path makes it fast again.
+    if stale {
+        ctx.federate_targets.push(mk(0, 0, true, s(), s(), 0));
+        return;
+    }
 
     // 1. RANGE-key bound (id BETWEEN / placed_at BETWEEN) -> range model: covered ->
     //    local (elision), else fetch the missing key span. INTEGER keys size the

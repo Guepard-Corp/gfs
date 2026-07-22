@@ -372,6 +372,122 @@ $$;
 COMMENT ON FUNCTION gfs.source_drift() IS
   'What changed on the source since clone time (empty = untouched); kinds: data, schema, unfederatable, unattributed';
 
+-- SYNC POLICY + DRIFT STATE ---------------------------------------------------
+-- Policy knobs for staying in step with the source. Single row, same pattern as
+-- gfs.cost / gfs.budget: a hot switch, no redeploy. `gfs config clone.autopull`
+-- writes .gfs/config.toml (durable intent) AND this row (the live setting).
+CREATE TABLE gfs.sync_policy (
+    autopull           boolean  NOT NULL DEFAULT false,      -- follow the source automatically
+    autopull_interval  interval NOT NULL DEFAULT '5 min',    -- how often the worker pulls
+    autopull_max_bytes bigint   NOT NULL DEFAULT 500000000,  -- never auto-copy a table larger than this
+    check_interval     interval NOT NULL DEFAULT '1 min'     -- how stale the drift verdict may be
+);
+INSERT INTO gfs.sync_policy DEFAULT VALUES;
+COMMENT ON TABLE gfs.sync_policy IS 'Source-sync policy (autopull off by default: a clone is a branch, not a mirror)';
+
+-- Per-table verdict the PLANNER HOOK reads on every scan. It must be LOCAL and
+-- cheap: the hook never does network I/O. gfs.refresh_drift_state() fills it.
+CREATE TABLE gfs.drift_state (
+    relid      regclass PRIMARY KEY REFERENCES gfs.clone_source(relid) ON DELETE CASCADE,
+    drifted    boolean     NOT NULL DEFAULT false,
+    reason     text,
+    checked_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+COMMENT ON TABLE gfs.drift_state IS 'Per-table "is the local copy stale?" verdict, read by the planner hook';
+
+-- Recompute the verdict from the source. One round trip (gfs.source_drift).
+-- 'unattributed' means the source moved but no table accounts for it, so EVERY
+-- materialized table is marked suspect: failing safe is the entire point.
+CREATE FUNCTION gfs.refresh_drift_state() RETURNS int LANGUAGE plpgsql AS $$
+DECLARE n int; blanket boolean;
+BEGIN
+    CREATE TEMP TABLE IF NOT EXISTS gfs_drift_scan(kind text, src_table text, detail text) ON COMMIT DROP;
+    DELETE FROM gfs_drift_scan;
+    INSERT INTO gfs_drift_scan SELECT * FROM gfs.source_drift();
+
+    SELECT EXISTS(SELECT 1 FROM gfs_drift_scan WHERE kind = 'unattributed') INTO blanket;
+
+    INSERT INTO gfs.drift_state(relid, drifted, reason, checked_at)
+    SELECT m.relid,
+           COALESCE(d.kind IS NOT NULL, false) OR blanket,
+           COALESCE(d.kind || ': ' || d.detail,
+                    CASE WHEN blanket THEN 'source moved but unattributed; treated as suspect' END),
+           clock_timestamp()
+      FROM gfs.source_map m
+      LEFT JOIN LATERAL (
+            SELECT s.kind, s.detail FROM gfs_drift_scan s
+             WHERE s.src_table = m.src_schema || '.' || m.src_table
+               AND s.kind IN ('data','schema')
+             LIMIT 1) d ON true
+    ON CONFLICT (relid) DO UPDATE
+        SET drifted = EXCLUDED.drifted, reason = EXCLUDED.reason, checked_at = EXCLUDED.checked_at;
+
+    SELECT count(*) INTO n FROM gfs.drift_state WHERE drifted;
+    RETURN n;
+END;
+$$;
+COMMENT ON FUNCTION gfs.refresh_drift_state() IS 'Recompute the per-table stale verdict the hook reads; returns how many tables are stale';
+
+-- gfs pull: put stale tables BACK ON THE LAZY PATH.
+-- It copies nothing itself. It clears the cached state so the table looks
+-- "never fetched", and the existing router then makes its normal cost decision
+-- on the next read (small table -> copy, huge table -> federate), exactly as it
+-- does for a freshly cloned table.
+--
+-- Runs in ONE transaction, so every table is reset against a single source
+-- snapshot: pulling tables one at a time would leave the clone fresh but still
+-- torn across different moments.
+--
+-- A table with local writes is NEVER reset (that would destroy the user's work);
+-- it is reported as a conflict for a human to resolve, like git refusing to
+-- clobber local changes.
+CREATE FUNCTION gfs.pull(force boolean DEFAULT false)
+RETURNS TABLE(action text, tbl text, detail text) LANGUAGE plpgsql AS $$
+DECLARE r record;
+BEGIN
+    PERFORM gfs.refresh_drift_state();
+
+    FOR r IN
+        SELECT d.relid, d.reason, m.src_schema || '.' || m.src_table AS name,
+               gfs.relation_diverged_sql(d.relid) AS diverged
+          FROM gfs.drift_state d
+          JOIN gfs.source_map m ON m.relid = d.relid
+         WHERE d.drifted
+         ORDER BY 3
+    LOOP
+        IF r.diverged AND NOT force THEN
+            action := 'conflict'; tbl := r.name;
+            detail := 'you have local writes AND the source changed; not touched (use force to discard yours)';
+            RETURN NEXT; CONTINUE;
+        END IF;
+
+        -- ONLY: never cascade into inheritance children, which are separate tables
+        EXECUTE format('TRUNCATE ONLY %s', r.relid::regclass);
+        DELETE FROM gfs.cached            WHERE relid = r.relid;
+        DELETE FROM gfs.cached_predicate  WHERE relid = r.relid;
+        UPDATE gfs.clone_source
+           SET whole_cached = false, partial_rows = 0, no_partial = false, access_count = 0
+         WHERE relid = r.relid;
+
+        action := 'reset'; tbl := r.name;
+        detail := 'back on the lazy path; next read fetches from the source';
+        RETURN NEXT;
+    END LOOP;
+
+    -- Re-anchor: everything above was reconciled against this snapshot.
+    PERFORM gfs.capture_source_baseline();
+    PERFORM gfs.refresh_drift_state();
+END;
+$$;
+COMMENT ON FUNCTION gfs.pull(boolean) IS 'Reset stale tables to "never fetched" so the lazy path refetches them; skips tables with local writes';
+
+-- Does this table have local writes or tombstones? (mirrors relation_diverged in
+-- catalog.rs, which the hook uses; kept in SQL so gfs.pull can consult it too.)
+CREATE FUNCTION gfs.relation_diverged_sql(p_relid regclass) RETURNS boolean LANGUAGE sql STABLE AS $$
+    SELECT COALESCE((SELECT has_local_writes FROM gfs.clone_source WHERE relid = p_relid), false)
+        OR EXISTS (SELECT 1 FROM gfs.tombstone WHERE relid = p_relid);
+$$;
+
 CREATE TABLE gfs.cached (
     relid regclass NOT NULL REFERENCES gfs.clone_source(relid) ON DELETE CASCADE,
     lo    bigint   NOT NULL,

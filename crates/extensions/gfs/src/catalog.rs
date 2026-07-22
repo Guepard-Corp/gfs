@@ -83,7 +83,8 @@ pub(crate) unsafe fn gfs_lookup_clone(relid: pg_sys::Oid) -> Option<CloneInfo> {
                 s.partial_rows::text, s.no_partial::int::text, \
                 x.partial_max_frac::text, x.promote_frac::text, x.max_partial_preds::text, \
                 COALESCE((SELECT t.typname FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid \
-                            WHERE a.attrelid = s.relid AND a.attname = s.key_col), '') \
+                            WHERE a.attrelid = s.relid AND a.attname = s.key_col), ''), \
+                COALESCE((SELECT d.drifted FROM gfs.drift_state d WHERE d.relid = s.relid), false)::int::text \
            FROM gfs.clone_source s, gfs.cost x \
           WHERE s.relid::oid = {} AND to_regclass(s.source_ref) IS NOT NULL",
         u32::from(relid)
@@ -123,6 +124,10 @@ pub(crate) unsafe fn gfs_lookup_clone(relid: pg_sys::Oid) -> Option<CloneInfo> {
                 w_partial_max_frac: num(18),
                 w_promote_frac: num(19),
                 w_max_partial_preds: num(20) as i64,
+                // SOURCE DRIFT: does the source no longer match our local copy?
+                // Read from a LOCAL table (gfs.drift_state) so the planner hook
+                // never does network I/O. false => behaviour identical to before.
+                drifted: g(22).as_deref() == Some("1"),
             });
         }
     }
