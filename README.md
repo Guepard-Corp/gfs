@@ -97,7 +97,8 @@ Run `gfs providers` to see all available providers and their supported versions.
 - Query database directly from CLI (SQL execution and interactive mode)
 - Schema extraction, show, and diff between commits
 - Export and import data (SQL, custom, CSV)
-- Lazily clone a remote PostgreSQL database (copy-on-read, experimental)
+- Lazily clone a remote PostgreSQL database (copy-on-read, experimental), with
+  detection of source changes so a clone never serves stale rows
 - Compute container management (start, stop, logs)
 - Repository config (user.name, user.email)
 
@@ -322,6 +323,62 @@ schemas. Cloned tables are views: plain CRUD works unchanged, but DDL and
 `SELECT … FOR UPDATE` are not supported on them. Quote the URL if the password
 contains shell metacharacters.
 
+#### When the source changes
+
+A clone copies each table the first time you read it. If the source changes that
+table afterwards, the clone notices and reads from the source instead, so a query
+never returns rows that no longer exist upstream:
+
+| situation | what you get | speed |
+| --- | --- | --- |
+| source unchanged | the local copy (provably identical to the source) | fast, no network |
+| source changed | read from the source | slower |
+| source changed **and** you wrote to that table | **your** version, plus a conflict warning | — |
+
+**Correct data is automatic.** You never have to run anything to avoid stale
+results; the last row is a conflict, and GFS always keeps your local writes
+rather than silently discarding them.
+
+Inspect what moved:
+
+```bash
+# has the source been written to at all? (a "false" is a guarantee it has not)
+gfs query "SELECT gfs.source_changed();"
+
+# which tables changed, and how
+gfs query "SELECT * FROM gfs.source_drift();"
+```
+
+Reading from the source is correct but slower. To go fast again, put the changed
+tables back on the lazy path so the next read re-copies them:
+
+```bash
+gfs query "SELECT * FROM gfs.pull();"
+```
+
+`pull` copies nothing itself: it clears the cached state and the normal
+cost model decides again on the next read (small table → copy, huge table → keep
+reading from the source). Tables you have written to are never reset, since that
+would discard your work; they are reported as conflicts for you to resolve.
+
+To have that happen on its own, without running anything:
+
+```bash
+gfs query "UPDATE gfs.sync_policy SET autopull = true;"
+```
+
+With autopull on, a changed table costs **one** query answered from the source,
+then it is re-copied in the background and later reads are local again. It is
+**off by default** because a clone is a branch: data shifting under a running
+test breaks reproducibility. For a read-only clone (analytics, dashboards) it is
+usually the better setting.
+
+> A clone is **not** a point-in-time snapshot of a changing source. Because
+> tables are copied at different moments, a clone of a source that is still being
+> written to can hold a combination of rows that never existed there at one
+> instant. Clone from a frozen source (a storage snapshot, backup, or paused
+> replica) if you need reproducibility.
+
 ### `gfs status`
 
 Show the current state of storage and compute resources.
@@ -389,6 +446,13 @@ gfs export --output-dir <dir> --format <fmt>
 ```
 
 Formats: `sql` (plain-text SQL), `custom` (PostgreSQL binary dump)
+
+> **Known issue on lazy clones.** `gfs export` dumps what the clone holds
+> *locally*. A lazy clone only holds rows for tables it has actually read, so
+> exporting one can produce a valid-looking file with entire tables empty, with
+> no warning. Read every table you need first, or export from a normal (non-clone)
+> repository. Tracked in
+> [#116](https://github.com/Guepard-Corp/gfs/issues/116).
 
 ### `gfs import`
 
