@@ -11,7 +11,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::model::config::GfsConfig;
-use crate::model::db_user::{RoleInfo, RolePreset, RoleSpec};
+use crate::model::db_user::{DeployEnvSpec, RoleInfo, RolePreset, RoleSpec};
 use crate::ports::compute::{Compute, ExecOutput, InstanceId};
 use crate::ports::database_provider::{DatabaseProvider, DatabaseProviderRegistry};
 
@@ -144,6 +144,23 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
         let (provider, container) = self.resolve(path)?;
         let command = provider
             .apply_preset_command(username, preset)
+            .map_err(map_provider_err)?;
+        expect_success(self.run(&container, &command).await?)
+    }
+
+    /// Bootstrap a database's deploy environment (RFC 009): create the `NOLOGIN`
+    /// group + the least-privileged `owner` login + grants + role-scoped default
+    /// privileges, in one transaction, as the management superuser via the exec
+    /// seam. Idempotency is the caller's concern (run on fresh deploy only).
+    pub async fn provision_deploy_env(
+        &self,
+        path: &Path,
+        spec: &DeployEnvSpec,
+    ) -> Result<(), ManageUsersError> {
+        require_password(&spec.owner_password)?;
+        let (provider, container) = self.resolve(path)?;
+        let command = provider
+            .bootstrap_deploy_env_command(spec)
             .map_err(map_provider_err)?;
         expect_success(self.run(&container, &command).await?)
     }
@@ -466,6 +483,14 @@ mod tests {
             self.guard()?;
             Ok(format!("MOCK-PRESET:{username}"))
         }
+
+        fn bootstrap_deploy_env_command(
+            &self,
+            spec: &DeployEnvSpec,
+        ) -> std::result::Result<String, ProviderError> {
+            self.guard()?;
+            Ok(format!("MOCK-DEPLOYENV:{}:{}", spec.owner, spec.group))
+        }
     }
 
     fn repo_with_config(container: &str) -> (TempDir, PathBuf) {
@@ -532,6 +557,39 @@ mod tests {
             compute.last_command.lock().unwrap().clone(),
             Some("MOCK-CREATE:alice".into())
         );
+    }
+
+    fn deploy_env_spec(owner_password: &str) -> DeployEnvSpec {
+        DeployEnvSpec {
+            owner: "app_owner".into(),
+            owner_password: owner_password.into(),
+            group: "developers".into(),
+            database: "appdb".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn provision_deploy_env_execs_the_provider_command() {
+        let (_temp, repo) = repo_with_config("pg-c1");
+        let (uc, compute) = use_case(MockCompute::default(), true);
+        uc.provision_deploy_env(&repo, &deploy_env_spec("pw"))
+            .await
+            .expect("ok");
+        assert_eq!(
+            compute.last_command.lock().unwrap().clone(),
+            Some("MOCK-DEPLOYENV:app_owner:developers".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_deploy_env_rejects_empty_owner_password() {
+        let (_temp, repo) = repo_with_config("pg-c1");
+        let (uc, _compute) = use_case(MockCompute::default(), true);
+        let err = uc
+            .provision_deploy_env(&repo, &deploy_env_spec(""))
+            .await
+            .expect_err("empty password must be rejected");
+        assert!(matches!(err, ManageUsersError::InvalidInput(_)));
     }
 
     #[tokio::test]

@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
-use crate::model::db_user::{RolePreset, RoleSpec};
+use crate::model::db_user::{DeployEnvSpec, RolePreset, RoleSpec};
 use crate::ports::compute::ComputeDefinition;
 
 // ---------------------------------------------------------------------------
@@ -463,6 +463,23 @@ pub trait DatabaseProvider: Send + Sync {
     ) -> std::result::Result<String, ProviderError> {
         let _ = (username, preset);
         Err(ProviderError::UnsupportedFormat("apply_preset".into()))
+    }
+
+    /// Build the in-instance command that bootstraps a database's deploy
+    /// environment (RFC 009): create the `NOLOGIN` group + the least-privileged
+    /// `owner` login, grant the owner `CONNECT` + `USAGE,CREATE ON SCHEMA public`
+    /// and group membership, and set role-scoped default privileges so future
+    /// owner objects flow to the group — all in one transaction. Emits nothing
+    /// that makes the owner a superuser or the database owner. Optional-defaulted
+    /// so non-Postgres providers cost nothing until phase 2.
+    fn bootstrap_deploy_env_command(
+        &self,
+        spec: &DeployEnvSpec,
+    ) -> std::result::Result<String, ProviderError> {
+        let _ = spec;
+        Err(ProviderError::UnsupportedFormat(
+            "bootstrap_deploy_env".into(),
+        ))
     }
 
     // -----------------------------------------------------------------------

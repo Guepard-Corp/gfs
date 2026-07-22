@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gfs_domain::model::db_user::{RolePreset, RoleSpec};
+use gfs_domain::model::db_user::{DeployEnvSpec, RolePreset, RoleSpec};
 use gfs_domain::ports::compute::{ComputeDefinition, EnvVar, PortMapping};
 use gfs_domain::ports::database_provider::{
     CloneSpec, ConnectionParams, DataFormat, DatabaseProvider, DatabaseProviderArg,
@@ -691,6 +691,36 @@ impl DatabaseProvider for PostgresqlProvider {
         ))
     }
 
+    fn bootstrap_deploy_env_command(
+        &self,
+        spec: &DeployEnvSpec,
+    ) -> std::result::Result<String, ProviderError> {
+        let owner = pg_quote_ident(&spec.owner)?;
+        let group = pg_quote_ident(&spec.group)?;
+        let database = pg_quote_ident(&spec.database)?;
+        // RFC 009 §5.1, hardened + transactional. The owner is LOGIN NOSUPERUSER
+        // NOCREATEROLE NOCREATEDB and is NOT made the database owner — it keeps
+        // `public` (explicit USAGE,CREATE + CONNECT, since roles don't inherit
+        // CONNECT once PUBLIC's default is revoked) but cannot DROP DATABASE or
+        // escalate. `public` itself is left at the engine default (PG15+ already
+        // denies CREATE to PUBLIC — no manual REVOKE). Future owner objects flow
+        // to the group via role-scoped default privileges (fixes v2 gap R5).
+        let sql = format!(
+            "BEGIN;\n\
+             CREATE ROLE {group} NOLOGIN;\n\
+             GRANT USAGE ON SCHEMA public TO {group};\n\
+             CREATE ROLE {owner} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '{pw}';\n\
+             GRANT CONNECT ON DATABASE {database} TO {owner};\n\
+             GRANT USAGE, CREATE ON SCHEMA public TO {owner};\n\
+             GRANT {group} TO {owner};\n\
+             ALTER DEFAULT PRIVILEGES FOR ROLE {owner} IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {group};\n\
+             ALTER DEFAULT PRIVILEGES FOR ROLE {owner} IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO {group};\n\
+             COMMIT;",
+            pw = sql_lit(&spec.owner_password),
+        );
+        self.query_in_instance_command(&sql)
+    }
+
     // -----------------------------------------------------------------------
     // Schema Extraction
     // -----------------------------------------------------------------------
@@ -1289,6 +1319,53 @@ mod tests {
         assert!(provider.drop_role_command("bad name").is_err());
         let alter = provider.alter_password_command("app_ro", "new'pw").unwrap();
         assert!(alter.contains(r#"ALTER ROLE "app_ro" WITH PASSWORD 'new''pw';"#));
+    }
+
+    #[test]
+    fn bootstrap_deploy_env_command_emits_hardened_sql() {
+        let provider = PostgresqlProvider::new();
+        let spec = DeployEnvSpec {
+            owner: "app_owner".into(),
+            owner_password: "s3cret'pw".into(),
+            group: "developers".into(),
+            database: "appdb".into(),
+        };
+        let cmd = provider.bootstrap_deploy_env_command(&spec).unwrap();
+        // group NOLOGIN + least-privileged owner; identifiers quoted, password escaped.
+        assert!(cmd.contains(r#"CREATE ROLE "developers" NOLOGIN;"#));
+        assert!(cmd.contains(
+            r#"CREATE ROLE "app_owner" WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD 's3cret''pw';"#
+        ));
+        // owner keeps `public` (explicit CONNECT + USAGE,CREATE).
+        assert!(cmd.contains(r#"GRANT CONNECT ON DATABASE "appdb" TO "app_owner";"#));
+        assert!(cmd.contains(r#"GRANT USAGE, CREATE ON SCHEMA public TO "app_owner";"#));
+        // membership + role-scoped default privileges (future owner objects → group).
+        assert!(cmd.contains(r#"GRANT "developers" TO "app_owner";"#));
+        assert!(cmd.contains(
+            r#"ALTER DEFAULT PRIVILEGES FOR ROLE "app_owner" IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO "developers";"#
+        ));
+        // transactional; owner is NOT the DB owner; no manual `public` REVOKE.
+        assert!(cmd.contains("BEGIN;") && cmd.contains("COMMIT;"));
+        assert!(
+            !cmd.contains("ALTER DATABASE"),
+            "owner must not become DB owner"
+        );
+        assert!(
+            !cmd.to_uppercase().contains("REVOKE"),
+            "no manual public lock"
+        );
+    }
+
+    #[test]
+    fn bootstrap_deploy_env_command_rejects_bad_identifiers() {
+        let provider = PostgresqlProvider::new();
+        let bad = DeployEnvSpec {
+            owner: "bad name".into(),
+            owner_password: "x".into(),
+            group: "developers".into(),
+            database: "appdb".into(),
+        };
+        assert!(provider.bootstrap_deploy_env_command(&bad).is_err());
     }
 
     #[test]

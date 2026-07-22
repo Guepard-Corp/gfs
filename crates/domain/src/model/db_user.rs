@@ -58,3 +58,20 @@ pub struct RoleInfo {
     pub can_login: bool,
     pub is_superuser: bool,
 }
+
+/// Everything needed to bootstrap a database's deploy environment (RFC 009): a
+/// `NOLOGIN` group carrying the shared CRUD baseline, an `owner` login (the
+/// least-privileged customer role that keeps `public`), the owner's membership
+/// in the group, and role-scoped default privileges so future owner objects
+/// flow to the group. Tenancy-free — the caller supplies validated names.
+#[derive(Debug, Clone)]
+pub struct DeployEnvSpec {
+    /// The customer's default login role (`LOGIN NOSUPERUSER`, never the DB owner).
+    pub owner: String,
+    /// The owner's password (SCRAM-hashed by the engine; never logged).
+    pub owner_password: String,
+    /// The `NOLOGIN` group role carrying the shared CRUD baseline (e.g. `developers`).
+    pub group: String,
+    /// The database the owner is granted `CONNECT` on.
+    pub database: String,
+}
