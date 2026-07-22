@@ -211,6 +211,20 @@ pub struct QueryRequest {
 }
 
 #[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+pub struct UserRequest {
+    #[schemars(description = "action: create | list | drop | set_password")]
+    pub action: String,
+    #[schemars(description = "username (required for create/drop/set_password)")]
+    pub username: Option<String>,
+    #[schemars(description = "role preset for create: readonly | readwrite | admin")]
+    pub preset: Option<String>,
+    #[schemars(description = "password (optional; generated and returned once if omitted)")]
+    pub password: Option<String>,
+    #[schemars(description = "repo root path")]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 pub struct ExtractSchemaRequest {
     #[schemars(description = "repo root path")]
     pub path: Option<String>,
@@ -474,6 +488,25 @@ impl GfsMcpHandler {
         });
         let result = do_query(&args).await;
         self.track_mcp("query", &result);
+        result
+    }
+
+    #[tool(
+        description = "Manage database users/roles inside the running instance. action = create | list | drop | set_password. create and set_password return the password once. Params: action (required); username (create/drop/set_password); preset (create: readonly|readwrite|admin); password (optional, generated once if omitted); path (repo root). Equivalent to gfs user."
+    )]
+    async fn user(
+        &self,
+        Parameters(req): Parameters<UserRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let args = json!({
+            "action": req.action,
+            "username": req.username,
+            "preset": req.preset,
+            "password": req.password,
+            "path": req.path,
+        });
+        let result = do_user(&args).await;
+        self.track_mcp("user", &result);
         result
     }
 
@@ -1250,6 +1283,99 @@ async fn do_import(args: &serde_json::Value) -> Result<CallToolResult, McpError>
         "format": output.format,
         "stdout": output.stdout,
     }))
+}
+
+async fn do_user(args: &serde_json::Value) -> Result<CallToolResult, McpError> {
+    use gfs_domain::model::db_user::{RolePreset, RoleSpec};
+    use gfs_domain::usecases::repository::manage_users_usecase::ManageUsersUseCase;
+
+    let args = if args.is_object() { args } else { &json!({}) };
+    let repo_path = repo_path_from_value(args);
+    let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+    let username = args
+        .get("username")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let password = args
+        .get("password")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    GfsConfig::load(&repo_path).map_err(|e| to_error_data(format!("not a GFS repository: {e}")))?;
+
+    let compute = Arc::new(DockerCompute::new().map_err(|e| to_error_data(e.to_string()))?);
+    let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
+    containers::register_all(registry.as_ref())
+        .map_err(|e| to_error_data(format!("register providers: {e}")))?;
+    let use_case = ManageUsersUseCase::new(compute, registry);
+
+    let gen_password = || uuid::Uuid::new_v4().simple().to_string();
+    let require_username = || {
+        username
+            .clone()
+            .ok_or_else(|| to_error_data(format!("action '{action}' requires 'username'")))
+    };
+
+    match action {
+        "create" => {
+            let username = require_username()?;
+            let preset = match args.get("preset").and_then(|v| v.as_str()) {
+                Some(p) => Some(
+                    RolePreset::parse(p)
+                        .ok_or_else(|| to_error_data(format!("unknown preset '{p}'")))?,
+                ),
+                None => None,
+            };
+            let password = password.unwrap_or_else(gen_password);
+            use_case
+                .create_role(
+                    &repo_path,
+                    &RoleSpec {
+                        username: username.clone(),
+                        password: password.clone(),
+                        preset,
+                    },
+                )
+                .await
+                .map_err(|e| to_error_data(e.to_string()))?;
+            Ok(CallToolResult::success(vec![Content::text(
+                json!({ "username": username, "password": password }).to_string(),
+            )]))
+        }
+        "list" => {
+            let roles = use_case
+                .list_roles(&repo_path)
+                .await
+                .map_err(|e| to_error_data(e.to_string()))?;
+            Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string(&roles).unwrap_or_default(),
+            )]))
+        }
+        "drop" => {
+            let username = require_username()?;
+            use_case
+                .drop_role(&repo_path, &username)
+                .await
+                .map_err(|e| to_error_data(e.to_string()))?;
+            Ok(CallToolResult::success(vec![Content::text(
+                json!({ "username": username, "dropped": true }).to_string(),
+            )]))
+        }
+        "set_password" => {
+            let username = require_username()?;
+            let password = password.unwrap_or_else(gen_password);
+            use_case
+                .set_password(&repo_path, &username, &password)
+                .await
+                .map_err(|e| to_error_data(e.to_string()))?;
+            Ok(CallToolResult::success(vec![Content::text(
+                json!({ "username": username, "password": password }).to_string(),
+            )]))
+        }
+        other => Err(to_error_data(format!(
+            "unknown user action '{other}' (create|list|drop|set_password)"
+        ))),
+    }
 }
 
 async fn do_query(args: &serde_json::Value) -> Result<CallToolResult, McpError> {
