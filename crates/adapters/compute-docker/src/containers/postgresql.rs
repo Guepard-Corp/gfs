@@ -649,7 +649,13 @@ impl DatabaseProvider for PostgresqlProvider {
 
     fn drop_role_command(&self, username: &str) -> std::result::Result<String, ProviderError> {
         let ident = pg_quote_ident(username)?;
-        self.query_in_instance_command(&format!("DROP ROLE {ident};"))
+        // `DROP OWNED BY` first: it removes the role's grants — including the
+        // `ALTER DEFAULT PRIVILEGES` entries a preset created — and objects it
+        // owns, so `DROP ROLE` no longer fails with "objects depend on it".
+        // Transactional so a partial drop can't leave a half-removed role.
+        self.query_in_instance_command(&format!(
+            "BEGIN;\nDROP OWNED BY {ident};\nDROP ROLE {ident};\nCOMMIT;"
+        ))
     }
 
     fn list_roles_command(&self) -> std::result::Result<String, ProviderError> {
@@ -1257,12 +1263,12 @@ mod tests {
     #[test]
     fn drop_and_alter_password_quote_identifier_and_literal() {
         let provider = PostgresqlProvider::new();
+        let drop = provider.drop_role_command("app_ro").unwrap();
         assert!(
-            provider
-                .drop_role_command("app_ro")
-                .unwrap()
-                .contains(r#"DROP ROLE "app_ro";"#)
+            drop.contains(r#"DROP OWNED BY "app_ro";"#),
+            "must clean up grants first"
         );
+        assert!(drop.contains(r#"DROP ROLE "app_ro";"#));
         assert!(provider.drop_role_command("bad name").is_err());
         let alter = provider.alter_password_command("app_ro", "new'pw").unwrap();
         assert!(alter.contains(r#"ALTER ROLE "app_ro" WITH PASSWORD 'new''pw';"#));
