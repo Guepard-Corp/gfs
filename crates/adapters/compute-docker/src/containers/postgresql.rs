@@ -667,8 +667,12 @@ impl DatabaseProvider for PostgresqlProvider {
         // filters system `pg_*` roles without LIKE-escape fragility; the private
         // `guepard-admin` management role is never listed.
         const DELIM: &str = "GFS_SQL_EOF";
+        // Exclude system `pg_*` roles and the platform's management/bootstrap
+        // supers (`guepard-admin`, `postgres`) — neither is a client role, and
+        // surfacing the connection superuser invites a wedging `drop` (see
+        // `reject_reserved_role`).
         let sql = "SELECT COALESCE(json_agg(json_build_object('username', rolname, 'can_login', rolcanlogin, 'is_superuser', rolsuper) ORDER BY rolname), '[]'::json) \
-                   FROM pg_roles WHERE left(rolname, 3) <> 'pg_' AND rolname <> 'guepard-admin';";
+                   FROM pg_roles WHERE left(rolname, 3) <> 'pg_' AND rolname NOT IN ('guepard-admin', 'postgres');";
         let body = gfs_domain::utils::shell::sql_heredoc_body(DELIM, sql)?;
         Ok(format!(
             r#"PGPASSWORD="${{POSTGRES_PASSWORD:-postgres}}" psql -h 127.0.0.1 -U "${{POSTGRES_USER:-postgres}}" -d "${{POSTGRES_DB:-postgres}}" -tA -v ON_ERROR_STOP=1 -c "{body}""#
@@ -1296,7 +1300,7 @@ mod tests {
             "list must use tuples-only unaligned output"
         );
         assert!(cmd.contains("json_agg"));
-        assert!(cmd.contains("rolname <> 'guepard-admin'"));
+        assert!(cmd.contains("rolname NOT IN ('guepard-admin', 'postgres')"));
         assert!(cmd.contains("left(rolname, 3) <> 'pg_'"));
     }
 

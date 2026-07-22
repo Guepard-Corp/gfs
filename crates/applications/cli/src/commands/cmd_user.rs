@@ -42,14 +42,20 @@ fn generate_password() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
-fn print_credential(username: &str, password: &str, json_output: bool) {
+fn print_credential(username: &str, password: &str, generated: bool, json_output: bool) {
     if json_output {
+        // Machine output keeps a stable shape; the caller opts into it and owns
+        // redaction of a password they themselves supplied.
         println!(
             "{}",
             serde_json::json!({ "username": username, "password": password })
         );
-    } else {
+    } else if generated {
+        // Only the server-generated secret is the "shown once" copy worth echoing.
         println!("user '{username}' — password (shown once): {password}");
+    } else {
+        // A caller-supplied password is not re-echoed to the terminal/logs.
+        println!("user '{username}' — password set");
     }
 }
 
@@ -62,6 +68,7 @@ pub async fn run_create(
 ) -> Result<()> {
     let repo_path = path.unwrap_or_else(get_repo_dir);
     let preset = parse_preset(preset)?;
+    let generated = password.is_none();
     let password = password.unwrap_or_else(generate_password);
     let use_case = build_use_case(&repo_path).await?;
     use_case
@@ -75,7 +82,7 @@ pub async fn run_create(
         )
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    print_credential(&username, &password, json_output);
+    print_credential(&username, &password, generated, json_output);
     Ok(())
 }
 
@@ -126,12 +133,13 @@ pub async fn run_set_password(
     json_output: bool,
 ) -> Result<()> {
     let repo_path = path.unwrap_or_else(get_repo_dir);
+    let generated = password.is_none();
     let password = password.unwrap_or_else(generate_password);
     let use_case = build_use_case(&repo_path).await?;
     use_case
         .set_password(&repo_path, &username, &password)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    print_credential(&username, &password, json_output);
+    print_credential(&username, &password, generated, json_output);
     Ok(())
 }

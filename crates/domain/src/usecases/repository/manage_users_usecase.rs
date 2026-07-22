@@ -126,6 +126,7 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
 
     /// Drop a role.
     pub async fn drop_role(&self, path: &Path, username: &str) -> Result<(), ManageUsersError> {
+        reject_reserved_role(username)?;
         let (provider, container) = self.resolve(path)?;
         let command = provider
             .drop_role_command(username)
@@ -192,6 +193,23 @@ fn require_password(password: &str) -> Result<(), ManageUsersError> {
     }
 }
 
+/// The platform's management/bootstrap roles, never client roles. Refuse to drop
+/// them: `postgres` is the engine's own connection superuser, and dropping it
+/// makes `DROP OWNED BY` walk the entire database and wedge the session (and the
+/// same holds for `guepard-admin` once it is the bootstrap super). Fail fast with
+/// a clear message instead.
+const RESERVED_ROLES: [&str; 2] = ["guepard-admin", "postgres"];
+
+fn reject_reserved_role(username: &str) -> Result<(), ManageUsersError> {
+    if RESERVED_ROLES.contains(&username) {
+        Err(ManageUsersError::InvalidInput(format!(
+            "'{username}' is a reserved management role and cannot be dropped"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 /// Map a provider error to the right domain error: validation failures (bad
 /// identifier, delimiter collision) are `InvalidInput`, not `Unsupported`.
 fn map_provider_err(e: crate::ports::database_provider::ProviderError) -> ManageUsersError {
@@ -208,6 +226,14 @@ mod tests {
     use std::sync::Mutex;
 
     use async_trait::async_trait;
+
+    #[test]
+    fn reserved_roles_cannot_be_dropped() {
+        use super::reject_reserved_role;
+        assert!(reject_reserved_role("postgres").is_err());
+        assert!(reject_reserved_role("guepard-admin").is_err());
+        assert!(reject_reserved_role("app_rw").is_ok());
+    }
     use tempfile::TempDir;
 
     use super::*;

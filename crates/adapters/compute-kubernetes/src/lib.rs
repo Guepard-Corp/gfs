@@ -25,13 +25,41 @@ use k8s_openapi::api::core::v1::{
     PodSecurityContext, PodSpec, PodTemplateSpec, Secret, SecretKeySelector, Service, ServicePort,
     ServiceSpec, Volume, VolumeMount,
 };
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, Status};
 use kube::api::{AttachParams, DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::{Api, Client};
 use serde_json::json;
 
 const DEFAULT_NAMESPACE: &str = "gfs";
 const DEFAULT_PVC_SIZE_GI: &str = "1";
+
+/// Extract the process exit code from a Kubernetes exec `Status`.
+///
+/// The kubelet sends a metav1 `Status` on the exec v4 error channel: `Success`
+/// ⇒ exit 0; otherwise `reason: NonZeroExitCode` with the code carried in
+/// `details.causes[reason=ExitCode].message`. A non-success status with no
+/// parseable code is treated as a generic failure (1) rather than a false
+/// success. `None` (no status delivered) preserves the lenient 0.
+fn exit_code_from_status(status: Option<Status>) -> i32 {
+    let Some(status) = status else {
+        return 0;
+    };
+    if status.status.as_deref() == Some("Success") {
+        return 0;
+    }
+    status
+        .details
+        .as_ref()
+        .and_then(|details| details.causes.as_ref())
+        .and_then(|causes| {
+            causes
+                .iter()
+                .find(|cause| cause.reason.as_deref() == Some("ExitCode"))
+        })
+        .and_then(|cause| cause.message.as_deref())
+        .and_then(|message| message.parse::<i32>().ok())
+        .unwrap_or(1)
+}
 
 fn k8s_storage_class() -> Option<String> {
     std::env::var("GFS_K8S_STORAGE_CLASS")
@@ -1173,8 +1201,9 @@ impl Compute for KubernetesCompute {
             }
         };
 
-        // Take the status channel before draining stdout/stderr; await it after
-        // (the streams close on process exit, at which point the status is ready).
+        // Take the status channel BEFORE draining stdout/stderr; the kubelet sends
+        // the exec `Status` (carrying the real exit code) on the v4 error channel
+        // when the process exits. Awaited after the streams are fully read.
         let status_fut = attached.take_status();
 
         let mut stdout = String::new();
@@ -1205,6 +1234,7 @@ impl Compute for KubernetesCompute {
             Some(fut) => exit_code_from_exec_status(fut.await),
             None => 0,
         };
+
         Ok(ExecOutput {
             exit_code,
             stdout,
@@ -1453,6 +1483,48 @@ mod tests {
     use super::*;
     use gfs_domain::ports::compute::EnvVar;
     use k8s_openapi::ByteString;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::{StatusCause, StatusDetails};
+
+    #[test]
+    fn exit_code_success_is_zero() {
+        let status = Status {
+            status: Some("Success".into()),
+            ..Default::default()
+        };
+        assert_eq!(exit_code_from_status(Some(status)), 0);
+    }
+
+    #[test]
+    fn exit_code_reads_nonzero_from_causes() {
+        let status = Status {
+            status: Some("Failure".into()),
+            reason: Some("NonZeroExitCode".into()),
+            details: Some(StatusDetails {
+                causes: Some(vec![StatusCause {
+                    reason: Some("ExitCode".into()),
+                    message: Some("3".into()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(exit_code_from_status(Some(status)), 3);
+    }
+
+    #[test]
+    fn exit_code_failure_without_code_is_generic_failure() {
+        let status = Status {
+            status: Some("Failure".into()),
+            ..Default::default()
+        };
+        assert_eq!(exit_code_from_status(Some(status)), 1);
+    }
+
+    #[test]
+    fn exit_code_absent_status_stays_zero() {
+        assert_eq!(exit_code_from_status(None), 0);
+    }
 
     fn definition_with_env(env: Vec<EnvVar>) -> ComputeDefinition {
         ComputeDefinition {
