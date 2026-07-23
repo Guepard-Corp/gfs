@@ -3,7 +3,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gfs_domain::model::db_user::{DeployEnvSpec, RolePreset, RoleSpec};
+use gfs_domain::model::db_user::{
+    DeployEnvSpec, GrantSpec, GrantableObject, Privilege, RevokeSpec, RolePreset, RoleSpec,
+};
 use gfs_domain::ports::compute::{ComputeDefinition, EnvVar, PortMapping};
 use gfs_domain::ports::database_provider::{
     CloneSpec, ConnectionParams, DataFormat, DatabaseProvider, DatabaseProviderArg,
@@ -721,6 +723,68 @@ impl DatabaseProvider for PostgresqlProvider {
         self.query_in_instance_command(&sql)
     }
 
+    fn grant_command(&self, spec: &GrantSpec) -> std::result::Result<String, ProviderError> {
+        let stmts = pg_privilege_change_sql(
+            PrivilegeChange::Grant,
+            &spec.role,
+            &spec.object,
+            &spec.privileges,
+            spec.with_grant_option,
+            false,
+            spec.apply_to_future.as_deref(),
+        )?;
+        // Transactional so a multi-statement grant (+ optional default-privileges
+        // line) is atomic — no partial grant on failure (fixes v2 gap).
+        self.query_in_instance_command(&format!("BEGIN;\n{stmts}\nCOMMIT;"))
+    }
+
+    fn revoke_command(&self, spec: &RevokeSpec) -> std::result::Result<String, ProviderError> {
+        let stmts = pg_privilege_change_sql(
+            PrivilegeChange::Revoke,
+            &spec.role,
+            &spec.object,
+            &spec.privileges,
+            false,
+            spec.cascade,
+            None,
+        )?;
+        self.query_in_instance_command(&format!("BEGIN;\n{stmts}\nCOMMIT;"))
+    }
+
+    fn list_privileges_command(&self, role: &str) -> std::result::Result<String, ProviderError> {
+        // Validate the identifier even though the query filters by a quoted
+        // literal — defence-in-depth (rejects anything outside the ident set).
+        pg_quote_ident(role)?;
+        const DELIM: &str = "GFS_SQL_EOF";
+        // Live read from the engine catalog (authoritative; no CP mirror). Table
+        // + sequence grants come from `information_schema.role_*_grants`; schema
+        // + database grants are expanded from their ACLs via `aclexplode`. `-tA`
+        // + `json_agg` → clean JSON parsed into `Vec<ObjectPrivilege>`. Never a
+        // secret. `grantee` is matched against a quoted literal.
+        let grantee = sql_lit(role);
+        let sql = format!(
+            "SELECT COALESCE(json_agg(row_to_json(p) ORDER BY p.object_type, p.object_name, p.privilege), '[]'::json) FROM (\n\
+               SELECT 'table'::text AS object_type, table_schema || '.' || table_name AS object_name, lower(privilege_type) AS privilege, (is_grantable = 'YES') AS grantable \
+                 FROM information_schema.role_table_grants WHERE grantee = '{grantee}'\n\
+             UNION ALL\n\
+               SELECT 'sequence'::text, object_schema || '.' || object_name, lower(privilege_type), (is_grantable = 'YES') \
+                 FROM information_schema.role_usage_grants WHERE grantee = '{grantee}' AND object_type = 'SEQUENCE'\n\
+             UNION ALL\n\
+               SELECT 'schema'::text, n.nspname, lower(a.privilege_type), a.is_grantable \
+                 FROM pg_namespace n, aclexplode(n.nspacl) a JOIN pg_roles r ON r.oid = a.grantee \
+                 WHERE r.rolname = '{grantee}'\n\
+             UNION ALL\n\
+               SELECT 'database'::text, d.datname, lower(a.privilege_type), a.is_grantable \
+                 FROM pg_database d, aclexplode(d.datacl) a JOIN pg_roles r ON r.oid = a.grantee \
+                 WHERE r.rolname = '{grantee}' AND d.datname = current_database()\n\
+             ) p;"
+        );
+        let body = gfs_domain::utils::shell::sql_heredoc_body(DELIM, &sql)?;
+        Ok(format!(
+            r#"PGPASSWORD="${{POSTGRES_PASSWORD:-postgres}}" psql -h 127.0.0.1 -U "${{POSTGRES_USER:-postgres}}" -d "${{POSTGRES_DB:-postgres}}" -tA -v ON_ERROR_STOP=1 -c "{body}""#
+        ))
+    }
+
     // -----------------------------------------------------------------------
     // Schema Extraction
     // -----------------------------------------------------------------------
@@ -963,6 +1027,155 @@ fn pg_preset_sql(ident: &str, preset: RolePreset) -> String {
         }
     }
     s
+}
+
+/// Whether a privilege change is a GRANT or a REVOKE.
+#[derive(Clone, Copy)]
+enum PrivilegeChange {
+    Grant,
+    Revoke,
+}
+
+/// The uppercase SQL keyword for a single privilege. `All` renders as the full
+/// `ALL PRIVILEGES` (though [`pg_privilege_list`] handles the ALL case first).
+fn pg_privilege_keyword(p: Privilege) -> &'static str {
+    match p {
+        Privilege::Select => "SELECT",
+        Privilege::Insert => "INSERT",
+        Privilege::Update => "UPDATE",
+        Privilege::Delete => "DELETE",
+        Privilege::Truncate => "TRUNCATE",
+        Privilege::References => "REFERENCES",
+        Privilege::Trigger => "TRIGGER",
+        Privilege::Usage => "USAGE",
+        Privilege::Create => "CREATE",
+        Privilege::Connect => "CONNECT",
+        Privilege::Temporary => "TEMPORARY",
+        Privilege::All => "ALL PRIVILEGES",
+    }
+}
+
+/// Render a privilege set for a `GRANT`/`REVOKE`. If any element is `All`, the
+/// whole set collapses to `ALL PRIVILEGES` (PostgreSQL forbids mixing `ALL`
+/// with named privileges).
+fn pg_privilege_list(privileges: &[Privilege]) -> String {
+    if privileges.iter().any(|p| matches!(p, Privilege::All)) {
+        return "ALL PRIVILEGES".to_string();
+    }
+    privileges
+        .iter()
+        .map(|p| pg_privilege_keyword(*p))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The `ON …` object clause for the non-`Database` variants, with every
+/// identifier validated + double-quoted via [`pg_quote_ident`]. `Database` is
+/// assembled separately (its name is resolved at runtime).
+fn pg_grant_object_clause(obj: &GrantableObject) -> std::result::Result<String, ProviderError> {
+    Ok(match obj {
+        GrantableObject::Database => {
+            return Err(ProviderError::InvalidParams(
+                "database object clause is assembled at runtime, not here".into(),
+            ));
+        }
+        GrantableObject::Schema { schema } => format!("ON SCHEMA {}", pg_quote_ident(schema)?),
+        GrantableObject::Table { schema, name } => {
+            format!(
+                "ON TABLE {}.{}",
+                pg_quote_ident(schema)?,
+                pg_quote_ident(name)?
+            )
+        }
+        GrantableObject::AllTablesInSchema { schema } => {
+            format!("ON ALL TABLES IN SCHEMA {}", pg_quote_ident(schema)?)
+        }
+        GrantableObject::Sequence { schema, name } => format!(
+            "ON SEQUENCE {}.{}",
+            pg_quote_ident(schema)?,
+            pg_quote_ident(name)?
+        ),
+        GrantableObject::AllSequencesInSchema { schema } => {
+            format!("ON ALL SEQUENCES IN SCHEMA {}", pg_quote_ident(schema)?)
+        }
+    })
+}
+
+/// Build the (non-transaction-wrapped) `GRANT`/`REVOKE` statement(s) for a
+/// privilege change. Every privilege is re-checked against the object type
+/// (allow-list, reject-not-warn), every identifier is `quote_ident`-quoted, and
+/// the `Database` scope resolves to the instance's own database at runtime. When
+/// `apply_to_future` is `Some(grantor)` (grant, all-in-schema scopes only) a
+/// role-scoped `ALTER DEFAULT PRIVILEGES FOR ROLE` line is appended.
+fn pg_privilege_change_sql(
+    action: PrivilegeChange,
+    role: &str,
+    object: &GrantableObject,
+    privileges: &[Privilege],
+    with_grant_option: bool,
+    cascade: bool,
+    apply_to_future: Option<&str>,
+) -> std::result::Result<String, ProviderError> {
+    if privileges.is_empty() {
+        return Err(ProviderError::InvalidParams(
+            "at least one privilege is required".into(),
+        ));
+    }
+    for p in privileges {
+        if !p.is_valid_for(object) {
+            return Err(ProviderError::InvalidParams(format!(
+                "privilege {} is not valid for the target object type",
+                pg_privilege_keyword(*p)
+            )));
+        }
+    }
+    let role_ident = pg_quote_ident(role)?;
+    let privs = pg_privilege_list(privileges);
+    let (verb, dir) = match action {
+        PrivilegeChange::Grant => ("GRANT", "TO"),
+        PrivilegeChange::Revoke => ("REVOKE", "FROM"),
+    };
+    let suffix = match action {
+        PrivilegeChange::Grant if with_grant_option => " WITH GRANT OPTION",
+        PrivilegeChange::Revoke if cascade => " CASCADE",
+        _ => "",
+    };
+
+    let mut sql = match object {
+        GrantableObject::Database => format!(
+            "DO $$ BEGIN EXECUTE '{verb} {privs} ON DATABASE ' || quote_ident(current_database()) || ' {dir} {role_ident}{suffix}'; END $$;"
+        ),
+        other => {
+            let clause = pg_grant_object_clause(other)?;
+            format!("{verb} {privs} {clause} {dir} {role_ident}{suffix};")
+        }
+    };
+
+    if let Some(grantor) = apply_to_future {
+        if matches!(action, PrivilegeChange::Revoke) {
+            return Err(ProviderError::InvalidParams(
+                "apply_to_future is only valid for grant".into(),
+            ));
+        }
+        let (schema, kind) = match object {
+            GrantableObject::AllTablesInSchema { schema } => (schema, "TABLES"),
+            GrantableObject::AllSequencesInSchema { schema } => (schema, "SEQUENCES"),
+            _ => {
+                return Err(ProviderError::InvalidParams(
+                    "apply_to_future is only valid for all-tables/all-sequences-in-schema scopes"
+                        .into(),
+                ));
+            }
+        };
+        let grantor_ident = pg_quote_ident(grantor)?;
+        let schema_ident = pg_quote_ident(schema)?;
+        sql.push('\n');
+        sql.push_str(&format!(
+            "ALTER DEFAULT PRIVILEGES FOR ROLE {grantor_ident} IN SCHEMA {schema_ident} GRANT {privs} ON {kind} TO {role_ident};"
+        ));
+    }
+
+    Ok(sql)
 }
 
 /// Build the bootstrap SQL run inside the local GFS database to set up a lazy
@@ -1720,6 +1933,318 @@ mod tests {
         assert!(
             spec.command
                 .contains("sed -i '/^SET transaction_timeout/d' /tmp/gfs_faithful.sql")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Object-level grant / revoke / list-privileges (phase 2) — exact SQL
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn grant_command_quotes_and_wraps_in_txn() {
+        use gfs_domain::model::db_user::{GrantSpec, GrantableObject, Privilege};
+        let provider = PostgresqlProvider::new();
+        let spec = GrantSpec {
+            role: "app_ro".into(),
+            object: GrantableObject::Table {
+                schema: "public".into(),
+                name: "orders".into(),
+            },
+            privileges: vec![Privilege::Select, Privilege::Insert],
+            with_grant_option: false,
+            apply_to_future: None,
+        };
+        let cmd = provider.grant_command(&spec).expect("cmd");
+        assert!(
+            cmd.contains(r#"GRANT SELECT, INSERT ON TABLE "public"."orders" TO "app_ro";"#),
+            "got: {cmd}"
+        );
+        assert!(
+            cmd.contains("BEGIN;") && cmd.contains("COMMIT;"),
+            "must be transactional"
+        );
+    }
+
+    #[test]
+    fn grant_command_collapses_all_and_appends_grant_option() {
+        use gfs_domain::model::db_user::{GrantSpec, GrantableObject, Privilege};
+        let provider = PostgresqlProvider::new();
+        let spec = GrantSpec {
+            role: "app_admin".into(),
+            object: GrantableObject::Schema {
+                schema: "public".into(),
+            },
+            privileges: vec![Privilege::All],
+            with_grant_option: true,
+            apply_to_future: None,
+        };
+        let cmd = provider.grant_command(&spec).unwrap();
+        assert!(
+            cmd.contains(
+                r#"GRANT ALL PRIVILEGES ON SCHEMA "public" TO "app_admin" WITH GRANT OPTION;"#
+            ),
+            "got: {cmd}"
+        );
+    }
+
+    #[test]
+    fn grant_command_apply_to_future_emits_role_scoped_default_privileges() {
+        use gfs_domain::model::db_user::{GrantSpec, GrantableObject, Privilege};
+        let provider = PostgresqlProvider::new();
+        let spec = GrantSpec {
+            role: "developers".into(),
+            object: GrantableObject::AllTablesInSchema {
+                schema: "public".into(),
+            },
+            privileges: vec![Privilege::Select],
+            with_grant_option: false,
+            apply_to_future: Some("owner".into()),
+        };
+        let cmd = provider.grant_command(&spec).unwrap();
+        assert!(cmd.contains(r#"GRANT SELECT ON ALL TABLES IN SCHEMA "public" TO "developers";"#));
+        assert!(
+            cmd.contains(r#"ALTER DEFAULT PRIVILEGES FOR ROLE "owner" IN SCHEMA "public" GRANT SELECT ON TABLES TO "developers";"#),
+            "got: {cmd}"
+        );
+    }
+
+    #[test]
+    fn grant_command_database_scope_resolves_name_at_runtime() {
+        use gfs_domain::model::db_user::{GrantSpec, GrantableObject, Privilege};
+        let provider = PostgresqlProvider::new();
+        let spec = GrantSpec {
+            role: "app_ro".into(),
+            object: GrantableObject::Database,
+            privileges: vec![Privilege::Connect],
+            with_grant_option: false,
+            apply_to_future: None,
+        };
+        let cmd = provider.grant_command(&spec).unwrap();
+        assert!(
+            cmd.contains("quote_ident(current_database())"),
+            "database name must resolve at runtime (no caller-named DB); got: {cmd}"
+        );
+        assert!(cmd.contains("GRANT CONNECT ON DATABASE"));
+    }
+
+    #[test]
+    fn grant_command_rejects_out_of_matrix_privilege() {
+        use gfs_domain::model::db_user::{GrantSpec, GrantableObject, Privilege};
+        let provider = PostgresqlProvider::new();
+        // INSERT is not a valid privilege on a sequence.
+        let spec = GrantSpec {
+            role: "app_ro".into(),
+            object: GrantableObject::Sequence {
+                schema: "public".into(),
+                name: "q".into(),
+            },
+            privileges: vec![Privilege::Insert],
+            with_grant_option: false,
+            apply_to_future: None,
+        };
+        assert!(
+            provider.grant_command(&spec).is_err(),
+            "INSERT on a sequence must be rejected before SQL"
+        );
+    }
+
+    #[test]
+    fn grant_command_rejects_apply_to_future_on_single_object() {
+        use gfs_domain::model::db_user::{GrantSpec, GrantableObject, Privilege};
+        let provider = PostgresqlProvider::new();
+        let spec = GrantSpec {
+            role: "app_ro".into(),
+            object: GrantableObject::Table {
+                schema: "public".into(),
+                name: "t".into(),
+            },
+            privileges: vec![Privilege::Select],
+            with_grant_option: false,
+            apply_to_future: Some("owner".into()),
+        };
+        assert!(
+            provider.grant_command(&spec).is_err(),
+            "apply_to_future is only valid for all-in-schema scopes"
+        );
+    }
+
+    #[test]
+    fn revoke_command_defaults_restrict_and_supports_cascade() {
+        use gfs_domain::model::db_user::{GrantableObject, Privilege, RevokeSpec};
+        let provider = PostgresqlProvider::new();
+        let spec = |cascade| RevokeSpec {
+            role: "app_rw".into(),
+            object: GrantableObject::Table {
+                schema: "public".into(),
+                name: "orders".into(),
+            },
+            privileges: vec![Privilege::Insert],
+            cascade,
+        };
+        let restrict = provider.revoke_command(&spec(false)).unwrap();
+        assert!(
+            restrict.contains(r#"REVOKE INSERT ON TABLE "public"."orders" FROM "app_rw";"#),
+            "got: {restrict}"
+        );
+        assert!(!restrict.contains("CASCADE"), "default is RESTRICT");
+        let cascade = provider.revoke_command(&spec(true)).unwrap();
+        assert!(
+            cascade.contains(r#"FROM "app_rw" CASCADE;"#),
+            "got: {cascade}"
+        );
+    }
+
+    #[test]
+    fn list_privileges_command_uses_ta_json_filtered_to_role() {
+        let provider = PostgresqlProvider::new();
+        let cmd = provider.list_privileges_command("app_ro").unwrap();
+        assert!(cmd.contains("-tA"), "tuples-only JSON read");
+        assert!(cmd.contains("json_agg"));
+        assert!(
+            cmd.contains("grantee = 'app_ro'"),
+            "must filter by the role literal"
+        );
+        assert!(cmd.contains("role_table_grants") && cmd.contains("aclexplode"));
+    }
+
+    #[test]
+    fn list_privileges_command_rejects_bad_role() {
+        let provider = PostgresqlProvider::new();
+        assert!(
+            provider
+                .list_privileges_command("bad; DROP ROLE x; --")
+                .is_err()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // EMPIRICAL: emitted SQL against a live PostgreSQL (Docker-gated).
+    // Proves grant/revoke actually change `has_table_privilege` — not just that
+    // our SQL string equals an expected string. Skips (does not fail) w/o Docker.
+    // -----------------------------------------------------------------------
+
+    fn docker_available() -> bool {
+        std::process::Command::new("docker")
+            .arg("info")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn grant_revoke_flip_has_table_privilege_on_live_pg() {
+        use gfs_domain::model::db_user::{GrantSpec, GrantableObject, Privilege, RevokeSpec};
+        if !docker_available() {
+            eprintln!("SKIP grant_revoke_flip_has_table_privilege_on_live_pg: docker unavailable");
+            return;
+        }
+        let provider = PostgresqlProvider::new();
+        let cn = format!("gfs-grant-live-{}", std::process::id());
+        let docker = |args: &[&str]| {
+            std::process::Command::new("docker")
+                .args(args)
+                .output()
+                .expect("docker")
+        };
+        let exec_sql = |cn: &str, sql: &str| {
+            std::process::Command::new("docker")
+                .args(["exec", cn, "psql", "-U", "postgres", "-tAc", sql])
+                .output()
+                .expect("docker exec psql")
+        };
+        // Run an emitted (full shell) command inside the container via `sh -c`.
+        let exec_shell = |cn: &str, cmd: &str| {
+            std::process::Command::new("docker")
+                .args(["exec", cn, "sh", "-c", cmd])
+                .output()
+                .expect("docker exec sh")
+        };
+
+        let _ = docker(&["rm", "-f", &cn]);
+        let run = docker(&[
+            "run",
+            "-d",
+            "--rm",
+            "--name",
+            &cn,
+            "-e",
+            "POSTGRES_PASSWORD=x",
+            "postgres:17",
+        ]);
+        assert!(
+            run.status.success(),
+            "docker run: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+
+        let mut ready = false;
+        for _ in 0..30 {
+            if docker(&["exec", &cn, "pg_isready", "-U", "postgres"])
+                .status
+                .success()
+            {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        exec_sql(&cn, "CREATE ROLE app_ro; CREATE TABLE public.t(id int);");
+
+        let grant = provider
+            .grant_command(&GrantSpec {
+                role: "app_ro".into(),
+                object: GrantableObject::Table {
+                    schema: "public".into(),
+                    name: "t".into(),
+                },
+                privileges: vec![Privilege::Select],
+                with_grant_option: false,
+                apply_to_future: None,
+            })
+            .unwrap();
+        let revoke = provider
+            .revoke_command(&RevokeSpec {
+                role: "app_ro".into(),
+                object: GrantableObject::Table {
+                    schema: "public".into(),
+                    name: "t".into(),
+                },
+                privileges: vec![Privilege::Select],
+                cascade: false,
+            })
+            .unwrap();
+        let priv_q = "SELECT has_table_privilege('app_ro','public.t','SELECT')";
+
+        let g = exec_shell(&cn, &grant);
+        let after_grant = String::from_utf8_lossy(&exec_sql(&cn, priv_q).stdout)
+            .trim()
+            .to_string();
+        let r = exec_shell(&cn, &revoke);
+        let after_revoke = String::from_utf8_lossy(&exec_sql(&cn, priv_q).stdout)
+            .trim()
+            .to_string();
+
+        // Clean up BEFORE asserting so a failed assert never leaks the container.
+        let _ = docker(&["rm", "-f", &cn]);
+
+        assert!(ready, "postgres never became ready");
+        assert!(
+            g.status.success(),
+            "emitted GRANT failed: {}",
+            String::from_utf8_lossy(&g.stderr)
+        );
+        assert_eq!(
+            after_grant, "t",
+            "SELECT must be granted after the emitted GRANT"
+        );
+        assert!(
+            r.status.success(),
+            "emitted REVOKE failed: {}",
+            String::from_utf8_lossy(&r.stderr)
+        );
+        assert_eq!(
+            after_revoke, "f",
+            "SELECT must be gone after the emitted REVOKE"
         );
     }
 }

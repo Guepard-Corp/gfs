@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
-use crate::model::db_user::{DeployEnvSpec, RolePreset, RoleSpec};
+use crate::model::db_user::{DeployEnvSpec, GrantSpec, RevokeSpec, RolePreset, RoleSpec};
 use crate::ports::compute::ComputeDefinition;
 
 // ---------------------------------------------------------------------------
@@ -480,6 +480,33 @@ pub trait DatabaseProvider: Send + Sync {
         Err(ProviderError::UnsupportedFormat(
             "bootstrap_deploy_env".into(),
         ))
+    }
+
+    /// In-instance command that grants `spec.privileges` on `spec.object` to
+    /// `spec.role` (optionally `WITH GRANT OPTION` and role-scoped default
+    /// privileges for future objects). Identifiers must be validated + quoted
+    /// and every privilege re-checked against the object type by the
+    /// implementation; the whole grant runs in one transaction. Optional-
+    /// defaulted so non-Postgres providers cost nothing until their phase.
+    fn grant_command(&self, spec: &GrantSpec) -> std::result::Result<String, ProviderError> {
+        let _ = spec;
+        Err(ProviderError::UnsupportedFormat("grant".into()))
+    }
+
+    /// In-instance command that revokes `spec.privileges` on `spec.object` from
+    /// `spec.role` (default `RESTRICT`, or `CASCADE` when `spec.cascade`). Same
+    /// validation/quoting/transaction contract as [`Self::grant_command`].
+    fn revoke_command(&self, spec: &RevokeSpec) -> std::result::Result<String, ProviderError> {
+        let _ = spec;
+        Err(ProviderError::UnsupportedFormat("revoke".into()))
+    }
+
+    /// In-instance command that lists `role`'s effective object privileges as
+    /// JSON (parsed into [`crate::model::db_user::ObjectPrivilege`]), read live
+    /// from the engine catalog. Never includes a secret.
+    fn list_privileges_command(&self, role: &str) -> std::result::Result<String, ProviderError> {
+        let _ = role;
+        Err(ProviderError::UnsupportedFormat("list_privileges".into()))
     }
 
     // -----------------------------------------------------------------------

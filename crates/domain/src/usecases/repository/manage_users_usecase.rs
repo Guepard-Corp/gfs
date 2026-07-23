@@ -11,7 +11,10 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::model::config::GfsConfig;
-use crate::model::db_user::{DeployEnvSpec, RoleInfo, RolePreset, RoleSpec};
+use crate::model::db_user::{
+    DeployEnvSpec, GrantSpec, GrantableObject, ObjectPrivilege, Privilege, RevokeSpec, RoleInfo,
+    RolePreset, RoleSpec,
+};
 use crate::ports::compute::{Compute, ExecOutput, InstanceId};
 use crate::ports::database_provider::{DatabaseProvider, DatabaseProviderRegistry};
 
@@ -176,6 +179,63 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
         serde_json::from_str(output.stdout.trim())
             .map_err(|e| ManageUsersError::Parse(e.to_string()))
     }
+
+    /// Grant object-level privileges on `spec.object` to `spec.role`.
+    pub async fn grant(&self, path: &Path, spec: &GrantSpec) -> Result<(), ManageUsersError> {
+        validate_privileges(&spec.privileges, &spec.object)?;
+        let (provider, container) = self.resolve(path)?;
+        let command = provider.grant_command(spec).map_err(map_provider_err)?;
+        expect_success(self.run(&container, &command).await?)
+    }
+
+    /// Revoke object-level privileges on `spec.object` from `spec.role`.
+    pub async fn revoke(&self, path: &Path, spec: &RevokeSpec) -> Result<(), ManageUsersError> {
+        validate_privileges(&spec.privileges, &spec.object)?;
+        let (provider, container) = self.resolve(path)?;
+        let command = provider.revoke_command(spec).map_err(map_provider_err)?;
+        expect_success(self.run(&container, &command).await?)
+    }
+
+    /// List a role's effective object privileges (never a secret).
+    pub async fn list_privileges(
+        &self,
+        path: &Path,
+        role: &str,
+    ) -> Result<Vec<ObjectPrivilege>, ManageUsersError> {
+        let (provider, container) = self.resolve(path)?;
+        let command = provider
+            .list_privileges_command(role)
+            .map_err(map_provider_err)?;
+        let output = self.run(&container, &command).await?;
+        if output.exit_code != 0 {
+            return Err(fail(output));
+        }
+        serde_json::from_str(output.stdout.trim())
+            .map_err(|e| ManageUsersError::Parse(e.to_string()))
+    }
+}
+
+/// Reject a privilege set that is empty or contains a privilege not valid for the
+/// target object type (the domain allow-list), *before* the command is built —
+/// engine-independent defence-in-depth (the provider re-checks too).
+fn validate_privileges(
+    privileges: &[Privilege],
+    object: &GrantableObject,
+) -> Result<(), ManageUsersError> {
+    if privileges.is_empty() {
+        return Err(ManageUsersError::InvalidInput(
+            "at least one privilege is required".into(),
+        ));
+    }
+    for p in privileges {
+        if !p.is_valid_for(object) {
+            return Err(ManageUsersError::InvalidInput(format!(
+                "privilege '{}' is not valid for the target object type",
+                p.as_str()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// A mutating op succeeded iff the exit code is zero.
@@ -491,6 +551,24 @@ mod tests {
             self.guard()?;
             Ok(format!("MOCK-DEPLOYENV:{}:{}", spec.owner, spec.group))
         }
+
+        fn grant_command(&self, spec: &GrantSpec) -> std::result::Result<String, ProviderError> {
+            self.guard()?;
+            Ok(format!("MOCK-GRANT:{}", spec.role))
+        }
+
+        fn revoke_command(&self, spec: &RevokeSpec) -> std::result::Result<String, ProviderError> {
+            self.guard()?;
+            Ok(format!("MOCK-REVOKE:{}", spec.role))
+        }
+
+        fn list_privileges_command(
+            &self,
+            role: &str,
+        ) -> std::result::Result<String, ProviderError> {
+            self.guard()?;
+            Ok(format!("MOCK-LISTPRIVS:{role}"))
+        }
     }
 
     fn repo_with_config(container: &str) -> (TempDir, PathBuf) {
@@ -659,5 +737,149 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ManageUsersError::InvalidInput(_)));
+    }
+
+    // ----- object-level grant / revoke / list-privileges (phase 2) -----
+
+    fn grant_spec(role: &str, object: GrantableObject, privileges: Vec<Privilege>) -> GrantSpec {
+        GrantSpec {
+            role: role.into(),
+            object,
+            privileges,
+            with_grant_option: false,
+            apply_to_future: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn grant_execs_the_provider_command() {
+        let (_temp, repo) = repo_with_config("pg-c1");
+        let (uc, compute) = use_case(MockCompute::default(), true);
+        uc.grant(
+            &repo,
+            &grant_spec(
+                "app_ro",
+                GrantableObject::Table {
+                    schema: "public".into(),
+                    name: "t".into(),
+                },
+                vec![Privilege::Select],
+            ),
+        )
+        .await
+        .expect("ok");
+        assert_eq!(
+            compute.last_command.lock().unwrap().clone(),
+            Some("MOCK-GRANT:app_ro".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_execs_the_provider_command() {
+        let (_temp, repo) = repo_with_config("pg-c1");
+        let (uc, compute) = use_case(MockCompute::default(), true);
+        uc.revoke(
+            &repo,
+            &RevokeSpec {
+                role: "app_rw".into(),
+                object: GrantableObject::Table {
+                    schema: "public".into(),
+                    name: "t".into(),
+                },
+                privileges: vec![Privilege::Insert],
+                cascade: false,
+            },
+        )
+        .await
+        .expect("ok");
+        assert_eq!(
+            compute.last_command.lock().unwrap().clone(),
+            Some("MOCK-REVOKE:app_rw".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_privilege_is_rejected_before_any_exec() {
+        let (_temp, repo) = repo_with_config("pg-c1");
+        let (uc, compute) = use_case(MockCompute::default(), true);
+        // INSERT is not valid on a sequence.
+        let err = uc
+            .grant(
+                &repo,
+                &grant_spec(
+                    "app_ro",
+                    GrantableObject::Sequence {
+                        schema: "public".into(),
+                        name: "q".into(),
+                    },
+                    vec![Privilege::Insert],
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ManageUsersError::InvalidInput(_)));
+        // The domain guard fired before resolve/exec — nothing reached compute.
+        assert!(
+            compute.last_command.lock().unwrap().is_none(),
+            "no command must be exec'd for an invalid privilege"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_privileges_is_rejected() {
+        let (_temp, repo) = repo_with_config("pg-c1");
+        let (uc, _c) = use_case(MockCompute::default(), true);
+        let err = uc
+            .grant(
+                &repo,
+                &grant_spec(
+                    "app_ro",
+                    GrantableObject::Table {
+                        schema: "public".into(),
+                        name: "t".into(),
+                    },
+                    vec![],
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ManageUsersError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn list_privileges_parses_json() {
+        let (_temp, repo) = repo_with_config("pg-c1");
+        let compute = MockCompute {
+            stdout: r#"[{"object_type":"table","object_name":"public.t","privilege":"select","grantable":false}]"#.into(),
+            ..Default::default()
+        };
+        let (uc, _c) = use_case(compute, true);
+        let privs = uc.list_privileges(&repo, "app_ro").await.expect("ok");
+        assert_eq!(privs.len(), 1);
+        assert_eq!(privs[0].object_type, "table");
+        assert_eq!(privs[0].object_name, "public.t");
+        assert_eq!(privs[0].privilege, "select");
+        assert!(!privs[0].grantable);
+    }
+
+    #[tokio::test]
+    async fn grant_on_unsupported_provider_maps_to_unsupported() {
+        let (_temp, repo) = repo_with_config("pg-c1");
+        let (uc, _c) = use_case(MockCompute::default(), /* support_users */ false);
+        let err = uc
+            .grant(
+                &repo,
+                &grant_spec(
+                    "app_ro",
+                    GrantableObject::Table {
+                        schema: "public".into(),
+                        name: "t".into(),
+                    },
+                    vec![Privilege::Select],
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ManageUsersError::Unsupported(_)));
     }
 }
