@@ -280,3 +280,85 @@ fn drop_is_non_destructive_and_recoverable_via_version_control() {
         );
     });
 }
+
+/// Story 007-004: object-level `gfs user grant/revoke/list-privs` change real
+/// privileges. Drives the ACTUAL CLI (clap parse → dispatch → run_grant →
+/// DockerCompute) and verifies against `has_table_privilege` in the engine.
+#[test]
+#[serial]
+fn user_grant_revoke_list_privileges() {
+    with_fresh_repo(|repo| {
+        let cid = get_container_id(repo);
+
+        // A least-privileged client role + a table to grant on.
+        assert!(gfs_user(
+            repo,
+            &[
+                "create",
+                "app_ro",
+                "--preset",
+                "readonly",
+                "--password",
+                "pw"
+            ],
+        ));
+        run_psql_select(&cid, "CREATE TABLE public.orders(id int);");
+
+        // GRANT SELECT on the table via the CLI.
+        assert!(gfs_user(
+            repo,
+            &[
+                "grant",
+                "app_ro",
+                "--on-table",
+                "public.orders",
+                "--privileges",
+                "SELECT",
+            ],
+        ));
+        assert_eq!(
+            run_psql_select(
+                &cid,
+                "SELECT has_table_privilege('app_ro','public.orders','SELECT')"
+            )
+            .trim(),
+            "t",
+            "CLI grant must give app_ro SELECT on public.orders",
+        );
+        // Least-privilege preserved: INSERT was NOT granted.
+        assert_eq!(
+            run_psql_select(
+                &cid,
+                "SELECT has_table_privilege('app_ro','public.orders','INSERT')"
+            )
+            .trim(),
+            "f",
+            "only SELECT was granted, not INSERT",
+        );
+
+        // list-privs runs (authoritative check is the has_table_privilege above).
+        assert!(gfs_user(repo, &["list-privs", "app_ro"]));
+
+        // REVOKE SELECT via the CLI.
+        assert!(gfs_user(
+            repo,
+            &[
+                "revoke",
+                "app_ro",
+                "--on-table",
+                "public.orders",
+                "--privileges",
+                "SELECT",
+            ],
+        ));
+        assert_eq!(
+            run_psql_select(
+                &cid,
+                "SELECT has_table_privilege('app_ro','public.orders','SELECT')"
+            )
+            .trim(),
+            "f",
+            "CLI revoke must remove SELECT",
+        );
+    });
+}

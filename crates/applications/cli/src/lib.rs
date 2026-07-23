@@ -104,6 +104,78 @@ pub enum UserAction {
         #[arg(long)]
         path: Option<PathBuf>,
     },
+    /// Grant object-level privileges to a user
+    Grant {
+        /// Grantee username
+        username: String,
+        /// Grant on the whole database
+        #[arg(long)]
+        on_database: bool,
+        /// Grant on a schema
+        #[arg(long, value_name = "SCHEMA")]
+        on_schema: Option<String>,
+        /// Grant on a table (or view): schema.name
+        #[arg(long, value_name = "SCHEMA.TABLE")]
+        on_table: Option<String>,
+        /// Grant on all existing tables in a schema
+        #[arg(long, value_name = "SCHEMA")]
+        on_all_tables_in_schema: Option<String>,
+        /// Grant on a sequence: schema.name
+        #[arg(long, value_name = "SCHEMA.SEQUENCE")]
+        on_sequence: Option<String>,
+        /// Grant on all existing sequences in a schema
+        #[arg(long, value_name = "SCHEMA")]
+        on_all_sequences_in_schema: Option<String>,
+        /// Comma-separated privileges, e.g. SELECT,INSERT (or ALL)
+        #[arg(long)]
+        privileges: String,
+        /// Allow the grantee to re-grant these privileges
+        #[arg(long)]
+        with_grant_option: bool,
+        /// Also cover future objects created by this grantor role (all-in-schema scopes only)
+        #[arg(long, value_name = "GRANTOR")]
+        apply_to_future: Option<String>,
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    /// Revoke object-level privileges from a user
+    Revoke {
+        /// Target username
+        username: String,
+        /// Revoke on the whole database
+        #[arg(long)]
+        on_database: bool,
+        /// Revoke on a schema
+        #[arg(long, value_name = "SCHEMA")]
+        on_schema: Option<String>,
+        /// Revoke on a table (or view): schema.name
+        #[arg(long, value_name = "SCHEMA.TABLE")]
+        on_table: Option<String>,
+        /// Revoke on all existing tables in a schema
+        #[arg(long, value_name = "SCHEMA")]
+        on_all_tables_in_schema: Option<String>,
+        /// Revoke on a sequence: schema.name
+        #[arg(long, value_name = "SCHEMA.SEQUENCE")]
+        on_sequence: Option<String>,
+        /// Revoke on all existing sequences in a schema
+        #[arg(long, value_name = "SCHEMA")]
+        on_all_sequences_in_schema: Option<String>,
+        /// Comma-separated privileges, e.g. SELECT,INSERT (or ALL)
+        #[arg(long)]
+        privileges: String,
+        /// Cascade to dependent grants (default RESTRICT)
+        #[arg(long)]
+        cascade: bool,
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    /// List a user's effective object privileges
+    ListPrivs {
+        /// Username
+        username: String,
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -881,6 +953,72 @@ where
                 } => {
                     commands::cmd_user::run_set_password(path, username, password, json_output)
                         .await?;
+                    Ok(0)
+                }
+                UserAction::Grant {
+                    username,
+                    on_database,
+                    on_schema,
+                    on_table,
+                    on_all_tables_in_schema,
+                    on_sequence,
+                    on_all_sequences_in_schema,
+                    privileges,
+                    with_grant_option,
+                    apply_to_future,
+                    path,
+                } => {
+                    commands::cmd_user::run_grant(
+                        path,
+                        username,
+                        commands::cmd_user::ObjectFlags {
+                            on_database,
+                            on_schema,
+                            on_table,
+                            on_all_tables_in_schema,
+                            on_sequence,
+                            on_all_sequences_in_schema,
+                        },
+                        privileges,
+                        with_grant_option,
+                        apply_to_future,
+                        json_output,
+                    )
+                    .await?;
+                    Ok(0)
+                }
+                UserAction::Revoke {
+                    username,
+                    on_database,
+                    on_schema,
+                    on_table,
+                    on_all_tables_in_schema,
+                    on_sequence,
+                    on_all_sequences_in_schema,
+                    privileges,
+                    cascade,
+                    path,
+                } => {
+                    commands::cmd_user::run_revoke(
+                        path,
+                        username,
+                        commands::cmd_user::ObjectFlags {
+                            on_database,
+                            on_schema,
+                            on_table,
+                            on_all_tables_in_schema,
+                            on_sequence,
+                            on_all_sequences_in_schema,
+                        },
+                        privileges,
+                        cascade,
+                        json_output,
+                    )
+                    .await?;
+                    Ok(0)
+                }
+                UserAction::ListPrivs { username, path } => {
+                    commands::cmd_user::run_list_privs(path, username, json_output).await?;
                     Ok(0)
                 }
             },

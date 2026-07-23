@@ -492,7 +492,7 @@ impl GfsMcpHandler {
     }
 
     #[tool(
-        description = "Manage database users/roles inside the running instance. action = create | list | drop | set_password. create and set_password return the password once. Params: action (required); username (create/drop/set_password); preset (create: readonly|readwrite|admin); password (optional, generated once if omitted); path (repo root). Equivalent to gfs user."
+        description = "Manage database users/roles inside the running instance. action = create | list | drop | set_password | grant | revoke | list_privs. create and set_password return the password once. Params: action (required); username (all except list); preset (create: readonly|readwrite|admin); password (optional, generated once if omitted); object (grant/revoke: JSON {type: database|schema|table|all_tables_in_schema|sequence|all_sequences_in_schema, schema?, name?}); privileges (grant/revoke: array or CSV, e.g. [\"SELECT\",\"INSERT\"] or \"ALL\"); with_grant_option, apply_to_future (grant); cascade (revoke); path (repo root). Equivalent to gfs user."
     )]
     async fn user(
         &self,
@@ -1285,8 +1285,56 @@ async fn do_import(args: &serde_json::Value) -> Result<CallToolResult, McpError>
     }))
 }
 
+/// Parse the `object` arg into a [`GrantableObject`] (internally-tagged JSON,
+/// e.g. `{"type":"table","schema":"public","name":"t"}`).
+fn parse_grant_object(
+    args: &serde_json::Value,
+) -> Result<gfs_domain::model::db_user::GrantableObject, McpError> {
+    match args.get("object") {
+        Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+            to_error_data(format!(
+                "invalid 'object' (expected {{type, schema?, name?}}): {e}"
+            ))
+        }),
+        None => Err(to_error_data(
+            "action requires 'object', e.g. {\"type\":\"table\",\"schema\":\"public\",\"name\":\"t\"}"
+                .to_string(),
+        )),
+    }
+}
+
+/// Parse the `privileges` arg (JSON array or comma-separated string), case-insensitive.
+fn parse_grant_privileges(
+    args: &serde_json::Value,
+) -> Result<Vec<gfs_domain::model::db_user::Privilege>, McpError> {
+    use gfs_domain::model::db_user::Privilege;
+    let raw: Vec<String> = match args.get("privileges") {
+        Some(serde_json::Value::Array(a)) => a
+            .iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect(),
+        Some(serde_json::Value::String(s)) => s
+            .split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    };
+    if raw.is_empty() {
+        return Err(to_error_data(
+            "action requires 'privileges' (array or comma-separated string)".to_string(),
+        ));
+    }
+    raw.iter()
+        .map(|p| {
+            Privilege::parse(&p.to_lowercase())
+                .ok_or_else(|| to_error_data(format!("unknown privilege '{p}'")))
+        })
+        .collect()
+}
+
 async fn do_user(args: &serde_json::Value) -> Result<CallToolResult, McpError> {
-    use gfs_domain::model::db_user::{RolePreset, RoleSpec};
+    use gfs_domain::model::db_user::{GrantSpec, RevokeSpec, RolePreset, RoleSpec};
     use gfs_domain::usecases::repository::manage_users_usecase::ManageUsersUseCase;
 
     let args = if args.is_object() { args } else { &json!({}) };
@@ -1372,8 +1420,72 @@ async fn do_user(args: &serde_json::Value) -> Result<CallToolResult, McpError> {
                 json!({ "username": username, "password": password }).to_string(),
             )]))
         }
+        "grant" => {
+            let username = require_username()?;
+            let object = parse_grant_object(args)?;
+            let privileges = parse_grant_privileges(args)?;
+            let with_grant_option = args
+                .get("with_grant_option")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let apply_to_future = args
+                .get("apply_to_future")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            use_case
+                .grant(
+                    &repo_path,
+                    &GrantSpec {
+                        role: username.clone(),
+                        object,
+                        privileges,
+                        with_grant_option,
+                        apply_to_future,
+                    },
+                )
+                .await
+                .map_err(|e| to_error_data(e.to_string()))?;
+            Ok(CallToolResult::success(vec![Content::text(
+                json!({ "username": username, "granted": true }).to_string(),
+            )]))
+        }
+        "revoke" => {
+            let username = require_username()?;
+            let object = parse_grant_object(args)?;
+            let privileges = parse_grant_privileges(args)?;
+            let cascade = args
+                .get("cascade")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            use_case
+                .revoke(
+                    &repo_path,
+                    &RevokeSpec {
+                        role: username.clone(),
+                        object,
+                        privileges,
+                        cascade,
+                    },
+                )
+                .await
+                .map_err(|e| to_error_data(e.to_string()))?;
+            Ok(CallToolResult::success(vec![Content::text(
+                json!({ "username": username, "revoked": true }).to_string(),
+            )]))
+        }
+        "list_privs" => {
+            let username = require_username()?;
+            let privileges = use_case
+                .list_privileges(&repo_path, &username)
+                .await
+                .map_err(|e| to_error_data(e.to_string()))?;
+            Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string(&privileges).unwrap_or_default(),
+            )]))
+        }
         other => Err(to_error_data(format!(
-            "unknown user action '{other}' (create|list|drop|set_password)"
+            "unknown user action '{other}' \
+             (create|list|drop|set_password|grant|revoke|list_privs)"
         ))),
     }
 }
