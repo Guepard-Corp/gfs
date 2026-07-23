@@ -1795,4 +1795,130 @@ mod tests {
             "instructions should mention list_providers"
         );
     }
+
+    // EMPIRICAL (Docker-gated): the MCP `user` tool's grant/revoke actions change
+    // real privileges. Drives the actual `do_user` handler (JSON args → parse →
+    // ManageUsersUseCase → real DockerCompute) against a live Postgres 17, and
+    // verifies with `has_table_privilege`. Skips (does not fail) without Docker.
+    // Run: GFS_DOCKER_IT=1 cargo test -p gfs-mcp user_tool_grant_revoke -- --nocapture
+    fn mcp_docker_ok() -> bool {
+        std::env::var("GFS_DOCKER_IT").ok().as_deref() == Some("1")
+            && std::process::Command::new("docker")
+                .arg("info")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn user_tool_grant_revoke_changes_real_privileges() {
+        use gfs_domain::model::config::{EnvironmentConfig, RuntimeConfig};
+        if !mcp_docker_ok() {
+            eprintln!(
+                "SKIP user_tool_grant_revoke_changes_real_privileges: set GFS_DOCKER_IT=1 + docker"
+            );
+            return;
+        }
+        let cn = format!("gfs-mcp-it-user-{}", std::process::id());
+        let docker = |args: &[&str]| {
+            std::process::Command::new("docker")
+                .args(args)
+                .output()
+                .expect("docker")
+        };
+        let psql = |sql: &str| {
+            let o = std::process::Command::new("docker")
+                .args(["exec", &cn, "psql", "-U", "postgres", "-tAc", sql])
+                .output()
+                .expect("psql");
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+
+        let _ = docker(&["rm", "-f", &cn]);
+        assert!(
+            docker(&[
+                "run",
+                "-d",
+                "--rm",
+                "--name",
+                &cn,
+                "-e",
+                "POSTGRES_PASSWORD=postgres",
+                "postgres:17",
+            ])
+            .status
+            .success(),
+            "docker run postgres:17 failed"
+        );
+        let mut ready = false;
+        for _ in 0..30 {
+            if docker(&["exec", &cn, "pg_isready", "-U", "postgres"])
+                .status
+                .success()
+            {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        let _ = psql("CREATE ROLE app_ro; CREATE TABLE public.t(id int)");
+
+        // A .gfs repo pointing at the container (no tempfile dep — manual temp dir).
+        let repo = std::env::temp_dir().join(format!("gfs-mcp-it-{}", std::process::id()));
+        std::fs::create_dir_all(repo.join(".gfs")).expect("mkdir .gfs");
+        GfsConfig {
+            mount_point: None,
+            version: String::new(),
+            description: String::new(),
+            user: None,
+            environment: Some(EnvironmentConfig {
+                database_provider: "postgres".into(),
+                database_version: "17".into(),
+                database_port: None,
+                display_name: None,
+            }),
+            runtime: Some(RuntimeConfig {
+                runtime_provider: "docker".into(),
+                runtime_version: "latest".into(),
+                container_name: cn.clone(),
+            }),
+            storage: None,
+            compute: None,
+            remote: None,
+        }
+        .save(&repo)
+        .expect("save .gfs config");
+        let repo_str = repo.to_str().unwrap();
+
+        // Drive the ACTUAL MCP handler.
+        let grant = do_user(&serde_json::json!({
+            "action": "grant", "username": "app_ro",
+            "object": {"type": "table", "schema": "public", "name": "t"},
+            "privileges": ["SELECT"], "path": repo_str,
+        }))
+        .await;
+        let after_grant = psql("SELECT has_table_privilege('app_ro','public.t','SELECT')");
+        let list = do_user(
+            &serde_json::json!({"action":"list_privs","username":"app_ro","path": repo_str}),
+        )
+        .await;
+        let revoke = do_user(&serde_json::json!({
+            "action": "revoke", "username": "app_ro",
+            "object": {"type": "table", "schema": "public", "name": "t"},
+            "privileges": ["SELECT"], "path": repo_str,
+        }))
+        .await;
+        let after_revoke = psql("SELECT has_table_privilege('app_ro','public.t','SELECT')");
+
+        // Clean up before asserting so a failed assert never leaks resources.
+        let _ = docker(&["rm", "-f", &cn]);
+        let _ = std::fs::remove_dir_all(&repo);
+
+        assert!(ready, "postgres never became ready");
+        assert!(grant.is_ok(), "MCP grant errored: {:?}", grant.err());
+        assert_eq!(after_grant, "t", "MCP user grant must set SELECT");
+        assert!(list.is_ok(), "MCP list_privs errored: {:?}", list.err());
+        assert!(revoke.is_ok(), "MCP revoke errored: {:?}", revoke.err());
+        assert_eq!(after_revoke, "f", "MCP user revoke must remove SELECT");
+    }
 }
