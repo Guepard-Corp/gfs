@@ -38,11 +38,14 @@ const DEFAULT_PVC_SIZE_GI: &str = "1";
 /// The kubelet sends a metav1 `Status` on the exec v4 error channel: `Success`
 /// ⇒ exit 0; otherwise `reason: NonZeroExitCode` with the code carried in
 /// `details.causes[reason=ExitCode].message`. A non-success status with no
-/// parseable code is treated as a generic failure (1) rather than a false
-/// success. `None` (no status delivered) preserves the lenient 0.
+/// parseable code is a generic failure (1). `None` (no status delivered — an
+/// abnormal WebSocket teardown, so the command's outcome is unknown) is treated
+/// as a **failure**, never a false success: a mutating op must not report
+/// success when its exit code could not be determined. A normally-completed exec
+/// always carries a status, so this only fires on genuine transport failures.
 fn exit_code_from_status(status: Option<Status>) -> i32 {
     let Some(status) = status else {
-        return 0;
+        return 1;
     };
     if status.status.as_deref() == Some("Success") {
         return 0;
@@ -1232,7 +1235,9 @@ impl Compute for KubernetesCompute {
         // can't tell a failed SQL statement from an empty result.
         let exit_code = match status_fut {
             Some(fut) => exit_code_from_exec_status(fut.await),
-            None => 0,
+            // No status channel at all (should not happen for a normal exec) —
+            // treat as failure rather than a silent success (RFC 009 §9.7 caveat 1).
+            None => 1,
         };
 
         Ok(ExecOutput {
@@ -1522,8 +1527,9 @@ mod tests {
     }
 
     #[test]
-    fn exit_code_absent_status_stays_zero() {
-        assert_eq!(exit_code_from_status(None), 0);
+    fn exit_code_absent_status_is_failure_not_false_success() {
+        // No status delivered ⇒ outcome unknown ⇒ must NOT read as success.
+        assert_eq!(exit_code_from_status(None), 1);
     }
 
     fn definition_with_env(env: Vec<EnvVar>) -> ComputeDefinition {
