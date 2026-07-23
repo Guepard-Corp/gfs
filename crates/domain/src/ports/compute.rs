@@ -336,6 +336,26 @@ pub trait Compute: Send + Sync {
         ))
     }
 
+    /// Node-local deploy-time credential env vars (`name → value`) for an
+    /// instance — e.g. the admin password the database was provisioned with.
+    ///
+    /// Backend-specific: the docker runtime reads the container's env; the
+    /// kubernetes runtime reads the per-instance credentials Secret. Callers
+    /// (e.g. the tenet PII scan) use this instead of assuming a docker
+    /// container exists, so it works under both compute backends.
+    ///
+    /// # Errors
+    /// Returns [`ComputeError`] when the credentials cannot be read. The
+    /// default is unsupported so backends that cannot resolve them fail loudly.
+    async fn read_deploy_credentials(
+        &self,
+        _id: &InstanceId,
+    ) -> Result<Vec<(String, String)>> {
+        Err(ComputeError::Internal(
+            "read_deploy_credentials not supported by this compute runtime".into(),
+        ))
+    }
+
     /// Describe the connected container runtime (for example Docker or Podman).
     async fn describe_runtime(&self) -> Result<RuntimeDescriptor> {
         Ok(RuntimeDescriptor {

@@ -1201,6 +1201,20 @@ impl Compute for KubernetesCompute {
         })
     }
 
+    async fn read_deploy_credentials(&self, id: &InstanceId) -> Result<Vec<(String, String)>> {
+        // Under k8s the DB password is not a pod-env literal: the StatefulSet
+        // references the per-instance credentials Secret via `secretKeyRef`.
+        // Read that Secret directly (there is no container to inspect).
+        let secret = self
+            .api_secrets()
+            .get(&credentials_secret_name(&id.0))
+            .await
+            .map_err(|e| {
+                ComputeError::Internal(format!("read credentials secret for {}: {e}", id.0))
+            })?;
+        Ok(decode_secret_values(secret).into_iter().collect())
+    }
+
     async fn logs(&self, id: &InstanceId, options: LogsOptions) -> Result<Vec<LogEntry>> {
         let pod = self.find_pod_name(&id.0).await?;
         let pods = self.api_pods();

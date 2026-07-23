@@ -795,6 +795,23 @@ impl Compute for DockerCompute {
     }
 
     #[instrument(skip(self))]
+    async fn read_deploy_credentials(&self, id: &InstanceId) -> Result<Vec<(String, String)>> {
+        let info = self
+            .docker
+            .inspect_container(&id.0, None)
+            .await
+            .map_err(|e| classify(&id.0, e))?;
+        let env = info
+            .config
+            .and_then(|c| c.env)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|s| s.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+            .collect();
+        Ok(env)
+    }
+
+    #[instrument(skip(self))]
     async fn logs(&self, id: &InstanceId, options: LogsOptions) -> Result<Vec<LogEntry>> {
         let since_secs = options.since.map(|dt| dt.timestamp() as i32).unwrap_or(0);
 
