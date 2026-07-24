@@ -39,35 +39,6 @@ pub struct RuntimeConfig {
 }
 
 /// Console-mediated remote target (no local k3s API).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RemoteConfig {
-    pub console_url: String,
-    /// Supabase deployment UUID. Omitted in legacy repos (same as `database_id`).
-    #[serde(default)]
-    pub deployment_id: Option<String>,
-    pub node_id: String,
-    /// CP `cpDatabaseId` (engine row). Legacy repos stored the deployment UUID here.
-    pub database_id: String,
-    #[serde(default = "default_remote_project")]
-    pub project: String,
-}
-
-impl RemoteConfig {
-    /// Supabase deployment UUID for deployment-scoped console routes.
-    pub fn deployment_id(&self) -> &str {
-        self.deployment_id.as_deref().unwrap_or(&self.database_id)
-    }
-
-    /// CP engine database id for thin node-level VCS proxy routes.
-    pub fn cp_database_id(&self) -> &str {
-        &self.database_id
-    }
-}
-
-fn default_remote_project() -> String {
-    "default".to_string()
-}
-
 impl fmt::Display for RuntimeConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -129,20 +100,9 @@ pub struct GfsConfig {
     pub storage: Option<StorageConfig>,
     #[serde(default)]
     pub compute: Option<ComputeConfig>,
-    #[serde(default)]
-    pub remote: Option<RemoteConfig>,
 }
 
 impl GfsConfig {
-    pub fn is_guepard_remote(&self) -> bool {
-        let provider = self
-            .runtime
-            .as_ref()
-            .map(|r| r.runtime_provider.trim().to_ascii_lowercase())
-            .unwrap_or_default();
-        matches!(provider.as_str(), "guepard" | "console" | "remote") && self.remote.is_some()
-    }
-
     pub fn load(repo_path: &Path) -> Result<Self, RepoError> {
         let config_path = repo_path.join(GFS_DIR).join(CONFIG_FILE);
         let content = std::fs::read_to_string(config_path)?;

@@ -78,7 +78,7 @@ fn k8s_service_type() -> &'static str {
     }
 }
 
-/// Per-instance port from Supabase `deployment_request.port` (via `GFS_INSTANCE_NODE_PORT`).
+/// Per-instance NodePort override (via `GFS_INSTANCE_NODE_PORT`).
 fn instance_expose_port() -> Option<i32> {
     std::env::var("GFS_INSTANCE_NODE_PORT")
         .ok()
@@ -461,7 +461,7 @@ impl KubernetesCompute {
                         // user itself. The image bakes in USER postgres (uid 100), which
                         // cannot chown the volume — initdb then fails with
                         // "could not change permissions of directory". This mirrors how the
-                        // official/supabase postgres images are meant to be run.
+                        // official postgres images are meant to be run.
                         security_context: Some(PodSecurityContext {
                             run_as_user: Some(0),
                             ..Default::default()
