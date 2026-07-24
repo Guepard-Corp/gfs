@@ -232,7 +232,6 @@ mod tests {
                 enable_reflink: true,
             }),
             compute: None,
-            remote: None,
         };
         config.save(dir.path()).unwrap();
 
@@ -299,7 +298,6 @@ mod tests {
             runtime: None,
             storage: None,
             compute: Some(ComputeConfig { params }),
-            remote: None,
         };
         config.save(dir.path()).unwrap();
 
@@ -321,7 +319,6 @@ mod tests {
                 runtime: None,
                 storage: None,
                 compute: None,
-                remote: None,
             }
             .compute_params()
             .is_empty()
@@ -340,7 +337,6 @@ mod tests {
             runtime: None,
             storage: None,
             compute: None,
-            remote: None,
         };
         // Pass path where .gfs does not exist; save writes to repo_path/.gfs/config.toml
         let result = config.save(dir.path());
