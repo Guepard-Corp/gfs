@@ -932,8 +932,20 @@ impl KubernetesCompute {
                 names.push(e.to_string());
             }
         }
-        for name in names {
-            let _ = pvcs.delete(&name, &DeleteParams::default()).await;
+        // Reclaim the per-commit VolumeSnapshots sourced from these PVCs — teardown
+        // deletes the pods/PVCs but would otherwise leak one ZFS snapshot per commit.
+        let storage = gfs_storage_kubernetes::KubernetesStorage::new(Some(self.namespace.clone()))
+            .await
+            .ok();
+        for name in &names {
+            let _ = pvcs.delete(name.as_str(), &DeleteParams::default()).await;
+            if let Some(ref storage) = storage
+                && let Err(e) = storage.delete_snapshots_for_pvc(name.as_str()).await
+            {
+                tracing::warn!(
+                    "remove_instance_with_pvcs: snapshot cleanup for '{name}' failed: {e}"
+                );
+            }
         }
         Ok(())
     }

@@ -74,6 +74,36 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
     ) -> std::result::Result<String, CheckoutRepoError> {
         let revision = revision.trim().to_string();
 
+        // Validate the target ref BEFORE stopping compute — a bad revision must
+        // not leave the database offline (mirrors the k8s checkout path).
+        match &create_branch {
+            Some(branch_name) if branch_name.trim().is_empty() => {
+                return Err(CheckoutRepoError::Repository(
+                    RepositoryError::RevisionNotFound("(empty branch name)".to_string()),
+                ));
+            }
+            Some(_) => {
+                let start_rev = if revision.is_empty() {
+                    "HEAD"
+                } else {
+                    revision.as_str()
+                };
+                if self.repository.rev_parse(&path, start_rev).await? == "0" {
+                    return Err(CheckoutRepoError::Repository(RepositoryError::Internal(
+                        "cannot create branch: start revision has no commits".to_string(),
+                    )));
+                }
+            }
+            None => {
+                if revision.is_empty() {
+                    return Err(CheckoutRepoError::Repository(
+                        RepositoryError::RevisionNotFound("(empty)".to_string()),
+                    ));
+                }
+                self.repository.rev_parse(&path, &revision).await?;
+            }
+        }
+
         let container_id = self
             .repository
             .get_runtime_config(&path)

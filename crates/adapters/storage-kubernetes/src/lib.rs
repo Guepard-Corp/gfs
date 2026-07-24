@@ -18,7 +18,7 @@ use gfs_domain::ports::storage::{
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, PersistentVolumeClaimSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::Client;
-use kube::api::{Api, DeleteParams, DynamicObject, Patch, PatchParams};
+use kube::api::{Api, DeleteParams, DynamicObject, ListParams, Patch, PatchParams};
 use kube::core::{ApiResource, GroupVersionKind};
 use serde_json::json;
 
@@ -176,6 +176,50 @@ impl KubernetesStorage {
         Err(StorageError::Internal(format!(
             "pvc '{name}' still exists after delete"
         )))
+    }
+
+    /// Delete every VolumeSnapshot whose source PVC is `pvc_name` (best-effort).
+    /// Instance teardown removes the pods/PVCs but not the per-commit snapshots;
+    /// this reclaims them so they don't accumulate after a database is destroyed.
+    /// Returns the number deleted.
+    pub async fn delete_snapshots_for_pvc(
+        &self,
+        pvc_name: &str,
+    ) -> std::result::Result<usize, StorageError> {
+        let pvc_name = pvc_name.trim();
+        if pvc_name.is_empty() {
+            return Ok(0);
+        }
+        let api = self.api_volume_snapshots();
+        let list = api
+            .list(&ListParams::default())
+            .await
+            .map_err(|e| StorageError::Internal(format!("list volumesnapshots failed: {e}")))?;
+        let mut deleted = 0usize;
+        for item in list {
+            let src = item
+                .data
+                .get("spec")
+                .and_then(|s| s.get("source"))
+                .and_then(|s| s.get("persistentVolumeClaimName"))
+                .and_then(|v| v.as_str());
+            if src != Some(pvc_name) {
+                continue;
+            }
+            let Some(name) = item.metadata.name.as_deref() else {
+                continue;
+            };
+            match api.delete(name, &DeleteParams::default()).await {
+                Ok(_) => deleted += 1,
+                Err(kube::Error::Api(err)) if err.code == 404 => {}
+                Err(e) => {
+                    return Err(StorageError::Internal(format!(
+                        "delete volumesnapshot '{name}' failed: {e}"
+                    )));
+                }
+            }
+        }
+        Ok(deleted)
     }
 
     /// Wait until PVC phase is Bound (after restore from VolumeSnapshot).
