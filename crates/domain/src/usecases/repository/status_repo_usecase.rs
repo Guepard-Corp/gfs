@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use crate::model::status::{ComputeStatus, StatusResponse};
-use crate::ports::compute::{Compute, InstanceId};
+use crate::ports::compute::{Compute, InstanceId, InstanceState};
 use crate::ports::database_provider::{ConnectionParams, DatabaseProviderRegistry};
 use crate::ports::repository::{Repository, RepositoryError};
 
@@ -109,8 +109,14 @@ async fn build_compute_status<R: DatabaseProviderRegistry>(
             Ok(status) => {
                 let container_id = status.id.0.clone();
                 let container_status = status.state.as_status_str().to_string();
-                let conn =
-                    build_connection_string(compute, registry, &instance_id, provider_name).await;
+                // Only advertise a connection string when the instance is actually
+                // running — a stopped container has no live port binding, and reporting
+                // a default (e.g. :5432) could point clients at the wrong database.
+                let conn = if matches!(status.state, InstanceState::Running) {
+                    build_connection_string(compute, registry, &instance_id, provider_name).await
+                } else {
+                    String::new()
+                };
                 let data_bind =
                     get_data_bind_host_path(compute, registry, &instance_id, provider_name).await;
                 (container_status, container_id, conn, data_bind)

@@ -970,6 +970,9 @@ impl Compute for KubernetesCompute {
         api.patch(&id.0, &PatchParams::default(), &Patch::Merge(&patch))
             .await
             .map_err(|e| ComputeError::Internal(format!("k8s scale up failed: {e}")))?;
+        // Wait (best-effort, bounded) for the pod to become Ready so we report the
+        // real post-start state instead of a transient "unknown" while it schedules.
+        let _ = self.wait_ready_pod_name(&id.0).await;
         Ok(Self::instance_status_from_pod(id, self.get_pod(id).await?))
     }
 

@@ -1,4 +1,6 @@
 \set ON_ERROR_STOP on
+-- Suppress NOTICE noise from the idempotent DROP/CREATE ... IF (NOT) EXISTS below.
+SET client_min_messages TO warning;
 
 CREATE EXTENSION IF NOT EXISTS postgres_fdw;
 CREATE EXTENSION IF NOT EXISTS dblink;
