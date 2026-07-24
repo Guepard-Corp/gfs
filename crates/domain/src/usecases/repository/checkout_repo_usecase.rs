@@ -212,15 +212,6 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
                 .unwrap_or(definition.image.as_str());
             definition.image = format!("{}:{}", base, environment.database_version);
         }
-        // Reuse the persisted host port so recreation keeps a stable endpoint
-        // instead of letting the runtime assign a fresh one on each checkout.
-        if let Some(port) = environment.database_port {
-            for mapping in &mut definition.ports {
-                if mapping.compute_port == provider.default_port() {
-                    mapping.host_port = Some(port);
-                }
-            }
-        }
         data_dir::prepare_for_database_provider(provider.name(), &active).map_err(|e| {
             ComputeError::Internal(format!(
                 "failed to prepare data dir '{}': {e}",

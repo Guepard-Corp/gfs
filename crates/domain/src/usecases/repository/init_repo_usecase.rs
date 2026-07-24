@@ -238,18 +238,6 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
 
         let id = compute.provision(&definition).await?;
         compute.start(&id, StartOptions::default()).await?;
-
-        // Persist the actually-assigned host port so recreation (checkout/start)
-        // reuses the same endpoint instead of re-randomizing it each time.
-        let effective_port = match database_port {
-            Some(p) => Some(p),
-            None => compute
-                .get_connection_info(&id, provider.default_port())
-                .await
-                .ok()
-                .map(|c| c.port),
-        };
-
         let runtime = compute
             .describe_runtime()
             .await
@@ -261,7 +249,7 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         let environment = EnvironmentConfig {
             database_provider: provider_name,
             database_version: provider_version,
-            database_port: effective_port,
+            database_port,
             display_name: display_name.filter(|n| !n.trim().is_empty()),
         };
         self.repository
