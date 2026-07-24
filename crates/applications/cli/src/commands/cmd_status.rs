@@ -25,11 +25,6 @@ use crate::output::{
 pub async fn run(path: Option<PathBuf>, output: String) -> Result<i32> {
     let repo_path = path.clone().unwrap_or_else(get_repo_dir);
 
-    if super::remote_support::is_remote_repo(&repo_path)? {
-        let json_output = output == "json";
-        return super::cmd_remote_status::run(path, json_output).await;
-    }
-
     let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
     let compute = compute_for_repo(&repository, &repo_path).await?;
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());

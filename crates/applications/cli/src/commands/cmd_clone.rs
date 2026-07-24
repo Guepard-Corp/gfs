@@ -87,9 +87,6 @@ pub async fn clone(
         port,
         Default::default(),
         json_output,
-        false,
-        None,
-        None,
         // No explicit `--image`: pass `None` so `init` channels the resolved
         // `version` onto the provider's default base (`gfs-postgres:<version>`).
         // Hardcoding an image here pins the tag and bypasses channeling, so a

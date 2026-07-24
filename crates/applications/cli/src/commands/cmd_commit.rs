@@ -28,11 +28,6 @@ pub async fn commit(
     author_email: Option<String>,
     json_output: bool,
 ) -> Result<()> {
-    let repo_path = path.clone().unwrap_or_else(get_repo_dir);
-    if super::remote_support::is_remote_repo(&repo_path)? {
-        return super::cmd_remote_commit::commit(path, message, json_output).await;
-    }
-
     #[cfg(target_os = "macos")]
     {
         use gfs_storage_apfs::ApfsStorage;

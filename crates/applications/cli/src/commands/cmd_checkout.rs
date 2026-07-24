@@ -34,11 +34,6 @@ pub async fn checkout(
 ) -> Result<()> {
     let repo_path = path.clone().unwrap_or_else(get_repo_dir);
 
-    if super::remote_support::is_remote_repo(&repo_path)? {
-        return super::cmd_remote_checkout::checkout(path, revision, create_branch, json_output)
-            .await;
-    }
-
     let (revision, create_branch) = match (&revision, &create_branch) {
         (Some(r), None) => (r.clone(), None),
         (None, Some(b)) => (String::new(), Some(b.clone())),

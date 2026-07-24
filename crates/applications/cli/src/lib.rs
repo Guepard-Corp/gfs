@@ -135,19 +135,6 @@ pub enum McpAction {
     Version,
 }
 
-#[derive(Subcommand)]
-pub enum RemoteAction {
-    /// Show persisted remote auth/config (token redacted)
-    Show,
-    /// List engine nodes visible to the authenticated account
-    Nodes,
-    /// Destroy the remote deployment backing this repo
-    Destroy {
-        #[arg(long)]
-        path: Option<PathBuf>,
-    },
-}
-
 // ---------------------------------------------------------------------------
 // Proxy daemon subcommands (used by commands)
 // ---------------------------------------------------------------------------
@@ -260,35 +247,6 @@ enum TopLevel {
         /// Database name (if provider is set)
         #[arg(long)]
         database_name: Option<String>,
-
-        /// Deploy via guepard-console API (no local KUBECONFIG / k3s)
-        #[arg(long)]
-        remote: bool,
-
-        /// Engine node id for remote init (or set GUEPARD_ENGINE_NODE_ID)
-        #[arg(long, env = "GUEPARD_ENGINE_NODE_ID")]
-        remote_node: Option<String>,
-
-        /// Console project slug (UI path /prj/{slug}/…; or set GUEPARD_PROJECT)
-        #[arg(long, env = "GUEPARD_PROJECT")]
-        project: Option<String>,
-    },
-
-    /// Sign in to console (Supabase password → ~/.config/guepard/credentials.toml)
-    Login {
-        #[arg(long, env = "GUEPARD_LOGIN_EMAIL")]
-        email: Option<String>,
-        #[arg(long, env = "GUEPARD_LOGIN_PASSWORD")]
-        password: Option<String>,
-        /// Agent/CI: store a JWT directly (no password grant)
-        #[arg(long, env = "GUEPARD_ACCESS_TOKEN")]
-        token: Option<String>,
-    },
-
-    /// Remote console profile introspection (auth URLs, list nodes)
-    Remote {
-        #[command(subcommand)]
-        action: RemoteAction,
     },
 
     /// Lazily clone a read-only remote database (copy-on-read; data fetched on first read)
@@ -610,8 +568,6 @@ fn command_name(cmd: &TopLevel) -> &'static str {
         TopLevel::Storage { .. } => "storage",
         TopLevel::Compute { .. } => "compute",
         TopLevel::Mcp { .. } => "mcp",
-        TopLevel::Login { .. } => "login",
-        TopLevel::Remote { .. } => "remote",
         TopLevel::Proxy { .. } => "proxy",
         TopLevel::Version => "version",
     }
@@ -643,10 +599,7 @@ where
     cli.color.init();
 
     // Skip telemetry for Version and Mcp (MCP tracks its own events)
-    let skip_telemetry = matches!(
-        cli.command,
-        TopLevel::Version | TopLevel::Mcp { .. } | TopLevel::Login { .. } | TopLevel::Remote { .. }
-    );
+    let skip_telemetry = matches!(cli.command, TopLevel::Version | TopLevel::Mcp { .. });
     let cmd_name = command_name(&cli.command);
     let telemetry = TelemetryClient::new();
     let source = gfs_telemetry::detect_source();
@@ -667,9 +620,6 @@ where
                 database_user,
                 database_password,
                 database_name,
-                remote,
-                remote_node,
-                project,
             } => {
                 let credentials =
                     gfs_domain::usecases::repository::init_repo_usecase::DatabaseCredentials {
@@ -684,9 +634,6 @@ where
                     port,
                     credentials,
                     json_output,
-                    remote,
-                    remote_node,
-                    project,
                     None,
                     None,
                     Default::default(),
@@ -716,28 +663,6 @@ where
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
                 Ok(0)
             }
-            TopLevel::Login {
-                email,
-                password,
-                token,
-            } => {
-                commands::cmd_login::run(email, password, token).await?;
-                Ok(0)
-            }
-            TopLevel::Remote { action } => match action {
-                RemoteAction::Show => {
-                    commands::cmd_remote::show(json_output).await?;
-                    Ok(0)
-                }
-                RemoteAction::Nodes => {
-                    commands::cmd_remote::nodes(json_output).await?;
-                    Ok(0)
-                }
-                RemoteAction::Destroy { path } => {
-                    commands::cmd_remote_compute::destroy(path, json_output).await?;
-                    Ok(0)
-                }
-            },
             TopLevel::Commit {
                 message,
                 path,

@@ -22,13 +22,9 @@ pub async fn run_extract(
     path: Option<PathBuf>,
     output: Option<PathBuf>,
     compact: bool,
-    json_output: bool,
+    _json_output: bool,
 ) -> Result<()> {
     let repo_path = path.clone().unwrap_or_else(get_repo_dir);
-
-    if super::remote_support::is_remote_repo(&repo_path)? {
-        return super::cmd_remote_schema::run_extract(path, json_output).await;
-    }
 
     // Validate the repo before touching Docker: on a machine without Docker the
     // right error for a non-repo is still "not a gfs repository", not a Docker one.
@@ -81,10 +77,6 @@ pub async fn run_show(
     ddl_only: bool,
 ) -> Result<()> {
     let repo_path = path.clone().unwrap_or_else(get_repo_dir);
-
-    if super::remote_support::is_remote_repo(&repo_path)? {
-        return super::cmd_remote_schema::run_show(commit, path, metadata_only, ddl_only).await;
-    }
 
     // Resolve commit hash
     let commit_hash = repo_layout::rev_parse(&repo_path, &commit)
@@ -152,10 +144,6 @@ pub async fn run_diff(
     }
 
     let repo_path = path.clone().unwrap_or_else(get_repo_dir);
-
-    if super::remote_support::is_remote_repo(&repo_path)? {
-        return super::cmd_remote_schema::run_diff(commit1, commit2, path, json).await;
-    }
 
     // Resolve commit hashes
     let hash1 = repo_layout::rev_parse(&repo_path, &commit1)
