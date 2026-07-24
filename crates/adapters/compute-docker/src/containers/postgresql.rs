@@ -696,8 +696,15 @@ impl DatabaseProvider for PostgresqlProvider {
     ) -> std::result::Result<String, ProviderError> {
         let ident = pg_quote_ident(username)?;
         let owner = default_privileges_owner.map(pg_quote_ident).transpose()?;
+        // Declarative, not additive: reset the role's schema-public privileges
+        // first so a *lower* preset (e.g. readwrite -> readonly) actually removes
+        // the higher grants + default-ACL entries, instead of leaving them (a
+        // downgrade that silently keeps write access). The reset + new grants run
+        // in one transaction. `create_role` does not need this (a fresh role has
+        // nothing to reset).
+        let reset = pg_preset_reset_sql(&ident, owner.as_deref());
         self.query_in_instance_command(&format!(
-            "BEGIN;\n{}\nCOMMIT;",
+            "BEGIN;\n{reset}\n{}\nCOMMIT;",
             pg_preset_sql(&ident, preset, owner.as_deref())
         ))
     }
@@ -989,6 +996,40 @@ fn pg_quote_ident(ident: &str) -> std::result::Result<String, ProviderError> {
             "invalid database identifier: {ident:?}"
         )))
     }
+}
+
+/// Revoke every privilege a preset could have granted the already-quoted role
+/// `ident` on schema `public`, so [`pg_preset_sql`] can re-apply a preset
+/// declaratively (the role ends at exactly the new preset, never the union of
+/// old + new). Covers ALL table/sequence privileges, `CREATE` on the schema, and
+/// the `ALTER DEFAULT PRIVILEGES` entries — both connecting-role-scoped and, when
+/// `owner` is set, `FOR ROLE owner`. `USAGE ON SCHEMA public` is left alone (every
+/// preset re-grants it). Semicolon-terminated; the caller wraps it in the same
+/// transaction as the re-grant.
+fn pg_preset_reset_sql(ident: &str, owner: Option<&str>) -> String {
+    let mut s = String::new();
+    s.push_str(&format!(
+        "REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM {ident};\n"
+    ));
+    s.push_str(&format!(
+        "REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM {ident};\n"
+    ));
+    s.push_str(&format!("REVOKE CREATE ON SCHEMA public FROM {ident};\n"));
+    s.push_str(&format!(
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM {ident};\n"
+    ));
+    s.push_str(&format!(
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON SEQUENCES FROM {ident};"
+    ));
+    if let Some(owner) = owner {
+        s.push_str(&format!(
+            "\nALTER DEFAULT PRIVILEGES FOR ROLE {owner} IN SCHEMA public REVOKE ALL ON TABLES FROM {ident};\n"
+        ));
+        s.push_str(&format!(
+            "ALTER DEFAULT PRIVILEGES FOR ROLE {owner} IN SCHEMA public REVOKE ALL ON SEQUENCES FROM {ident};"
+        ));
+    }
+    s
 }
 
 /// The allow-listed grant bundle for `preset`, applied to the already-quoted
@@ -1550,6 +1591,32 @@ mod tests {
             ),
             "single-node preset keeps role-scoped-to-self defaults; got:\n{cmd_none}"
         );
+    }
+
+    #[test]
+    fn apply_preset_is_declarative_resets_before_granting() {
+        use gfs_domain::model::db_user::RolePreset;
+        let provider = PostgresqlProvider::new();
+        // apply_preset must REVOKE the role's existing schema-public privileges
+        // (incl. FOR ROLE owner default-ACLs) BEFORE granting the new preset, so a
+        // downgrade actually reduces privileges.
+        let cmd = provider
+            .apply_preset_command("app_rw", RolePreset::Readonly, Some("owner"))
+            .expect("cmd");
+        assert!(
+            cmd.contains(r#"REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM "app_rw""#),
+            "must revoke existing table privileges first; got:\n{cmd}"
+        );
+        assert!(
+            cmd.contains(
+                r#"ALTER DEFAULT PRIVILEGES FOR ROLE "owner" IN SCHEMA public REVOKE ALL ON TABLES FROM "app_rw""#
+            ),
+            "must revoke owner-scoped default privileges first; got:\n{cmd}"
+        );
+        // The reset precedes the new preset's grant (declarative order).
+        let revoke_at = cmd.find("REVOKE ALL PRIVILEGES ON ALL TABLES").unwrap();
+        let grant_at = cmd.find("GRANT SELECT ON ALL TABLES").unwrap();
+        assert!(revoke_at < grant_at, "reset must run before the re-grant");
     }
 
     #[test]

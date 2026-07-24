@@ -259,3 +259,59 @@ async fn preset_default_privileges_follow_owner_future_objects() {
         "control: without FOR ROLE owner, a preset must NOT cover the owner's future objects"
     );
 }
+
+/// `apply_preset` must be DECLARATIVE, not additive: downgrading a role from
+/// `readwrite` to `readonly` must actually REVOKE the write privileges, not leave
+/// them (an HTTP-200 downgrade that silently keeps INSERT/UPDATE/DELETE is a
+/// security-correctness bug). Proven at the engine with `has_table_privilege`.
+#[tokio::test]
+async fn apply_preset_downgrade_revokes_write_privileges() {
+    if !docker_ok() {
+        eprintln!("skip: set GFS_DOCKER_IT=1 and ensure docker is running");
+        return;
+    }
+
+    start_postgres();
+    // Owner + a pre-existing table the presets act on.
+    psql(
+        "CREATE ROLE owner LOGIN; GRANT CREATE ON SCHEMA public TO owner; CREATE TABLE public.t(id int);",
+    );
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path();
+    write_repo(repo, CONTAINER);
+
+    let compute = Arc::new(DockerCompute::new().expect("docker compute"));
+    let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
+    containers::register_all(&*registry).expect("register providers");
+    let uc = ManageUsersUseCase::new(compute, registry);
+
+    // Create a readwrite user (write access), then DOWNGRADE to readonly.
+    uc.create_role(
+        repo,
+        &RoleSpec {
+            username: "u".into(),
+            password: "pw_downgrade_1234".into(),
+            preset: Some(RolePreset::Readwrite),
+            default_privileges_owner: Some("owner".into()),
+        },
+    )
+    .await
+    .expect("create readwrite");
+    let insert_before = psql("SELECT has_table_privilege('u','public.t','INSERT')");
+
+    uc.apply_preset(repo, "u", RolePreset::Readonly, Some("owner"))
+        .await
+        .expect("apply readonly");
+    let insert_after = psql("SELECT has_table_privilege('u','public.t','INSERT')");
+    let select_after = psql("SELECT has_table_privilege('u','public.t','SELECT')");
+
+    stop_postgres();
+
+    assert_eq!(insert_before, "t", "readwrite preset must grant INSERT");
+    assert_eq!(
+        insert_after, "f",
+        "downgrade to readonly must REVOKE INSERT (declarative, not additive)"
+    );
+    assert_eq!(select_after, "t", "readonly must still allow SELECT");
+}
