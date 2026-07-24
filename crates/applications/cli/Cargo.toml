@@ -52,6 +52,7 @@ rmcp               = { workspace = true }
 axum               = { version = "0.7", features = ["json", "macros"] }
 tokio-util         = "0.7"
 owo-colors         = { version = "4", features = ["supports-colors"] }
+rustls             = { version = "0.23", features = ["aws-lc-rs"] }
 [dev-dependencies]
 gfs-domain         = { workspace = true }
 tempfile           = { workspace = true }
