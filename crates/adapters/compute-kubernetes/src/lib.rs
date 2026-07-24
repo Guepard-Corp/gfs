@@ -462,6 +462,9 @@ impl KubernetesCompute {
                         // cannot chown the volume — initdb then fails with
                         // "could not change permissions of directory". This mirrors how the
                         // official postgres images are meant to be run.
+                        // NOTE: restricted Pod-Security-Admission clusters that forbid
+                        // runAsUser=0 need a non-root postgres image or an fsGroup-based
+                        // volume chown instead of this root entrypoint.
                         security_context: Some(PodSecurityContext {
                             run_as_user: Some(0),
                             ..Default::default()
