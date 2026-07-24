@@ -138,15 +138,20 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
     }
 
     /// Apply a role preset to an existing role.
+    ///
+    /// `default_privileges_owner`, when set, is the role whose future objects the
+    /// preset's default privileges should cover (the customer's `owner` role in a
+    /// deploy). `None` role-scopes the defaults to the connecting role (single-node).
     pub async fn apply_preset(
         &self,
         path: &Path,
         username: &str,
         preset: RolePreset,
+        default_privileges_owner: Option<&str>,
     ) -> Result<(), ManageUsersError> {
         let (provider, container) = self.resolve(path)?;
         let command = provider
-            .apply_preset_command(username, preset)
+            .apply_preset_command(username, preset, default_privileges_owner)
             .map_err(map_provider_err)?;
         expect_success(self.run(&container, &command).await?)
     }
@@ -539,6 +544,7 @@ mod tests {
             &self,
             username: &str,
             _: RolePreset,
+            _: Option<&str>,
         ) -> std::result::Result<String, ProviderError> {
             self.guard()?;
             Ok(format!("MOCK-PRESET:{username}"))
@@ -627,6 +633,7 @@ mod tests {
                 username: "alice".into(),
                 password: "pw".into(),
                 preset: None,
+                default_privileges_owner: None,
             },
         )
         .await
@@ -700,6 +707,7 @@ mod tests {
                     username: "alice".into(),
                     password: "pw".into(),
                     preset: None,
+                    default_privileges_owner: None,
                 },
             )
             .await
@@ -732,6 +740,7 @@ mod tests {
                     username: "alice".into(),
                     password: String::new(),
                     preset: None,
+                    default_privileges_owner: None,
                 },
             )
             .await

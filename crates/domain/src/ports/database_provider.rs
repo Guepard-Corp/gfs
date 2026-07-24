@@ -456,12 +456,17 @@ pub trait DatabaseProvider: Send + Sync {
     }
 
     /// In-instance command that applies `preset`'s privilege bundle to `username`.
+    ///
+    /// `default_privileges_owner`, when set, is the role whose FUTURE objects the
+    /// preset's `ALTER DEFAULT PRIVILEGES` should cover (the customer's `owner`
+    /// role in a deploy) so a preset user sees tables the owner creates later.
     fn apply_preset_command(
         &self,
         username: &str,
         preset: RolePreset,
+        default_privileges_owner: Option<&str>,
     ) -> std::result::Result<String, ProviderError> {
-        let _ = (username, preset);
+        let _ = (username, preset, default_privileges_owner);
         Err(ProviderError::UnsupportedFormat("apply_preset".into()))
     }
 

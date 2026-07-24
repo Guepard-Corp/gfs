@@ -48,6 +48,11 @@ pub struct RoleSpec {
     pub password: String,
     /// Optional preset to apply at create time.
     pub preset: Option<RolePreset>,
+    /// The role whose FUTURE objects the preset's `ALTER DEFAULT PRIVILEGES`
+    /// should cover — the customer's object-creating role (`owner`) in a deploy,
+    /// so a preset user sees the tables the customer creates later. `None`
+    /// (single-node, no deploy owner) covers the connecting role's future objects.
+    pub default_privileges_owner: Option<String>,
 }
 
 /// A role as read back from the engine's catalog (the `list` projection).

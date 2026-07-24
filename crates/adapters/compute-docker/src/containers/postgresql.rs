@@ -630,8 +630,15 @@ impl DatabaseProvider for PostgresqlProvider {
             sql_lit(&spec.password)
         );
         if let Some(preset) = spec.preset {
+            // Quote the deploy owner (if any) so the preset's default privileges
+            // are role-scoped to the customer's object-creating role.
+            let owner = spec
+                .default_privileges_owner
+                .as_deref()
+                .map(pg_quote_ident)
+                .transpose()?;
             sql.push('\n');
-            sql.push_str(&pg_preset_sql(&ident, preset));
+            sql.push_str(&pg_preset_sql(&ident, preset, owner.as_deref()));
         }
         // Wrap in a transaction so create+grants are atomic (fixes v2 partial-state).
         self.query_in_instance_command(&format!("BEGIN;\n{sql}\nCOMMIT;"))
@@ -685,11 +692,13 @@ impl DatabaseProvider for PostgresqlProvider {
         &self,
         username: &str,
         preset: RolePreset,
+        default_privileges_owner: Option<&str>,
     ) -> std::result::Result<String, ProviderError> {
         let ident = pg_quote_ident(username)?;
+        let owner = default_privileges_owner.map(pg_quote_ident).transpose()?;
         self.query_in_instance_command(&format!(
             "BEGIN;\n{}\nCOMMIT;",
-            pg_preset_sql(&ident, preset)
+            pg_preset_sql(&ident, preset, owner.as_deref())
         ))
     }
 
@@ -984,8 +993,18 @@ fn pg_quote_ident(ident: &str) -> std::result::Result<String, ProviderError> {
 
 /// The allow-listed grant bundle for `preset`, applied to the already-quoted
 /// role `ident` on schema `public`. Semicolon-terminated; the caller wraps the
-/// bundle in a transaction. `ALTER DEFAULT PRIVILEGES` covers future objects.
-fn pg_preset_sql(ident: &str, preset: RolePreset) -> String {
+/// bundle in a transaction.
+///
+/// `owner` (already quoted) is the role whose FUTURE objects the
+/// `ALTER DEFAULT PRIVILEGES` lines cover — the customer's `owner` role in a
+/// deploy, so a preset user sees the tables the customer creates later. When
+/// `None` the defaults are role-scoped to the connecting role (single-node
+/// gfs). Without this, presets only cover the connecting admin's future tables
+/// — never the customer's — so they behave as one-time snapshots (RFC 007
+/// hardening; matches the RFC 009 bootstrap's `FOR ROLE owner`).
+fn pg_preset_sql(ident: &str, preset: RolePreset, owner: Option<&str>) -> String {
+    // `FOR ROLE "owner" ` (trailing space) when a deploy owner is supplied.
+    let for_role = owner.map(|o| format!("FOR ROLE {o} ")).unwrap_or_default();
     let mut s = format!("GRANT USAGE ON SCHEMA public TO {ident};\n");
     match preset {
         RolePreset::Readonly => {
@@ -993,7 +1012,7 @@ fn pg_preset_sql(ident: &str, preset: RolePreset) -> String {
                 "GRANT SELECT ON ALL TABLES IN SCHEMA public TO {ident};\n"
             ));
             s.push_str(&format!(
-                "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO {ident};"
+                "ALTER DEFAULT PRIVILEGES {for_role}IN SCHEMA public GRANT SELECT ON TABLES TO {ident};"
             ));
         }
         RolePreset::Readwrite => {
@@ -1004,10 +1023,10 @@ fn pg_preset_sql(ident: &str, preset: RolePreset) -> String {
                 "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {ident};\n"
             ));
             s.push_str(&format!(
-                "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {ident};\n"
+                "ALTER DEFAULT PRIVILEGES {for_role}IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {ident};\n"
             ));
             s.push_str(&format!(
-                "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO {ident};"
+                "ALTER DEFAULT PRIVILEGES {for_role}IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO {ident};"
             ));
         }
         RolePreset::Admin => {
@@ -1019,10 +1038,10 @@ fn pg_preset_sql(ident: &str, preset: RolePreset) -> String {
                 "GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO {ident};\n"
             ));
             s.push_str(&format!(
-                "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL PRIVILEGES ON TABLES TO {ident};\n"
+                "ALTER DEFAULT PRIVILEGES {for_role}IN SCHEMA public GRANT ALL PRIVILEGES ON TABLES TO {ident};\n"
             ));
             s.push_str(&format!(
-                "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL PRIVILEGES ON SEQUENCES TO {ident};"
+                "ALTER DEFAULT PRIVILEGES {for_role}IN SCHEMA public GRANT ALL PRIVILEGES ON SEQUENCES TO {ident};"
             ));
         }
     }
@@ -1476,6 +1495,7 @@ mod tests {
             username: "app_rw".into(),
             password: "p'wd".into(),
             preset: Some(RolePreset::Readwrite),
+            default_privileges_owner: None,
         };
         let cmd = provider.create_role_command(&spec).expect("cmd");
         assert!(
@@ -1495,6 +1515,44 @@ mod tests {
     }
 
     #[test]
+    fn preset_default_privileges_are_role_scoped_to_owner() {
+        use gfs_domain::model::db_user::{RolePreset, RoleSpec};
+        let provider = PostgresqlProvider::new();
+        // With a deploy owner, the ALTER DEFAULT PRIVILEGES lines must be
+        // FOR ROLE "owner" so the preset covers the owner's FUTURE objects.
+        let spec = RoleSpec {
+            username: "reader".into(),
+            password: "pw".into(),
+            preset: Some(RolePreset::Readonly),
+            default_privileges_owner: Some("owner".into()),
+        };
+        let cmd = provider.create_role_command(&spec).expect("cmd");
+        assert!(
+            cmd.contains(
+                r#"ALTER DEFAULT PRIVILEGES FOR ROLE "owner" IN SCHEMA public GRANT SELECT ON TABLES TO "reader""#
+            ),
+            "preset defaults must be role-scoped to the deploy owner; got:\n{cmd}"
+        );
+
+        // Without an owner (single-node), no FOR ROLE clause is emitted.
+        let spec_none = RoleSpec {
+            default_privileges_owner: None,
+            ..spec
+        };
+        let cmd_none = provider.create_role_command(&spec_none).expect("cmd");
+        assert!(
+            !cmd_none.contains("FOR ROLE"),
+            "single-node preset must not name a deploy owner; got:\n{cmd_none}"
+        );
+        assert!(
+            cmd_none.contains(
+                r#"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO "reader""#
+            ),
+            "single-node preset keeps role-scoped-to-self defaults; got:\n{cmd_none}"
+        );
+    }
+
+    #[test]
     fn create_role_rejects_bad_username() {
         use gfs_domain::model::db_user::RoleSpec;
         let provider = PostgresqlProvider::new();
@@ -1503,6 +1561,7 @@ mod tests {
                 username: bad.into(),
                 password: "x".into(),
                 preset: None,
+                default_privileges_owner: None,
             };
             assert!(
                 provider.create_role_command(&spec).is_err(),

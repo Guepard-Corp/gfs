@@ -1382,6 +1382,8 @@ async fn do_user(args: &serde_json::Value) -> Result<CallToolResult, McpError> {
                         username: username.clone(),
                         password: password.clone(),
                         preset,
+                        // Single-node gfs MCP: no deploy owner (see cmd_user).
+                        default_privileges_owner: None,
                     },
                 )
                 .await

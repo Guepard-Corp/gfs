@@ -80,6 +80,9 @@ pub async fn run_create(
                 username: username.clone(),
                 password: password.clone(),
                 preset,
+                // Single-node gfs CLI: no deploy owner, so a preset's default
+                // privileges are role-scoped to the connecting role.
+                default_privileges_owner: None,
             },
         )
         .await
