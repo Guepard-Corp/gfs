@@ -7,14 +7,13 @@ GFS="${GFS_BIN:-$ROOT/target/debug/gfs}"
 E2E="${GFS_E2E_DIR:-/tmp/gfs-k3s-e2e}"
 LOG="${GFS_E2E_LOG:-/tmp/gfs-k3s-e2e.log}"
 
-export KUBECONFIG="${KUBECONFIG:-$ROOT/.kube-remote/k3s.yaml}"
+export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
 export GFS_RUNTIME_PROVIDER=kubernetes
 export GFS_ALLOW_UNFROZEN_SNAPSHOT=1
 export GFS_K8S_STORAGE_CLASS=openebs-zfs-gfs
 export GFS_K8S_SNAPSHOT_CLASS=openebs-zfs-gfs-snapclass
 export GFS_K8S_PVC_SIZE_GI=1
-export GUEPARD_EXTERNAL_HOST="${GUEPARD_EXTERNAL_HOST:-${GFS_K8S_EXTERNAL_HOST:?set GFS_K8S_EXTERNAL_HOST (or GUEPARD_EXTERNAL_HOST) to your node's externally-reachable IP/host}}"
-export GFS_K8S_EXTERNAL_HOST="${GFS_K8S_EXTERNAL_HOST:-$GUEPARD_EXTERNAL_HOST}"
+export GFS_K8S_EXTERNAL_HOST="${GFS_K8S_EXTERNAL_HOST:?set GFS_K8S_EXTERNAL_HOST to your node's externally-reachable IP/host}"
 
 exec > >(tee -a "$LOG") 2>&1
 

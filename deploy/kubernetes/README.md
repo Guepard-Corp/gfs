@@ -4,7 +4,7 @@ GFS can run its database workspace on a k3s cluster when `runtime.runtime_provid
 
 ### Prereqs
 
-- **k3s is installed** (control-plane on `guepard-dev-cp`, worker on `guepard-dev-dp`)
+- **k3s (or any Kubernetes) is installed** (a control-plane node and at least one worker node)
 - **VolumeSnapshot CRDs + controller are installed**
   - If they are missing, `gfs commit`/`gfs checkout` will fail when trying to create/restore snapshots.
 

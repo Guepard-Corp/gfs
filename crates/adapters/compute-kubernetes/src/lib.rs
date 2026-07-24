@@ -991,8 +991,8 @@ impl Compute for KubernetesCompute {
         let cluster_host = format!("{svc_name}.{}.svc.cluster.local", self.namespace);
 
         if k8s_expose_nodeport() {
-            let host = std::env::var("GUEPARD_EXTERNAL_HOST")
-                .or_else(|_| std::env::var("GFS_K8S_EXTERNAL_HOST"))
+            let host = std::env::var("GFS_K8S_EXTERNAL_HOST")
+                .or_else(|_| std::env::var("GUEPARD_EXTERNAL_HOST")) // deprecated alias
                 .ok()
                 .filter(|h| !h.is_empty())
                 .unwrap_or(cluster_host);
