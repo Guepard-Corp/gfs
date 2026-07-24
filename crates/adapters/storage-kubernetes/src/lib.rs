@@ -23,15 +23,16 @@ use kube::core::{ApiResource, GroupVersionKind};
 use serde_json::json;
 
 const DEFAULT_NAMESPACE: &str = "gfs";
-const DEFAULT_SNAPSHOT_CLASS: &str = "openebs-zfs-gfs-snapclass";
 const DEFAULT_PVC_SIZE_GI: &str = "1";
 
-fn k8s_snapshot_class() -> String {
+/// VolumeSnapshotClass to use. When `GFS_K8S_SNAPSHOT_CLASS` is unset the field
+/// is omitted so the cluster's default VolumeSnapshotClass applies — works with
+/// any CSI snapshot driver, not just OpenEBS-ZFS.
+fn k8s_snapshot_class() -> Option<String> {
     std::env::var("GFS_K8S_SNAPSHOT_CLASS")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_SNAPSHOT_CLASS.to_string())
 }
 
 fn k8s_storage_class() -> Option<String> {
@@ -307,6 +308,12 @@ impl StoragePort for KubernetesStorage {
             .unwrap_or_else(|| format!("gfs-snap-{}", now_suffix()));
 
         // options.label is a filesystem path in file storage; in k8s we keep it as metadata only.
+        // Omit volumeSnapshotClassName when unset so the cluster's default
+        // VolumeSnapshotClass applies (any CSI snapshot driver, not just ZFS).
+        let mut spec = json!({ "source": { "persistentVolumeClaimName": pvc_name } });
+        if let Some(class) = k8s_snapshot_class() {
+            spec["volumeSnapshotClassName"] = json!(class);
+        }
         let manifest = json!({
           "apiVersion": "snapshot.storage.k8s.io/v1",
           "kind": "VolumeSnapshot",
@@ -321,10 +328,7 @@ impl StoragePort for KubernetesStorage {
               "gfs.guepard.run/snapshot_hash": snap_hash
             }
           },
-          "spec": {
-            "volumeSnapshotClassName": k8s_snapshot_class(),
-            "source": { "persistentVolumeClaimName": pvc_name }
-          }
+          "spec": spec
         });
 
         api.patch(
