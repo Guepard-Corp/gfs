@@ -932,20 +932,13 @@ impl KubernetesCompute {
                 names.push(e.to_string());
             }
         }
-        // Reclaim the per-commit VolumeSnapshots sourced from these PVCs — teardown
-        // deletes the pods/PVCs but would otherwise leak one ZFS snapshot per commit.
-        let storage = gfs_storage_kubernetes::KubernetesStorage::new(Some(self.namespace.clone()))
-            .await
-            .ok();
+        // NOTE: this teardown is SHARED with the checkout / clone-seed RESTORE path,
+        // which deletes the data PVC and then restores it FROM a VolumeSnapshot. It
+        // must NOT delete VolumeSnapshots here — doing so destroys the snapshot the
+        // restore needs (data loss on every k8s checkout). Snapshot reclamation
+        // happens only in the genuine destroy path (`remove_instance`).
         for name in &names {
             let _ = pvcs.delete(name.as_str(), &DeleteParams::default()).await;
-            if let Some(ref storage) = storage
-                && let Err(e) = storage.delete_snapshots_for_pvc(name.as_str()).await
-            {
-                tracing::warn!(
-                    "remove_instance_with_pvcs: snapshot cleanup for '{name}' failed: {e}"
-                );
-            }
         }
         Ok(())
     }
@@ -1205,7 +1198,18 @@ impl Compute for KubernetesCompute {
             .api_secrets()
             .delete(&credentials_secret_name(&id.0), &DeleteParams::default())
             .await;
-        self.remove_instance_with_pvcs(id, &[]).await
+        self.remove_instance_with_pvcs(id, &[]).await?;
+        // Genuine destroy: also reclaim the per-commit VolumeSnapshots (checkout
+        // never reaches here, so its restore snapshot is never at risk).
+        if let Ok(storage) =
+            gfs_storage_kubernetes::KubernetesStorage::new(Some(self.namespace.clone())).await
+            && let Err(e) = storage
+                .delete_snapshots_for_pvc(&format!("{}-data", id.0))
+                .await
+        {
+            tracing::warn!("remove_instance: snapshot reclaim for '{}-data' failed: {e}", id.0);
+        }
+        Ok(())
     }
 
     async fn get_task_connection_info(
