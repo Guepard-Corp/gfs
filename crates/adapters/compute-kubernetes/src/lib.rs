@@ -1143,6 +1143,10 @@ impl Compute for KubernetesCompute {
             }
         };
 
+        // Take the status channel before draining stdout/stderr; await it after
+        // (the streams close on process exit, at which point the status is ready).
+        let status_fut = attached.take_status();
+
         let mut stdout = String::new();
         let mut stderr = String::new();
         if let Some(mut reader) = attached.stdout() {
@@ -1164,10 +1168,27 @@ impl Compute for KubernetesCompute {
             stderr = String::from_utf8_lossy(&buf).into_owned();
         }
 
-        // Kubernetes doesn't provide a simple exit code via this API; treat non-empty stderr
-        // as signal only when command explicitly reports it. We default to 0 to avoid false failures.
+        // Recover the command's real exit code from the exec status channel. kube
+        // reports a non-zero exit as `status=Failure` with an `ExitCode` cause
+        // carrying the numeric code; `Success` means 0. Without this the caller
+        // (e.g. `gfs query`) can't tell a failed SQL statement from an empty result.
+        let exit_code = match status_fut {
+            Some(fut) => match fut.await {
+                Some(status) if status.status.as_deref() == Some("Success") => 0,
+                Some(status) => status
+                    .details
+                    .as_ref()
+                    .and_then(|d| d.causes.as_ref())
+                    .and_then(|causes| causes.iter().find(|c| c.reason.as_deref() == Some("ExitCode")))
+                    .and_then(|c| c.message.as_deref())
+                    .and_then(|m| m.parse::<i32>().ok())
+                    .unwrap_or(1),
+                None => 0,
+            },
+            None => 0,
+        };
         Ok(ExecOutput {
-            exit_code: 0,
+            exit_code,
             stdout,
             stderr,
         })
