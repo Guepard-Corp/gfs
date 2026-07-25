@@ -407,25 +407,28 @@ impl Compute for DockerCompute {
     async fn provision(&self, definition: &ComputeDefinition) -> Result<InstanceId> {
         use std::collections::HashMap;
 
-        // Ensure the image exists locally, pulling it if necessary. A pull failure
-        // is TOLERATED when the image is already present locally — e.g. a
-        // locally-built image (like `gfs-postgres:16`) that was never pushed to a
-        // registry, so `docker pull` 404s but `docker run` would work.
-        let mut pull_builder = bollard::query_parameters::CreateImageOptionsBuilder::default()
-            .from_image(definition.image.as_str());
-        if let Some(p) = self.platform.as_deref() {
-            pull_builder = pull_builder.platform(p);
-        }
-        let pull_opts = pull_builder.build();
-        if let Err(e) = self
-            .docker
-            .create_image(Some(pull_opts), None, None)
-            .try_collect::<Vec<_>>()
-            .await
-        {
-            // Fall back to a locally-present image; only surface the pull error
-            // (missing tag, no manifest for this arch, auth) if it isn't local.
-            if self.docker.inspect_image(&definition.image).await.is_err() {
+        // Use the locally-present image when we have it (normal `docker run`
+        // semantics) and pull only when it is genuinely absent. This matters
+        // because `create_image` (a registry pull) can block for ~30s on registry
+        // auth/timeout for a locally-built image with no upstream registry (e.g.
+        // `gfs-postgres:17`) before failing — a cost that would otherwise be paid
+        // on every provision (each checkout recreate, init, and start).
+        if self.docker.inspect_image(&definition.image).await.is_err() {
+            let mut pull_builder = bollard::query_parameters::CreateImageOptionsBuilder::default()
+                .from_image(definition.image.as_str());
+            if let Some(p) = self.platform.as_deref() {
+                pull_builder = pull_builder.platform(p);
+            }
+            let pull_opts = pull_builder.build();
+            // Surface a pull error only if the image is still absent afterwards
+            // (a locally-built image that 404s but exists is fine).
+            if let Err(e) = self
+                .docker
+                .create_image(Some(pull_opts), None, None)
+                .try_collect::<Vec<_>>()
+                .await
+                && self.docker.inspect_image(&definition.image).await.is_err()
+            {
                 return Err(ComputeError::Internal(format!(
                     "failed to pull image '{}': {e}{}",
                     definition.image,
@@ -436,11 +439,6 @@ impl Compute for DockerCompute {
                     }
                 )));
             }
-            tracing::debug!(
-                image = %definition.image,
-                error = %e,
-                "image pull failed but the image is present locally; using the local image"
-            );
         }
 
         let image_name = definition.image.to_ascii_lowercase();
@@ -900,19 +898,22 @@ impl Compute for DockerCompute {
         command: &str,
         linked_to: Option<&InstanceId>,
     ) -> Result<ExecOutput> {
-        // 1. Pull image (tolerate a pull failure when it's already present locally,
-        //    e.g. a locally-built image never pushed to a registry).
-        let pull_opts = bollard::query_parameters::CreateImageOptionsBuilder::default()
-            .from_image(definition.image.as_str())
-            .build();
-        if let Err(e) = self
-            .docker
-            .create_image(Some(pull_opts), None, None)
-            .try_collect::<Vec<_>>()
-            .await
-            && self.docker.inspect_image(&definition.image).await.is_err()
-        {
-            return Err(classify(definition.image.as_str(), e));
+        // 1. Use the locally-present image when we have it and pull only when it is
+        //    absent — a registry pull of a locally-built image (no upstream repo)
+        //    can block ~30s on auth/timeout before failing, on every task.
+        if self.docker.inspect_image(&definition.image).await.is_err() {
+            let pull_opts = bollard::query_parameters::CreateImageOptionsBuilder::default()
+                .from_image(definition.image.as_str())
+                .build();
+            if let Err(e) = self
+                .docker
+                .create_image(Some(pull_opts), None, None)
+                .try_collect::<Vec<_>>()
+                .await
+                && self.docker.inspect_image(&definition.image).await.is_err()
+            {
+                return Err(classify(definition.image.as_str(), e));
+            }
         }
 
         // 2. Resolve the network of the linked instance so the task can reach it.
