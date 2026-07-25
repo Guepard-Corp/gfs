@@ -328,6 +328,17 @@ enum TopLevel {
         revision: Option<String>,
     },
 
+    /// Tear down the compute instance and remove the repository's .gfs store
+    Destroy {
+        /// Path to the GFS repository root (default: current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+
+        /// Skip the confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+
     /// List, create, or delete branches
     Branch {
         /// Name of the branch to create (omit to list all branches)
@@ -557,6 +568,7 @@ fn command_name(cmd: &TopLevel) -> &'static str {
         TopLevel::Commit { .. } => "commit",
         TopLevel::Config { .. } => "config",
         TopLevel::Checkout { .. } => "checkout",
+        TopLevel::Destroy { .. } => "destroy",
         TopLevel::Branch { .. } => "branch",
         TopLevel::Export { .. } => "export",
         TopLevel::Import { .. } => "import",
@@ -690,6 +702,10 @@ where
             } => {
                 commands::cmd_checkout::checkout(path, revision, create_branch, json_output)
                     .await?;
+                Ok(0)
+            }
+            TopLevel::Destroy { path, yes } => {
+                commands::cmd_destroy::destroy(path, yes).await?;
                 Ok(0)
             }
             TopLevel::Branch {
