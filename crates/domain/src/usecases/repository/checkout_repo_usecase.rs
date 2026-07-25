@@ -212,6 +212,31 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
                 .unwrap_or(definition.image.as_str());
             definition.image = format!("{}:{}", base, environment.database_version);
         }
+        // Re-apply the credentials the data was initialized with, so the recreated
+        // container's startup probe connects as the right role (custom-cred repos
+        // otherwise probe as the provider default and fail to come up).
+        let creds = crate::model::config::RepoCredentials::load(path);
+        if let Some(ref user) = creds.user {
+            for env in &mut definition.env {
+                if env.name.contains("USER") {
+                    env.default = Some(user.clone());
+                }
+            }
+        }
+        if let Some(ref password) = creds.password {
+            for env in &mut definition.env {
+                if env.name.contains("PASSWORD") {
+                    env.default = Some(password.clone());
+                }
+            }
+        }
+        if let Some(ref db) = creds.name {
+            for env in &mut definition.env {
+                if env.name.contains("DB") || env.name.contains("DATABASE") {
+                    env.default = Some(db.clone());
+                }
+            }
+        }
         data_dir::prepare_for_database_provider(provider.name(), &active).map_err(|e| {
             ComputeError::Internal(format!(
                 "failed to prepare data dir '{}': {e}",

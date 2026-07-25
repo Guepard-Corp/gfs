@@ -139,6 +139,46 @@ impl GfsConfig {
     }
 }
 
+/// Database credentials the repo was initialized with, persisted to a small
+/// `.gfs/credentials.toml` sidecar so container recreation (checkout) re-applies
+/// the same user/password/db. Without it, a recreated container's startup probe
+/// connects as the default role and fails for custom-credential repos. Kept out
+/// of `EnvironmentConfig` to avoid churning its many construction sites.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RepoCredentials {
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+impl RepoCredentials {
+    fn path(repo_path: &Path) -> PathBuf {
+        repo_path.join(GFS_DIR).join("credentials.toml")
+    }
+
+    /// Load persisted credentials, tolerating a missing/invalid file.
+    pub fn load(repo_path: &Path) -> Self {
+        std::fs::read_to_string(Self::path(repo_path))
+            .ok()
+            .and_then(|s| toml::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, repo_path: &Path) -> Result<(), RepoError> {
+        let content = toml::to_string_pretty(self)
+            .map_err(|e| RepoError::InvalidConfig(e.to_string()))?;
+        std::fs::write(Self::path(repo_path), content)?;
+        Ok(())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.user.is_none() && self.password.is_none() && self.name.is_none()
+    }
+}
+
 fn default_telemetry() -> bool {
     true
 }

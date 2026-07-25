@@ -164,6 +164,15 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
             }
         }
 
+        // Persist the credentials so container recreation (checkout) can re-apply
+        // them — a recreated container's startup probe must connect as the same
+        // role the data was initialized with, or it fails for custom-cred repos.
+        let repo_credentials = crate::model::config::RepoCredentials {
+            user: credentials.user.clone(),
+            password: credentials.password.clone(),
+            name: credentials.name.clone(),
+        };
+
         // Apply user-provided credentials if supported by the provider's env vars
         if let Some(user) = credentials.user {
             for env in &mut definition.env {
@@ -255,6 +264,10 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         self.repository
             .update_environment_config(repo_path, environment)
             .await?;
+
+        if !repo_credentials.is_empty() {
+            let _ = repo_credentials.save(repo_path);
+        }
 
         let runtime = RuntimeConfig {
             runtime_provider: runtime.provider,
