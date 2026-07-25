@@ -318,23 +318,25 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
             Err(e) => return Err(CheckoutRepoError::Compute(e)),
         }
         let new_id = self.compute.provision(&definition).await?;
-        // Always repair before first start of a new container — the workspace was just
-        // populated from snapshot and ownership may not match the DB process user.
-        self.pre_start_repair_data_dir(
-            &definition,
-            &compute_data_path,
-            repair_target.as_deref(),
-            repair_marker.as_deref(),
-        )
-        .await;
+        // Repair ownership/mode only when a filesystem snapshot was just copied
+        // into this workspace (the `.needs-repair` marker). A read-only snapshot
+        // restore leaves the tree 0400/0500, which the DB process can't write, so
+        // an ephemeral-container `chown -R … && chmod -R 0700` is required first. A
+        // plain branch-switch to an existing, already-writable workspace sets no
+        // marker and needs no repair — skipping it avoids a slow recursive metadata
+        // pass over the bind mount. The pre-start pass (run as root before the DB
+        // starts) is authoritative, so the previous redundant in-container repeat
+        // is dropped.
+        if repair_needed {
+            self.pre_start_repair_data_dir(
+                &definition,
+                &compute_data_path,
+                repair_target.as_deref(),
+                repair_marker.as_deref(),
+            )
+            .await;
+        }
         let _ = self.compute.start(&new_id, Default::default()).await?;
-        // Belt-and-suspenders: also repair inside the running container.
-        self.repair_data_dir_permissions_in_container(
-            &new_id,
-            &compute_data_path,
-            repair_target.as_deref(),
-        )
-        .await;
         self.assert_container_healthy(&new_id, startup_probes)
             .await?;
         let runtime = self
