@@ -471,9 +471,10 @@ impl DatabaseProvider for PostgresqlProvider {
 
         // Step 1 — FAITHFUL schema: dump the remote's DDL (tables, triggers,
         // functions, indexes, constraints, sequences, types) and replay it onto
-        // the local clone, so the source's real objects exist as real tables (not
-        // overlay views). The overlay (gfs_ovl__<schema>) is layered on top by the
-        // bootstrap. `--no-owner --no-privileges` avoids depending on remote roles;
+        // the local clone, so the source's real objects exist as real local heap
+        // tables. The `gfs` copy-on-read extension then serves each one lazily via
+        // its planner hook (no overlay views or INSTEAD OF triggers).
+        // `--no-owner --no-privileges` avoids depending on remote roles;
         // restrict to the requested schemas when given.
         let schema_flags = remote
             .schemas
@@ -506,8 +507,8 @@ impl DatabaseProvider for PostgresqlProvider {
 
         // Step 2 — replay the faithful schema into the LOCAL database. Best-effort
         // (no ON_ERROR_STOP): an object that can't be recreated locally (e.g. a
-        // missing extension) is skipped, and its table is later skipped by the
-        // overlay builder, rather than aborting the whole clone.
+        // missing extension) is skipped, and its table is later skipped during
+        // copy-on-read registration, rather than aborting the whole clone.
         let replay = format!(
             "psql -h {host} -p {port} -U {user} -d {db} -f /tmp/gfs_faithful.sql || true",
             host = local.host,
@@ -516,8 +517,9 @@ impl DatabaseProvider for PostgresqlProvider {
             db = db,
         );
 
-        // Step 3 — bootstrap FDW + overlay (fed via a quoted heredoc; no shell
-        // expansion inside). ON_ERROR_STOP=1 so a real failure fails the clone.
+        // Step 3 — bootstrap the FDW + register each table for copy-on-read with the
+        // `gfs` planner-hook extension (fed via a quoted heredoc; no shell expansion
+        // inside). ON_ERROR_STOP=1 so a real failure fails the clone.
         let bootstrap = format!(
             "psql -h {host} -p {port} -U {user} -d {db} -v ON_ERROR_STOP=1 <<'GFS_CLONE_BOOTSTRAP'\n{sql}\nGFS_CLONE_BOOTSTRAP\n",
             host = local.host,
@@ -781,7 +783,7 @@ pub fn register(registry: &impl DatabaseProviderRegistry) -> Result<()> {
 // Lazy-clone bootstrap SQL generation (RFC 008)
 // ---------------------------------------------------------------------------
 
-/// The overlay bootstrap template, kept as a real `.sql` file (proper syntax
+/// The copy-on-read bootstrap template, kept as a real `.sql` file (proper syntax
 /// highlighting / linting). `__PLACEHOLDER__` sentinels are substituted by
 /// `build_clone_bootstrap_sql`.
 const CLONE_BOOTSTRAP_TMPL: &str = include_str!("clone_bootstrap.sql");
@@ -792,17 +794,21 @@ fn sql_lit(s: &str) -> String {
 }
 
 /// Build the bootstrap SQL run inside the local GFS database to set up a lazy
-/// (copy-on-read) clone of `remote`, using the **overlay** mechanic.
+/// (copy-on-read) clone of `remote`.
 ///
 /// Installs `postgres_fdw` + `dblink`, imports the remote schema as foreign
-/// tables, and — for each remote table with a single-column primary key —
-/// creates a local store, a delete-tombstone table, an updatable overlay view
-/// (local wins; remote rows only if neither local nor tombstoned), and
-/// `INSTEAD OF` triggers for copy-on-write. No data is copied.
+/// tables (`gfs_remote_*`), and registers each cloned table with the `gfs`
+/// copy-on-read extension. Each cloned table is a REAL local heap (carrying the
+/// source's indexes); the extension's `planner_hook` inspects every query's cold
+/// plan and, per scan on a registered table, serves it locally, hydrates the
+/// matching key range / selective slice, whole-copies a small table, or federates
+/// the query to the source. No data is copied at bootstrap time.
 ///
-/// Correctness is guaranteed by the view (disjoint row sets), independent of
-/// hydration. The mechanic is the one validated by
-/// `docs/rfcs/008-remote-clone/poc-overlay`.
+/// Correctness is the extension's responsibility (it fetches a query's real rows
+/// before execution); a source table without a usable unique key is refused
+/// loudly at registration rather than served empty. See
+/// `crates/extensions/gfs/README.md` for the mechanism — the original overlay-view
+/// design in `docs/rfcs/008-remote-clone.md` was superseded by this planner hook.
 fn build_clone_bootstrap_sql(remote: &RemoteSource) -> String {
     // dblink connection string, used only for read-only introspection of the
     // remote (schema/table/key discovery).
@@ -1238,15 +1244,14 @@ mod tests {
                 "IMPORT FOREIGN SCHEMA %I LIMIT TO (%I) FROM SERVER gfs_remote_srv INTO %I"
             )
         );
-        // Resilience hooks: skip un-importable tables / overlays.
+        // Resilience hooks: skip un-importable tables.
         assert!(sql.contains("CREATE EXTENSION IF NOT EXISTS %I"));
         assert!(sql.contains("to_regclass(fq_remote) IS NULL"));
         // dblink introspection connection string is present.
         assert!(
             sql.contains("host=rds.example.com port=5432 dbname=shop user=reader password=p@ss")
         );
-        // No leftover placeholders (the template still legitimately contains the
-        // reserved `gfs_ovl__` / `__deleted` names, so check the tokens directly).
+        // No leftover placeholders — every `__…__` substitution sentinel is gone.
         for ph in [
             "__RHOST__",
             "__RPORT__",
