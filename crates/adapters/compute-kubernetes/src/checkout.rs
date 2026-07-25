@@ -120,8 +120,11 @@ pub async fn restore_database_volume_from_snapshot<R: DatabaseProviderRegistry>(
         .collect();
 
     let instance_id = InstanceId(stable_instance.clone());
+    // RESTORE teardown: must PRESERVE the VolumeSnapshots — we delete the data PVC
+    // below and then clone it back FROM `vs_name`. Using the destroy teardown
+    // (`remove_instance_with_pvcs`) here would reclaim that snapshot (SEV1 data loss).
     compute
-        .remove_instance_with_pvcs(&instance_id, &legacy_pvcs)
+        .teardown_instance_keep_snapshots(&instance_id, &legacy_pvcs)
         .await
         .map_err(|e| K8sCheckoutReprovisionError::Compute(e.to_string()))?;
 

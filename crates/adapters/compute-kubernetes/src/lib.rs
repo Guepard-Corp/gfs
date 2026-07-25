@@ -910,8 +910,26 @@ impl KubernetesCompute {
         Ok(InstanceId(instance))
     }
 
-    /// Tear down StatefulSet/Service and delete `{instance}-data` plus any extra PVC names.
-    pub async fn remove_instance_with_pvcs(
+    /// PVC names for an instance: the stable `{id}-data` plus any de-duplicated
+    /// non-empty extras.
+    fn pvc_names(id: &InstanceId, extra_pvcs: &[String]) -> Vec<String> {
+        let mut names = vec![format!("{}-data", id.0)];
+        for extra in extra_pvcs {
+            let e = extra.trim();
+            if !e.is_empty() && !names.iter().any(|n| n == e) {
+                names.push(e.to_string());
+            }
+        }
+        names
+    }
+
+    /// Tear down StatefulSet/Service and delete the instance PVCs, WITHOUT
+    /// touching VolumeSnapshots. This is the teardown the checkout / clone-seed
+    /// RESTORE path needs: it deletes the data PVC and then restores it FROM a
+    /// VolumeSnapshot, so the snapshots must survive here. Deleting them here is
+    /// the SEV1 data-loss bug — every valid checkout would destroy the snapshot
+    /// it is about to restore from.
+    pub async fn teardown_instance_keep_snapshots(
         &self,
         id: &InstanceId,
         extra_pvcs: &[String],
@@ -925,20 +943,37 @@ impl KubernetesCompute {
             .delete(&Self::svc_name(&id.0), &DeleteParams::default())
             .await;
 
-        let mut names = vec![format!("{}-data", id.0)];
-        for extra in extra_pvcs {
-            let e = extra.trim();
-            if !e.is_empty() && !names.iter().any(|n| n == e) {
-                names.push(e.to_string());
-            }
-        }
-        // NOTE: this teardown is SHARED with the checkout / clone-seed RESTORE path,
-        // which deletes the data PVC and then restores it FROM a VolumeSnapshot. It
-        // must NOT delete VolumeSnapshots here — doing so destroys the snapshot the
-        // restore needs (data loss on every k8s checkout). Snapshot reclamation
-        // happens only in the genuine destroy path (`remove_instance`).
-        for name in &names {
+        for name in Self::pvc_names(id, extra_pvcs) {
             let _ = pvcs.delete(name.as_str(), &DeleteParams::default()).await;
+        }
+        Ok(())
+    }
+
+    /// Full teardown for a genuine DESTROY: everything
+    /// [`Self::teardown_instance_keep_snapshots`] does, plus reclaim the
+    /// per-commit VolumeSnapshots sourced from these PVCs — one ZFS snapshot per
+    /// commit would otherwise leak. Consumers that DESTROY a database call this
+    /// (the CLI via `remove_instance`, and the data-plane daemon directly);
+    /// consumers that RESTORE from a snapshot MUST use
+    /// `teardown_instance_keep_snapshots` instead.
+    pub async fn remove_instance_with_pvcs(
+        &self,
+        id: &InstanceId,
+        extra_pvcs: &[String],
+    ) -> Result<()> {
+        self.teardown_instance_keep_snapshots(id, extra_pvcs).await?;
+
+        let storage = gfs_storage_kubernetes::KubernetesStorage::new(Some(self.namespace.clone()))
+            .await
+            .ok();
+        for name in Self::pvc_names(id, extra_pvcs) {
+            if let Some(ref storage) = storage
+                && let Err(e) = storage.delete_snapshots_for_pvc(name.as_str()).await
+            {
+                tracing::warn!(
+                    "remove_instance_with_pvcs: snapshot cleanup for '{name}' failed: {e}"
+                );
+            }
         }
         Ok(())
     }
@@ -1191,25 +1226,16 @@ impl Compute for KubernetesCompute {
 
     async fn remove_instance(&self, id: &InstanceId) -> Result<()> {
         // Genuine deletion also retires the credentials Secret. The checkout /
-        // clone-seed restore tears down via `remove_instance_with_pvcs`, which
-        // deliberately preserves the Secret — it is the only durable copy of
-        // the deploy-time password and must survive StatefulSet recreation.
+        // clone-seed restore tears down via `teardown_instance_keep_snapshots`,
+        // which deliberately preserves the Secret — it is the only durable copy
+        // of the deploy-time password and must survive StatefulSet recreation.
         let _ = self
             .api_secrets()
             .delete(&credentials_secret_name(&id.0), &DeleteParams::default())
             .await;
-        self.remove_instance_with_pvcs(id, &[]).await?;
-        // Genuine destroy: also reclaim the per-commit VolumeSnapshots (checkout
-        // never reaches here, so its restore snapshot is never at risk).
-        if let Ok(storage) =
-            gfs_storage_kubernetes::KubernetesStorage::new(Some(self.namespace.clone())).await
-            && let Err(e) = storage
-                .delete_snapshots_for_pvc(&format!("{}-data", id.0))
-                .await
-        {
-            tracing::warn!("remove_instance: snapshot reclaim for '{}-data' failed: {e}", id.0);
-        }
-        Ok(())
+        // Full destroy: `remove_instance_with_pvcs` also reclaims the per-commit
+        // VolumeSnapshots.
+        self.remove_instance_with_pvcs(id, &[]).await
     }
 
     async fn get_task_connection_info(
