@@ -208,6 +208,19 @@ pub async fn reprovision_after_pvc_restore<R: DatabaseProviderRegistry>(
     let mut def = provider.definition();
     let base = def.image.split(':').next().unwrap_or(&def.image);
     def.image = format!("{base}:{database_version}");
+    // Re-apply the repo's configured database name. Checkout rebuilds the pod from
+    // the provider default (POSTGRES_DB=postgres); the credentials Secret carries
+    // user/password but NOT the database name, so without this a repo created with
+    // a custom --database-name would silently advertise and default to `postgres`
+    // after every checkout — making `gfs query` target the wrong database.
+    let creds = gfs_domain::model::config::RepoCredentials::load(repo_path);
+    if let Some(db) = creds.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        for env in &mut def.env {
+            if env.name.contains("DB") || env.name.contains("DATABASE") {
+                env.default = Some(db.to_string());
+            }
+        }
+    }
     // PVC already exists from VolumeSnapshot restore; mount default `{instance}-data`.
     def.host_data_dir = None;
 
