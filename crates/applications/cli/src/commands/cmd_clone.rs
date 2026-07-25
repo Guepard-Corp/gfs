@@ -66,8 +66,15 @@ pub async fn clone(
                     Some(v)
                 }
                 Err(e) => {
-                    eprintln!("gfs: could not detect remote version ({e}); defaulting to 16");
-                    Some("16".to_string())
+                    // Fail loudly rather than guessing a major version. A wrong
+                    // guess provisions a mismatched local engine whose pg_dump
+                    // then refuses the source ("server version mismatch"), so a
+                    // transient probe failure would silently corrupt the clone.
+                    return Err(format!(
+                        "could not detect remote PostgreSQL version ({e}); \
+                         retry, or pass --database-version <major> (e.g. --database-version 17)"
+                    )
+                    .into());
                 }
             },
         }
