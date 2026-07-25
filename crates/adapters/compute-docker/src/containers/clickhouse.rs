@@ -464,11 +464,19 @@ fi"#,
         Ok(cmd)
     }
 
-    fn query_in_instance_command(&self, sql: &str) -> std::result::Result<String, ProviderError> {
+    fn query_in_instance_command(
+        &self,
+        sql: &str,
+        database: Option<&str>,
+    ) -> std::result::Result<String, ProviderError> {
         const DELIM: &str = "GFS_SQL_EOF";
         let body = gfs_domain::utils::shell::sql_heredoc_body(DELIM, sql)?;
+        let db = match database.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(name) => gfs_domain::utils::shell::shell_single_quote(name),
+            None => r#""${CLICKHOUSE_DB:-default}""#.to_string(),
+        };
         Ok(format!(
-            r#"clickhouse-client --host 127.0.0.1 --user "${{CLICKHOUSE_USER:-default}}" --password "${{CLICKHOUSE_PASSWORD:-clickhouse}}" --database "${{CLICKHOUSE_DB:-default}}" --query "{body}""#
+            r#"clickhouse-client --host 127.0.0.1 --user "${{CLICKHOUSE_USER:-default}}" --password "${{CLICKHOUSE_PASSWORD:-clickhouse}}" --database {db} --query "{body}""#
         ))
     }
 

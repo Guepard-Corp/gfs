@@ -66,7 +66,7 @@ pub async fn run(
             "interactive query is not supported for kubernetes runtime; pass SQL as an argument",
         )?;
         let out = ExecuteQueryUseCase::new(compute, registry.clone())
-            .run(&repo_path, sql)
+            .run(&repo_path, sql, database.as_deref())
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         print!("{}", out.stdout);

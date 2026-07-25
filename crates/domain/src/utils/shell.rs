@@ -11,3 +11,9 @@ pub fn sql_heredoc_body(delimiter: &str, sql: &str) -> Result<String, ProviderEr
     }
     Ok(format!("$(cat <<'{delimiter}'\n{sql}\n{delimiter}\n)"))
 }
+
+/// Wrap `s` in single quotes for safe use in a `sh -c` command, escaping any
+/// embedded single quote (`'` -> `'\''`).
+pub fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}

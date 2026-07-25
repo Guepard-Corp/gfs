@@ -404,8 +404,14 @@ pub trait DatabaseProvider: Send + Sync {
     ///
     /// Uses container env vars and loopback — no host-side client binaries. Interactive
     /// sessions are not supported; `sql` must be non-empty.
-    fn query_in_instance_command(&self, sql: &str) -> std::result::Result<String, ProviderError> {
-        let _ = sql;
+    /// When `database` is `Some`, the query targets that database; otherwise it
+    /// uses the instance's configured default (e.g. `$POSTGRES_DB`).
+    fn query_in_instance_command(
+        &self,
+        sql: &str,
+        database: Option<&str>,
+    ) -> std::result::Result<String, ProviderError> {
+        let _ = (sql, database);
         Err(ProviderError::UnsupportedFormat("query_in_instance".into()))
     }
 

@@ -50,6 +50,7 @@ impl<R: DatabaseProviderRegistry> ExecuteQueryUseCase<R> {
         &self,
         path: &Path,
         sql: &str,
+        database: Option<&str>,
     ) -> Result<ExecuteQueryOutput, ExecuteQueryError> {
         if sql.trim().is_empty() {
             return Err(ExecuteQueryError::Unsupported(
@@ -89,7 +90,7 @@ impl<R: DatabaseProviderRegistry> ExecuteQueryUseCase<R> {
             .ok_or_else(|| ExecuteQueryError::ProviderNotFound(provider_name.clone()))?;
 
         let command = provider
-            .query_in_instance_command(sql)
+            .query_in_instance_command(sql, database)
             .map_err(|e| ExecuteQueryError::Unsupported(e.to_string()))?;
 
         let instance_id = InstanceId(container_name);
@@ -351,8 +352,12 @@ mod tests {
         fn query_in_instance_command(
             &self,
             sql: &str,
+            database: Option<&str>,
         ) -> std::result::Result<String, ProviderError> {
-            Ok(format!("mock-exec-query: {sql}"))
+            match database {
+                Some(db) => Ok(format!("mock-exec-query[{db}]: {sql}")),
+                None => Ok(format!("mock-exec-query: {sql}")),
+            }
         }
     }
 
@@ -397,7 +402,7 @@ mod tests {
         });
 
         let uc = ExecuteQueryUseCase::new(compute.clone(), registry);
-        let out = uc.run(&repo_path, "SELECT 1").await.unwrap();
+        let out = uc.run(&repo_path, "SELECT 1", None).await.unwrap();
         assert!(out.stdout.contains("(1 row)"));
 
         let cmd = compute.last_command.lock().unwrap().clone().unwrap();
@@ -419,7 +424,7 @@ mod tests {
         });
 
         let uc = ExecuteQueryUseCase::new(compute, registry);
-        let err = uc.run(&repo_path, "BAD SQL").await.unwrap_err();
+        let err = uc.run(&repo_path, "BAD SQL", None).await.unwrap_err();
         match err {
             ExecuteQueryError::QueryFailed { message, .. } => {
                 assert!(message.contains("syntax error"));

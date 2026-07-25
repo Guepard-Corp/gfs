@@ -115,7 +115,7 @@ async fn execute_query_inside_running_postgres_container() {
 
     let uc = ExecuteQueryUseCase::new(compute, registry);
     let out = uc
-        .run(repo_path, "SELECT 42 AS answer;")
+        .run(repo_path, "SELECT 42 AS answer;", None)
         .await
         .expect("query inside container");
 

@@ -594,11 +594,21 @@ impl DatabaseProvider for PostgresqlProvider {
         Ok(cmd)
     }
 
-    fn query_in_instance_command(&self, sql: &str) -> std::result::Result<String, ProviderError> {
+    fn query_in_instance_command(
+        &self,
+        sql: &str,
+        database: Option<&str>,
+    ) -> std::result::Result<String, ProviderError> {
         const DELIM: &str = "GFS_SQL_EOF";
         let body = gfs_domain::utils::shell::sql_heredoc_body(DELIM, sql)?;
+        // Target an explicit database when given (`gfs query --database`), else the
+        // container's configured POSTGRES_DB.
+        let db = match database.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(name) => gfs_domain::utils::shell::shell_single_quote(name),
+            None => r#""${POSTGRES_DB:-postgres}""#.to_string(),
+        };
         Ok(format!(
-            r#"PGPASSWORD="${{POSTGRES_PASSWORD:-postgres}}" psql -h 127.0.0.1 -U "${{POSTGRES_USER:-postgres}}" -d "${{POSTGRES_DB:-postgres}}" -v ON_ERROR_STOP=1 -c "{body}""#
+            r#"PGPASSWORD="${{POSTGRES_PASSWORD:-postgres}}" psql -h 127.0.0.1 -U "${{POSTGRES_USER:-postgres}}" -d {db} -v ON_ERROR_STOP=1 -c "{body}""#
         ))
     }
 
@@ -1050,12 +1060,20 @@ mod tests {
     fn query_in_instance_command_uses_loopback_and_heredoc() {
         let provider = PostgresqlProvider::new();
         let cmd = provider
-            .query_in_instance_command("SELECT 1;")
+            .query_in_instance_command("SELECT 1;", None)
             .expect("query command");
         assert!(cmd.contains("127.0.0.1"));
         assert!(cmd.contains("POSTGRES_USER:-postgres"));
+        assert!(cmd.contains(r#"-d "${POSTGRES_DB:-postgres}""#));
         assert!(cmd.contains("GFS_SQL_EOF"));
         assert!(cmd.contains("SELECT 1;"));
+
+        // An explicit database override targets that DB literally.
+        let cmd_db = provider
+            .query_in_instance_command("SELECT 1;", Some("myapp"))
+            .expect("query command");
+        assert!(cmd_db.contains("-d 'myapp'"));
+        assert!(!cmd_db.contains("${POSTGRES_DB"));
         assert!(!cmd.starts_with("psql postgresql://"));
     }
 
