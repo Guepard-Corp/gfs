@@ -599,7 +599,6 @@ mod tests {
             }),
             storage: None,
             compute: None,
-            remote: None,
         };
         config.save(&path).expect("save config");
         (temp, path)

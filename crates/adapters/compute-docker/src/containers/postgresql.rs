@@ -641,7 +641,7 @@ impl DatabaseProvider for PostgresqlProvider {
             sql.push_str(&pg_preset_sql(&ident, preset, owner.as_deref()));
         }
         // Wrap in a transaction so create+grants are atomic (fixes v2 partial-state).
-        self.query_in_instance_command(&format!("BEGIN;\n{sql}\nCOMMIT;"))
+        self.query_in_instance_command(&format!("BEGIN;\n{sql}\nCOMMIT;"), None)
     }
 
     fn alter_password_command(
@@ -650,10 +650,10 @@ impl DatabaseProvider for PostgresqlProvider {
         password: &str,
     ) -> std::result::Result<String, ProviderError> {
         let ident = pg_quote_ident(username)?;
-        self.query_in_instance_command(&format!(
-            "ALTER ROLE {ident} WITH PASSWORD '{}';",
-            sql_lit(password)
-        ))
+        self.query_in_instance_command(
+            &format!("ALTER ROLE {ident} WITH PASSWORD '{}';", sql_lit(password)),
+            None,
+        )
     }
 
     fn drop_role_command(&self, username: &str) -> std::result::Result<String, ProviderError> {
@@ -666,9 +666,12 @@ impl DatabaseProvider for PostgresqlProvider {
         // created (it now owns no objects, so nothing is destroyed). `DROP ROLE`
         // then succeeds instead of failing with "objects depend on it".
         // Transactional so a partial drop can't leave a half-removed role.
-        self.query_in_instance_command(&format!(
-            "BEGIN;\nREASSIGN OWNED BY {ident} TO CURRENT_USER;\nDROP OWNED BY {ident};\nDROP ROLE {ident};\nCOMMIT;"
-        ))
+        self.query_in_instance_command(
+            &format!(
+                "BEGIN;\nREASSIGN OWNED BY {ident} TO CURRENT_USER;\nDROP OWNED BY {ident};\nDROP ROLE {ident};\nCOMMIT;"
+            ),
+            None,
+        )
     }
 
     fn list_roles_command(&self) -> std::result::Result<String, ProviderError> {
@@ -703,10 +706,13 @@ impl DatabaseProvider for PostgresqlProvider {
         // in one transaction. `create_role` does not need this (a fresh role has
         // nothing to reset).
         let reset = pg_preset_reset_sql(&ident, owner.as_deref());
-        self.query_in_instance_command(&format!(
-            "BEGIN;\n{reset}\n{}\nCOMMIT;",
-            pg_preset_sql(&ident, preset, owner.as_deref())
-        ))
+        self.query_in_instance_command(
+            &format!(
+                "BEGIN;\n{reset}\n{}\nCOMMIT;",
+                pg_preset_sql(&ident, preset, owner.as_deref())
+            ),
+            None,
+        )
     }
 
     fn bootstrap_deploy_env_command(
@@ -736,7 +742,7 @@ impl DatabaseProvider for PostgresqlProvider {
              COMMIT;",
             pw = sql_lit(&spec.owner_password),
         );
-        self.query_in_instance_command(&sql)
+        self.query_in_instance_command(&sql, None)
     }
 
     fn grant_command(&self, spec: &GrantSpec) -> std::result::Result<String, ProviderError> {
@@ -751,7 +757,7 @@ impl DatabaseProvider for PostgresqlProvider {
         )?;
         // Transactional so a multi-statement grant (+ optional default-privileges
         // line) is atomic — no partial grant on failure (fixes v2 gap).
-        self.query_in_instance_command(&format!("BEGIN;\n{stmts}\nCOMMIT;"))
+        self.query_in_instance_command(&format!("BEGIN;\n{stmts}\nCOMMIT;"), None)
     }
 
     fn revoke_command(&self, spec: &RevokeSpec) -> std::result::Result<String, ProviderError> {
@@ -764,7 +770,7 @@ impl DatabaseProvider for PostgresqlProvider {
             spec.cascade,
             None,
         )?;
-        self.query_in_instance_command(&format!("BEGIN;\n{stmts}\nCOMMIT;"))
+        self.query_in_instance_command(&format!("BEGIN;\n{stmts}\nCOMMIT;"), None)
     }
 
     fn list_privileges_command(&self, role: &str) -> std::result::Result<String, ProviderError> {

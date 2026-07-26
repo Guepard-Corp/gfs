@@ -1886,7 +1886,6 @@ mod tests {
             }),
             storage: None,
             compute: None,
-            remote: None,
         }
         .save(&repo)
         .expect("save .gfs config");

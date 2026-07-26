@@ -49,7 +49,6 @@ fn write_repo(path: &std::path::Path, container: &str) {
         }),
         storage: None,
         compute: None,
-        remote: None,
     };
     config.save(path).expect("save config");
 }
