@@ -1655,4 +1655,134 @@ mod tests {
             vec![("POSTGRES_PASSWORD".to_string(), "literal".to_string())]
         );
     }
+
+    fn definition_with_image(image: &str) -> ComputeDefinition {
+        ComputeDefinition {
+            image: image.into(),
+            ..definition_with_env(vec![])
+        }
+    }
+
+    fn pod_with_phase_ready(phase: Option<&str>, ready: Option<bool>) -> Pod {
+        use k8s_openapi::api::core::v1::{PodCondition, PodStatus};
+        Pod {
+            status: Some(PodStatus {
+                phase: phase.map(str::to_string),
+                conditions: ready.map(|r| {
+                    vec![PodCondition {
+                        type_: "Ready".to_string(),
+                        status: if r { "True" } else { "False" }.to_string(),
+                        ..Default::default()
+                    }]
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn valid_k8s_node_port_enforces_30000_32767_range() {
+        // Inclusive Kubernetes NodePort range.
+        assert!(is_valid_k8s_node_port(30000));
+        assert!(is_valid_k8s_node_port(32767));
+        assert!(is_valid_k8s_node_port(31500));
+        // Just outside either edge, plus a raw Postgres port and non-positive values.
+        assert!(!is_valid_k8s_node_port(29999));
+        assert!(!is_valid_k8s_node_port(32768));
+        assert!(!is_valid_k8s_node_port(5432));
+        assert!(!is_valid_k8s_node_port(0));
+        assert!(!is_valid_k8s_node_port(-1));
+    }
+
+    #[test]
+    fn host_port_from_mapping_prefers_explicit_host_port() {
+        let m = PortMapping {
+            compute_port: 5432,
+            host_port: Some(31000),
+        };
+        assert_eq!(host_port_from_mapping(&m), Some(31000));
+    }
+
+    #[test]
+    fn service_node_port_only_pins_ports_in_nodeport_range() {
+        // A host port inside the NodePort range pins the Service NodePort.
+        let in_range = PortMapping {
+            compute_port: 5432,
+            host_port: Some(31000),
+        };
+        assert_eq!(service_node_port_from_mapping(&in_range), Some(31000));
+        // A host port outside the range (e.g. a raw Postgres port) must NOT be
+        // pinned — the apiserver would reject a NodePort of 5432.
+        let out_of_range = PortMapping {
+            compute_port: 5432,
+            host_port: Some(5432),
+        };
+        assert_eq!(service_node_port_from_mapping(&out_of_range), None);
+    }
+
+    #[test]
+    fn pod_is_ready_requires_running_phase_and_ready_condition() {
+        assert!(pod_is_ready(&pod_with_phase_ready(Some("Running"), Some(true))));
+        // Running but not yet Ready → not exec-able (exec would race the DB).
+        assert!(!pod_is_ready(&pod_with_phase_ready(
+            Some("Running"),
+            Some(false)
+        )));
+        // Ready condition True but still Pending → not exec-able.
+        assert!(!pod_is_ready(&pod_with_phase_ready(Some("Pending"), Some(true))));
+        // No Ready condition at all, and an empty pod.
+        assert!(!pod_is_ready(&pod_with_phase_ready(Some("Running"), None)));
+        assert!(!pod_is_ready(&Pod::default()));
+    }
+
+    #[test]
+    fn ensure_dns_label_sanitizes_to_rfc1123() {
+        // Uppercase lowercased; underscores/dots/slashes become dashes.
+        assert_eq!(ensure_dns_label("Gfs_PG_17"), "gfs-pg-17");
+        assert_eq!(ensure_dns_label("my.db/name"), "my-db-name");
+        // Leading/trailing non-alphanumerics are trimmed, not left as dashes.
+        assert_eq!(ensure_dns_label("__edge__"), "edge");
+        // An already-valid label is unchanged.
+        assert_eq!(ensure_dns_label("already-valid-1"), "already-valid-1");
+    }
+
+    #[test]
+    fn instance_name_prefix_follows_image_family() {
+        assert!(
+            instance_name_from_definition(&definition_with_image("postgres:17"))
+                .starts_with("gfs-pg-")
+        );
+        assert!(
+            instance_name_from_definition(&definition_with_image("mysql:8"))
+                .starts_with("gfs-mysql-")
+        );
+        assert!(
+            instance_name_from_definition(&definition_with_image("clickhouse/clickhouse-server"))
+                .starts_with("gfs-ch-")
+        );
+        // Unknown engine falls back to the generic prefix.
+        assert!(
+            instance_name_from_definition(&definition_with_image("redis:7")).starts_with("gfs-db-")
+        );
+        // Family match is case-insensitive.
+        assert!(
+            instance_name_from_definition(&definition_with_image("PostgreSQL:16"))
+                .starts_with("gfs-pg-")
+        );
+    }
+
+    #[test]
+    fn labels_for_sets_app_and_instance_labels() {
+        let labels = labels_for("gfs-pg-42");
+        assert_eq!(
+            labels.get("app.kubernetes.io/name").map(String::as_str),
+            Some("gfs")
+        );
+        assert_eq!(
+            labels.get("gfs.guepard.run/instance").map(String::as_str),
+            Some("gfs-pg-42")
+        );
+        assert_eq!(labels.len(), 2);
+    }
 }

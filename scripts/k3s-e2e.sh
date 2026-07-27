@@ -138,6 +138,18 @@ psql_rows
 step "query"
 run "$GFS" query "select count(*) from gfs_e2e"
 
+step "query error surfacing (k8s must not swallow SQL errors)"
+# A failing SQL statement must exit non-zero. A silent exit 0 here means the k8s
+# exec path is discarding the real exit code (regression guard for that fix).
+if "$GFS" query "select 1/0" >/dev/null 2>&1; then
+  echo "FAIL: div-by-zero query exited 0 — k8s swallowed the SQL error"; exit 1
+fi
+echo "OK: div-by-zero surfaced as a non-zero exit"
+if "$GFS" query "select * from no_such_table_xyz" >/dev/null 2>&1; then
+  echo "FAIL: missing-table query exited 0 — k8s swallowed the SQL error"; exit 1
+fi
+echo "OK: missing-table surfaced as a non-zero exit"
+
 step "branch -d hotfix"
 run "$GFS" branch -d hotfix
 

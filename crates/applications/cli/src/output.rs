@@ -221,3 +221,60 @@ pub fn fmt_box_row_colored(
         " ".repeat(remaining)
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn box_top_without_title_is_a_full_rule() {
+        // width+2 horizontal glyphs between the rounded corners.
+        assert_eq!(box_top("", 4), format!("  {}{}{}", BOX_TL, BOX_H.repeat(6), BOX_TR));
+    }
+
+    #[test]
+    fn box_top_with_title_embeds_label_and_closes() {
+        let top = box_top("Repository", 20);
+        assert!(top.starts_with(&format!("  {BOX_TL}")), "top: {top}");
+        assert!(top.contains("─ Repository "), "title embedded: {top}");
+        assert!(top.ends_with(BOX_TR), "closes with corner: {top}");
+    }
+
+    #[test]
+    fn box_bottom_is_a_full_rule() {
+        assert_eq!(box_bottom(4), format!("  {}{}{}", BOX_BL, BOX_H.repeat(6), BOX_BR));
+    }
+
+    #[test]
+    fn box_row_wraps_content_in_verticals() {
+        assert_eq!(box_row("hi", 5), format!("  {BOX_V} hi {BOX_V}"));
+    }
+
+    #[test]
+    fn tbl_rule_joins_columns_with_junctions() {
+        // Two columns of width 3 and 5 → 5 and 7 glyphs, separated by the mid junction.
+        let rule = tbl_rule(&[3, 5], TBL_TL, TBL_T_DOWN, TBL_TR);
+        let expected = format!(
+            "  {}{}{}{}{}",
+            TBL_TL,
+            TBL_H.repeat(5),
+            TBL_T_DOWN,
+            TBL_H.repeat(7),
+            TBL_TR
+        );
+        assert_eq!(rule, expected);
+    }
+
+    #[test]
+    fn fmt_box_row_keeps_label_and_value() {
+        let row = fmt_box_row("Branch", "main", 8, 20);
+        assert!(row.contains("Branch"), "label present: {row}");
+        assert!(row.contains("main"), "value present: {row}");
+    }
+
+    #[test]
+    fn color_mode_never_disables_color() {
+        // `Never` short-circuits to false regardless of TTY or NO_COLOR.
+        assert!(!ColorMode::Never.use_color());
+    }
+}
