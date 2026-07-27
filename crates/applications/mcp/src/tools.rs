@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use gfs_compute_docker::DockerCompute;
 use gfs_compute_docker::containers;
+use gfs_compute_kubernetes::KubernetesCompute;
 use gfs_domain::adapters::gfs_repository::GfsRepository;
 use gfs_domain::model::config::{GfsConfig, RuntimeConfig};
 use gfs_domain::model::datasource::diff::compute_schema_diff;
@@ -44,6 +45,30 @@ use serde_json::json;
 
 fn to_error_data(msg: impl Into<std::borrow::Cow<'static, str>>) -> McpError {
     McpError::internal_error(msg, None)
+}
+
+/// Build the compute backend for the active runtime. Mirrors the CLI/data-plane:
+/// honors `GFS_RUNTIME_PROVIDER` (`kubernetes`/`k8s`/`k3s` → Kubernetes, else
+/// Docker) instead of hardcoding Docker, so the MCP tools operate on the k8s
+/// runtime rather than silently talking to — or spinning up — a Docker container.
+async fn runtime_compute() -> Result<Arc<dyn Compute>, McpError> {
+    let k8s = std::env::var("GFS_RUNTIME_PROVIDER")
+        .map(|v| {
+            let v = v.to_ascii_lowercase();
+            v == "kubernetes" || v == "k8s" || v == "k3s"
+        })
+        .unwrap_or(false);
+    if k8s {
+        Ok(Arc::new(
+            KubernetesCompute::new(None)
+                .await
+                .map_err(|e| to_error_data(e.to_string()))?,
+        ))
+    } else {
+        Ok(Arc::new(
+            DockerCompute::new().map_err(|e| to_error_data(e.to_string()))?,
+        ))
+    }
 }
 
 /// Default repo path: env GFS_REPO_PATH or current directory.
@@ -590,7 +615,7 @@ async fn do_status(args: &serde_json::Value) -> Result<CallToolResult, McpError>
     let repo_path = repo_path_from_value(args);
 
     let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
-    let compute = Arc::new(DockerCompute::new().map_err(|e| to_error_data(e.to_string()))?);
+    let compute = runtime_compute().await?;
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
     containers::register_all(registry.as_ref())
         .map_err(|e| to_error_data(format!("register providers: {e}")))?;
@@ -640,8 +665,7 @@ async fn do_commit(args: &serde_json::Value) -> Result<CallToolResult, McpError>
         use gfs_domain::ports::storage::StoragePort;
         let storage: Arc<dyn StoragePort> = Arc::new(gfs_storage_apfs::ApfsStorage::new());
         let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
-        let compute: Arc<dyn Compute> =
-            Arc::new(DockerCompute::new().map_err(|e| to_error_data(e.to_string()))?);
+        let compute: Arc<dyn Compute> = runtime_compute().await?;
         let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
         containers::register_all(registry.as_ref())
             .map_err(|e| to_error_data(format!("register providers: {e}")))?;
@@ -680,8 +704,7 @@ async fn do_commit(args: &serde_json::Value) -> Result<CallToolResult, McpError>
             Arc::new(gfs_storage_file::FileStorage::new())
         };
         let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
-        let compute: Arc<dyn Compute> =
-            Arc::new(DockerCompute::new().map_err(|e| to_error_data(e.to_string()))?);
+        let compute: Arc<dyn Compute> = runtime_compute().await?;
         let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
         containers::register_all(registry.as_ref())
             .map_err(|e| to_error_data(format!("register providers: {e}")))?;
@@ -713,8 +736,7 @@ async fn do_commit(args: &serde_json::Value) -> Result<CallToolResult, McpError>
         use gfs_domain::ports::storage::StoragePort;
         let storage: Arc<dyn StoragePort> = Arc::new(gfs_storage_file::FileStorage::new());
         let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
-        let compute: Arc<dyn Compute> =
-            Arc::new(DockerCompute::new().map_err(|e| to_error_data(e.to_string()))?);
+        let compute: Arc<dyn Compute> = runtime_compute().await?;
         let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
         containers::register_all(registry.as_ref())
             .map_err(|e| to_error_data(format!("register providers: {e}")))?;
@@ -806,8 +828,7 @@ async fn do_checkout(args: &serde_json::Value) -> Result<CallToolResult, McpErro
 
     let repo_path = repo_path_from_value(args);
     let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
-    let compute: Arc<dyn Compute> =
-        Arc::new(DockerCompute::new().map_err(|e| to_error_data(e.to_string()))?);
+    let compute: Arc<dyn Compute> = runtime_compute().await?;
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
     containers::register_all(registry.as_ref())
         .map_err(|e| to_error_data(format!("register providers: {e}")))?;
@@ -838,9 +859,7 @@ async fn do_init(args: &serde_json::Value) -> Result<CallToolResult, McpError> {
 
     let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
     let compute: Option<Arc<dyn Compute>> = if database_provider.is_some() {
-        Some(Arc::new(
-            DockerCompute::new().map_err(|e| to_error_data(e.to_string()))?,
-        ))
+        Some(runtime_compute().await?)
     } else {
         None
     };
@@ -899,7 +918,7 @@ async fn do_compute(args: &serde_json::Value) -> Result<CallToolResult, McpError
         }
     };
 
-    let compute = DockerCompute::new().map_err(|e| to_error_data(e.to_string()))?;
+    let compute = runtime_compute().await?;
     let instance_id = InstanceId(id);
 
     let result = match action {
@@ -1033,7 +1052,7 @@ fn format_instance_state(s: &InstanceState) -> &'static str {
 }
 
 async fn start_or_restart(
-    compute: &DockerCompute,
+    compute: &Arc<dyn Compute>,
     instance_id: &InstanceId,
     repo_path: &std::path::Path,
     restart: bool,
@@ -1131,7 +1150,7 @@ async fn start_or_restart(
 }
 
 async fn just_start_or_restart(
-    compute: &DockerCompute,
+    compute: &Arc<dyn Compute>,
     instance_id: &InstanceId,
     restart: bool,
 ) -> Result<(InstanceId, InstanceStatus), McpError> {
@@ -1180,7 +1199,7 @@ async fn do_export(args: &serde_json::Value) -> Result<CallToolResult, McpError>
         .map(PathBuf::from)
         .unwrap_or_else(default_repo_path);
 
-    let compute = Arc::new(DockerCompute::new().map_err(|e| to_error_data(e.to_string()))?);
+    let compute = runtime_compute().await?;
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
     containers::register_all(registry.as_ref())
         .map_err(|e| to_error_data(format!("register providers: {e}")))?;
@@ -1215,7 +1234,7 @@ async fn do_import(args: &serde_json::Value) -> Result<CallToolResult, McpError>
         .unwrap_or("")
         .to_string();
 
-    let compute = Arc::new(DockerCompute::new().map_err(|e| to_error_data(e.to_string()))?);
+    let compute = runtime_compute().await?;
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
     containers::register_all(registry.as_ref())
         .map_err(|e| to_error_data(format!("register providers: {e}")))?;
@@ -1259,7 +1278,7 @@ async fn do_query(args: &serde_json::Value) -> Result<CallToolResult, McpError> 
     let container_name = &runtime.container_name;
 
     // Set up compute and registry
-    let compute = Arc::new(DockerCompute::new().map_err(|e| to_error_data(e.to_string()))?);
+    let compute = runtime_compute().await?;
 
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
     containers::register_all(registry.as_ref())
@@ -1368,7 +1387,7 @@ async fn do_extract_schema(args: &serde_json::Value) -> Result<CallToolResult, M
     let args = if args.is_object() { args } else { &json!({}) };
     let repo_path = repo_path_from_value(args);
 
-    let compute = Arc::new(DockerCompute::new().map_err(|e| to_error_data(e.to_string()))?);
+    let compute = runtime_compute().await?;
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
     containers::register_all(registry.as_ref())
         .map_err(|e| to_error_data(format!("register providers: {e}")))?;

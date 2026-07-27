@@ -1496,6 +1496,7 @@ dependencies = [
  "axum",
  "chrono",
  "gfs-compute-docker",
+ "gfs-compute-kubernetes",
  "gfs-domain",
  "gfs-storage-apfs",
  "gfs-storage-btrfs",
