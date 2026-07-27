@@ -68,7 +68,10 @@ pub async fn destroy(path: Option<PathBuf>, yes: bool) -> Result<()> {
             match compute.remove_instance(&id).await {
                 Ok(()) => println!("  {} removed compute instance {}", green("✓"), cyan(name)),
                 Err(e) => {
-                    eprintln!("  {} could not remove instance {name}: {e} (continuing)", yellow("!"))
+                    eprintln!(
+                        "  {} could not remove instance {name}: {e} (continuing)",
+                        yellow("!")
+                    )
                 }
             }
         }
@@ -148,7 +151,11 @@ async fn remove_gfs_as_root(
     // 0500), so their entries can't be unlinked until the write bit is back —
     // `rm` alone fails even as root.
     let out = compute
-        .run_task(&definition, "chmod -R u+rwX /work/.gfs && rm -rf /work/.gfs", None)
+        .run_task(
+            &definition,
+            "chmod -R u+rwX /work/.gfs && rm -rf /work/.gfs",
+            None,
+        )
         .await
         .map_err(|e| anyhow::anyhow!("root cleanup task: {e}"))?;
     if out.exit_code != 0 {

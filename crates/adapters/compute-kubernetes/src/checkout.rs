@@ -214,7 +214,12 @@ pub async fn reprovision_after_pvc_restore<R: DatabaseProviderRegistry>(
     // a custom --database-name would silently advertise and default to `postgres`
     // after every checkout — making `gfs query` target the wrong database.
     let creds = gfs_domain::model::config::RepoCredentials::load(repo_path);
-    if let Some(db) = creds.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(db) = creds
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         for env in &mut def.env {
             if env.name.contains("DB") || env.name.contains("DATABASE") {
                 env.default = Some(db.to_string());

@@ -229,7 +229,10 @@ mod tests {
     #[test]
     fn box_top_without_title_is_a_full_rule() {
         // width+2 horizontal glyphs between the rounded corners.
-        assert_eq!(box_top("", 4), format!("  {}{}{}", BOX_TL, BOX_H.repeat(6), BOX_TR));
+        assert_eq!(
+            box_top("", 4),
+            format!("  {}{}{}", BOX_TL, BOX_H.repeat(6), BOX_TR)
+        );
     }
 
     #[test]
@@ -242,7 +245,10 @@ mod tests {
 
     #[test]
     fn box_bottom_is_a_full_rule() {
-        assert_eq!(box_bottom(4), format!("  {}{}{}", BOX_BL, BOX_H.repeat(6), BOX_BR));
+        assert_eq!(
+            box_bottom(4),
+            format!("  {}{}{}", BOX_BL, BOX_H.repeat(6), BOX_BR)
+        );
     }
 
     #[test]

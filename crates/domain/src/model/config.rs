@@ -168,8 +168,8 @@ impl RepoCredentials {
     }
 
     pub fn save(&self, repo_path: &Path) -> Result<(), RepoError> {
-        let content = toml::to_string_pretty(self)
-            .map_err(|e| RepoError::InvalidConfig(e.to_string()))?;
+        let content =
+            toml::to_string_pretty(self).map_err(|e| RepoError::InvalidConfig(e.to_string()))?;
         std::fs::write(Self::path(repo_path), content)?;
         Ok(())
     }
