@@ -145,6 +145,35 @@ fn task_container_exit_code(pod: &Pod) -> Option<i32> {
         })
 }
 
+/// Map a kube exec status-channel result to the command's real exit code.
+///
+/// kube reports a non-zero exit as `status = "Failure"` with an `ExitCode` cause
+/// carrying the numeric code; `status = "Success"` means 0. A `Failure` without
+/// an `ExitCode` cause is still a failure, so it maps to a conservative `1`. A
+/// missing status (the stream closed without a status frame) is treated as
+/// success. Without this, `gfs query` can't tell a failed SQL statement from an
+/// empty result — a hardcoded 0 would silently swallow the error.
+fn exit_code_from_exec_status(
+    status: Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Status>,
+) -> i32 {
+    match status {
+        Some(s) if s.status.as_deref() == Some("Success") => 0,
+        Some(s) => s
+            .details
+            .as_ref()
+            .and_then(|d| d.causes.as_ref())
+            .and_then(|causes| {
+                causes
+                    .iter()
+                    .find(|c| c.reason.as_deref() == Some("ExitCode"))
+            })
+            .and_then(|c| c.message.as_deref())
+            .and_then(|m| m.parse::<i32>().ok())
+            .unwrap_or(1),
+        None => 0,
+    }
+}
+
 async fn fetch_task_pod_logs(pods: &kube::Api<Pod>, name: &str) -> String {
     // Requesting `previous=true` for a container that never restarted returns an
     // expected error ("previous terminated container not found"), so only the
@@ -961,7 +990,8 @@ impl KubernetesCompute {
         id: &InstanceId,
         extra_pvcs: &[String],
     ) -> Result<()> {
-        self.teardown_instance_keep_snapshots(id, extra_pvcs).await?;
+        self.teardown_instance_keep_snapshots(id, extra_pvcs)
+            .await?;
 
         let storage = gfs_storage_kubernetes::KubernetesStorage::new(Some(self.namespace.clone()))
             .await
@@ -1168,23 +1198,11 @@ impl Compute for KubernetesCompute {
             stderr = String::from_utf8_lossy(&buf).into_owned();
         }
 
-        // Recover the command's real exit code from the exec status channel. kube
-        // reports a non-zero exit as `status=Failure` with an `ExitCode` cause
-        // carrying the numeric code; `Success` means 0. Without this the caller
-        // (e.g. `gfs query`) can't tell a failed SQL statement from an empty result.
+        // Recover the command's real exit code from the exec status channel (see
+        // `exit_code_from_exec_status`). Without it the caller (e.g. `gfs query`)
+        // can't tell a failed SQL statement from an empty result.
         let exit_code = match status_fut {
-            Some(fut) => match fut.await {
-                Some(status) if status.status.as_deref() == Some("Success") => 0,
-                Some(status) => status
-                    .details
-                    .as_ref()
-                    .and_then(|d| d.causes.as_ref())
-                    .and_then(|causes| causes.iter().find(|c| c.reason.as_deref() == Some("ExitCode")))
-                    .and_then(|c| c.message.as_deref())
-                    .and_then(|m| m.parse::<i32>().ok())
-                    .unwrap_or(1),
-                None => 0,
-            },
+            Some(fut) => exit_code_from_exec_status(fut.await),
             None => 0,
         };
         Ok(ExecOutput {
@@ -1723,14 +1741,20 @@ mod tests {
 
     #[test]
     fn pod_is_ready_requires_running_phase_and_ready_condition() {
-        assert!(pod_is_ready(&pod_with_phase_ready(Some("Running"), Some(true))));
+        assert!(pod_is_ready(&pod_with_phase_ready(
+            Some("Running"),
+            Some(true)
+        )));
         // Running but not yet Ready → not exec-able (exec would race the DB).
         assert!(!pod_is_ready(&pod_with_phase_ready(
             Some("Running"),
             Some(false)
         )));
         // Ready condition True but still Pending → not exec-able.
-        assert!(!pod_is_ready(&pod_with_phase_ready(Some("Pending"), Some(true))));
+        assert!(!pod_is_ready(&pod_with_phase_ready(
+            Some("Pending"),
+            Some(true)
+        )));
         // No Ready condition at all, and an empty pod.
         assert!(!pod_is_ready(&pod_with_phase_ready(Some("Running"), None)));
         assert!(!pod_is_ready(&Pod::default()));
@@ -1784,5 +1808,107 @@ mod tests {
             Some("gfs-pg-42")
         );
         assert_eq!(labels.len(), 2);
+    }
+
+    /// Build a `Failure` exec status, optionally carrying an `ExitCode` cause.
+    fn failure_status(
+        exit_code_cause: Option<&str>,
+    ) -> k8s_openapi::apimachinery::pkg::apis::meta::v1::Status {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Status, StatusCause, StatusDetails};
+        Status {
+            status: Some("Failure".to_string()),
+            details: exit_code_cause.map(|code| StatusDetails {
+                causes: Some(vec![StatusCause {
+                    reason: Some("ExitCode".to_string()),
+                    message: Some(code.to_string()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn exec_exit_code_success_is_zero() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Status;
+        let ok = Status {
+            status: Some("Success".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(exit_code_from_exec_status(Some(ok)), 0);
+    }
+
+    #[test]
+    fn exec_exit_code_reads_failure_exitcode_cause() {
+        // A failed SQL statement must surface its real non-zero code, not a
+        // hardcoded 0 that would make `gfs query` look like an empty success.
+        assert_eq!(
+            exit_code_from_exec_status(Some(failure_status(Some("2")))),
+            2
+        );
+        assert_eq!(
+            exit_code_from_exec_status(Some(failure_status(Some("137")))),
+            137
+        );
+    }
+
+    #[test]
+    fn exec_exit_code_failure_without_cause_defaults_nonzero() {
+        // A Failure with no ExitCode cause is still a failure → conservative 1.
+        assert_eq!(exit_code_from_exec_status(Some(failure_status(None))), 1);
+    }
+
+    #[test]
+    fn exec_exit_code_none_status_is_zero() {
+        // The stream closed without a status frame → treat as success, matching
+        // the exec path's fallback.
+        assert_eq!(exit_code_from_exec_status(None), 0);
+    }
+
+    #[test]
+    fn instance_status_none_pod_is_unknown() {
+        let id = InstanceId("gfs-pg-1".to_string());
+        assert!(matches!(
+            KubernetesCompute::instance_status_from_pod(&id, None).state,
+            InstanceState::Unknown
+        ));
+    }
+
+    #[test]
+    fn instance_status_maps_pod_phase_to_state() {
+        let id = InstanceId("gfs-pg-1".to_string());
+        let case = |phase: Option<&str>| {
+            KubernetesCompute::instance_status_from_pod(
+                &id,
+                Some(pod_with_phase_ready(phase, None)),
+            )
+            .state
+        };
+        assert!(matches!(case(Some("Running")), InstanceState::Running));
+        assert!(matches!(case(Some("Pending")), InstanceState::Starting));
+        assert!(matches!(case(Some("Succeeded")), InstanceState::Stopped));
+        assert!(matches!(case(Some("Failed")), InstanceState::Failed));
+        // An unrecognized phase, and a missing phase, both map to Unknown.
+        assert!(matches!(case(Some("Weird")), InstanceState::Unknown));
+        assert!(matches!(case(None), InstanceState::Unknown));
+    }
+
+    #[test]
+    fn instance_status_deleting_pod_is_stopping() {
+        // A terminating pod (deletion_timestamp set) surfaces as Stopping even
+        // though its phase is still Running, so auto-resume re-scales it instead
+        // of mistaking it for a live instance. Built from JSON to avoid coupling
+        // to the meta/v1 `Time` inner representation.
+        let id = InstanceId("gfs-pg-1".to_string());
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "metadata": { "deletionTimestamp": "2020-01-01T00:00:00Z" },
+            "status": { "phase": "Running" }
+        }))
+        .expect("valid pod json");
+        assert!(matches!(
+            KubernetesCompute::instance_status_from_pod(&id, Some(pod)).state,
+            InstanceState::Stopping
+        ));
     }
 }
