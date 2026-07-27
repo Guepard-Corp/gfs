@@ -347,10 +347,7 @@ pub trait Compute: Send + Sync {
     /// # Errors
     /// Returns [`ComputeError`] when the credentials cannot be read. The
     /// default is unsupported so backends that cannot resolve them fail loudly.
-    async fn read_deploy_credentials(
-        &self,
-        _id: &InstanceId,
-    ) -> Result<Vec<(String, String)>> {
+    async fn read_deploy_credentials(&self, _id: &InstanceId) -> Result<Vec<(String, String)>> {
         Err(ComputeError::Internal(
             "read_deploy_credentials not supported by this compute runtime".into(),
         ))

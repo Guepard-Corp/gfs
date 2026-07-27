@@ -806,7 +806,10 @@ impl Compute for DockerCompute {
             .and_then(|c| c.env)
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|s| s.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+            .filter_map(|s| {
+                s.split_once('=')
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+            })
             .collect();
         Ok(env)
     }
