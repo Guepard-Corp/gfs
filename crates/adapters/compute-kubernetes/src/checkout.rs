@@ -3,8 +3,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use gfs_domain::model::config::{EnvironmentConfig, GfsConfig, RuntimeConfig};
-use gfs_domain::ports::compute::{Compute, InstanceId};
+use gfs_domain::model::config::{EnvironmentConfig, GfsConfig, RepoCredentials, RuntimeConfig};
+use gfs_domain::ports::compute::{Compute, EnvVar, InstanceId};
 use gfs_domain::ports::database_provider::DatabaseProviderRegistry;
 use gfs_domain::ports::repository::Repository;
 use gfs_domain::ports::storage::{CloneOptions, SnapshotId, StoragePort, VolumeId};
@@ -158,6 +158,40 @@ pub async fn restore_database_volume_from_snapshot<R: DatabaseProviderRegistry>(
     reprovision_after_pvc_restore(compute, registry, repository, repo_path, data_pvc).await
 }
 
+/// Re-apply the repo's configured database name and user onto a provider-default
+/// env set. A k8s checkout rebuilds the pod from `provider.definition()` (which
+/// defaults to `POSTGRES_DB=postgres` / `POSTGRES_USER=postgres`); the credentials
+/// Secret carries only the *password*, so without this both the DB name and the
+/// user silently revert to `postgres` after every checkout — which makes `gfs
+/// status`/`gfs query` advertise the wrong user (connections then fail with
+/// `role "postgres" does not exist`) and target the wrong database.
+fn apply_repo_credentials_to_env(env: &mut [EnvVar], creds: &RepoCredentials) {
+    if let Some(db) = creds
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        for e in env.iter_mut() {
+            if e.name.contains("DB") || e.name.contains("DATABASE") {
+                e.default = Some(db.to_string());
+            }
+        }
+    }
+    if let Some(user) = creds
+        .user
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        for e in env.iter_mut() {
+            if e.name.contains("USER") {
+                e.default = Some(user.to_string());
+            }
+        }
+    }
+}
+
 /// Rebind the workspace PVC and recreate the StatefulSet/Service with the same instance name and NodePort.
 pub async fn reprovision_after_pvc_restore<R: DatabaseProviderRegistry>(
     compute: &KubernetesCompute,
@@ -208,24 +242,14 @@ pub async fn reprovision_after_pvc_restore<R: DatabaseProviderRegistry>(
     let mut def = provider.definition();
     let base = def.image.split(':').next().unwrap_or(&def.image);
     def.image = format!("{base}:{database_version}");
-    // Re-apply the repo's configured database name. Checkout rebuilds the pod from
-    // the provider default (POSTGRES_DB=postgres); the credentials Secret carries
-    // user/password but NOT the database name, so without this a repo created with
-    // a custom --database-name would silently advertise and default to `postgres`
-    // after every checkout — making `gfs query` target the wrong database.
-    let creds = gfs_domain::model::config::RepoCredentials::load(repo_path);
-    if let Some(db) = creds
-        .name
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        for env in &mut def.env {
-            if env.name.contains("DB") || env.name.contains("DATABASE") {
-                env.default = Some(db.to_string());
-            }
-        }
-    }
+    // Re-apply the repo's configured database name AND user (see
+    // apply_repo_credentials_to_env): a checkout rebuilds the pod from the provider
+    // default (POSTGRES_DB=postgres, POSTGRES_USER=postgres), and the credentials
+    // Secret carries only the password — so without this a repo created with a custom
+    // --database-name/--database-user reverts to `postgres` after every checkout,
+    // breaking `gfs query` with `role "postgres" does not exist`.
+    let creds = RepoCredentials::load(repo_path);
+    apply_repo_credentials_to_env(&mut def.env, &creds);
     // PVC already exists from VolumeSnapshot restore; mount default `{instance}-data`.
     def.host_data_dir = None;
 
@@ -304,5 +328,51 @@ mod tests {
         assert_eq!(source_instance_from_pvc("gfs-pg-1"), None);
         assert_eq!(source_instance_from_pvc("-data"), None);
         assert_eq!(source_instance_from_pvc(""), None);
+    }
+
+    fn env(pairs: &[(&str, &str)]) -> Vec<EnvVar> {
+        pairs
+            .iter()
+            .map(|(n, v)| EnvVar {
+                name: n.to_string(),
+                default: Some(v.to_string()),
+            })
+            .collect()
+    }
+
+    fn creds(user: Option<&str>, name: Option<&str>) -> RepoCredentials {
+        RepoCredentials {
+            user: user.map(str::to_string),
+            password: Some("pw".to_string()),
+            name: name.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn reapply_credentials_restores_custom_user_and_db() {
+        // Provider defaults, as a fresh checkout reprovision rebuilds them.
+        let mut e = env(&[
+            ("POSTGRES_USER", "postgres"),
+            ("POSTGRES_DB", "postgres"),
+            ("POSTGRES_PASSWORD", "postgres"),
+        ]);
+        apply_repo_credentials_to_env(&mut e, &creds(Some("k8suser"), Some("shopdb")));
+        let get = |n: &str| e.iter().find(|v| v.name == n).unwrap().default.as_deref();
+        // Regression guard: the custom user used to revert to `postgres`, making
+        // `gfs query` fail with `role "postgres" does not exist`.
+        assert_eq!(get("POSTGRES_USER"), Some("k8suser"));
+        assert_eq!(get("POSTGRES_DB"), Some("shopdb"));
+        // Password env is left untouched (routed through the credentials Secret).
+        assert_eq!(get("POSTGRES_PASSWORD"), Some("postgres"));
+    }
+
+    #[test]
+    fn reapply_credentials_skips_empty_or_missing() {
+        let mut e = env(&[("POSTGRES_USER", "postgres"), ("POSTGRES_DB", "postgres")]);
+        // None and whitespace-only are treated as "not configured" → defaults kept.
+        apply_repo_credentials_to_env(&mut e, &creds(None, Some("   ")));
+        let get = |n: &str| e.iter().find(|v| v.name == n).unwrap().default.as_deref();
+        assert_eq!(get("POSTGRES_USER"), Some("postgres"));
+        assert_eq!(get("POSTGRES_DB"), Some("postgres"));
     }
 }
