@@ -25,44 +25,13 @@ use k8s_openapi::api::core::v1::{
     PodSecurityContext, PodSpec, PodTemplateSpec, Secret, SecretKeySelector, Service, ServicePort,
     ServiceSpec, Volume, VolumeMount,
 };
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, Status};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use kube::api::{AttachParams, DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::{Api, Client};
 use serde_json::json;
 
 const DEFAULT_NAMESPACE: &str = "gfs";
 const DEFAULT_PVC_SIZE_GI: &str = "1";
-
-/// Extract the process exit code from a Kubernetes exec `Status`.
-///
-/// The kubelet sends a metav1 `Status` on the exec v4 error channel: `Success`
-/// ⇒ exit 0; otherwise `reason: NonZeroExitCode` with the code carried in
-/// `details.causes[reason=ExitCode].message`. A non-success status with no
-/// parseable code is a generic failure (1). `None` (no status delivered — an
-/// abnormal WebSocket teardown, so the command's outcome is unknown) is treated
-/// as a **failure**, never a false success: a mutating op must not report
-/// success when its exit code could not be determined. A normally-completed exec
-/// always carries a status, so this only fires on genuine transport failures.
-fn exit_code_from_status(status: Option<Status>) -> i32 {
-    let Some(status) = status else {
-        return 1;
-    };
-    if status.status.as_deref() == Some("Success") {
-        return 0;
-    }
-    status
-        .details
-        .as_ref()
-        .and_then(|details| details.causes.as_ref())
-        .and_then(|causes| {
-            causes
-                .iter()
-                .find(|cause| cause.reason.as_deref() == Some("ExitCode"))
-        })
-        .and_then(|cause| cause.message.as_deref())
-        .and_then(|message| message.parse::<i32>().ok())
-        .unwrap_or(1)
-}
 
 fn k8s_storage_class() -> Option<String> {
     std::env::var("GFS_K8S_STORAGE_CLASS")
@@ -1488,49 +1457,6 @@ mod tests {
     use super::*;
     use gfs_domain::ports::compute::EnvVar;
     use k8s_openapi::ByteString;
-    use k8s_openapi::apimachinery::pkg::apis::meta::v1::{StatusCause, StatusDetails};
-
-    #[test]
-    fn exit_code_success_is_zero() {
-        let status = Status {
-            status: Some("Success".into()),
-            ..Default::default()
-        };
-        assert_eq!(exit_code_from_status(Some(status)), 0);
-    }
-
-    #[test]
-    fn exit_code_reads_nonzero_from_causes() {
-        let status = Status {
-            status: Some("Failure".into()),
-            reason: Some("NonZeroExitCode".into()),
-            details: Some(StatusDetails {
-                causes: Some(vec![StatusCause {
-                    reason: Some("ExitCode".into()),
-                    message: Some("3".into()),
-                    ..Default::default()
-                }]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        assert_eq!(exit_code_from_status(Some(status)), 3);
-    }
-
-    #[test]
-    fn exit_code_failure_without_code_is_generic_failure() {
-        let status = Status {
-            status: Some("Failure".into()),
-            ..Default::default()
-        };
-        assert_eq!(exit_code_from_status(Some(status)), 1);
-    }
-
-    #[test]
-    fn exit_code_absent_status_is_failure_not_false_success() {
-        // No status delivered ⇒ outcome unknown ⇒ must NOT read as success.
-        assert_eq!(exit_code_from_status(None), 1);
-    }
 
     fn definition_with_env(env: Vec<EnvVar>) -> ComputeDefinition {
         ComputeDefinition {

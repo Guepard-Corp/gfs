@@ -1351,7 +1351,7 @@ async fn do_user(args: &serde_json::Value) -> Result<CallToolResult, McpError> {
 
     GfsConfig::load(&repo_path).map_err(|e| to_error_data(format!("not a GFS repository: {e}")))?;
 
-    let compute = Arc::new(DockerCompute::new().map_err(|e| to_error_data(e.to_string()))?);
+    let compute = runtime_compute().await?;
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
     containers::register_all(registry.as_ref())
         .map_err(|e| to_error_data(format!("register providers: {e}")))?;
