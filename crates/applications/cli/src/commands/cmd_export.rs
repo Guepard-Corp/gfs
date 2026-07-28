@@ -29,6 +29,13 @@ pub async fn run(
     gfs_compute_docker::containers::register_all(registry.as_ref())
         .context("failed to register database providers")?;
 
+    // A lazy clone only holds rows for tables that have actually been read, and
+    // pg_dump reads those local tables directly (it never goes through the
+    // copy-on-read planner hook). Exporting one without materializing first
+    // produces a valid-looking dump with entire tables empty, silently (#116).
+    // No-op for a normal repository.
+    super::cmd_source::materialize_clone(&repo_path, json_output).await?;
+
     let use_case = ExportRepoUseCase::new(compute, registry);
     // Do not use `.context("export failed")`: anyhow's context Display only prints that string
     // and hides the underlying `ExportRepoError` / `ComputeError` message on stderr.
