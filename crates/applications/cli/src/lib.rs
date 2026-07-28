@@ -400,6 +400,36 @@ enum TopLevel {
         port: Option<u16>,
     },
 
+    /// Show what has changed on a clone's source (read-only; never modifies the clone)
+    Fetch {
+        /// Path to the GFS repository root (default: current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+
+        /// Probe the source now instead of using the last cached verdict
+        #[arg(long)]
+        check: bool,
+    },
+
+    /// Put tables the source has changed back on the lazy path so reads are local again
+    Pull {
+        /// Path to the GFS repository root (default: current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+
+        /// Also reset tables you have written to, discarding those local changes
+        #[arg(long)]
+        force: bool,
+
+        /// Turn automatic pulling on or off instead of pulling now (on|off)
+        #[arg(long)]
+        auto: Option<String>,
+
+        /// Turn automatic SCHEMA repair on or off instead of pulling now (on|off)
+        #[arg(long = "auto-schema")]
+        auto_schema: Option<String>,
+    },
+
     /// Record a commit of the current repository state
     Commit {
         /// Commit message (required)
@@ -693,6 +723,8 @@ fn command_name(cmd: &TopLevel) -> &'static str {
     match cmd {
         TopLevel::Init { .. } => "init",
         TopLevel::Clone { .. } => "clone",
+        TopLevel::Fetch { .. } => "fetch",
+        TopLevel::Pull { .. } => "pull",
         TopLevel::Commit { .. } => "commit",
         TopLevel::Config { .. } => "config",
         TopLevel::Checkout { .. } => "checkout",
@@ -802,6 +834,14 @@ where
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
+                Ok(0)
+            }
+            TopLevel::Fetch { path, check } => {
+                commands::cmd_source::fetch(path, check, json_output).await?;
+                Ok(0)
+            }
+            TopLevel::Pull { path, force, auto, auto_schema } => {
+                commands::cmd_source::pull(path, force, auto, auto_schema, json_output).await?;
                 Ok(0)
             }
             TopLevel::Commit {

@@ -179,17 +179,50 @@ pub async fn pull(
     path: Option<PathBuf>,
     force: bool,
     auto: Option<String>,
+    auto_schema: Option<String>,
     json_output: bool,
 ) -> Result<()> {
     let repo = path.unwrap_or_else(get_repo_dir);
 
+    let parse_on = |v: &str, flag: &str| -> Result<bool> {
+        match v.to_ascii_lowercase().as_str() {
+            "on" | "true" | "yes" | "1" => Ok(true),
+            "off" | "false" | "no" | "0" => Ok(false),
+            other => bail!("{flag} expects 'on' or 'off' (got '{other}')"),
+        }
+    };
+
+    // `--auto-schema on|off` flips SHAPE repair, the counterpart of `--auto` for
+    // rows. Off by default for the same reason: a clone is a branch, so it does
+    // not change under you unless you ask.
+    if let Some(a) = auto_schema {
+        let on = parse_on(&a, "--auto-schema")?;
+        run_sql(&repo, &format!("UPDATE gfs.sync_policy SET autoschema = {on};")).await?;
+        if json_output {
+            println!("{}", serde_json::to_string_pretty(&json!({ "autoschema": on }))?);
+        } else {
+            println!();
+            println!("  {} auto schema repair {}", green("✓"), bold(if on { "on" } else { "off" }));
+            println!(
+                "    {}",
+                dimmed(if on {
+                    "a source shape change is re-imported automatically (additive changes only)"
+                } else {
+                    "a source shape change fails with a clear message until you run `gfs pull`"
+                })
+            );
+            println!(
+                "    {}",
+                dimmed("a column dropped on the source is never applied automatically: that could destroy local data")
+            );
+            println!();
+        }
+        return Ok(());
+    }
+
     // `--auto on|off` only flips the setting; it does not also pull.
     if let Some(a) = auto {
-        let on = match a.to_ascii_lowercase().as_str() {
-            "on" | "true" | "yes" | "1" => true,
-            "off" | "false" | "no" | "0" => false,
-            other => bail!("--auto expects 'on' or 'off' (got '{other}')"),
-        };
+        let on = parse_on(&a, "--auto")?;
         run_sql(
             &repo,
             &format!("UPDATE gfs.sync_policy SET autopull = {on};"),
@@ -242,6 +275,9 @@ pub async fn pull(
     }
 
     println!();
+    for r in actions.iter().filter(|r| r[0] == "schema") {
+        println!("  {} {} {}", green("✓"), cyan(&r[1]), dimmed(&r[2]));
+    }
     if actions.is_empty() {
         println!("  {} already up to date", green("✓"));
         println!();
@@ -267,17 +303,19 @@ pub async fn pull(
             red("!"),
             bold(conflicts.len().to_string())
         );
+        // Print each conflict's OWN reason: a local-write conflict and a schema
+        // conflict are different situations, and a single hardcoded line claimed
+        // the user had local writes even when the clash was purely structural.
         for r in &conflicts {
             println!("    {} {}", red("conflict"), cyan(&r[1]));
+            println!("      {}", dimmed(r[2].trim_start_matches("conflict: ")));
         }
-        println!(
-            "    {}",
-            dimmed("you have local writes AND the source changed; your version was kept")
-        );
-        println!(
-            "    {}",
-            dimmed("use `gfs pull --force` to discard yours and take the source's")
-        );
+        if conflicts.iter().any(|r| r[2].contains("local writes")) {
+            println!(
+                "    {}",
+                dimmed("use `gfs pull --force` to discard yours and take the source's")
+            );
+        }
     }
     println!();
     Ok(())

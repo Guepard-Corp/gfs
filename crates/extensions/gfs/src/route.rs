@@ -237,10 +237,42 @@ unsafe fn classify_scan(
     //                                          is a short bridge and not a permanent
     //                                          state (always federating defeats the
     //                                          point of having a clone at all)
-    let (autopull, verdict_stale) = gfs_sync_flags(relid);
+    let (autopull, verdict_stale, autoschema) = gfs_sync_flags(relid);
     if verdict_stale {
         gfs_enqueue_copy(relid, "driftcheck", 0, 0);
         worker::spawn();
+    }
+
+    // SCHEMA DRIFT. The source changed this table's SHAPE, so our imported
+    // definition no longer describes it and a federated read fails on the remote
+    // with a raw `column "..." does not exist` naming SQL the user never wrote.
+    // Say what actually happened instead, and what to run.
+    //
+    // Deliberately aligned with the data-drift policy: repair only when the user
+    // opted in (autoschema, off by default, same as autopull), and never apply a
+    // destructive change automatically -- gfs.repair_schema refuses to drop a
+    // local column, exactly as a diverged table is never auto-reset.
+    //
+    // The repair cannot run inside this query (re-importing takes locks the
+    // reading query already holds), so it is queued and the caller retries.
+    if info.schema_drifted {
+        // NOTE: we cannot queue the repair from here. Enqueuing writes a row in THIS
+        // transaction, and the error below aborts it, so the job would be rolled back
+        // and never run -- the query would report "queued" forever while nothing
+        // happened. The repair therefore lives in gfs.refresh_drift_state(), which the
+        // background drift check runs in a transaction that actually commits.
+        if autoschema {
+            pgrx::error!(
+                "gfs: the source schema for {} changed; automatic repair runs on the next \
+                 background check, or run `gfs pull` to do it now",
+                info.local_ref
+            );
+        }
+        pgrx::error!(
+            "gfs: the source schema for {} changed, so this clone's definition of it is stale. \
+             Run `gfs pull` to re-import it, or enable automatic repair with `gfs pull --auto-schema on`.",
+            info.local_ref
+        );
     }
     if stale && autopull {
         gfs_enqueue_copy(relid, "resync", 0, 0);

@@ -383,7 +383,8 @@ COMMENT ON FUNCTION gfs.source_drift() IS
 -- runs inside the database and cannot read the repo's config file). Tracked in
 -- https://github.com/Guepard-Corp/gfs/issues/133.
 CREATE TABLE gfs.sync_policy (
-    autopull           boolean  NOT NULL DEFAULT false,      -- follow the source automatically
+    autopull           boolean  NOT NULL DEFAULT false,      -- follow the source automatically (DATA drift)
+    autoschema         boolean  NOT NULL DEFAULT false,      -- repair the table's SHAPE automatically (SCHEMA drift)
     autopull_interval  interval NOT NULL DEFAULT '5 min',    -- how often the worker pulls
     autopull_max_bytes bigint   NOT NULL DEFAULT 500000000,  -- never auto-copy a table larger than this
     check_interval     interval NOT NULL DEFAULT '1 min'     -- how stale the drift verdict may be
@@ -395,7 +396,8 @@ COMMENT ON TABLE gfs.sync_policy IS 'Source-sync policy (autopull off by default
 -- cheap: the hook never does network I/O. gfs.refresh_drift_state() fills it.
 CREATE TABLE gfs.drift_state (
     relid      regclass PRIMARY KEY REFERENCES gfs.clone_source(relid) ON DELETE CASCADE,
-    drifted    boolean     NOT NULL DEFAULT false,
+    drifted    boolean     NOT NULL DEFAULT false,   -- the source's ROWS changed
+    schema_drifted boolean NOT NULL DEFAULT false,   -- the source's SHAPE changed (columns added/dropped/retyped)
     reason     text,
     checked_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
@@ -405,7 +407,7 @@ COMMENT ON TABLE gfs.drift_state IS 'Per-table "is the local copy stale?" verdic
 -- 'unattributed' means the source moved but no table accounts for it, so EVERY
 -- materialized table is marked suspect: failing safe is the entire point.
 CREATE FUNCTION gfs.refresh_drift_state() RETURNS int LANGUAGE plpgsql AS $$
-DECLARE n int; blanket boolean;
+DECLARE n int; blanket boolean; r record;
 BEGIN
     CREATE TEMP TABLE IF NOT EXISTS gfs_drift_scan(kind text, src_table text, detail text) ON COMMIT DROP;
     DELETE FROM gfs_drift_scan;
@@ -413,9 +415,12 @@ BEGIN
 
     SELECT EXISTS(SELECT 1 FROM gfs_drift_scan WHERE kind = 'unattributed') INTO blanket;
 
-    INSERT INTO gfs.drift_state(relid, drifted, reason, checked_at)
+    INSERT INTO gfs.drift_state(relid, drifted, schema_drifted, reason, checked_at)
     SELECT m.relid,
            COALESCE(d.kind IS NOT NULL, false) OR blanket,
+           EXISTS (SELECT 1 FROM gfs_drift_scan s2
+                    WHERE s2.src_table = m.src_schema || '.' || m.src_table
+                      AND s2.kind IN ('schema','schema_mismatch')),
            COALESCE(d.kind || ': ' || d.detail,
                     CASE WHEN blanket THEN 'source moved but unattributed; treated as suspect' END),
            clock_timestamp()
@@ -426,7 +431,20 @@ BEGIN
                AND s.kind IN ('data','schema')
              LIMIT 1) d ON true
     ON CONFLICT (relid) DO UPDATE
-        SET drifted = EXCLUDED.drifted, reason = EXCLUDED.reason, checked_at = EXCLUDED.checked_at;
+        SET drifted = EXCLUDED.drifted, schema_drifted = EXCLUDED.schema_drifted,
+            reason = EXCLUDED.reason, checked_at = EXCLUDED.checked_at;
+
+    -- Repair SHAPE drift here when the user opted in. This is the only place that
+    -- can: the planner hook detects the drift but must raise an error (the query is
+    -- unanswerable), and an error rolls back anything it tried to enqueue. This
+    -- function runs from the background drift check, whose transaction commits.
+    IF COALESCE((SELECT autoschema FROM gfs.sync_policy LIMIT 1), false) THEN
+        FOR r IN SELECT relid FROM gfs.drift_state WHERE schema_drifted LOOP
+            -- best-effort: a destructive change returns 'conflict: ...' and is left
+            -- for the user, exactly as gfs.pull() reports it
+            PERFORM gfs.repair_schema(r.relid);
+        END LOOP;
+    END IF;
 
     SELECT count(*) INTO n FROM gfs.drift_state WHERE drifted;
     RETURN n;
@@ -449,40 +467,77 @@ COMMENT ON FUNCTION gfs.refresh_drift_state() IS 'Recompute the per-table stale 
 -- clobber local changes.
 CREATE FUNCTION gfs.pull(force boolean DEFAULT false)
 RETURNS TABLE(action text, tbl text, detail text) LANGUAGE plpgsql AS $$
-DECLARE r record;
+DECLARE r record; seen text; skipped int := 0; res text;
 BEGIN
+    -- Where the source is as we start. Everything below reconciles against this
+    -- point, so it becomes the new "accounted for up to here" marker at the end.
+    seen := gfs.source_lsn();
     PERFORM gfs.refresh_drift_state();
 
     FOR r IN
         SELECT d.relid, d.reason, m.src_schema || '.' || m.src_table AS name,
-               gfs.relation_diverged_sql(d.relid) AS diverged
+               gfs.relation_diverged_sql(d.relid) AS diverged,
+               d.schema_drifted
           FROM gfs.drift_state d
           JOIN gfs.source_map m ON m.relid = d.relid
-         WHERE d.drifted
+         WHERE d.drifted OR d.schema_drifted
          ORDER BY 3
     LOOP
+        -- SHAPE first: refetching rows cannot help while our definition of the
+        -- table is stale, and hydration would ask the source for columns it no
+        -- longer has. repair_schema resyncs the table itself on success.
+        IF r.schema_drifted THEN
+            res := gfs.repair_schema(r.relid);
+            IF res LIKE 'conflict:%' THEN
+                -- Unresolved, so it must keep reporting. Counting it as skipped
+                -- stops the global WAL marker advancing past this change, which
+                -- would make the next check short-circuit and silently clear the
+                -- conflict (the failure mode fixed for data conflicts).
+                skipped := skipped + 1;
+                action := 'conflict'; tbl := r.name; detail := res;
+                RETURN NEXT; CONTINUE;
+            END IF;
+            action := 'schema'; tbl := r.name; detail := res;
+            RETURN NEXT; CONTINUE;
+        END IF;
+
         IF r.diverged AND NOT force THEN
+            skipped := skipped + 1;
             action := 'conflict'; tbl := r.name;
             detail := 'you have local writes AND the source changed; not touched (use force to discard yours)';
             RETURN NEXT; CONTINUE;
         END IF;
 
-        -- ONLY: never cascade into inheritance children, which are separate tables
-        EXECUTE format('TRUNCATE ONLY %s', r.relid::regclass);
-        DELETE FROM gfs.cached            WHERE relid = r.relid;
-        DELETE FROM gfs.cached_predicate  WHERE relid = r.relid;
-        UPDATE gfs.clone_source
-           SET whole_cached = false, partial_rows = 0, no_partial = false, access_count = 0
-         WHERE relid = r.relid;
+        -- Delegate to resync_table: it resets the table AND re-anchors THIS
+        -- table's baseline. Doing the reset inline here (as an earlier version
+        -- did) left the baseline untouched, so the table stayed flagged as
+        -- drifted forever and every later read went to the source.
+        PERFORM gfs.resync_table(r.relid, force);
 
         action := 'reset'; tbl := r.name;
         detail := 'back on the lazy path; next read fetches from the source';
         RETURN NEXT;
     END LOOP;
 
-    -- Re-anchor ONLY what we actually reset. capture_source_baseline() would
-    -- rewrite EVERY table's baseline, including the diverged ones we just
-    -- refused to touch -- silently marking an unresolved conflict as "in sync".
+    -- Advance the GLOBAL WAL marker ONLY when nothing was skipped.
+    --
+    -- Why advance at all: otherwise the marker stays at clone time forever, so
+    -- every later check sees "the source moved", finds nothing to attribute
+    -- (the per-table baselines were just re-anchored) and blankets every table
+    -- as suspect, meaning a pull could never reach a clean state.
+    --
+    -- Why only when nothing was skipped: gfs.source_drift() short-circuits when
+    -- the marker equals the source's current position, so advancing it while a
+    -- conflict is still outstanding would stop the per-table comparison running
+    -- at all and the conflict would silently disappear -- the same class of bug
+    -- as re-anchoring a skipped table's baseline.
+    --
+    -- Leaving the marker in place when a conflict remains is safe: that conflict
+    -- still attributes the source's movement, so the "unattributed" blanket does
+    -- not fire on the tables we just reset.
+    IF skipped = 0 THEN
+        UPDATE gfs.source_baseline SET lsn = seen;
+    END IF;
     PERFORM gfs.refresh_drift_state();
 END;
 $$;
@@ -495,11 +550,18 @@ $$;
 -- It must run OUTSIDE the query that noticed the drift: TRUNCATE needs an
 -- ACCESS EXCLUSIVE lock, which cannot be taken on a table the current query is
 -- already reading.
-CREATE FUNCTION gfs.resync_table(p_relid regclass) RETURNS boolean LANGUAGE plpgsql AS $$
+CREATE FUNCTION gfs.resync_table(p_relid regclass, p_force boolean DEFAULT false)
+RETURNS boolean LANGUAGE plpgsql AS $$
 DECLARE p jsonb; m record;
 BEGIN
-    IF gfs.relation_diverged_sql(p_relid) THEN
+    IF gfs.relation_diverged_sql(p_relid) AND NOT p_force THEN
         RETURN false;   -- local writes: a conflict, never resolved automatically
+    END IF;
+    IF p_force THEN
+        -- the caller is explicitly discarding local work, so drop the markers too;
+        -- otherwise the table would stay flagged as diverged after being reset
+        UPDATE gfs.clone_source SET has_local_writes = false WHERE relid = p_relid;
+        DELETE FROM gfs.tombstone WHERE relid = p_relid;
     END IF;
 
     EXECUTE format('TRUNCATE ONLY %s', p_relid::regclass);  -- ONLY: keep inheritance children
@@ -530,7 +592,7 @@ BEGIN
     RETURN true;
 END;
 $$;
-COMMENT ON FUNCTION gfs.resync_table(regclass) IS 'Reset one table to never-fetched and re-anchor its baseline (the autopull unit of work)';
+COMMENT ON FUNCTION gfs.resync_table(regclass, boolean) IS 'Reset one table to never-fetched and re-anchor its baseline (the autopull unit of work)';
 COMMENT ON FUNCTION gfs.pull(boolean) IS 'Reset stale tables to "never fetched" so the lazy path refetches them; skips tables with local writes';
 
 -- Does this table have local writes or tombstones? (mirrors relation_diverged in
@@ -539,6 +601,111 @@ CREATE FUNCTION gfs.relation_diverged_sql(p_relid regclass) RETURNS boolean LANG
     SELECT COALESCE((SELECT has_local_writes FROM gfs.clone_source WHERE relid = p_relid), false)
         OR EXISTS (SELECT 1 FROM gfs.tombstone WHERE relid = p_relid);
 $$;
+
+-- SCHEMA REPAIR ---------------------------------------------------------------
+-- The clone's description of each source table (its imported FOREIGN TABLE) is
+-- written ONCE at clone time and never refreshed. When the source changes shape,
+-- that description goes stale and any federated query using it fails with a raw
+-- remote error ("column ... does not exist"), which names SQL the user never wrote.
+--
+-- DDL moves no row counter, so schema drift is invisible to the row-level signals;
+-- it is caught by comparing column digests (see gfs.source_probe).
+
+-- The source table's current columns, straight from its catalog. One round trip.
+CREATE FUNCTION gfs.source_columns(p_schema text, p_table text)
+RETURNS TABLE(colname text, coltype text) LANGUAGE plpgsql AS $$
+BEGIN
+    RETURN QUERY SELECT * FROM dblink('gfs_remote_srv', format($q$
+        SELECT a.attname::text, format_type(a.atttypid, a.atttypmod)::text
+          FROM pg_attribute a
+          JOIN pg_class c ON c.oid = a.attrelid
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = %L AND c.relname = %L
+           AND a.attnum > 0 AND NOT a.attisdropped
+         ORDER BY a.attnum
+    $q$, p_schema, p_table)) AS t(colname text, coltype text);
+END;
+$$;
+COMMENT ON FUNCTION gfs.source_columns(text, text) IS 'Current columns of a table on the source';
+
+-- Re-import one table's definition so the clone matches the source again.
+--
+-- Deliberately split by risk, mirroring how a data conflict is handled: an
+-- ADDITIVE change (the source gained a column) is applied automatically, while a
+-- DESTRUCTIVE one (a column that exists locally is gone from the source) is
+-- refused and reported. Dropping that column locally could destroy data the user
+-- put there, and the same rule holds no matter what the policy says: never
+-- silently discard the user's work.
+--
+-- Returns 'repaired: ...' or 'conflict: ...'.
+CREATE FUNCTION gfs.repair_schema(p_relid regclass) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE m record; added text[]; removed text[]; c record; ftname text;
+BEGIN
+    SELECT * INTO m FROM gfs.source_map WHERE relid = p_relid;
+    IF m.relid IS NULL THEN RETURN 'conflict: not a registered clone table'; END IF;
+
+    CREATE TEMP TABLE IF NOT EXISTS gfs_srccols(colname text, coltype text) ON COMMIT DROP;
+    DELETE FROM gfs_srccols;
+    BEGIN
+        INSERT INTO gfs_srccols SELECT * FROM gfs.source_columns(m.src_schema, m.src_table);
+    EXCEPTION WHEN others THEN
+        RETURN format('conflict: cannot read %s.%s on the source (%s)', m.src_schema, m.src_table, SQLERRM);
+    END;
+
+    IF NOT EXISTS (SELECT 1 FROM gfs_srccols) THEN
+        RETURN format('conflict: %s.%s no longer exists on the source; the local copy is orphaned',
+                      m.src_schema, m.src_table);
+    END IF;
+
+    -- present locally but gone from the source -> destructive, never automatic
+    SELECT array_agg(a.attname ORDER BY a.attnum) INTO removed
+      FROM pg_attribute a
+     WHERE a.attrelid = p_relid AND a.attnum > 0 AND NOT a.attisdropped
+       AND NOT EXISTS (SELECT 1 FROM gfs_srccols s WHERE s.colname = a.attname);
+    IF removed IS NOT NULL THEN
+        RETURN format('conflict: the source no longer has column(s) %s; not dropped locally because that may destroy your data',
+                      array_to_string(removed, ', '));
+    END IF;
+
+    -- present on the source but not locally -> additive, safe to apply
+    SELECT array_agg(s.colname) INTO added
+      FROM gfs_srccols s
+     WHERE NOT EXISTS (SELECT 1 FROM pg_attribute a
+                        WHERE a.attrelid = p_relid AND a.attnum > 0 AND NOT a.attisdropped
+                          AND a.attname = s.colname);
+
+    -- refresh the foreign table so federated queries stop asking for stale columns
+    ftname := m.ftrel::text;
+    BEGIN
+        EXECUTE format('DROP FOREIGN TABLE IF EXISTS %s', ftname);
+        EXECUTE format('IMPORT FOREIGN SCHEMA %I LIMIT TO (%I) FROM SERVER gfs_remote_srv INTO %I',
+                       m.src_schema, m.src_table, split_part(ftname, '.', 1));
+    EXCEPTION WHEN others THEN
+        RETURN format('conflict: could not re-import %s (%s)', ftname, SQLERRM);
+    END;
+
+    -- mirror any new columns locally, so a refetch can populate them
+    IF added IS NOT NULL THEN
+        FOR c IN SELECT colname, coltype FROM gfs_srccols WHERE colname = ANY(added) LOOP
+            BEGIN
+                EXECUTE format('ALTER TABLE %s ADD COLUMN %I %s', p_relid::text, c.colname, c.coltype);
+            EXCEPTION WHEN others THEN
+                RETURN format('conflict: could not add column %I locally (%s)', c.colname, SQLERRM);
+            END;
+        END LOOP;
+    END IF;
+
+    -- the shape changed, so whatever was copied is no longer a faithful copy
+    PERFORM gfs.resync_table(p_relid);
+    UPDATE gfs.drift_state SET schema_drifted = false, checked_at = clock_timestamp()
+     WHERE relid = p_relid;
+
+    RETURN CASE WHEN added IS NULL THEN 'repaired: definition re-imported'
+                ELSE format('repaired: definition re-imported, added column(s) %s', array_to_string(added, ', ')) END;
+END;
+$$;
+COMMENT ON FUNCTION gfs.repair_schema(regclass) IS
+  'Re-import one table''s definition from the source; additive changes are applied, destructive ones reported as conflicts';
 
 CREATE TABLE gfs.cached (
     relid regclass NOT NULL REFERENCES gfs.clone_source(relid) ON DELETE CASCADE,
@@ -570,13 +737,13 @@ CREATE INDEX cached_predicate_queued_idx ON gfs.cached_predicate (relid)
 -- removed once run (completeness is recorded in clone_source.whole_cached / gfs.cached).
 CREATE TABLE gfs.copy_queue (
     relid       regclass    NOT NULL REFERENCES gfs.clone_source(relid) ON DELETE CASCADE,
-    kind        text        NOT NULL CHECK (kind IN ('whole','time','resync','driftcheck')),
+    kind        text        NOT NULL CHECK (kind IN ('whole','time','resync','driftcheck','schemafix')),
     lo          bigint      NOT NULL DEFAULT 0,
     hi          bigint      NOT NULL DEFAULT 0,
     enqueued_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (relid, kind, lo, hi)
 );
-COMMENT ON TABLE gfs.copy_queue IS 'Pending async work (kind=whole|time|resync|driftcheck) the background worker drains off the query critical path.';
+COMMENT ON TABLE gfs.copy_queue IS 'Pending async work (kind=whole|time|resync|driftcheck|schemafix) the background worker drains off the query critical path.';
 
 -- Copy-on-write DELETE tombstones: a user DELETE on a clone table records the
 -- deleted row's PRIMARY KEY (as jsonb) here, so later copy-on-read hydration never

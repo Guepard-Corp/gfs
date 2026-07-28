@@ -193,7 +193,7 @@ unsafe fn drain_one() -> bool {
         // `resync` is the autopull unit of work -- it runs HERE, off the query
         // that noticed the drift, because TRUNCATE needs a lock that cannot be
         // taken on a table the current query is reading.
-        if kind == "resync" || kind == "driftcheck" {
+        if kind == "resync" || kind == "driftcheck" || kind == "schemafix" {
             gfs_run_upkeep(relid, &kind);
             log!("gfs: {} done for {}", kind, relid_text(relid));
             gfs_clear_copy_job(relid, &kind, lo, hi);
