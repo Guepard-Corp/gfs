@@ -576,7 +576,7 @@ enum TopLevel {
         action: StorageAction,
     },
 
-    /// Compute instance management (Docker containers)
+    /// Compute instance lifecycle (start/stop/restart) for the active runtime (Docker or Kubernetes)
     Compute {
         /// Path to the GFS repository root (default: current directory). When set, --id may be omitted and the container name is read from .gfs/config.toml (runtime.container_name).
         #[arg(long)]

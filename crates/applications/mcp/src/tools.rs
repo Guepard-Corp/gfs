@@ -621,8 +621,9 @@ impl ServerHandler for GfsMcpHandler {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "GFS MCP server. Tools: list_providers, status, commit, log, checkout, init, compute, export_database, import_database, query, extract_schema, show_schema, diff_schema. \
+                "GFS MCP server. Tools: list_providers, status, commit, log, checkout, init, compute, user, export_database, import_database, query, extract_schema, show_schema, diff_schema. \
                  Schema versioning: commits automatically capture database schemas. Use show_schema to view schema at any commit, diff_schema to compare schema evolution. \
+                 Database users/roles: use the user tool (actions create, list, drop, set_password, grant, revoke, list_privs, apply_preset) to manage least-privilege login roles and presets. \
                  Use path to target a repo or set GFS_REPO_PATH."
                     .into(),
             ),
