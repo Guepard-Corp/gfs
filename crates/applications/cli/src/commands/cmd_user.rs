@@ -73,6 +73,15 @@ pub async fn run_create(
     let generated = password.is_none();
     let password = password.unwrap_or_else(generate_password);
     let use_case = build_use_case(&repo_path).await?;
+    // A preset's default privileges must cover the customer's FUTURE tables, which
+    // the deploy `owner` role creates — not the connecting admin. Auto-detect the
+    // deploy owner so a readonly/readwrite user isn't blind to owner's later tables
+    // (None on single-node repos with no `owner` role → connecting-role-scoped).
+    let default_privileges_owner = if preset.is_some() {
+        use_case.detect_deploy_owner(&repo_path).await
+    } else {
+        None
+    };
     use_case
         .create_role(
             &repo_path,
@@ -80,9 +89,7 @@ pub async fn run_create(
                 username: username.clone(),
                 password: password.clone(),
                 preset,
-                // Single-node gfs CLI: no deploy owner, so a preset's default
-                // privileges are role-scoped to the connecting role.
-                default_privileges_owner: None,
+                default_privileges_owner,
             },
         )
         .await

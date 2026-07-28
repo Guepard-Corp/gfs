@@ -105,6 +105,7 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
     /// Create a login role (optionally with a preset).
     pub async fn create_role(&self, path: &Path, spec: &RoleSpec) -> Result<(), ManageUsersError> {
         require_password(&spec.password)?;
+        reject_reserved_role(&spec.username)?;
         let (provider, container) = self.resolve(path)?;
         let command = provider
             .create_role_command(spec)
@@ -120,6 +121,7 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
         password: &str,
     ) -> Result<(), ManageUsersError> {
         require_password(password)?;
+        reject_reserved_role(username)?;
         let (provider, container) = self.resolve(path)?;
         let command = provider
             .alter_password_command(username, password)
@@ -149,6 +151,7 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
         preset: RolePreset,
         default_privileges_owner: Option<&str>,
     ) -> Result<(), ManageUsersError> {
+        reject_reserved_role(username)?;
         let (provider, container) = self.resolve(path)?;
         let command = provider
             .apply_preset_command(username, preset, default_privileges_owner)
@@ -185,8 +188,23 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
             .map_err(|e| ManageUsersError::Parse(e.to_string()))
     }
 
+    /// Detect the deploy's object-creating `owner` role (RFC 009 §5.1) so a
+    /// preset's `ALTER DEFAULT PRIVILEGES` covers the customer's future tables,
+    /// not the connecting admin's. The CLI/MCP don't know the deploy owner: if the
+    /// conventional `owner` role exists, scope preset defaults to it; otherwise
+    /// `None` (single-node — defaults stay connecting-role-scoped).
+    pub async fn detect_deploy_owner(&self, path: &Path) -> Option<String> {
+        const DEPLOY_OWNER_ROLE: &str = "owner";
+        let roles = self.list_roles(path).await.ok()?;
+        roles
+            .iter()
+            .any(|r| r.username == DEPLOY_OWNER_ROLE)
+            .then(|| DEPLOY_OWNER_ROLE.to_string())
+    }
+
     /// Grant object-level privileges on `spec.object` to `spec.role`.
     pub async fn grant(&self, path: &Path, spec: &GrantSpec) -> Result<(), ManageUsersError> {
+        reject_reserved_role(&spec.role)?;
         validate_privileges(&spec.privileges, &spec.object)?;
         let (provider, container) = self.resolve(path)?;
         let command = provider.grant_command(spec).map_err(map_provider_err)?;
@@ -195,6 +213,7 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
 
     /// Revoke object-level privileges on `spec.object` from `spec.role`.
     pub async fn revoke(&self, path: &Path, spec: &RevokeSpec) -> Result<(), ManageUsersError> {
+        reject_reserved_role(&spec.role)?;
         validate_privileges(&spec.privileges, &spec.object)?;
         let (provider, container) = self.resolve(path)?;
         let command = provider.revoke_command(spec).map_err(map_provider_err)?;
@@ -275,17 +294,20 @@ fn require_password(password: &str) -> Result<(), ManageUsersError> {
     }
 }
 
-/// The platform's management/bootstrap roles, never client roles. Refuse to drop
-/// them: `postgres` is the engine's own connection superuser, and dropping it
-/// makes `DROP OWNED BY` walk the entire database and wedge the session (and the
-/// same holds for `guepard-admin` once it is the bootstrap super). Fail fast with
-/// a clear message instead.
-const RESERVED_ROLES: [&str; 2] = ["guepard-admin", "postgres"];
+/// The platform's load-bearing roles (RFC 009), never client roles: the engine
+/// connection superuser `postgres`, the bootstrap super `guepard-admin`, the
+/// customer's least-privileged login `owner`, and the `developers` group. Client
+/// user management (`gfs user`) refuses to mutate any of them — dropping the
+/// connection superuser makes `DROP OWNED BY` wedge the session; dropping `owner`
+/// destroys the customer's primary login; rotating a password or privileges
+/// out-of-band desyncs the deploy's stored credential/connection string. Fail
+/// fast with a clear message instead.
+const RESERVED_ROLES: [&str; 4] = ["guepard-admin", "postgres", "owner", "developers"];
 
 fn reject_reserved_role(username: &str) -> Result<(), ManageUsersError> {
     if RESERVED_ROLES.contains(&username) {
         Err(ManageUsersError::InvalidInput(format!(
-            "'{username}' is a reserved management role and cannot be dropped"
+            "'{username}' is a reserved platform role and cannot be modified via user management"
         )))
     } else {
         Ok(())
@@ -314,6 +336,9 @@ mod tests {
         use super::reject_reserved_role;
         assert!(reject_reserved_role("postgres").is_err());
         assert!(reject_reserved_role("guepard-admin").is_err());
+        // The customer's load-bearing deploy roles are protected too (F-04).
+        assert!(reject_reserved_role("owner").is_err());
+        assert!(reject_reserved_role("developers").is_err());
         assert!(reject_reserved_role("app_rw").is_ok());
     }
     use tempfile::TempDir;

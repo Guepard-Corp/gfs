@@ -212,14 +212,32 @@ pub struct QueryRequest {
 
 #[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 pub struct UserRequest {
-    #[schemars(description = "action: create | list | drop | set_password")]
+    #[schemars(
+        description = "action: create | list | drop | set_password | grant | revoke | list_privs"
+    )]
     pub action: String,
-    #[schemars(description = "username (required for create/drop/set_password)")]
+    #[schemars(description = "username (required for every action except list)")]
     pub username: Option<String>,
     #[schemars(description = "role preset for create: readonly | readwrite | admin")]
     pub preset: Option<String>,
     #[schemars(description = "password (optional; generated and returned once if omitted)")]
     pub password: Option<String>,
+    #[schemars(
+        description = "grant/revoke target object, JSON {type: database|schema|table|all_tables_in_schema|sequence|all_sequences_in_schema, schema?, name?}"
+    )]
+    pub object: Option<serde_json::Value>,
+    #[schemars(
+        description = "grant/revoke privileges: array or CSV, e.g. [\"SELECT\",\"INSERT\"] or \"ALL\""
+    )]
+    pub privileges: Option<serde_json::Value>,
+    #[schemars(description = "grant: allow the grantee to re-grant (WITH GRANT OPTION)")]
+    pub with_grant_option: Option<bool>,
+    #[schemars(
+        description = "grant: also cover future objects created by this grantor role (all-in-schema scopes only)"
+    )]
+    pub apply_to_future: Option<String>,
+    #[schemars(description = "revoke: cascade to dependent grants (default RESTRICT)")]
+    pub cascade: Option<bool>,
     #[schemars(description = "repo root path")]
     pub path: Option<String>,
 }
@@ -503,6 +521,11 @@ impl GfsMcpHandler {
             "username": req.username,
             "preset": req.preset,
             "password": req.password,
+            "object": req.object,
+            "privileges": req.privileges,
+            "with_grant_option": req.with_grant_option,
+            "apply_to_future": req.apply_to_future,
+            "cascade": req.cascade,
             "path": req.path,
         });
         let result = do_user(&args).await;
@@ -1375,6 +1398,14 @@ async fn do_user(args: &serde_json::Value) -> Result<CallToolResult, McpError> {
                 None => None,
             };
             let password = password.unwrap_or_else(gen_password);
+            // Scope a preset's default privileges to the deploy owner (the role that
+            // creates the customer's future tables), not the connecting admin, so a
+            // preset user isn't blind to owner's later tables (see cmd_user / F-03).
+            let default_privileges_owner = if preset.is_some() {
+                use_case.detect_deploy_owner(&repo_path).await
+            } else {
+                None
+            };
             use_case
                 .create_role(
                     &repo_path,
@@ -1382,8 +1413,7 @@ async fn do_user(args: &serde_json::Value) -> Result<CallToolResult, McpError> {
                         username: username.clone(),
                         password: password.clone(),
                         preset,
-                        // Single-node gfs MCP: no deploy owner (see cmd_user).
-                        default_privileges_owner: None,
+                        default_privileges_owner,
                     },
                 )
                 .await
