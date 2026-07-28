@@ -156,6 +156,39 @@ pub async fn run_set_password(
     Ok(())
 }
 
+pub async fn run_apply_preset(
+    path: Option<PathBuf>,
+    username: String,
+    preset: String,
+    json_output: bool,
+) -> Result<()> {
+    let repo_path = path.unwrap_or_else(get_repo_dir);
+    let preset = parse_preset(Some(preset))?
+        .ok_or_else(|| anyhow::anyhow!("a preset is required (readonly|readwrite|admin)"))?;
+    let use_case = build_use_case(&repo_path).await?;
+    // Scope the preset's default privileges to the deploy owner's future objects
+    // (same as create) so a re-applied/changed preset stays owner-aware.
+    let default_privileges_owner = use_case.detect_deploy_owner(&repo_path).await;
+    use_case
+        .apply_preset(
+            &repo_path,
+            &username,
+            preset,
+            default_privileges_owner.as_deref(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::json!({ "username": username, "preset_applied": true })
+        );
+    } else {
+        println!("user '{username}' — preset applied");
+    }
+    Ok(())
+}
+
 /// The mutually-exclusive `--on-*` object flags for grant/revoke.
 pub struct ObjectFlags {
     pub on_database: bool,

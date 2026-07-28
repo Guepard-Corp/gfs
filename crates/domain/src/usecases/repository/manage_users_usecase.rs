@@ -305,7 +305,10 @@ fn require_password(password: &str) -> Result<(), ManageUsersError> {
 const RESERVED_ROLES: [&str; 4] = ["guepard-admin", "postgres", "owner", "developers"];
 
 fn reject_reserved_role(username: &str) -> Result<(), ManageUsersError> {
-    if RESERVED_ROLES.contains(&username) {
+    // Case-insensitive: a look-alike like `POSTGRES` is a *distinct* Postgres role
+    // (quoted identifiers are case-sensitive), but creating one invites confusion
+    // with the real reserved role, so refuse every case variant too.
+    if RESERVED_ROLES.contains(&username.to_ascii_lowercase().as_str()) {
         Err(ManageUsersError::InvalidInput(format!(
             "'{username}' is a reserved platform role and cannot be modified via user management"
         )))
@@ -339,6 +342,9 @@ mod tests {
         // The customer's load-bearing deploy roles are protected too (F-04).
         assert!(reject_reserved_role("owner").is_err());
         assert!(reject_reserved_role("developers").is_err());
+        // Case variants of a reserved name are refused (no confusing look-alikes).
+        assert!(reject_reserved_role("POSTGRES").is_err());
+        assert!(reject_reserved_role("Owner").is_err());
         assert!(reject_reserved_role("app_rw").is_ok());
     }
     use tempfile::TempDir;

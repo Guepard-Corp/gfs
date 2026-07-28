@@ -213,7 +213,7 @@ pub struct QueryRequest {
 #[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 pub struct UserRequest {
     #[schemars(
-        description = "action: create | list | drop | set_password | grant | revoke | list_privs"
+        description = "action: create | list | drop | set_password | apply_preset | grant | revoke | list_privs"
     )]
     pub action: String,
     #[schemars(description = "username (required for every action except list)")]
@@ -510,7 +510,7 @@ impl GfsMcpHandler {
     }
 
     #[tool(
-        description = "Manage database users/roles inside the running instance. action = create | list | drop | set_password | grant | revoke | list_privs. create and set_password return the password once. Params: action (required); username (all except list); preset (create: readonly|readwrite|admin); password (optional, generated once if omitted); object (grant/revoke: JSON {type: database|schema|table|all_tables_in_schema|sequence|all_sequences_in_schema, schema?, name?}); privileges (grant/revoke: array or CSV, e.g. [\"SELECT\",\"INSERT\"] or \"ALL\"); with_grant_option, apply_to_future (grant); cascade (revoke); path (repo root). Equivalent to gfs user."
+        description = "Manage database users/roles inside the running instance. action = create | list | drop | set_password | apply_preset | grant | revoke | list_privs. create and set_password return the password once. Params: action (required); username (all except list); preset (create: readonly|readwrite|admin); password (optional, generated once if omitted); object (grant/revoke: JSON {type: database|schema|table|all_tables_in_schema|sequence|all_sequences_in_schema, schema?, name?}); privileges (grant/revoke: array or CSV, e.g. [\"SELECT\",\"INSERT\"] or \"ALL\"); with_grant_option, apply_to_future (grant); cascade (revoke); path (repo root). Equivalent to gfs user."
     )]
     async fn user(
         &self,
@@ -1450,6 +1450,24 @@ async fn do_user(args: &serde_json::Value) -> Result<CallToolResult, McpError> {
                 .map_err(|e| to_error_data(e.to_string()))?;
             Ok(CallToolResult::success(vec![Content::text(
                 json!({ "username": username, "password": password }).to_string(),
+            )]))
+        }
+        "apply_preset" => {
+            let username = require_username()?;
+            let preset = args
+                .get("preset")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| to_error_data("action 'apply_preset' requires 'preset'"))?;
+            let preset = RolePreset::parse(preset)
+                .ok_or_else(|| to_error_data(format!("unknown preset '{preset}'")))?;
+            // Scope defaults to the deploy owner's future objects (same as create).
+            let owner = use_case.detect_deploy_owner(&repo_path).await;
+            use_case
+                .apply_preset(&repo_path, &username, preset, owner.as_deref())
+                .await
+                .map_err(|e| to_error_data(e.to_string()))?;
+            Ok(CallToolResult::success(vec![Content::text(
+                json!({ "username": username, "preset_applied": true }).to_string(),
             )]))
         }
         "grant" => {

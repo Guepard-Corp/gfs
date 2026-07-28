@@ -104,6 +104,16 @@ pub enum UserAction {
         #[arg(long)]
         path: Option<PathBuf>,
     },
+    /// Apply (or change) a role preset on an existing user. A downgrade (e.g.
+    /// readwrite → readonly) revokes the privileges the higher preset granted.
+    ApplyPreset {
+        /// Target username
+        username: String,
+        /// Role preset: readonly | readwrite | admin
+        preset: String,
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
     /// Grant object-level privileges to a user
     Grant {
         /// Grantee username
@@ -952,6 +962,15 @@ where
                     path,
                 } => {
                     commands::cmd_user::run_set_password(path, username, password, json_output)
+                        .await?;
+                    Ok(0)
+                }
+                UserAction::ApplyPreset {
+                    username,
+                    preset,
+                    path,
+                } => {
+                    commands::cmd_user::run_apply_preset(path, username, preset, json_output)
                         .await?;
                     Ok(0)
                 }
