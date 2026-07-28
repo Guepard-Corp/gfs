@@ -679,7 +679,10 @@ impl KubernetesCompute {
         if let Ok(ss) = self.api_statefulsets().get(instance).await
             && ss.spec.as_ref().and_then(|s| s.replicas) == Some(0)
         {
-            return Err(ComputeError::Internal(format!(
+            // NotAvailable has a bare `{0}` Display: this is an expected state, not an
+            // internal fault, so avoid the misleading "internal error:" prefix while
+            // keeping the actionable "resume it" guidance intact.
+            return Err(ComputeError::NotAvailable(format!(
                 "instance '{instance}' is stopped (scaled to zero); resume it \
                  (e.g. `gfs compute start`) before running this operation"
             )));
