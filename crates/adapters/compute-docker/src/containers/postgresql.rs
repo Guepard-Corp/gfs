@@ -639,6 +639,11 @@ impl DatabaseProvider for PostgresqlProvider {
                 .transpose()?;
             sql.push('\n');
             sql.push_str(&pg_preset_sql(&ident, preset, owner.as_deref()));
+            // Record the applied preset in the role comment so `list` surfaces it.
+            sql.push_str(&format!(
+                "\nCOMMENT ON ROLE {ident} IS 'gfs-preset:{}';",
+                preset.as_str()
+            ));
         }
         // Wrap in a transaction so create+grants are atomic (fixes v2 partial-state).
         self.query_in_instance_command(&format!("BEGIN;\n{sql}\nCOMMIT;"), None)
@@ -683,7 +688,9 @@ impl DatabaseProvider for PostgresqlProvider {
         // supers (`guepard-admin`, `postgres`) — neither is a client role, and
         // surfacing the connection superuser invites a wedging `drop` (see
         // `reject_reserved_role`).
-        let sql = "SELECT COALESCE(json_agg(json_build_object('username', rolname, 'can_login', rolcanlogin, 'is_superuser', rolsuper) ORDER BY rolname), '[]'::json) \
+        // `preset` is read back from the role comment (`gfs-preset:<name>`) set at
+        // create/apply time; NULL when the role carries no preset comment.
+        let sql = "SELECT COALESCE(json_agg(json_build_object('username', rolname, 'can_login', rolcanlogin, 'is_superuser', rolsuper, 'preset', substring(shobj_description(oid, 'pg_authid') FROM '^gfs-preset:(.*)$')) ORDER BY rolname), '[]'::json) \
                    FROM pg_roles WHERE left(rolname, 3) <> 'pg_' AND rolname NOT IN ('guepard-admin', 'postgres');";
         let body = gfs_domain::utils::shell::sql_heredoc_body(DELIM, sql)?;
         Ok(format!(
@@ -708,8 +715,9 @@ impl DatabaseProvider for PostgresqlProvider {
         let reset = pg_preset_reset_sql(&ident, owner.as_deref());
         self.query_in_instance_command(
             &format!(
-                "BEGIN;\n{reset}\n{}\nCOMMIT;",
-                pg_preset_sql(&ident, preset, owner.as_deref())
+                "BEGIN;\n{reset}\n{}\nCOMMENT ON ROLE {ident} IS 'gfs-preset:{}';\nCOMMIT;",
+                pg_preset_sql(&ident, preset, owner.as_deref()),
+                preset.as_str()
             ),
             None,
         )

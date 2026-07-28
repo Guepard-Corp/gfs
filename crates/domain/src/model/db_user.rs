@@ -62,6 +62,10 @@ pub struct RoleInfo {
     pub username: String,
     pub can_login: bool,
     pub is_superuser: bool,
+    /// The applied preset (`readonly`/`readwrite`/`admin`), recorded in the
+    /// role's comment at create/apply time. `None` when no preset was set.
+    #[serde(default)]
+    pub preset: Option<String>,
 }
 
 /// Everything needed to bootstrap a database's deploy environment (RFC 009): a
