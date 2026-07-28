@@ -37,6 +37,24 @@ pub fn with_fresh_repo<F>(f: F)
 where
     F: FnOnce(&Path),
 {
+    // `gfs init` below provisions a `gfs-postgres:17` container. That image is built
+    // locally (not published to any registry), so an environment without it — e.g.
+    // GitHub Actions running a full `cargo test` — can't pull it and would otherwise
+    // panic at `gfs init`. Skip (don't fail) when the image is absent, matching
+    // e2e_clone_postgres and the repo's "skip gracefully when prerequisites are
+    // missing" testing rule.
+    let img_ok = super::container_runtime::runtime_command()
+        .args(["image", "inspect", "gfs-postgres:17"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !img_ok {
+        eprintln!(
+            "SKIP: image gfs-postgres:17 absent — build: docker build -t gfs-postgres:17 crates/extensions/gfs"
+        );
+        return;
+    }
+
     // Use a Docker-shareable temp directory (not /tmp which Docker can't mount on Linux)
     // Use home directory which is typically Docker-shareable, fall back to system temp
     let temp_base = std::env::var("HOME")

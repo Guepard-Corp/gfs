@@ -30,7 +30,7 @@ pub struct LogArgs {
 }
 
 pub async fn log(args: LogArgs) -> Result<()> {
-    let repo_path = args.path.unwrap_or_else(get_repo_dir);
+    let repo_path = args.path.clone().unwrap_or_else(get_repo_dir);
 
     if args.graph || args.all {
         run_graph(

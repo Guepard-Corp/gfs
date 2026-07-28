@@ -89,6 +89,55 @@ fn resolve_host_bind_path(path: &Path) -> Result<std::path::PathBuf> {
     Ok(absolute.canonicalize().unwrap_or(absolute))
 }
 
+/// Subdirectory of the bind-mounted data dir used as PGDATA under Podman.
+///
+/// On `podman-machine` (macOS), the host data dir reaches the container through
+/// a virtiofs bind mount whose *mount point* is presented to the container as
+/// root-owned (`0:0`) and cannot be `chmod`'d by the unprivileged uid the
+/// database runs as. `initdb` (and the stock postgres entrypoint) require PGDATA
+/// to be `0700`, so pointing PGDATA at the mount root fails with
+/// `could not change permissions of directory ... Operation not permitted`.
+///
+/// A directory the container *creates inside* the mount is owned by the
+/// container uid and IS `chmod`-able, so we redirect PGDATA one level down into
+/// this subdirectory. The host still snapshots/restores the whole bind-mounted
+/// dir (now containing `<subdir>/`), so the copy-on-write commit model is
+/// unchanged — the data simply lives one directory deeper on both sides.
+const POSTGRES_PODMAN_PGDATA_SUBDIR: &str = "pgdata";
+
+/// Compute the effective PGDATA value for a single env var, redirecting it into
+/// [`POSTGRES_PODMAN_PGDATA_SUBDIR`] only when all of the following hold:
+///
+/// * the engine is Podman,
+/// * the container has a host bind mount (`has_bind`),
+/// * the var is `PGDATA`, and
+/// * `PGDATA` currently points exactly at the bind-mount root (`data_dir`).
+///
+/// Returns `Some(new_pgdata)` when the redirect applies, else `None` (leave the
+/// value untouched). Docker and non-`PGDATA` vars always return `None`.
+fn podman_pgdata_redirect(
+    is_podman: bool,
+    has_bind: bool,
+    name: &str,
+    value: &str,
+    container_data_dir: &str,
+) -> Option<String> {
+    if is_podman
+        && has_bind
+        && name == "PGDATA"
+        && !value.is_empty()
+        && value.trim_end_matches('/') == container_data_dir.trim_end_matches('/')
+    {
+        Some(format!(
+            "{}/{}",
+            value.trim_end_matches('/'),
+            POSTGRES_PODMAN_PGDATA_SUBDIR
+        ))
+    } else {
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DockerCompute
 // ---------------------------------------------------------------------------
@@ -253,9 +302,14 @@ impl DockerCompute {
     }
 
     async fn bind_mount_spec(&self, host_path: &str, container_path: &str) -> String {
-        if self.is_podman_engine().await {
-            // Podman commonly requires SELinux relabeling and uid/gid remapping for bind mounts.
-            // Keep this Podman-specific so Docker behavior stays unchanged.
+        Self::format_bind_spec(self.is_podman_engine().await, host_path, container_path)
+    }
+
+    /// Build the `host:container[:opts]` bind spec. Podman commonly requires
+    /// SELinux relabeling and uid/gid remapping for bind mounts, so we append
+    /// `:Z,U` there. Kept Podman-specific so Docker behavior stays unchanged.
+    fn format_bind_spec(is_podman: bool, host_path: &str, container_path: &str) -> String {
+        if is_podman {
             format!("{}:{}:Z,U", host_path, container_path)
         } else {
             format!("{}:{}", host_path, container_path)
@@ -407,25 +461,28 @@ impl Compute for DockerCompute {
     async fn provision(&self, definition: &ComputeDefinition) -> Result<InstanceId> {
         use std::collections::HashMap;
 
-        // Ensure the image exists locally, pulling it if necessary. A pull failure
-        // is TOLERATED when the image is already present locally — e.g. a
-        // locally-built image (like `gfs-postgres:16`) that was never pushed to a
-        // registry, so `docker pull` 404s but `docker run` would work.
-        let mut pull_builder = bollard::query_parameters::CreateImageOptionsBuilder::default()
-            .from_image(definition.image.as_str());
-        if let Some(p) = self.platform.as_deref() {
-            pull_builder = pull_builder.platform(p);
-        }
-        let pull_opts = pull_builder.build();
-        if let Err(e) = self
-            .docker
-            .create_image(Some(pull_opts), None, None)
-            .try_collect::<Vec<_>>()
-            .await
-        {
-            // Fall back to a locally-present image; only surface the pull error
-            // (missing tag, no manifest for this arch, auth) if it isn't local.
-            if self.docker.inspect_image(&definition.image).await.is_err() {
+        // Use the locally-present image when we have it (normal `docker run`
+        // semantics) and pull only when it is genuinely absent. This matters
+        // because `create_image` (a registry pull) can block for ~30s on registry
+        // auth/timeout for a locally-built image with no upstream registry (e.g.
+        // `gfs-postgres:17`) before failing — a cost that would otherwise be paid
+        // on every provision (each checkout recreate, init, and start).
+        if self.docker.inspect_image(&definition.image).await.is_err() {
+            let mut pull_builder = bollard::query_parameters::CreateImageOptionsBuilder::default()
+                .from_image(definition.image.as_str());
+            if let Some(p) = self.platform.as_deref() {
+                pull_builder = pull_builder.platform(p);
+            }
+            let pull_opts = pull_builder.build();
+            // Surface a pull error only if the image is still absent afterwards
+            // (a locally-built image that 404s but exists is fine).
+            if let Err(e) = self
+                .docker
+                .create_image(Some(pull_opts), None, None)
+                .try_collect::<Vec<_>>()
+                .await
+                && self.docker.inspect_image(&definition.image).await.is_err()
+            {
                 return Err(ComputeError::Internal(format!(
                     "failed to pull image '{}': {e}{}",
                     definition.image,
@@ -436,11 +493,6 @@ impl Compute for DockerCompute {
                     }
                 )));
             }
-            tracing::debug!(
-                image = %definition.image,
-                error = %e,
-                "image pull failed but the image is present locally; using the local image"
-            );
         }
 
         let image_name = definition.image.to_ascii_lowercase();
@@ -459,12 +511,30 @@ impl Compute for DockerCompute {
                 .unwrap()
                 .as_millis()
         );
+        // Detect Podman once: it drives both the PGDATA redirect below and the
+        // bind-mount options. Docker paths are entirely unaffected.
+        let is_podman = self.is_podman_engine().await;
+        let has_bind = definition.host_data_dir.is_some();
+        let container_data_dir = definition.data_dir.to_string_lossy().into_owned();
+
         let env: Vec<String> = definition
             .env
             .iter()
             .map(|e| {
                 let value = e.default.as_deref().unwrap_or("");
-                format!("{}={}", e.name, value)
+                // On podman-machine (macOS) the bind-mount root cannot be
+                // chmod'd by the DB uid, so PGDATA must live in a container-
+                // created subdirectory. See `podman_pgdata_redirect`.
+                match podman_pgdata_redirect(
+                    is_podman,
+                    has_bind,
+                    &e.name,
+                    value,
+                    &container_data_dir,
+                ) {
+                    Some(redirected) => format!("{}={}", e.name, redirected),
+                    None => format!("{}={}", e.name, value),
+                }
             })
             .collect();
 
@@ -485,8 +555,11 @@ impl Compute for DockerCompute {
         let mut binds = Vec::new();
         if let Some(ref host_data) = definition.host_data_dir {
             let host_path = host_path_for_docker_bind(&resolve_host_bind_path(host_data)?);
-            let container_path = definition.data_dir.to_string_lossy();
-            binds.push(self.bind_mount_spec(&host_path, &container_path).await);
+            binds.push(Self::format_bind_spec(
+                is_podman,
+                &host_path,
+                &container_data_dir,
+            ));
         }
 
         let host_config = bollard::service::HostConfig {
@@ -711,11 +784,34 @@ impl Compute for DockerCompute {
         Ok(ComputeCapabilities {
             supports_stream_snapshot: true,
             supports_exec_as_root: true,
+            // Docker `pause()` freezes the container/database, so schema
+            // extraction must run strictly before the snapshot.
+            db_live_during_snapshot: false,
         })
     }
 
     async fn exec(&self, id: &InstanceId, command: &str, user: Option<&str>) -> Result<ExecOutput> {
         self.run_exec_command(id, command, user).await
+    }
+
+    #[instrument(skip(self))]
+    async fn read_deploy_credentials(&self, id: &InstanceId) -> Result<Vec<(String, String)>> {
+        let info = self
+            .docker
+            .inspect_container(&id.0, None)
+            .await
+            .map_err(|e| classify(&id.0, e))?;
+        let env = info
+            .config
+            .and_then(|c| c.env)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|s| {
+                s.split_once('=')
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+            })
+            .collect();
+        Ok(env)
     }
 
     #[instrument(skip(self))]
@@ -897,19 +993,22 @@ impl Compute for DockerCompute {
         command: &str,
         linked_to: Option<&InstanceId>,
     ) -> Result<ExecOutput> {
-        // 1. Pull image (tolerate a pull failure when it's already present locally,
-        //    e.g. a locally-built image never pushed to a registry).
-        let pull_opts = bollard::query_parameters::CreateImageOptionsBuilder::default()
-            .from_image(definition.image.as_str())
-            .build();
-        if let Err(e) = self
-            .docker
-            .create_image(Some(pull_opts), None, None)
-            .try_collect::<Vec<_>>()
-            .await
-            && self.docker.inspect_image(&definition.image).await.is_err()
-        {
-            return Err(classify(definition.image.as_str(), e));
+        // 1. Use the locally-present image when we have it and pull only when it is
+        //    absent — a registry pull of a locally-built image (no upstream repo)
+        //    can block ~30s on auth/timeout before failing, on every task.
+        if self.docker.inspect_image(&definition.image).await.is_err() {
+            let pull_opts = bollard::query_parameters::CreateImageOptionsBuilder::default()
+                .from_image(definition.image.as_str())
+                .build();
+            if let Err(e) = self
+                .docker
+                .create_image(Some(pull_opts), None, None)
+                .try_collect::<Vec<_>>()
+                .await
+                && self.docker.inspect_image(&definition.image).await.is_err()
+            {
+                return Err(classify(definition.image.as_str(), e));
+            }
         }
 
         // 2. Resolve the network of the linked instance so the task can reach it.
@@ -1404,7 +1503,12 @@ impl DockerCompute {
         cmd: &str,
         user: Option<&str>,
     ) -> Result<ExecOutput> {
-        const MAX_CAPTURE_BYTES: usize = 256 * 1024; // per-stream cap
+        // Per-stream capture ceiling. Sized to hold large schema-extraction output
+        // (metadata JSON + `pg_dump` DDL for big databases, run via `exec` during
+        // commit), not just the tiny CHECKPOINT/probe output this was originally
+        // written for. Output beyond this is truncated with a marker rather than
+        // buffered unbounded.
+        const MAX_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
 
         let opts = bollard::exec::CreateExecOptions {
             cmd: Some(vec!["sh".into(), "-c".into(), cmd.to_string()]),
@@ -1558,6 +1662,73 @@ mod tar_safety_tests {
     fn parent_dir_component_is_unsafe() {
         assert!(!tar_link_target_is_safe(Path::new("../escape")));
         assert!(!tar_link_target_is_safe(Path::new("a/../../b")));
+    }
+}
+
+#[cfg(test)]
+mod podman_pgdata_tests {
+    use super::{POSTGRES_PODMAN_PGDATA_SUBDIR, podman_pgdata_redirect};
+
+    const DATA_DIR: &str = "/var/lib/postgresql/data";
+
+    #[test]
+    fn redirects_pgdata_on_podman_with_bind() {
+        let got = podman_pgdata_redirect(true, true, "PGDATA", DATA_DIR, DATA_DIR);
+        assert_eq!(
+            got,
+            Some(format!("{DATA_DIR}/{POSTGRES_PODMAN_PGDATA_SUBDIR}"))
+        );
+    }
+
+    #[test]
+    fn trailing_slash_on_pgdata_is_normalized() {
+        let got =
+            podman_pgdata_redirect(true, true, "PGDATA", "/var/lib/postgresql/data/", DATA_DIR);
+        assert_eq!(
+            got,
+            Some(format!("{DATA_DIR}/{POSTGRES_PODMAN_PGDATA_SUBDIR}"))
+        );
+    }
+
+    #[test]
+    fn no_redirect_on_docker() {
+        assert_eq!(
+            podman_pgdata_redirect(false, true, "PGDATA", DATA_DIR, DATA_DIR),
+            None
+        );
+    }
+
+    #[test]
+    fn no_redirect_without_bind_mount() {
+        assert_eq!(
+            podman_pgdata_redirect(true, false, "PGDATA", DATA_DIR, DATA_DIR),
+            None
+        );
+    }
+
+    #[test]
+    fn no_redirect_for_non_pgdata_var() {
+        assert_eq!(
+            podman_pgdata_redirect(true, true, "POSTGRES_PASSWORD", "secret", DATA_DIR),
+            None
+        );
+    }
+
+    #[test]
+    fn no_redirect_when_pgdata_is_not_mount_root() {
+        // Already a custom sub-path: leave it alone rather than double-nesting.
+        assert_eq!(
+            podman_pgdata_redirect(true, true, "PGDATA", "/some/other/dir", DATA_DIR),
+            None
+        );
+    }
+
+    #[test]
+    fn no_redirect_for_empty_value() {
+        assert_eq!(
+            podman_pgdata_redirect(true, true, "PGDATA", "", DATA_DIR),
+            None
+        );
     }
 }
 

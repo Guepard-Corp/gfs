@@ -627,8 +627,11 @@ impl Repository for GfsRepository {
                     let _ = fs::write(marker, b"");
                 }
             } else {
-                tracing::warn!(
-                    "Checkout: snapshot_dir does not exist or is not a directory, creating empty workspace"
+                // Expected on a fresh branch (no snapshot yet) and always on the k8s
+                // runtime, where the real restore is a PVC VolumeSnapshot rather than a
+                // filesystem snapshot. Not an error — seed an empty workspace.
+                tracing::debug!(
+                    "Checkout: no filesystem snapshot for this workspace; seeding empty workspace"
                 );
                 create_empty_workspace(&workspace_path).map_err(RepositoryError::Io)?;
             }

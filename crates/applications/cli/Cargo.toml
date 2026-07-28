@@ -35,7 +35,9 @@ path = "tests/schema/extract_clickhouse.rs"
 gfs-domain     = { workspace = true }
 gfs-telemetry  = { workspace = true }
 gfs-compute-docker        = { workspace = true }
+gfs-compute-kubernetes    = { workspace = true }
 gfs-storage-file   = { workspace = true }
+gfs-storage-kubernetes = { workspace = true }
 gfs-mcp            = { workspace = true }
 chrono             = { workspace = true }
 clap               = { workspace = true }
@@ -49,6 +51,7 @@ rmcp               = { workspace = true }
 axum               = { version = "0.7", features = ["json", "macros"] }
 tokio-util         = "0.7"
 owo-colors         = { version = "4", features = ["supports-colors"] }
+rustls             = { version = "0.23", features = ["aws-lc-rs"] }
 [dev-dependencies]
 gfs-domain         = { workspace = true }
 tempfile           = { workspace = true }

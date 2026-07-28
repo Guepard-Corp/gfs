@@ -404,6 +404,22 @@ impl DatabaseProvider for MysqlProvider {
         Ok(cmd)
     }
 
+    fn query_in_instance_command(
+        &self,
+        sql: &str,
+        database: Option<&str>,
+    ) -> std::result::Result<String, ProviderError> {
+        const DELIM: &str = "GFS_SQL_EOF";
+        let body = gfs_domain::utils::shell::sql_heredoc_body(DELIM, sql)?;
+        let db = match database.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(name) => gfs_domain::utils::shell::shell_single_quote(name),
+            None => r#""${MYSQL_DATABASE:-mysql}""#.to_string(),
+        };
+        Ok(format!(
+            r#"MYSQL_PWD="${{MYSQL_ROOT_PASSWORD:-mysql}}" mysql -h 127.0.0.1 -u root {db} -e "{body}""#
+        ))
+    }
+
     // -----------------------------------------------------------------------
     // Schema Extraction
     // -----------------------------------------------------------------------
@@ -535,7 +551,9 @@ echo "GFS_SCHEMA_COLUMNS"
 MYSQL_PWD="{password}" mysql -h {host} -P {port} -u root -D {db} -N -e "$(cat <<'COLUMNS_EOF'
 {columns_query}
 COLUMNS_EOF
-)""#,
+)"
+echo "GFS_SCHEMA_DDL"
+MYSQL_PWD="{password}" mysqldump -h {host} -P {port} -u root --no-data --skip-comments --skip-dump-date {db} || true"#,
             password = password,
             host = params.host,
             port = params.port,

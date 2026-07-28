@@ -4,13 +4,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use gfs_compute_docker::DockerCompute;
+use gfs_compute_docker::containers;
+use gfs_domain::adapters::gfs_repository::GfsRepository;
 use gfs_domain::model::config::GfsConfig;
-use gfs_domain::ports::compute::{Compute, InstanceId};
+use gfs_domain::ports::compute::InstanceId;
 use gfs_domain::ports::database_provider::{
     ConnectionParams, DatabaseProviderRegistry, InMemoryDatabaseProviderRegistry,
 };
+use gfs_domain::ports::repository::Repository;
+use gfs_domain::usecases::repository::execute_query_usecase::ExecuteQueryUseCase;
 
+use super::compute_support::compute_for_repo;
 use crate::cli_utils::get_repo_dir;
 
 /// Execute a SQL query against the running database instance.
@@ -24,8 +28,9 @@ pub async fn run(
     path: Option<PathBuf>,
     database: Option<String>,
     query: Option<String>,
+    _json_output: bool,
 ) -> Result<()> {
-    let repo_path = path.unwrap_or_else(get_repo_dir);
+    let repo_path = path.clone().unwrap_or_else(get_repo_dir);
 
     // Load config to get provider name and container name
     let config =
@@ -44,13 +49,31 @@ pub async fn run(
     let provider_name = &environment.database_provider;
     let container_name = &runtime.container_name;
 
-    // Set up compute and registry
-    let compute = Arc::new(DockerCompute::new().map_err(|e| anyhow::anyhow!("{e}"))?);
+    let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
+    let compute = compute_for_repo(&repository, &repo_path).await?;
 
     let registry_impl = InMemoryDatabaseProviderRegistry::new();
-    gfs_compute_docker::containers::register_all(&registry_impl)
-        .context("failed to register database providers")?;
-    let registry: Arc<dyn DatabaseProviderRegistry> = Arc::new(registry_impl);
+    containers::register_all(&registry_impl).context("failed to register database providers")?;
+    let registry = Arc::new(registry_impl);
+
+    let is_k8s = runtime
+        .runtime_provider
+        .trim()
+        .eq_ignore_ascii_case("kubernetes");
+
+    if is_k8s {
+        let sql = query.as_deref().context(
+            "interactive query is not supported for kubernetes runtime; pass SQL as an argument",
+        )?;
+        let out = ExecuteQueryUseCase::new(compute, registry.clone())
+            .run(&repo_path, sql, database.as_deref())
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        print!("{}", out.stdout);
+        return Ok(());
+    }
+
+    let registry: Arc<dyn DatabaseProviderRegistry> = registry;
 
     // Get the provider
     let provider = registry

@@ -328,6 +328,17 @@ enum TopLevel {
         revision: Option<String>,
     },
 
+    /// Tear down the compute instance and remove the repository's .gfs store
+    Destroy {
+        /// Path to the GFS repository root (default: current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+
+        /// Skip the confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+
     /// List, create, or delete branches
     Branch {
         /// Name of the branch to create (omit to list all branches)
@@ -557,6 +568,7 @@ fn command_name(cmd: &TopLevel) -> &'static str {
         TopLevel::Commit { .. } => "commit",
         TopLevel::Config { .. } => "config",
         TopLevel::Checkout { .. } => "checkout",
+        TopLevel::Destroy { .. } => "destroy",
         TopLevel::Branch { .. } => "branch",
         TopLevel::Export { .. } => "export",
         TopLevel::Import { .. } => "import",
@@ -692,6 +704,10 @@ where
                     .await?;
                 Ok(0)
             }
+            TopLevel::Destroy { path, yes } => {
+                commands::cmd_destroy::destroy(path, yes).await?;
+                Ok(0)
+            }
             TopLevel::Branch {
                 name,
                 start_point,
@@ -758,7 +774,7 @@ where
                 database,
                 query,
             } => {
-                commands::cmd_query::run(path, database, query).await?;
+                commands::cmd_query::run(path, database, query, json_output).await?;
                 Ok(0)
             }
             TopLevel::Schema { action } => match action {
@@ -767,7 +783,7 @@ where
                     output,
                     compact,
                 } => {
-                    commands::cmd_schema::run_extract(path, output, compact).await?;
+                    commands::cmd_schema::run_extract(path, output, compact, json_output).await?;
                     Ok(0)
                 }
                 SchemaAction::Show {

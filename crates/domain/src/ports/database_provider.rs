@@ -150,6 +150,13 @@ pub struct SchemaExtractionSpec {
     pub definition: ComputeDefinition,
     /// Shell command to execute in the sidecar. Output must use delimiters
     /// `GFS_SCHEMA_VERSION`, `GFS_SCHEMA_SCHEMAS`, `GFS_SCHEMA_TABLES`, `GFS_SCHEMA_COLUMNS`.
+    ///
+    /// The command MAY additionally emit a `GFS_SCHEMA_DDL` section carrying the
+    /// schema-only DDL dump. Emitting the DDL through stdout (rather than a
+    /// mounted file) is the only channel that survives runtimes where the task
+    /// sidecar runs on a different host than the gfs process (e.g. Kubernetes,
+    /// where the task pod and the repository live on separate nodes). When the
+    /// section is absent the stored schema object simply carries an empty DDL.
     pub command: String,
 }
 
@@ -171,6 +178,8 @@ pub struct RemoteSource {
     /// Remote schemas to mirror (e.g. `["public"]`). Empty means "all
     /// non-system schemas", discovered at bootstrap time.
     pub schemas: Vec<String>,
+    /// libpq `sslmode` for remote connections (`require`, `verify-full`, …).
+    pub sslmode: Option<String>,
 }
 
 /// Sidecar spec that bootstraps a lazy clone inside the local GFS database.
@@ -391,6 +400,21 @@ pub trait DatabaseProvider: Send + Sync {
         query: Option<&str>,
     ) -> std::result::Result<std::process::Command, ProviderError>;
 
+    /// Shell command to run **inside** the running database instance (via [`Compute::exec`]).
+    ///
+    /// Uses container env vars and loopback — no host-side client binaries. Interactive
+    /// sessions are not supported; `sql` must be non-empty.
+    /// When `database` is `Some`, the query targets that database; otherwise it
+    /// uses the instance's configured default (e.g. `$POSTGRES_DB`).
+    fn query_in_instance_command(
+        &self,
+        sql: &str,
+        database: Option<&str>,
+    ) -> std::result::Result<String, ProviderError> {
+        let _ = (sql, database);
+        Err(ProviderError::UnsupportedFormat("query_in_instance".into()))
+    }
+
     // -----------------------------------------------------------------------
     // Schema Extraction
     // -----------------------------------------------------------------------
@@ -436,6 +460,22 @@ pub trait DatabaseProvider: Send + Sync {
     // -----------------------------------------------------------------------
     // Lazy clone (RFC 008)
     // -----------------------------------------------------------------------
+
+    /// Whether RFC-008 lazy clone (external read-through) is supported.
+    fn supports_lazy_clone(&self) -> bool {
+        false
+    }
+
+    /// Shell commands run inside the instance via [`Compute::exec`] to detach a
+    /// snapshot-seeded lazy clone from its remote source (`fetch_remote_source=false`).
+    fn lazy_clone_detach_in_instance_commands(
+        &self,
+    ) -> std::result::Result<Vec<String>, ProviderError> {
+        let _ = self;
+        Err(ProviderError::UnsupportedFormat(
+            "lazy clone detach not supported by this provider".into(),
+        ))
+    }
 
     /// Build a sidecar spec that bootstraps a lazy (copy-on-read) clone of a
     /// read-only `remote` database inside the local GFS database.

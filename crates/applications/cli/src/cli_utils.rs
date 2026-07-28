@@ -64,3 +64,71 @@ pub fn relativize_to_repo(repo_path: &Path, full_path: &str) -> String {
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .unwrap_or_else(|_| full_path.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn write_ref(root: &Path, branch: &str, hash: &str) {
+        let p = root
+            .join(GFS_DIR)
+            .join(REFS_DIR)
+            .join(HEADS_DIR)
+            .join(branch);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, format!("{hash}\n")).unwrap();
+    }
+
+    #[test]
+    fn list_branch_tips_collects_flat_and_nested_refs() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        let (a, b, c) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+        write_ref(root, "main", &a);
+        write_ref(root, "feature", &b);
+        write_ref(root, "team/alpha", &c); // nested ref → "team/alpha"
+
+        let mut tips = list_branch_tips(root, false).unwrap();
+        tips.sort();
+        assert_eq!(
+            tips,
+            vec![
+                ("feature".to_string(), b),
+                ("main".to_string(), a),
+                ("team/alpha".to_string(), c),
+            ]
+        );
+    }
+
+    #[test]
+    fn list_branch_tips_honors_missing_ok() {
+        let tmp = tempdir().unwrap();
+        // No refs dir: missing_ok=true → empty; missing_ok=false → error.
+        assert!(list_branch_tips(tmp.path(), true).unwrap().is_empty());
+        assert!(list_branch_tips(tmp.path(), false).is_err());
+    }
+
+    #[test]
+    fn relativize_to_repo_strips_repo_prefix() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        let sub = root.join(".gfs/workspaces/main/0/data");
+        fs::create_dir_all(&sub).unwrap();
+        assert_eq!(
+            relativize_to_repo(root, sub.to_str().unwrap()),
+            ".gfs/workspaces/main/0/data"
+        );
+    }
+
+    #[test]
+    fn relativize_to_repo_returns_original_when_outside_repo() {
+        let tmp = tempdir().unwrap();
+        // A path outside the repo (and non-existent) is returned unchanged.
+        assert_eq!(
+            relativize_to_repo(tmp.path(), "/some/other/path"),
+            "/some/other/path"
+        );
+    }
+}

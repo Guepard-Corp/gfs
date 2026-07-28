@@ -80,6 +80,7 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         database_version: Option<String>,
         database_port: Option<u16>,
         credentials: DatabaseCredentials,
+        display_name: Option<String>,
         image: Option<String>,
         labels: std::collections::BTreeMap<String, String>,
     ) -> std::result::Result<(), InitRepoError> {
@@ -92,6 +93,7 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
                 database_version,
                 database_port,
                 credentials,
+                display_name,
                 image,
                 labels,
             )
@@ -109,6 +111,7 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         database_version: Option<String>,
         database_port: Option<u16>,
         credentials: DatabaseCredentials,
+        display_name: Option<String>,
         image: Option<String>,
         labels: std::collections::BTreeMap<String, String>,
     ) -> std::result::Result<(), InitRepoError> {
@@ -160,6 +163,15 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
                 }
             }
         }
+
+        // Persist the credentials so container recreation (checkout) can re-apply
+        // them — a recreated container's startup probe must connect as the same
+        // role the data was initialized with, or it fails for custom-cred repos.
+        let repo_credentials = crate::model::config::RepoCredentials {
+            user: credentials.user.clone(),
+            password: credentials.password.clone(),
+            name: credentials.name.clone(),
+        };
 
         // Apply user-provided credentials if supported by the provider's env vars
         if let Some(user) = credentials.user {
@@ -247,10 +259,15 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
             database_provider: provider_name,
             database_version: provider_version,
             database_port,
+            display_name: display_name.filter(|n| !n.trim().is_empty()),
         };
         self.repository
             .update_environment_config(repo_path, environment)
             .await?;
+
+        if !repo_credentials.is_empty() {
+            let _ = repo_credentials.save(repo_path);
+        }
 
         let runtime = RuntimeConfig {
             runtime_provider: runtime.provider,
@@ -658,6 +675,7 @@ mod tests {
                 None,
                 DatabaseCredentials::default(),
                 None,
+                None,
                 Default::default(),
             )
             .await;
@@ -680,6 +698,7 @@ mod tests {
                 Some("17".into()),
                 None,
                 DatabaseCredentials::default(),
+                None,
                 None,
                 Default::default(),
             )
@@ -709,6 +728,7 @@ mod tests {
                 Some("17".into()),
                 None,
                 DatabaseCredentials::default(),
+                None,
                 None,
                 labels.clone(),
             )
@@ -770,6 +790,7 @@ mod tests {
                 None,
                 DatabaseCredentials::default(),
                 None,
+                None,
                 labels,
             )
             .await
@@ -807,6 +828,7 @@ mod tests {
                 None,
                 DatabaseCredentials::default(),
                 None,
+                None,
                 Default::default(),
             )
             .await;
@@ -832,6 +854,7 @@ mod tests {
                 Some("8".into()),
                 None,
                 DatabaseCredentials::default(),
+                None,
                 None,
                 Default::default(),
             )
@@ -862,6 +885,7 @@ mod tests {
                 None,
                 DatabaseCredentials::default(),
                 None,
+                None,
                 Default::default(),
             )
             .await;
@@ -876,6 +900,7 @@ mod tests {
                 None,
                 None,
                 DatabaseCredentials::default(),
+                None,
                 None,
                 Default::default(),
             )

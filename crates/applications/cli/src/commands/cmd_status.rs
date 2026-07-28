@@ -23,7 +23,7 @@ use crate::output::{
 
 /// Returns exit code: 0 = compute running (or no compute configured), 1 = compute not running.
 pub async fn run(path: Option<PathBuf>, output: String) -> Result<i32> {
-    let repo_path = path.unwrap_or_else(get_repo_dir);
+    let repo_path = path.clone().unwrap_or_else(get_repo_dir);
 
     let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
     let compute = compute_for_repo(&repository, &repo_path).await?;

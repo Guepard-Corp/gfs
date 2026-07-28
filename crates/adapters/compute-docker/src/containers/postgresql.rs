@@ -12,8 +12,12 @@ use gfs_domain::ports::database_provider::{
 
 const NAME: &str = "postgres";
 
-/// Default PostgreSQL image (official image, current LTS-alpine).
-const DEFAULT_IMAGE: &str = "postgres:latest";
+/// Default PostgreSQL image. The tag here is only a fallback base — every
+/// provisioning and sidecar-task site re-tags it with the repository's
+/// configured `database_version` (see `task_image_for_version`, deploy, and
+/// checkout), so the effective image follows the user's chosen PG version,
+/// defaulting to the supported `17`.
+const DEFAULT_IMAGE: &str = "gfs-postgres:17";
 
 /// Path inside the container where PostgreSQL stores data (PGDATA).
 const CONTAINER_DATA_DIR: &str = "/var/lib/postgresql/data";
@@ -74,6 +78,14 @@ impl PostgresqlProvider {
 
     fn default_args_impl() -> Vec<DatabaseProviderArg> {
         vec![
+            DatabaseProviderArg {
+                // Listen on all interfaces so the container is reachable via the
+                // k8s Service/NodePort (and Docker port mapping). Without this a
+                // fresh initdb defaults to localhost, so the pod runs healthy but
+                // the CP's connection to the NodePort times out (deploy 500).
+                name: "-c".into(),
+                value: "listen_addresses=*".into(),
+            },
             DatabaseProviderArg {
                 name: "-c".into(),
                 value: "shared_buffers=32MB".into(),
@@ -183,6 +195,19 @@ fn sidecar_definition(image: String, password: &str, data_dir: &str) -> ComputeD
         logs_dir: None,
         conf_dir: None,
         args: vec![],
+    }
+}
+
+impl PostgresqlProvider {
+    /// Single-line `psql -c` for k8s exec (stdin=false); heredocs hang there.
+    fn psql_inline_instance_command(
+        &self,
+        sql: &str,
+    ) -> std::result::Result<String, ProviderError> {
+        let escaped = sql.replace('\\', "\\\\").replace('"', "\\\"");
+        Ok(format!(
+            r#"PGPASSWORD="${{POSTGRES_PASSWORD:-postgres}}" psql -h 127.0.0.1 -U "${{POSTGRES_USER:-postgres}}" -d "${{POSTGRES_DB:-postgres}}" -v ON_ERROR_STOP=1 -c "{escaped}""#
+        ))
     }
 }
 
@@ -446,17 +471,24 @@ impl DatabaseProvider for PostgresqlProvider {
 
         // Step 1 — FAITHFUL schema: dump the remote's DDL (tables, triggers,
         // functions, indexes, constraints, sequences, types) and replay it onto
-        // the local clone, so the source's real objects exist as real tables (not
-        // overlay views). The overlay (gfs_ovl__<schema>) is layered on top by the
-        // bootstrap. `--no-owner --no-privileges` avoids depending on remote roles;
+        // the local clone, so the source's real objects exist as real local heap
+        // tables. The `gfs` copy-on-read extension then serves each one lazily via
+        // its planner hook (no overlay views or INSTEAD OF triggers).
+        // `--no-owner --no-privileges` avoids depending on remote roles;
         // restrict to the requested schemas when given.
         let schema_flags = remote
             .schemas
             .iter()
             .map(|s| format!(" -n {}", shell_single_quote(s)))
             .collect::<String>();
+        let ssl_env = remote
+            .sslmode
+            .as_ref()
+            .map(|m| format!("PGSSLMODE={} ", shell_single_quote(m)))
+            .unwrap_or_default();
         let dump = format!(
-            "PGPASSWORD={rpass} pg_dump -h {rhost} -p {rport} -U {ruser} -d {rdb} --schema-only --no-owner --no-privileges{schemas} -f /tmp/gfs_faithful.sql",
+            "{ssl_env}PGCONNECT_TIMEOUT=15 PGPASSWORD={rpass} pg_dump -h {rhost} -p {rport} -U {ruser} -d {rdb} --schema-only --no-owner --no-privileges{schemas} -f /tmp/gfs_faithful.sql",
+            ssl_env = ssl_env,
             rpass = shell_single_quote(&remote.password),
             rhost = remote.host,
             rport = remote.port,
@@ -475,8 +507,8 @@ impl DatabaseProvider for PostgresqlProvider {
 
         // Step 2 — replay the faithful schema into the LOCAL database. Best-effort
         // (no ON_ERROR_STOP): an object that can't be recreated locally (e.g. a
-        // missing extension) is skipped, and its table is later skipped by the
-        // overlay builder, rather than aborting the whole clone.
+        // missing extension) is skipped, and its table is later skipped during
+        // copy-on-read registration, rather than aborting the whole clone.
         let replay = format!(
             "psql -h {host} -p {port} -U {user} -d {db} -f /tmp/gfs_faithful.sql || true",
             host = local.host,
@@ -485,8 +517,9 @@ impl DatabaseProvider for PostgresqlProvider {
             db = db,
         );
 
-        // Step 3 — bootstrap FDW + overlay (fed via a quoted heredoc; no shell
-        // expansion inside). ON_ERROR_STOP=1 so a real failure fails the clone.
+        // Step 3 — bootstrap the FDW + register each table for copy-on-read with the
+        // `gfs` planner-hook extension (fed via a quoted heredoc; no shell expansion
+        // inside). ON_ERROR_STOP=1 so a real failure fails the clone.
         let bootstrap = format!(
             "psql -h {host} -p {port} -U {user} -d {db} -v ON_ERROR_STOP=1 <<'GFS_CLONE_BOOTSTRAP'\n{sql}\nGFS_CLONE_BOOTSTRAP\n",
             host = local.host,
@@ -502,19 +535,39 @@ impl DatabaseProvider for PostgresqlProvider {
         // host load -- replaying then fails with "connection refused". Poll a real
         // SELECT 1 (same creds as the replay, via the sidecar's PGPASSWORD).
         let wait_clone = format!(
-            "for i in $(seq 1 120); do if psql -h {host} -p {port} -U {user} -d {db} -c 'SELECT 1' >/dev/null 2>&1; then break; fi; sleep 1; done",
+            "for i in $(seq 1 120); do if PGCONNECT_TIMEOUT=5 psql -h {host} -p {port} -U {user} -d {db} -c 'SELECT 1' >/dev/null 2>&1; then break; fi; sleep 1; done",
             host = local.host,
             port = local.port,
             user = user,
             db = db,
         );
 
-        let command = format!("set -e\n{dump}\n{sanitize}\n{wait_clone}\n{replay}\n{bootstrap}");
+        let command = format!(
+            "set -e\nexport PGCONNECT_TIMEOUT=15\n{wait_clone}\n{dump}\n{sanitize}\n{replay}\n{bootstrap}"
+        );
 
         Ok(CloneSpec {
             definition: sidecar_definition(self.definition().image, password, "/data"),
             command,
         })
+    }
+
+    fn supports_lazy_clone(&self) -> bool {
+        true
+    }
+
+    fn lazy_clone_detach_in_instance_commands(
+        &self,
+    ) -> std::result::Result<Vec<String>, ProviderError> {
+        const DETACH: &[&str] = &[
+            "DROP SERVER IF EXISTS gfs_remote_srv CASCADE",
+            "UPDATE gfs.clone_source SET whole_cached = true, no_partial = true \
+             WHERE EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'gfs')",
+        ];
+        DETACH
+            .iter()
+            .map(|sql| self.psql_inline_instance_command(sql))
+            .collect()
     }
 
     // -----------------------------------------------------------------------
@@ -541,6 +594,24 @@ impl DatabaseProvider for PostgresqlProvider {
         }
 
         Ok(cmd)
+    }
+
+    fn query_in_instance_command(
+        &self,
+        sql: &str,
+        database: Option<&str>,
+    ) -> std::result::Result<String, ProviderError> {
+        const DELIM: &str = "GFS_SQL_EOF";
+        let body = gfs_domain::utils::shell::sql_heredoc_body(DELIM, sql)?;
+        // Target an explicit database when given (`gfs query --database`), else the
+        // container's configured POSTGRES_DB.
+        let db = match database.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(name) => gfs_domain::utils::shell::shell_single_quote(name),
+            None => r#""${POSTGRES_DB:-postgres}""#.to_string(),
+        };
+        Ok(format!(
+            r#"PGPASSWORD="${{POSTGRES_PASSWORD:-postgres}}" psql -h 127.0.0.1 -U "${{POSTGRES_USER:-postgres}}" -d {db} -v ON_ERROR_STOP=1 -c "{body}""#
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -656,6 +727,16 @@ impl DatabaseProvider for PostgresqlProvider {
 
         // Run schema extraction inside a container (no psql on host required).
         // Output uses delimiters for parsing.
+        //
+        // The trailing `pg_dump … || true` is deliberate: it is the LAST command
+        // in this `sh -c` script (no `set -e`), so its exit status becomes the
+        // task's exit status. The metadata queries above are tolerant; `pg_dump`
+        // is the fragile step (client/server version skew, large schemas, partial
+        // permissions). Without `|| true`, a dump failure would propagate a
+        // non-zero exit and make `ExtractSchemaUseCase` discard the metadata it
+        // already captured — leaving the commit with no stored schema (the exact
+        // bug this path fixes). `|| true` degrades a dump failure to an empty DDL
+        // while keeping metadata-driven `schema show`/`schema diff` working.
         let command = format!(
             r#"echo "GFS_SCHEMA_VERSION"
 PGPASSWORD="{password}" psql -h {host} -p {port} -U {user} -d {db} -t -A -c "SELECT version();"
@@ -673,7 +754,9 @@ echo "GFS_SCHEMA_COLUMNS"
 PGPASSWORD="{password}" psql -h {host} -p {port} -U {user} -d {db} -t -A -c "$(cat <<'COLUMNS_EOF'
 {columns_query}
 COLUMNS_EOF
-)""#,
+)"
+echo "GFS_SCHEMA_DDL"
+PGPASSWORD="{password}" pg_dump -h {host} -p {port} -U {user} -d {db} --schema-only --no-owner --no-privileges || true"#,
             password = password,
             host = params.host,
             port = params.port,
@@ -700,7 +783,7 @@ pub fn register(registry: &impl DatabaseProviderRegistry) -> Result<()> {
 // Lazy-clone bootstrap SQL generation (RFC 008)
 // ---------------------------------------------------------------------------
 
-/// The overlay bootstrap template, kept as a real `.sql` file (proper syntax
+/// The copy-on-read bootstrap template, kept as a real `.sql` file (proper syntax
 /// highlighting / linting). `__PLACEHOLDER__` sentinels are substituted by
 /// `build_clone_bootstrap_sql`.
 const CLONE_BOOTSTRAP_TMPL: &str = include_str!("clone_bootstrap.sql");
@@ -711,24 +794,37 @@ fn sql_lit(s: &str) -> String {
 }
 
 /// Build the bootstrap SQL run inside the local GFS database to set up a lazy
-/// (copy-on-read) clone of `remote`, using the **overlay** mechanic.
+/// (copy-on-read) clone of `remote`.
 ///
 /// Installs `postgres_fdw` + `dblink`, imports the remote schema as foreign
-/// tables, and — for each remote table with a single-column primary key —
-/// creates a local store, a delete-tombstone table, an updatable overlay view
-/// (local wins; remote rows only if neither local nor tombstoned), and
-/// `INSTEAD OF` triggers for copy-on-write. No data is copied.
+/// tables (`gfs_remote_*`), and registers each cloned table with the `gfs`
+/// copy-on-read extension. Each cloned table is a REAL local heap (carrying the
+/// source's indexes); the extension's `planner_hook` inspects every query's cold
+/// plan and, per scan on a registered table, serves it locally, hydrates the
+/// matching key range / selective slice, whole-copies a small table, or federates
+/// the query to the source. No data is copied at bootstrap time.
 ///
-/// Correctness is guaranteed by the view (disjoint row sets), independent of
-/// hydration. The mechanic is the one validated by
-/// `docs/rfcs/008-remote-clone/poc-overlay`.
+/// Correctness is the extension's responsibility (it fetches a query's real rows
+/// before execution); a source table without a usable unique key is refused
+/// loudly at registration rather than served empty. See
+/// `crates/extensions/gfs/README.md` for the mechanism — the original overlay-view
+/// design in `docs/rfcs/008-remote-clone.md` was superseded by this planner hook.
 fn build_clone_bootstrap_sql(remote: &RemoteSource) -> String {
     // dblink connection string, used only for read-only introspection of the
     // remote (schema/table/key discovery).
-    let conn = format!(
+    let mut conn = format!(
         "host={} port={} dbname={} user={} password={}",
         remote.host, remote.port, remote.dbname, remote.user, remote.password,
     );
+    if let Some(sslmode) = &remote.sslmode {
+        conn.push_str(&format!(" sslmode={sslmode}"));
+    }
+
+    let sslmode_opt = remote
+        .sslmode
+        .as_ref()
+        .map(|m| format!(", sslmode '{}'", sql_lit(m)))
+        .unwrap_or_default();
 
     // SQL array literal of schemas to mirror, or NULL meaning "all user schemas".
     let schemas_array = if remote.schemas.is_empty() {
@@ -750,6 +846,7 @@ fn build_clone_bootstrap_sql(remote: &RemoteSource) -> String {
         .replace("__RDB__", &sql_lit(&remote.dbname))
         .replace("__RUSER__", &sql_lit(&remote.user))
         .replace("__RPASS__", &sql_lit(&remote.password))
+        .replace("__RSSLMODE_OPT__", &sslmode_opt)
         .replace("__CONN__", &sql_lit(&conn))
         .replace("__SCHEMAS_ARRAY__", &schemas_array)
 }
@@ -848,7 +945,10 @@ mod tests {
         let def = provider.definition();
         assert_eq!(def.args.len(), args.len() * 2);
         assert_eq!(def.args.first(), Some(&"-c".to_string()));
-        assert_eq!(def.args.get(1), Some(&"shared_buffers=32MB".to_string()));
+        // First tuning value binds the listener so the container is reachable via
+        // the k8s Service/NodePort (a fresh initdb otherwise defaults to localhost).
+        assert_eq!(def.args.get(1), Some(&"listen_addresses=*".to_string()));
+        assert!(def.args.contains(&"shared_buffers=32MB".to_string()));
     }
 
     #[test]
@@ -963,6 +1063,27 @@ mod tests {
     }
 
     #[test]
+    fn query_in_instance_command_uses_loopback_and_heredoc() {
+        let provider = PostgresqlProvider::new();
+        let cmd = provider
+            .query_in_instance_command("SELECT 1;", None)
+            .expect("query command");
+        assert!(cmd.contains("127.0.0.1"));
+        assert!(cmd.contains("POSTGRES_USER:-postgres"));
+        assert!(cmd.contains(r#"-d "${POSTGRES_DB:-postgres}""#));
+        assert!(cmd.contains("GFS_SQL_EOF"));
+        assert!(cmd.contains("SELECT 1;"));
+
+        // An explicit database override targets that DB literally.
+        let cmd_db = provider
+            .query_in_instance_command("SELECT 1;", Some("myapp"))
+            .expect("query command");
+        assert!(cmd_db.contains("-d 'myapp'"));
+        assert!(!cmd_db.contains("${POSTGRES_DB"));
+        assert!(!cmd.starts_with("psql postgresql://"));
+    }
+
+    #[test]
     fn schema_extraction_spec_returns_some_with_delimiters() {
         let provider = PostgresqlProvider::new();
         let params = ConnectionParams {
@@ -976,7 +1097,7 @@ mod tests {
         };
         let spec = provider.schema_extraction_spec(&params).unwrap();
         let spec = spec.expect("postgres provider supports schema extraction");
-        assert_eq!(spec.definition.image, "postgres:latest");
+        assert_eq!(spec.definition.image, "gfs-postgres:17");
         assert!(spec.command.contains("GFS_SCHEMA_VERSION"));
         assert!(spec.command.contains("GFS_SCHEMA_SCHEMAS"));
         assert!(spec.command.contains("GFS_SCHEMA_TABLES"));
@@ -985,6 +1106,23 @@ mod tests {
         assert!(spec.command.contains("-h 172.17.0.2"));
         assert!(spec.command.contains("-U myuser"));
         assert!(spec.command.contains("-d mydb"));
+        // The DDL must be dumped to STDOUT (no `-f <file>`) so it survives
+        // runtimes where the sidecar runs on a different host than gfs (k8s).
+        assert!(spec.command.contains("GFS_SCHEMA_DDL"));
+        assert!(spec.command.contains("pg_dump"));
+        assert!(spec.command.contains("--schema-only"));
+        assert!(
+            !spec
+                .command
+                .contains("--schema-only --no-owner --no-privileges -f"),
+            "schema DDL dump must not write to a file"
+        );
+        // The dump must be non-fatal: a pg_dump failure must not nuke the
+        // already-captured metadata (which keeps `schema diff` working).
+        assert!(
+            spec.command.contains("--no-privileges || true"),
+            "schema DDL dump must be non-fatal (|| true)"
+        );
     }
 
     #[test]
@@ -1072,6 +1210,7 @@ mod tests {
             user: "reader".into(),
             password: "p@ss".into(),
             schemas: vec!["public".into()],
+            sslmode: None,
         }
     }
 
@@ -1105,26 +1244,35 @@ mod tests {
                 "IMPORT FOREIGN SCHEMA %I LIMIT TO (%I) FROM SERVER gfs_remote_srv INTO %I"
             )
         );
-        // Resilience hooks: skip un-importable tables / overlays.
+        // Resilience hooks: skip un-importable tables.
         assert!(sql.contains("CREATE EXTENSION IF NOT EXISTS %I"));
         assert!(sql.contains("to_regclass(fq_remote) IS NULL"));
         // dblink introspection connection string is present.
         assert!(
             sql.contains("host=rds.example.com port=5432 dbname=shop user=reader password=p@ss")
         );
-        // No leftover placeholders (the template still legitimately contains the
-        // reserved `gfs_ovl__` / `__deleted` names, so check the tokens directly).
+        // No leftover placeholders — every `__…__` substitution sentinel is gone.
         for ph in [
             "__RHOST__",
             "__RPORT__",
             "__RDB__",
             "__RUSER__",
             "__RPASS__",
+            "__RSSLMODE_OPT__",
             "__CONN__",
             "__SCHEMAS_ARRAY__",
         ] {
             assert!(!sql.contains(ph), "leftover placeholder: {ph}");
         }
+    }
+
+    #[test]
+    fn clone_bootstrap_sql_propagates_sslmode() {
+        let mut remote = sample_remote();
+        remote.sslmode = Some("require".into());
+        let sql = build_clone_bootstrap_sql(&remote);
+        assert!(sql.contains(", sslmode 'require'"));
+        assert!(sql.contains("password=p@ss sslmode=require"));
     }
 
     #[test]

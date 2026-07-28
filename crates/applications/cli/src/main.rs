@@ -23,6 +23,12 @@ fn wants_json(args: &[String]) -> bool {
 
 #[tokio::main]
 async fn main() {
+    // rustls 0.23 requires an explicit process-level CryptoProvider when both
+    // aws-lc-rs and ring are present in the dependency graph (kube pulls one,
+    // other deps pull the other). kube's TLS client defaults to aws-lc-rs, so
+    // install it before any TLS connection is attempted, or rustls panics.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     // Tracing goes to stderr by default. CLI consumers that scrape stderr for
     // error messages can override the level via RUST_LOG to silence INFO logs,
     // or via GFS_LOG to a stricter default. WARN+ERROR always pass through so

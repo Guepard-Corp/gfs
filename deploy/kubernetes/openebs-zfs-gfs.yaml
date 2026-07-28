@@ -1,0 +1,22 @@
+# OpenEBS ZFS CSI storage for GFS (requires zfspv-pool on each node — see docs/k3s-ssm-smoketest.md)
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: openebs-zfs-gfs
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  fstype: zfs
+  poolname: zfspv-pool
+  thinprovision: "yes"
+  recordsize: 128k
+  compression: "off"
+provisioner: zfs.csi.openebs.io
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: openebs-zfs-gfs-snapclass
+driver: zfs.csi.openebs.io
+deletionPolicy: Delete

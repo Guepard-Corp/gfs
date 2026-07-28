@@ -7,14 +7,13 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::model::commit::NewCommit;
-use crate::model::config::GlobalSettings;
+use crate::model::config::{EnvironmentConfig, GlobalSettings, RuntimeConfig};
 use crate::model::layout::GFS_DIR;
 use crate::ports::compute::{Compute, ComputeError, InstanceId, InstanceState};
 use crate::ports::database_provider::{ConnectionParams, DatabaseProviderRegistry};
 use crate::ports::repository::{Repository, RepositoryError};
 use crate::ports::storage::{SnapshotOptions, StorageError, StoragePort, VolumeId};
 use crate::repo_utils::repo_layout;
-use crate::usecases::repository::export_repo_usecase::ExportRepoUseCase;
 use crate::usecases::repository::extract_schema_usecase::ExtractSchemaUseCase;
 use crate::utils::hash::hash_snapshot;
 
@@ -380,18 +379,139 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
             })
             .or_else(|| git_config.email.clone());
 
-        // 2. Extract and store schema (best-effort) while the container is still running.
-        //    Must run before pausing, since schema extraction requires a live database connection.
-        let schema_hash = if runtime_config.is_some() && environment.is_some() {
-            self.extract_and_store_schema(&path).await.ok()
+        // 2. Decide whether schema extraction may overlap the snapshot.
+        //    On runtimes where `pause()` does not freeze the database
+        //    (`db_live_during_snapshot`, e.g. Kubernetes), the read-only schema
+        //    extraction can run concurrently with the snapshot, so commit
+        //    latency is max(schema, snapshot) instead of their sum. On runtimes
+        //    that freeze the database (Docker), the two phases MUST stay
+        //    sequential: schema extraction needs a live connection, so it has to
+        //    finish before the pause. A probe failure falls back to the safe
+        //    sequential path rather than aborting the commit.
+        let db_live_during_snapshot = self
+            .compute
+            .capabilities()
+            .await
+            .map(|caps| caps.db_live_during_snapshot)
+            .unwrap_or(false);
+
+        // The schema arm and the snapshot arm are independent: schema extraction
+        // is a pure reader writing only `.gfs/objects/...`, while the snapshot
+        // captures the data volume. The snapshot consumes nothing the schema arm
+        // produces (`schema_hash` is attached at commit-build, after the
+        // snapshot). The CHECKPOINT -> snapshot ordering stays inside the
+        // snapshot arm regardless of which path runs.
+        let (schema_hash, snapshot_hash) = if db_live_during_snapshot {
+            // Overlap: run both arms to completion, then apply the asymmetry.
+            // `join!` (not `try_join!`) is required because schema extraction is
+            // best-effort while the snapshot is fatal: a failed schema arm must
+            // NOT cancel the in-flight snapshot. A `.gfs/objects` orphan left by
+            // a schema arm that finished while the snapshot failed is harmless —
+            // no ref points to it.
+            let (schema_res, snapshot_res) = tokio::join!(
+                self.maybe_extract_schema(&path, &runtime_config, &environment),
+                self.take_snapshot(
+                    &path,
+                    &runtime_config,
+                    &environment,
+                    mount_point,
+                    db_live_during_snapshot,
+                ),
+            );
+            (schema_res, snapshot_res?)
         } else {
-            None
+            // Sequential: schema extraction must complete before the snapshot
+            // pauses (and thus freezes) the database.
+            let schema_res = self
+                .maybe_extract_schema(&path, &runtime_config, &environment)
+                .await;
+            let snapshot_hash = self
+                .take_snapshot(
+                    &path,
+                    &runtime_config,
+                    &environment,
+                    mount_point,
+                    db_live_during_snapshot,
+                )
+                .await?;
+            (schema_res, snapshot_hash)
         };
 
+        // 5. Build the new commit.
+        //    Use "0" parent when this is the very first real commit.
+        let parents = if parent_commit_id == "0" {
+            None
+        } else {
+            Some(vec![parent_commit_id])
+        };
+
+        let mut new_commit = NewCommit::new(
+            message,
+            resolved_author,
+            resolved_author_email,
+            resolved_committer,
+            resolved_committer_email,
+            snapshot_hash,
+            parents,
+        );
+        new_commit.schema_hash = schema_hash;
+
+        // 6. Persist the commit object and advance the branch ref.
+        let commit_hash = self.repository.commit(&path, new_commit).await?;
+
+        tracing::info!("Commit created: {}", commit_hash);
+        Ok(commit_hash)
+    }
+
+    /// Best-effort schema extraction: extract and store the schema while the
+    /// database is still serving reads, returning the schema hash on success.
+    ///
+    /// Returns `None` when no database is configured or when extraction fails —
+    /// schema capture is never allowed to abort a commit. This is the `A` arm of
+    /// the overlap path; on the sequential path it is awaited before the
+    /// snapshot.
+    async fn maybe_extract_schema(
+        &self,
+        path: &Path,
+        runtime_config: &Option<RuntimeConfig>,
+        environment: &Option<EnvironmentConfig>,
+    ) -> Option<String> {
+        if runtime_config.is_some() && environment.is_some() {
+            self.extract_and_store_schema(path).await.ok()
+        } else {
+            None
+        }
+    }
+
+    /// Prepare, pause, snapshot, and unpause the database volume, returning the
+    /// snapshot hash on success.
+    ///
+    /// This is the `B` arm of the overlap path and the whole snapshot phase on
+    /// the sequential path. It owns the crash-consistency ordering — provider
+    /// CHECKPOINT (`prepare_for_snapshot`) strictly precedes the storage
+    /// snapshot — and always unpauses a paused instance, even on snapshot
+    /// failure. Any partially-written snapshot tree is removed before returning
+    /// an error so the next commit never finds stale state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommitRepoError`] when the provider is unknown, a compute
+    /// operation fails, the storage snapshot fails (without a usable
+    /// `stream_snapshot` fallback), or — under the default safe policy — the
+    /// runtime cannot freeze the database and `GFS_ALLOW_UNFROZEN_SNAPSHOT` is
+    /// not set.
+    async fn take_snapshot(
+        &self,
+        path: &Path,
+        runtime_config: &Option<RuntimeConfig>,
+        environment: &Option<EnvironmentConfig>,
+        mount_point: Option<String>,
+        db_live_during_snapshot: bool,
+    ) -> Result<String, CommitRepoError> {
         // 3. Prepare the database container for snapshotting (if present).
         let mut unpause_guard: Option<UnpauseGuard> = None;
         let mut paused_instance_id: Option<InstanceId> = None;
-        if let (Some(runtime), Some(env)) = (&runtime_config, &environment) {
+        if let (Some(runtime), Some(env)) = (runtime_config, environment) {
             let instance_id = InstanceId(runtime.container_name.clone());
 
             let provider = self.registry.get(&env.database_provider).ok_or_else(|| {
@@ -429,7 +549,25 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                         paused_instance_id = Some(instance_id);
                     }
                     Err(ComputeError::PauseUnsupported(ref e)) => {
-                        if !unfrozen_snapshot_allowed() {
+                        if db_live_during_snapshot {
+                            // This runtime intentionally snapshots a *live* database
+                            // (`db_live_during_snapshot`) because its storage takes an
+                            // atomic, point-in-time snapshot — e.g. Kubernetes + a ZFS
+                            // CSI `VolumeSnapshot`. Combined with the CHECKPOINT already
+                            // issued by `prepare_for_snapshot`, that atomic snapshot is
+                            // crash-consistent WITHOUT freezing: on restore Postgres
+                            // heals any in-flight page write via WAL full-page-writes,
+                            // exactly as after a crash. So `pause()` being unsupported is
+                            // expected here, not an error — and the unfrozen-copy risk
+                            // guarded below only applies to NON-atomic, file-level copies
+                            // (a can't-freeze runtime on file storage), never to this one.
+                            tracing::debug!(
+                                instance = %instance_id,
+                                "pause unsupported but runtime snapshots live via an atomic \
+                                 storage snapshot (CHECKPOINT + atomic snapshot is \
+                                 crash-consistent); proceeding without freeze"
+                            );
+                        } else if !unfrozen_snapshot_allowed() {
                             return Err(CommitRepoError::Compute(ComputeError::PauseUnsupported(
                                 format!(
                                     "{e}. Refusing to snapshot an unfrozen database: \
@@ -445,15 +583,16 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                                      WAL replay on restore"
                                 ),
                             )));
+                        } else {
+                            tracing::warn!(
+                                error = %e,
+                                instance = %instance_id,
+                                "container pause unavailable (cgroup v1 or rootless runtime); \
+                                 proceeding with UNFROZEN snapshot per GFS_ALLOW_UNFROZEN_SNAPSHOT — \
+                                 snapshot is NOT crash-consistent and may contain torn pages and \
+                                 half-applied WAL; restore may require manual recovery"
+                            );
                         }
-                        tracing::warn!(
-                            error = %e,
-                            instance = %instance_id,
-                            "container pause unavailable (cgroup v1 or rootless runtime); \
-                             proceeding with UNFROZEN snapshot per GFS_ALLOW_UNFROZEN_SNAPSHOT — \
-                             snapshot is NOT crash-consistent and may contain torn pages and \
-                             half-applied WAL; restore may require manual recovery"
-                        );
                         // No unpause guard: nothing was paused.
                     }
                     Err(e) => return Err(CommitRepoError::Compute(e)),
@@ -469,7 +608,7 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
         let volume_id = if let Some(mp) = mount_point {
             VolumeId(mp)
         } else {
-            let data_dir = self.repository.get_active_workspace_data_dir(&path).await?;
+            let data_dir = self.repository.get_active_workspace_data_dir(path).await?;
             VolumeId(data_dir.to_string_lossy().into_owned())
         };
 
@@ -480,7 +619,7 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
         // Ensure .gfs/snapshots/<2>/ exists and return the full COW destination path.
         let snapshot_dest = self
             .repository
-            .ensure_snapshot_path(&path, &snapshot_hash)
+            .ensure_snapshot_path(path, &snapshot_hash)
             .await?;
 
         // Prefer fast host-side COW/reflink snapshot (`storage.snapshot`).
@@ -504,7 +643,7 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                     if !storage_error_looks_like_permission_denied(&e) {
                         return Err(CommitRepoError::Storage(e));
                     }
-                    let (Some(runtime), Some(env)) = (&runtime_config, &environment) else {
+                    let (Some(runtime), Some(env)) = (runtime_config, environment) else {
                         return Err(CommitRepoError::Storage(e));
                     };
 
@@ -584,7 +723,7 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                     // Use the canonical workspace path (.gfs/WORKSPACE) rather than volume_id,
                     // because volume_id may point to a custom mount_point that differs from the
                     // path where checkout will look for the marker.
-                    let canonical_ws = self.repository.get_active_workspace_data_dir(&path).await;
+                    let canonical_ws = self.repository.get_active_workspace_data_dir(path).await;
                     if let Ok(ws) = canonical_ws {
                         if let Some(m) = repo_layout::repair_marker_path(&ws) {
                             let _ = std::fs::write(&m, b"");
@@ -649,42 +788,29 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
             return Err(e);
         }
 
-        // 5. Build the new commit.
-        //    Use "0" parent when this is the very first real commit.
-        let parents = if parent_commit_id == "0" {
-            None
-        } else {
-            Some(vec![parent_commit_id])
-        };
-
-        let mut new_commit = NewCommit::new(
-            message,
-            resolved_author,
-            resolved_author_email,
-            resolved_committer,
-            resolved_committer_email,
-            snapshot_hash,
-            parents,
-        );
-        new_commit.schema_hash = schema_hash;
-
-        // 6. Persist the commit object and advance the branch ref.
-        let commit_hash = self.repository.commit(&path, new_commit).await?;
-
-        tracing::info!("Commit created: {}", commit_hash);
-        Ok(commit_hash)
+        Ok(snapshot_hash)
     }
 
     /// Extract and store schema for the current database state.
     /// Returns the schema hash on success, or None if extraction fails.
     /// This is best-effort - failures are logged but don't fail the commit.
+    ///
+    /// Both the schema metadata and the schema-only DDL are captured from a
+    /// SINGLE extraction sidecar's stdout. Stdout is the only channel that
+    /// survives runtimes where the sidecar runs on a different host than the
+    /// repository (e.g. Kubernetes, where the task pod and `.gfs` live on
+    /// separate nodes): a mounted output file the sidecar writes is never
+    /// readable by the gfs process. Routing the DDL through stdout — instead of
+    /// a second `pg_dump -f <file>` sidecar whose file the host then reads —
+    /// fixes schema history on Kubernetes and halves the per-commit sidecar
+    /// cost (one cold start instead of two).
     async fn extract_and_store_schema(
         &self,
         repo_path: &std::path::Path,
     ) -> Result<String, Box<dyn std::error::Error>> {
         tracing::debug!("Extracting schema for commit");
 
-        // 1. Extract schema metadata using ExtractSchemaUseCase.
+        // Extract schema metadata + DDL via a single ExtractSchemaUseCase run.
         let extract_use_case =
             ExtractSchemaUseCase::new(self.compute.clone(), self.registry.clone());
         let schema_output = extract_use_case.run(repo_path).await.map_err(|e| {
@@ -692,43 +818,20 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
             e
         })?;
 
-        // 2. Export schema DDL using ExportRepoUseCase with "schema" format.
-        let export_use_case = ExportRepoUseCase::new(self.compute.clone(), self.registry.clone());
-        let temp_dir = repo_path.join(".gfs").join("tmp").join(format!(
-            "gfs-schema-{}-{}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-        ));
-        std::fs::create_dir_all(temp_dir.parent().unwrap()).map_err(|e| {
-            tracing::warn!("Failed to create temp directory: {}", e);
-            Box::new(std::io::Error::other(format!(
-                "cannot create temp directory: {}",
-                e
-            ))) as Box<dyn std::error::Error>
-        })?;
-        let export_output = export_use_case
-            .run(repo_path, Some(temp_dir.clone()), "schema")
-            .await
-            .map_err(|e| {
-                tracing::warn!("Schema DDL export failed: {}", e);
-                e
-            })?;
-
-        let schema_sql = std::fs::read_to_string(&export_output.file_path).map_err(|e| {
-            tracing::warn!("Failed to read exported schema DDL: {}", e);
+        // Store schema object in repo. The hash is derived from the metadata
+        // (schema.json); the DDL (schema.sql) is stored alongside for `gfs
+        // schema show --ddl`. An empty DDL is acceptable — `schema show`
+        // (metadata) and `schema diff` operate on the metadata and remain
+        // fully functional.
+        let schema_hash = repo_layout::write_schema_object(
+            repo_path,
+            &schema_output.metadata,
+            &schema_output.schema_sql,
+        )
+        .map_err(|e| {
+            tracing::warn!("Failed to write schema object: {}", e);
             e
         })?;
-
-        // 3. Store schema object in repo.
-        let schema_hash =
-            repo_layout::write_schema_object(repo_path, &schema_output.metadata, &schema_sql)
-                .map_err(|e| {
-                    tracing::warn!("Failed to write schema object: {}", e);
-                    e
-                })?;
-
-        // 4. Cleanup temp directory.
-        let _ = std::fs::remove_dir_all(temp_dir);
 
         tracing::info!("Schema stored with hash: {}", schema_hash);
         Ok(schema_hash)
@@ -950,6 +1053,9 @@ mod tests {
         /// When set, `pause()` returns `ComputeError::Internal` with this message
         /// instead of succeeding (simulates cgroup v1 / rootless Podman).
         pause_fails_with: Option<String>,
+        /// Reported via `capabilities()`. `true` models an atomic-snapshot runtime
+        /// (e.g. Kubernetes + ZFS `VolumeSnapshot`) that snapshots a live database.
+        db_live_during_snapshot: bool,
     }
 
     impl Default for MockCompute {
@@ -962,6 +1068,7 @@ mod tests {
                 stream_snapshot_fail_message: Mutex::new(None),
                 stream_snapshot_calls: AtomicUsize::new(0),
                 pause_fails_with: None,
+                db_live_during_snapshot: false,
             }
         }
     }
@@ -1028,6 +1135,15 @@ mod tests {
             _: LogsOptions,
         ) -> crate::ports::compute::Result<Vec<LogEntry>> {
             Ok(vec![])
+        }
+        async fn capabilities(
+            &self,
+        ) -> crate::ports::compute::Result<crate::ports::compute::ComputeCapabilities> {
+            Ok(crate::ports::compute::ComputeCapabilities {
+                supports_stream_snapshot: false,
+                supports_exec_as_root: false,
+                db_live_during_snapshot: self.db_live_during_snapshot,
+            })
         }
         async fn pause(&self, id: &InstanceId) -> crate::ports::compute::Result<InstanceStatus> {
             if let Some(ref msg) = self.pause_fails_with {
@@ -1397,6 +1513,7 @@ mod tests {
                 database_provider: "mock-db".into(),
                 database_version: "16".into(),
                 database_port: None,
+                display_name: None,
             }),
             ..Default::default()
         };
@@ -1468,6 +1585,7 @@ mod tests {
                 database_provider: "mock-db".into(),
                 database_version: "16".into(),
                 database_port: None,
+                display_name: None,
             }),
             ..Default::default()
         };
@@ -1525,6 +1643,7 @@ mod tests {
                 database_provider: "mock-db".into(),
                 database_version: "16".into(),
                 database_port: None,
+                display_name: None,
             }),
             ..Default::default()
         };
@@ -1742,6 +1861,7 @@ mod tests {
                 database_provider: "mock-db".into(),
                 database_version: "16".into(),
                 database_port: None,
+                display_name: None,
             }),
             ..Default::default()
         };
@@ -1879,6 +1999,7 @@ mod tests {
                 database_provider: "mock-db".into(),
                 database_version: "16".into(),
                 database_port: None,
+                display_name: None,
             }),
             ..Default::default()
         };
@@ -1920,6 +2041,69 @@ mod tests {
         );
     }
 
+    /// Kubernetes (and any runtime reporting `db_live_during_snapshot`) takes an
+    /// atomic storage snapshot — a CSI/ZFS `VolumeSnapshot` — that is
+    /// crash-consistent WITHOUT a write-freeze (CHECKPOINT + atomic snapshot;
+    /// Postgres heals torn pages via WAL full-page-writes on restore). So
+    /// `pause()` returning `PauseUnsupported` there is EXPECTED, and the commit
+    /// must proceed WITHOUT `GFS_ALLOW_UNFROZEN_SNAPSHOT` — unlike the
+    /// podman/cgroup-v1 file-copy case, which still refuses.
+    #[tokio::test]
+    async fn commit_proceeds_when_pause_unsupported_on_atomic_snapshot_runtime() {
+        let compute = Arc::new(MockCompute {
+            state: InstanceState::Running,
+            pause_fails_with: Some(
+                "pause is not supported for kubernetes runtime (instance 'gfs-pg-1')".into(),
+            ),
+            db_live_during_snapshot: true,
+            ..Default::default()
+        });
+        let repo = MockRepository {
+            commit_hash: "k8scommit".into(),
+            current_commit: "prev".into(),
+            mount_point: Some("/vol/main".into()),
+            runtime_config: Some(RuntimeConfig {
+                runtime_provider: "kubernetes".into(),
+                runtime_version: "1.30".into(),
+                container_name: "gfs-pg-1".into(),
+            }),
+            environment: Some(EnvironmentConfig {
+                database_provider: "mock-db".into(),
+                database_version: "17".into(),
+                database_port: None,
+                display_name: None,
+            }),
+            ..Default::default()
+        };
+        let storage = Arc::new(MockStorage::new("snap-k8s"));
+        let registry = Arc::new(MockRegistry);
+
+        let uc = CommitRepoUseCase::new(Arc::new(repo), compute.clone(), storage, registry);
+        let result = uc
+            .run(
+                existing_repo_path(),
+                "k8s atomic snapshot commit".into(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "atomic-snapshot runtime must commit without a freeze or the opt-in flag; got: {result:?}"
+        );
+        assert!(
+            !*compute.paused.lock().unwrap(),
+            "pause must not be marked — the runtime reported it unsupported"
+        );
+        assert!(
+            !*compute.unpaused.lock().unwrap(),
+            "unpause must not be called when nothing was paused"
+        );
+    }
+
     /// A genuine pause failure (container not found, daemon error) must still
     /// propagate as an error — only the "unsupported" subset is swallowed.
     #[tokio::test]
@@ -1942,6 +2126,7 @@ mod tests {
                 database_provider: "mock-db".into(),
                 database_version: "16".into(),
                 database_port: None,
+                display_name: None,
             }),
             ..Default::default()
         };
@@ -1964,5 +2149,652 @@ mod tests {
             matches!(result, Err(CommitRepoError::Compute(_))),
             "genuine pause error must propagate: {result:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Overlap optimization: schema extraction concurrent with snapshot.
+    //
+    // These tests drive BOTH commit arms to completion. The schema arm
+    // (`ExtractSchemaUseCase`) reads `.gfs/config.toml` from disk via
+    // `GfsConfig::load`, while the snapshot arm reads config from the
+    // `MockRepository` getters — two independent sources that must agree. The
+    // shared provider therefore satisfies both arms: it returns a
+    // `SchemaExtractionSpec` (schema arm) and a default port +
+    // prepare-for-snapshot commands (snapshot arm).
+    // -----------------------------------------------------------------------
+    mod overlap_tests {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        use async_trait::async_trait;
+        use tokio::sync::Notify;
+
+        use super::{MockRepository, existing_repo_path};
+        use crate::model::config::{EnvironmentConfig, GfsConfig, RuntimeConfig};
+        use crate::ports::compute::{
+            Compute, ComputeCapabilities, ComputeDefinition, ExecOutput, InstanceId, InstanceState,
+            InstanceStatus, LogEntry, LogsOptions, StartOptions,
+        };
+        use crate::ports::database_provider::{
+            ConnectionParams, DatabaseProvider, DatabaseProviderArg, DatabaseProviderRegistry,
+            ProviderError, Result as RegistryResult, SIGTERM, SchemaExtractionSpec,
+            SupportedFeature,
+        };
+        use crate::ports::storage::{
+            CloneOptions, MountStatus, Quota, Snapshot, SnapshotId, SnapshotOptions, StorageError,
+            StoragePort, VolumeId, VolumeStatus,
+        };
+        use crate::usecases::repository::commit_repo_usecase::{
+            CommitRepoError, CommitRepoUseCase,
+        };
+
+        const PROVIDER_NAME: &str = "overlap-db";
+        const CONTAINER_NAME: &str = "overlap-pg";
+
+        /// stdout the schema-extraction `exec` returns so parsing succeeds.
+        const SCHEMA_STDOUT: &str = "GFS_SCHEMA_VERSION\nPostgreSQL 16.0\nGFS_SCHEMA_SCHEMAS\n[]\nGFS_SCHEMA_TABLES\n[]\nGFS_SCHEMA_COLUMNS\n[]";
+
+        /// A pair of rendezvous notifies shared by the two arms to prove they run
+        /// concurrently: each arm signals its own entry and awaits the other's.
+        #[derive(Default)]
+        struct Latch {
+            /// Fired by the snapshot arm on entry; awaited by the schema arm.
+            snapshot_entered: Notify,
+            /// Fired by the schema arm on entry; awaited by the snapshot arm.
+            schema_entered: Notify,
+        }
+
+        // ---------------------------------------------------------------
+        // Compute mock: capability flag + latching/step-counting `exec`.
+        // `status -> Stopped` so the snapshot arm never pauses — snapshot
+        // entry is gated ONLY by the storage rendezvous, never by env flags.
+        // ---------------------------------------------------------------
+        struct OverlapCompute {
+            db_live_during_snapshot: bool,
+            /// Monotonic step counter shared with storage to order the arms.
+            step: Arc<AtomicUsize>,
+            /// Step at which `exec` (schema arm) ran. 0 means never.
+            exec_step: AtomicUsize,
+            /// Optional rendezvous latch (overlap test only).
+            latch: Option<Arc<Latch>>,
+        }
+
+        impl OverlapCompute {
+            fn new(db_live_during_snapshot: bool, step: Arc<AtomicUsize>) -> Self {
+                Self {
+                    db_live_during_snapshot,
+                    step,
+                    exec_step: AtomicUsize::new(0),
+                    latch: None,
+                }
+            }
+
+            fn with_latch(mut self, latch: Arc<Latch>) -> Self {
+                self.latch = Some(latch);
+                self
+            }
+        }
+
+        #[async_trait]
+        impl Compute for OverlapCompute {
+            async fn provision(
+                &self,
+                _: &ComputeDefinition,
+            ) -> crate::ports::compute::Result<InstanceId> {
+                Ok(InstanceId("mock".into()))
+            }
+            async fn start(
+                &self,
+                id: &InstanceId,
+                _: StartOptions,
+            ) -> crate::ports::compute::Result<InstanceStatus> {
+                Ok(running(id))
+            }
+            async fn stop(&self, id: &InstanceId) -> crate::ports::compute::Result<InstanceStatus> {
+                Ok(stopped(id))
+            }
+            async fn restart(
+                &self,
+                id: &InstanceId,
+            ) -> crate::ports::compute::Result<InstanceStatus> {
+                Ok(running(id))
+            }
+            async fn status(
+                &self,
+                id: &InstanceId,
+            ) -> crate::ports::compute::Result<InstanceStatus> {
+                // Stopped → the snapshot arm skips pause/unpause entirely.
+                Ok(stopped(id))
+            }
+            async fn prepare_for_snapshot(
+                &self,
+                _: &InstanceId,
+                _: &[String],
+            ) -> crate::ports::compute::Result<()> {
+                Ok(())
+            }
+            async fn logs(
+                &self,
+                _: &InstanceId,
+                _: LogsOptions,
+            ) -> crate::ports::compute::Result<Vec<LogEntry>> {
+                Ok(vec![])
+            }
+            async fn pause(
+                &self,
+                id: &InstanceId,
+            ) -> crate::ports::compute::Result<InstanceStatus> {
+                Ok(InstanceStatus {
+                    id: id.clone(),
+                    state: InstanceState::Paused,
+                    pid: None,
+                    started_at: None,
+                    exit_code: None,
+                })
+            }
+            async fn unpause(
+                &self,
+                id: &InstanceId,
+            ) -> crate::ports::compute::Result<InstanceStatus> {
+                Ok(running(id))
+            }
+            async fn capabilities(&self) -> crate::ports::compute::Result<ComputeCapabilities> {
+                Ok(ComputeCapabilities {
+                    supports_stream_snapshot: false,
+                    supports_exec_as_root: false,
+                    db_live_during_snapshot: self.db_live_during_snapshot,
+                })
+            }
+            async fn get_connection_info(
+                &self,
+                _: &InstanceId,
+                port: u16,
+            ) -> crate::ports::compute::Result<crate::ports::compute::InstanceConnectionInfo>
+            {
+                Ok(crate::ports::compute::InstanceConnectionInfo {
+                    host: "127.0.0.1".into(),
+                    port,
+                    env: vec![],
+                })
+            }
+            async fn get_task_connection_info(
+                &self,
+                _: &InstanceId,
+                port: u16,
+            ) -> crate::ports::compute::Result<crate::ports::compute::InstanceConnectionInfo>
+            {
+                Ok(crate::ports::compute::InstanceConnectionInfo {
+                    host: "127.0.0.1".into(),
+                    port,
+                    env: vec![],
+                })
+            }
+            async fn get_instance_data_mount_host_path(
+                &self,
+                _: &InstanceId,
+                _: &str,
+            ) -> crate::ports::compute::Result<Option<std::path::PathBuf>> {
+                Ok(None)
+            }
+            async fn remove_instance(&self, _: &InstanceId) -> crate::ports::compute::Result<()> {
+                Ok(())
+            }
+            async fn run_task(
+                &self,
+                _: &ComputeDefinition,
+                _: &str,
+                _: Option<&InstanceId>,
+            ) -> crate::ports::compute::Result<ExecOutput> {
+                Ok(ExecOutput {
+                    exit_code: 0,
+                    stdout: SCHEMA_STDOUT.into(),
+                    stderr: String::new(),
+                })
+            }
+            async fn exec(
+                &self,
+                _: &InstanceId,
+                _: &str,
+                _: Option<&str>,
+            ) -> crate::ports::compute::Result<ExecOutput> {
+                // `exec` is unique to the schema arm — the snapshot arm never
+                // calls it — so it is the schema-side rendezvous point.
+                if let Some(latch) = &self.latch {
+                    latch.schema_entered.notify_one();
+                    latch.snapshot_entered.notified().await;
+                }
+                self.exec_step.store(
+                    self.step.fetch_add(1, Ordering::SeqCst) + 1,
+                    Ordering::SeqCst,
+                );
+                Ok(ExecOutput {
+                    exit_code: 0,
+                    stdout: SCHEMA_STDOUT.into(),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        fn running(id: &InstanceId) -> InstanceStatus {
+            InstanceStatus {
+                id: id.clone(),
+                state: InstanceState::Running,
+                pid: None,
+                started_at: None,
+                exit_code: None,
+            }
+        }
+        fn stopped(id: &InstanceId) -> InstanceStatus {
+            InstanceStatus {
+                id: id.clone(),
+                state: InstanceState::Stopped,
+                pid: None,
+                started_at: None,
+                exit_code: None,
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // Storage mock: latching/step-counting `snapshot` + optional failure.
+        // ---------------------------------------------------------------
+        struct OverlapStorage {
+            step: Arc<AtomicUsize>,
+            /// Step at which `snapshot` ran. 0 means never.
+            snapshot_step: AtomicUsize,
+            latch: Option<Arc<Latch>>,
+            fail: bool,
+        }
+
+        impl OverlapStorage {
+            fn new(step: Arc<AtomicUsize>) -> Self {
+                Self {
+                    step,
+                    snapshot_step: AtomicUsize::new(0),
+                    latch: None,
+                    fail: false,
+                }
+            }
+            fn with_latch(mut self, latch: Arc<Latch>) -> Self {
+                self.latch = Some(latch);
+                self
+            }
+            fn failing(mut self) -> Self {
+                self.fail = true;
+                self
+            }
+        }
+
+        #[async_trait]
+        impl StoragePort for OverlapStorage {
+            async fn mount(
+                &self,
+                _: &VolumeId,
+                _: &std::path::Path,
+            ) -> crate::ports::storage::Result<()> {
+                Ok(())
+            }
+            async fn unmount(&self, _: &VolumeId) -> crate::ports::storage::Result<()> {
+                Ok(())
+            }
+            async fn snapshot(
+                &self,
+                id: &VolumeId,
+                options: SnapshotOptions,
+            ) -> crate::ports::storage::Result<Snapshot> {
+                // `snapshot` is unique to the snapshot arm, so it is the
+                // snapshot-side rendezvous point.
+                if let Some(latch) = &self.latch {
+                    latch.snapshot_entered.notify_one();
+                    latch.schema_entered.notified().await;
+                }
+                self.snapshot_step.store(
+                    self.step.fetch_add(1, Ordering::SeqCst) + 1,
+                    Ordering::SeqCst,
+                );
+                if self.fail {
+                    return Err(StorageError::Internal("snapshot failed".into()));
+                }
+                Ok(Snapshot {
+                    id: SnapshotId("snap".into()),
+                    volume_id: id.clone(),
+                    created_at: chrono::Utc::now(),
+                    size_bytes: 0,
+                    label: options.label,
+                })
+            }
+            async fn clone(
+                &self,
+                _: &VolumeId,
+                target: VolumeId,
+                _: CloneOptions,
+            ) -> crate::ports::storage::Result<VolumeStatus> {
+                Ok(VolumeStatus {
+                    id: target,
+                    mount_point: None,
+                    status: MountStatus::Unmounted,
+                    size_bytes: 0,
+                    used_bytes: 0,
+                })
+            }
+            async fn status(&self, id: &VolumeId) -> crate::ports::storage::Result<VolumeStatus> {
+                Ok(VolumeStatus {
+                    id: id.clone(),
+                    mount_point: None,
+                    status: MountStatus::Unmounted,
+                    size_bytes: 0,
+                    used_bytes: 0,
+                })
+            }
+            async fn quota(&self, id: &VolumeId) -> crate::ports::storage::Result<Quota> {
+                Ok(Quota {
+                    volume_id: id.clone(),
+                    limit_bytes: 0,
+                    used_bytes: 0,
+                    free_bytes: 0,
+                })
+            }
+            async fn finalize_snapshot(
+                &self,
+                _: &std::path::Path,
+            ) -> crate::ports::storage::Result<()> {
+                Ok(())
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // Provider + registry serving BOTH arms.
+        // ---------------------------------------------------------------
+        struct OverlapProvider;
+
+        impl DatabaseProvider for OverlapProvider {
+            fn name(&self) -> &str {
+                PROVIDER_NAME
+            }
+            fn definition(&self) -> ComputeDefinition {
+                ComputeDefinition {
+                    labels: Default::default(),
+                    image: "mock:latest".into(),
+                    env: vec![],
+                    ports: vec![],
+                    data_dir: std::path::PathBuf::from("/data"),
+                    host_data_dir: None,
+                    user: None,
+                    logs_dir: None,
+                    conf_dir: None,
+                    args: vec![],
+                }
+            }
+            fn default_port(&self) -> u16 {
+                5432
+            }
+            fn default_args(&self) -> Vec<DatabaseProviderArg> {
+                vec![]
+            }
+            fn default_signal(&self) -> u32 {
+                SIGTERM
+            }
+            fn connection_string(
+                &self,
+                _: &ConnectionParams,
+            ) -> std::result::Result<String, ProviderError> {
+                Ok("mock://localhost:5432".into())
+            }
+            fn supported_versions(&self) -> Vec<String> {
+                vec!["latest".into()]
+            }
+            fn supported_features(&self) -> Vec<SupportedFeature> {
+                vec![]
+            }
+            fn prepare_for_snapshot(&self, _: &ConnectionParams) -> RegistryResult<Vec<String>> {
+                Ok(vec!["CHECKPOINT".into()])
+            }
+            fn query_client_command(
+                &self,
+                _: &ConnectionParams,
+                _: Option<&str>,
+            ) -> std::result::Result<std::process::Command, ProviderError> {
+                Ok(std::process::Command::new("true"))
+            }
+            fn schema_extraction_spec(
+                &self,
+                _: &ConnectionParams,
+            ) -> std::result::Result<Option<SchemaExtractionSpec>, ProviderError> {
+                Ok(Some(SchemaExtractionSpec {
+                    definition: self.definition(),
+                    command: "echo schema".into(),
+                }))
+            }
+        }
+
+        struct OverlapRegistry;
+
+        impl DatabaseProviderRegistry for OverlapRegistry {
+            fn register(&self, _: Arc<dyn DatabaseProvider>) -> RegistryResult<()> {
+                Ok(())
+            }
+            fn get(&self, name: &str) -> Option<Arc<dyn DatabaseProvider>> {
+                if name == PROVIDER_NAME {
+                    Some(Arc::new(OverlapProvider))
+                } else {
+                    None
+                }
+            }
+            fn list(&self) -> Vec<String> {
+                vec![PROVIDER_NAME.into()]
+            }
+            fn unregister(&self, _: &str) -> Option<Arc<dyn DatabaseProvider>> {
+                None
+            }
+        }
+
+        /// Create a repo on disk whose `.gfs/config.toml` (schema-arm source) and
+        /// `MockRepository` getters (snapshot-arm source) describe the SAME
+        /// provider + container, so both arms run to completion.
+        fn configured_repo() -> (std::path::PathBuf, MockRepository) {
+            let path = existing_repo_path();
+            std::fs::create_dir_all(path.join(".gfs")).expect("create .gfs dir");
+            let environment = EnvironmentConfig {
+                database_provider: PROVIDER_NAME.into(),
+                database_version: "16".into(),
+                database_port: None,
+                display_name: None,
+            };
+            let runtime = RuntimeConfig {
+                runtime_provider: "docker".into(),
+                runtime_version: "24".into(),
+                container_name: CONTAINER_NAME.into(),
+            };
+            // On-disk config: the source the schema arm loads.
+            let config = GfsConfig {
+                mount_point: Some("/vol/main".into()),
+                version: String::new(),
+                description: String::new(),
+                user: None,
+                environment: Some(environment.clone()),
+                runtime: Some(runtime.clone()),
+                storage: None,
+                compute: None,
+            };
+            config.save(&path).expect("save .gfs/config.toml");
+            // MockRepository getters: the source the snapshot arm reads.
+            let repo = MockRepository {
+                commit_hash: "overlap-commit".into(),
+                current_commit: "0".into(),
+                mount_point: Some("/vol/main".into()),
+                runtime_config: Some(runtime),
+                environment: Some(environment),
+                ..Default::default()
+            };
+            (path, repo)
+        }
+
+        /// Sequential proof: with `db_live_during_snapshot = false`, schema
+        /// extraction (`exec`) MUST run strictly before the snapshot. The step
+        /// counter records the order; `exec_step` being non-zero also proves the
+        /// fixture drives the schema arm all the way to `exec` (so the overlap
+        /// test's latch can rely on it firing).
+        #[tokio::test]
+        async fn incapable_runtime_runs_schema_before_snapshot() {
+            let (path, repo) = configured_repo();
+            let step = Arc::new(AtomicUsize::new(0));
+            let compute = Arc::new(OverlapCompute::new(false, step.clone()));
+            let storage = Arc::new(OverlapStorage::new(step.clone()));
+
+            let uc = CommitRepoUseCase::new(
+                Arc::new(repo),
+                compute.clone(),
+                storage.clone(),
+                Arc::new(OverlapRegistry),
+            );
+            let hash = uc
+                .run(path, "sequential".into(), None, None, None, None)
+                .await
+                .expect("commit should succeed");
+
+            assert_eq!(hash, "overlap-commit");
+            let exec_step = compute.exec_step.load(Ordering::SeqCst);
+            let snapshot_step = storage.snapshot_step.load(Ordering::SeqCst);
+            assert!(exec_step > 0, "schema arm must reach exec (fixture sanity)");
+            assert!(
+                snapshot_step > 0,
+                "snapshot arm must reach storage.snapshot"
+            );
+            assert!(
+                exec_step < snapshot_step,
+                "schema extraction (step {exec_step}) must precede snapshot (step {snapshot_step})"
+            );
+        }
+
+        /// Overlap proof (load-bearing): with `db_live_during_snapshot = true`,
+        /// the two arms are `join!`ed. The rendezvous latch makes each arm block
+        /// until the OTHER has started: this completes iff both run concurrently.
+        /// If the code were sequential, the first arm would block forever waiting
+        /// for the second to start, and the `timeout` would elapse. We assert NO
+        /// timeout.
+        #[tokio::test]
+        async fn capable_runtime_overlaps_schema_and_snapshot() {
+            let (path, repo) = configured_repo();
+            let step = Arc::new(AtomicUsize::new(0));
+            let latch = Arc::new(Latch::default());
+            let compute =
+                Arc::new(OverlapCompute::new(true, step.clone()).with_latch(latch.clone()));
+            let storage = Arc::new(OverlapStorage::new(step.clone()).with_latch(latch.clone()));
+
+            let uc =
+                CommitRepoUseCase::new(Arc::new(repo), compute, storage, Arc::new(OverlapRegistry));
+
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(5),
+                uc.run(path, "overlap".into(), None, None, None, None),
+            )
+            .await;
+
+            let hash = outcome
+                .expect("arms must overlap: a sequential commit would deadlock on the latch")
+                .expect("commit should succeed");
+            assert_eq!(hash, "overlap-commit");
+        }
+
+        /// Error asymmetry (a): schema extraction fails, snapshot succeeds → the
+        /// commit still SUCCEEDS with `schema_hash == None`. Schema capture is
+        /// best-effort and never aborts a commit.
+        #[tokio::test]
+        async fn schema_failure_does_not_abort_commit() {
+            let path = existing_repo_path();
+            // No `.gfs/config.toml` on disk → the schema arm fails at config load,
+            // but the snapshot arm still runs from the MockRepository getters.
+            let repo = MockRepository {
+                commit_hash: "schema-failed".into(),
+                current_commit: "0".into(),
+                mount_point: Some("/vol/main".into()),
+                runtime_config: Some(RuntimeConfig {
+                    runtime_provider: "docker".into(),
+                    runtime_version: "24".into(),
+                    container_name: CONTAINER_NAME.into(),
+                }),
+                environment: Some(EnvironmentConfig {
+                    database_provider: PROVIDER_NAME.into(),
+                    database_version: "16".into(),
+                    database_port: None,
+                    display_name: None,
+                }),
+                ..Default::default()
+            };
+            let step = Arc::new(AtomicUsize::new(0));
+            let compute = Arc::new(OverlapCompute::new(true, step.clone()));
+            let storage = Arc::new(OverlapStorage::new(step.clone()));
+
+            let repo_arc = Arc::new(repo);
+            let uc = CommitRepoUseCase::new(
+                repo_arc.clone(),
+                compute,
+                storage,
+                Arc::new(OverlapRegistry),
+            );
+            let hash = uc
+                .run(path, "schema-failed".into(), None, None, None, None)
+                .await
+                .expect("commit should succeed despite schema failure");
+            assert_eq!(hash, "schema-failed");
+
+            let committed = repo_arc.committed.lock().unwrap();
+            let new_commit = committed.as_ref().expect("a commit was recorded");
+            assert!(
+                new_commit.schema_hash.is_none(),
+                "failed schema extraction must yield schema_hash == None"
+            );
+        }
+
+        /// Error asymmetry (b): snapshot fails, schema succeeds → the commit
+        /// FAILS with the storage error and the partial snapshot tree is removed.
+        /// Because the arms are `join!`ed (not `try_join!`ed), the schema object
+        /// is still written even though the snapshot failed — proving the schema
+        /// arm was not cancelled.
+        #[tokio::test]
+        async fn snapshot_failure_aborts_commit_and_cleans_up() {
+            let (path, mut repo) = configured_repo();
+            // Route the snapshot into a tempdir so we can assert it was cleaned.
+            let snapshot_root = existing_repo_path();
+            repo.snapshot_root = Some(snapshot_root.clone());
+
+            let step = Arc::new(AtomicUsize::new(0));
+            let compute = Arc::new(OverlapCompute::new(true, step.clone()));
+            let storage = Arc::new(OverlapStorage::new(step.clone()).failing());
+
+            let uc = CommitRepoUseCase::new(
+                Arc::new(repo),
+                compute.clone(),
+                storage,
+                Arc::new(OverlapRegistry),
+            );
+            let result = uc
+                .run(
+                    path.clone(),
+                    "snapshot-failed".into(),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+
+            assert!(
+                matches!(result, Err(CommitRepoError::Storage(_))),
+                "snapshot failure must abort the commit with a storage error: {result:?}"
+            );
+            // The schema arm completed (join!, not try_join!): exec ran.
+            assert!(
+                compute.exec_step.load(Ordering::SeqCst) > 0,
+                "schema arm must run to completion even when the snapshot fails"
+            );
+            // No partial snapshot tree is left behind.
+            assert!(
+                std::fs::read_dir(&snapshot_root)
+                    .map(|mut entries| entries.next().is_none())
+                    .unwrap_or(true),
+                "partial snapshot must be cleaned up on failure"
+            );
+        }
     }
 }

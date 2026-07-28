@@ -4,6 +4,18 @@ title: Lazy clone of a remote database (copy-on-read overlay)
 status: Accepted
 ---
 
+> **⚠️ Implementation note — the design below was superseded.** The mechanism this
+> RFC describes (an updatable overlay **view** + `INSTEAD OF` triggers) is the
+> *original, accepted* design and is **not** what ships. The shipped implementation
+> is a Postgres **`planner_hook` extension** (`crates/extensions/gfs`): each cloned
+> table is a *real local heap* served lazily by inspecting each query's cold plan
+> per scan (hydrate the matching key range / selective slice, whole-copy a small
+> table, or federate the query to the source). The overlay-view prototype was
+> dropped because a view/storage layer is blind to a query's predicate and would
+> fetch whole tables, defeating multi-TB laziness. **For the actual mechanism, see
+> [`crates/extensions/gfs/README.md`](../../crates/extensions/gfs/README.md).** The
+> rest of this RFC is kept for its requirements, rationale, and history.
+
 ## Summary
 
 Clone a remote PostgreSQL database into GFS **instantly**, without dumping and

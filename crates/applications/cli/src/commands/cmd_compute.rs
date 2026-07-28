@@ -23,6 +23,8 @@ use crate::output::{
     yellow,
 };
 
+use super::compute_support::compute_for_repo;
+
 // ---------------------------------------------------------------------------
 // Entry point called from main
 // ---------------------------------------------------------------------------
@@ -59,9 +61,13 @@ pub async fn run(path: Option<PathBuf>, action: ComputeAction, json_output: bool
     if let ComputeAction::Config { ref key, ref value } = action {
         return handle_config(path, key, value, json_output);
     }
-    let compute = DockerCompute::new().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let id = resolve_id(path.clone(), &action)?;
-    dispatch(&compute, &id, action, path, json_output).await
+    let repo_path = path.clone().unwrap_or_else(get_repo_dir);
+
+    let repository: Arc<dyn gfs_domain::ports::repository::Repository> =
+        Arc::new(gfs_domain::adapters::gfs_repository::GfsRepository::new());
+    let compute = compute_for_repo(&repository, &repo_path).await?;
+    let id = resolve_id(Some(repo_path), &action)?;
+    dispatch_dyn(compute.as_ref(), &id, action, path, json_output).await
 }
 
 fn handle_config(path: Option<PathBuf>, key: &str, value: &str, json_output: bool) -> Result<()> {
@@ -107,8 +113,8 @@ fn handle_config(path: Option<PathBuf>, key: &str, value: &str, json_output: boo
 // Dispatch
 // ---------------------------------------------------------------------------
 
-async fn dispatch(
-    compute: &DockerCompute,
+async fn dispatch_dyn(
+    compute: &dyn Compute,
     id: &str,
     action: ComputeAction,
     path: Option<PathBuf>,
@@ -122,24 +128,24 @@ async fn dispatch(
                 .status(&instance_id)
                 .await
                 .map_err(anyhow::Error::from)?;
-            let data_dir = container_data_dir(compute, &instance_id, path.clone()).await;
+            // Only Docker compute can report bind-mount host paths; k8s returns None.
+            let data_dir: Option<&str> = None;
             if json_output {
-                print_status_json(&status, data_dir.as_deref(), path.as_ref(), None)?;
+                print_status_json(&status, data_dir, path.as_ref(), None)?;
             } else {
-                print_status(&status, data_dir.as_deref(), path.as_ref());
+                print_status(&status, data_dir, path.as_ref());
             }
         }
 
         ComputeAction::Start { .. } => {
-            let repo_path = path.clone().unwrap_or_else(get_repo_dir);
-            let (instance_id, status) =
-                start_restart_or_recreate(compute, &instance_id, &repo_path, false).await?;
-            let data_dir = container_data_dir(compute, &instance_id, path.clone()).await;
+            let _repo_path = path.clone().unwrap_or_else(get_repo_dir);
+            let status = compute.start(&instance_id, Default::default()).await?;
+            let data_dir: Option<&str> = None;
             if json_output {
-                print_status_json(&status, data_dir.as_deref(), path.as_ref(), Some("start"))?;
+                print_status_json(&status, data_dir, path.as_ref(), Some("start"))?;
             } else {
                 println!("{} Compute started", green("✓"));
-                print_status(&status, data_dir.as_deref(), path.as_ref());
+                print_status(&status, data_dir, path.as_ref());
             }
         }
 
@@ -157,15 +163,13 @@ async fn dispatch(
         }
 
         ComputeAction::Restart { .. } => {
-            let repo_path = path.clone().unwrap_or_else(get_repo_dir);
-            let (instance_id, status) =
-                start_restart_or_recreate(compute, &instance_id, &repo_path, true).await?;
-            let data_dir = container_data_dir(compute, &instance_id, path.clone()).await;
+            let status = compute.restart(&instance_id).await?;
+            let data_dir: Option<&str> = None;
             if json_output {
-                print_status_json(&status, data_dir.as_deref(), path.as_ref(), Some("restart"))?;
+                print_status_json(&status, data_dir, path.as_ref(), Some("restart"))?;
             } else {
                 println!("{} Compute restarted", green("✓"));
-                print_status(&status, data_dir.as_deref(), path.as_ref());
+                print_status(&status, data_dir, path.as_ref());
             }
         }
 
@@ -401,6 +405,7 @@ fn truncate_id(id: &str) -> String {
 /// If the container exists and its data bind does not match the active workspace, recreate it
 /// (stop, remove, provision with current active workspace, start, update config). Otherwise start or restart the existing container.
 /// When `restart_if_same` is true (e.g. for `gfs compute restart`), calls restart instead of start when bind matches.
+#[allow(dead_code)]
 async fn start_restart_or_recreate(
     compute: &DockerCompute,
     instance_id: &InstanceId,
@@ -495,6 +500,7 @@ async fn start_restart_or_recreate(
     Ok((new_id, status))
 }
 
+#[allow(dead_code)]
 async fn just_start_or_restart(
     compute: &DockerCompute,
     instance_id: &InstanceId,
@@ -508,6 +514,7 @@ async fn just_start_or_restart(
     Ok((instance_id.clone(), status))
 }
 
+#[allow(dead_code)]
 fn paths_differ(a: &str, b: &str) -> bool {
     let a = std::path::Path::new(a);
     let b = std::path::Path::new(b);
@@ -518,6 +525,7 @@ fn paths_differ(a: &str, b: &str) -> bool {
 }
 
 /// Resolve the container's data bind host path from repo config (database provider) and Docker inspect.
+#[allow(dead_code)]
 async fn container_data_dir(
     compute: &DockerCompute,
     instance_id: &InstanceId,

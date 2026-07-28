@@ -1,0 +1,12 @@
+# Runtime image when no local postgres base is available (extension built via apt+pgrx on VM).
+ARG PG_VERSION=17
+FROM ubuntu:24.04
+ARG PG_VERSION
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "postgresql-${PG_VERSION}" \
+ && rm -rf /var/lib/apt/lists/*
+COPY gfs.so /usr/lib/postgresql/${PG_VERSION}/lib/gfs.so
+COPY gfs.control /usr/share/postgresql/${PG_VERSION}/extension/gfs.control
+COPY gfs--0.0.1.sql /usr/share/postgresql/${PG_VERSION}/extension/gfs--0.0.1.sql
+RUN test -f /usr/lib/postgresql/${PG_VERSION}/lib/gfs.so
+USER postgres

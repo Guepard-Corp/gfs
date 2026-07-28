@@ -74,6 +74,36 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
     ) -> std::result::Result<String, CheckoutRepoError> {
         let revision = revision.trim().to_string();
 
+        // Validate the target ref BEFORE stopping compute — a bad revision must
+        // not leave the database offline (mirrors the k8s checkout path).
+        match &create_branch {
+            Some(branch_name) if branch_name.trim().is_empty() => {
+                return Err(CheckoutRepoError::Repository(
+                    RepositoryError::RevisionNotFound("(empty branch name)".to_string()),
+                ));
+            }
+            Some(_) => {
+                let start_rev = if revision.is_empty() {
+                    "HEAD"
+                } else {
+                    revision.as_str()
+                };
+                if self.repository.rev_parse(&path, start_rev).await? == "0" {
+                    return Err(CheckoutRepoError::Repository(RepositoryError::Internal(
+                        "cannot create branch: start revision has no commits".to_string(),
+                    )));
+                }
+            }
+            None => {
+                if revision.is_empty() {
+                    return Err(CheckoutRepoError::Repository(
+                        RepositoryError::RevisionNotFound("(empty)".to_string()),
+                    ));
+                }
+                self.repository.rev_parse(&path, &revision).await?;
+            }
+        }
+
         let container_id = self
             .repository
             .get_runtime_config(&path)
@@ -182,6 +212,31 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
                 .unwrap_or(definition.image.as_str());
             definition.image = format!("{}:{}", base, environment.database_version);
         }
+        // Re-apply the credentials the data was initialized with, so the recreated
+        // container's startup probe connects as the right role (custom-cred repos
+        // otherwise probe as the provider default and fail to come up).
+        let creds = crate::model::config::RepoCredentials::load(path);
+        if let Some(ref user) = creds.user {
+            for env in &mut definition.env {
+                if env.name.contains("USER") {
+                    env.default = Some(user.clone());
+                }
+            }
+        }
+        if let Some(ref password) = creds.password {
+            for env in &mut definition.env {
+                if env.name.contains("PASSWORD") {
+                    env.default = Some(password.clone());
+                }
+            }
+        }
+        if let Some(ref db) = creds.name {
+            for env in &mut definition.env {
+                if env.name.contains("DB") || env.name.contains("DATABASE") {
+                    env.default = Some(db.clone());
+                }
+            }
+        }
         data_dir::prepare_for_database_provider(provider.name(), &active).map_err(|e| {
             ComputeError::Internal(format!(
                 "failed to prepare data dir '{}': {e}",
@@ -263,23 +318,25 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
             Err(e) => return Err(CheckoutRepoError::Compute(e)),
         }
         let new_id = self.compute.provision(&definition).await?;
-        // Always repair before first start of a new container — the workspace was just
-        // populated from snapshot and ownership may not match the DB process user.
-        self.pre_start_repair_data_dir(
-            &definition,
-            &compute_data_path,
-            repair_target.as_deref(),
-            repair_marker.as_deref(),
-        )
-        .await;
+        // Repair ownership/mode only when a filesystem snapshot was just copied
+        // into this workspace (the `.needs-repair` marker). A read-only snapshot
+        // restore leaves the tree 0400/0500, which the DB process can't write, so
+        // an ephemeral-container `chown -R … && chmod -R 0700` is required first. A
+        // plain branch-switch to an existing, already-writable workspace sets no
+        // marker and needs no repair — skipping it avoids a slow recursive metadata
+        // pass over the bind mount. The pre-start pass (run as root before the DB
+        // starts) is authoritative, so the previous redundant in-container repeat
+        // is dropped.
+        if repair_needed {
+            self.pre_start_repair_data_dir(
+                &definition,
+                &compute_data_path,
+                repair_target.as_deref(),
+                repair_marker.as_deref(),
+            )
+            .await;
+        }
         let _ = self.compute.start(&new_id, Default::default()).await?;
-        // Belt-and-suspenders: also repair inside the running container.
-        self.repair_data_dir_permissions_in_container(
-            &new_id,
-            &compute_data_path,
-            repair_target.as_deref(),
-        )
-        .await;
         self.assert_container_healthy(&new_id, startup_probes)
             .await?;
         let runtime = self
@@ -319,6 +376,7 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
             .unwrap_or(ComputeCapabilities {
                 supports_stream_snapshot: false,
                 supports_exec_as_root: false,
+                db_live_during_snapshot: false,
             });
         // Startup probes are connectivity checks (pg_isready, mysqladmin ping) that do
         // not require root. When exec-as-root is unavailable, run as the container's
@@ -1190,6 +1248,7 @@ mod tests {
                 database_provider: "postgres".into(),
                 database_version: "17".into(),
                 database_port: None,
+                display_name: None,
             }))
         }
         async fn get_user_config(
@@ -1280,6 +1339,7 @@ mod tests {
             Ok(ComputeCapabilities {
                 supports_stream_snapshot: false,
                 supports_exec_as_root: true,
+                db_live_during_snapshot: false,
             })
         }
         async fn exec(
@@ -1566,6 +1626,7 @@ mod tests {
             Ok(ComputeCapabilities {
                 supports_stream_snapshot: false,
                 supports_exec_as_root: false,
+                db_live_during_snapshot: false,
             })
         }
         async fn exec(
@@ -1713,6 +1774,7 @@ mod tests {
             Ok(ComputeCapabilities {
                 supports_stream_snapshot: false,
                 supports_exec_as_root: false,
+                db_live_during_snapshot: false,
             })
         }
         async fn exec(

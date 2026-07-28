@@ -152,6 +152,11 @@ pub struct ExecOutput {
 pub struct ComputeCapabilities {
     pub supports_stream_snapshot: bool,
     pub supports_exec_as_root: bool,
+    /// `true` when `pause()` does not freeze the database, so a read-only exec
+    /// (e.g. schema extraction) may run concurrently with the snapshot without
+    /// observing or perturbing an in-flight freeze. Defaults to `false`, which
+    /// forces the safe, strictly-sequential commit path.
+    pub db_live_during_snapshot: bool,
 }
 
 /// Human-readable description of the connected container runtime.
@@ -312,6 +317,7 @@ pub trait Compute: Send + Sync {
         Ok(ComputeCapabilities {
             supports_stream_snapshot: false,
             supports_exec_as_root: false,
+            db_live_during_snapshot: false,
         })
     }
 
@@ -327,6 +333,23 @@ pub trait Compute: Send + Sync {
     ) -> Result<ExecOutput> {
         Err(ComputeError::Internal(
             "exec not supported by this compute runtime".into(),
+        ))
+    }
+
+    /// Node-local deploy-time credential env vars (`name → value`) for an
+    /// instance — e.g. the admin password the database was provisioned with.
+    ///
+    /// Backend-specific: the docker runtime reads the container's env; the
+    /// kubernetes runtime reads the per-instance credentials Secret. Callers
+    /// (e.g. the tenet PII scan) use this instead of assuming a docker
+    /// container exists, so it works under both compute backends.
+    ///
+    /// # Errors
+    /// Returns [`ComputeError`] when the credentials cannot be read. The
+    /// default is unsupported so backends that cannot resolve them fail loudly.
+    async fn read_deploy_credentials(&self, _id: &InstanceId) -> Result<Vec<(String, String)>> {
+        Err(ComputeError::Internal(
+            "read_deploy_credentials not supported by this compute runtime".into(),
         ))
     }
 

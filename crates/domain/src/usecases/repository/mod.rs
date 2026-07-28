@@ -1,9 +1,11 @@
 pub mod checkout_repo_usecase;
 pub mod clone_repo_usecase;
 pub mod commit_repo_usecase;
+pub mod execute_query_usecase;
 pub mod export_repo_usecase;
 pub mod extract_schema_usecase;
 pub mod import_repo_usecase;
 pub mod init_repo_usecase;
 pub mod log_repo_usecase;
 pub mod status_repo_usecase;
+mod task_image;

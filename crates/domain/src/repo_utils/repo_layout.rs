@@ -970,6 +970,18 @@ fn collect_branch_refs(dir: &Path, prefix: &str) -> Result<Vec<(String, String)>
     Ok(result)
 }
 
+/// List every branch in `refs/heads/` as `(branch_name, tip_commit_hash)` pairs.
+///
+/// Returns an empty vec when the heads directory is absent (fresh repo with no
+/// committed branch refs yet) rather than erroring.
+pub fn list_branches(repo_path: &Path) -> Result<Vec<(String, String)>, RepoError> {
+    let refs_dir = repo_path.join(GFS_DIR).join(REFS_DIR).join(HEADS_DIR);
+    if !refs_dir.exists() {
+        return Ok(Vec::new());
+    }
+    collect_branch_refs(&refs_dir, "")
+}
+
 /// Returns the list of ref names pointing to the given commit hash.
 ///
 /// For each branch in `refs/heads/` whose tip equals `commit_hash`, includes the branch name.

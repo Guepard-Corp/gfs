@@ -1,0 +1,22 @@
+# Runtime-only image: gfs extension artifacts are built on the host/VM (cargo pgrx).
+# Usage (after pgrx install):
+#   docker build --pull=false -f Dockerfile.runtime \
+#     --build-arg PG_VERSION=17 \
+#     --build-arg BASE_IMAGE=postgres:17 \
+#     --build-context ext=/usr/lib/postgresql/17/lib \
+#     -t gfs-postgres:17 .
+#
+# Or use build_gfs_postgres_on_vm() which handles paths automatically.
+
+ARG PG_VERSION=17
+ARG BASE_IMAGE=postgres:17
+FROM ${BASE_IMAGE}
+
+ARG PG_VERSION
+USER root
+COPY gfs.so /usr/lib/postgresql/${PG_VERSION}/lib/gfs.so
+COPY gfs.control /usr/share/postgresql/${PG_VERSION}/extension/gfs.control
+COPY gfs--0.0.1.sql /usr/share/postgresql/${PG_VERSION}/extension/gfs--0.0.1.sql
+RUN test -f /usr/lib/postgresql/${PG_VERSION}/lib/gfs.so \
+ && test -f /usr/share/postgresql/${PG_VERSION}/extension/gfs.control
+USER postgres

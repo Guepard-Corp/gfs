@@ -26,4 +26,8 @@ target
 .claude/
 .wrangler/
 
+# Local architecture reference (not versioned)
+docs/k3s-architecture.md
+docs/k3s-architecture.docx
+
 lcov.info
