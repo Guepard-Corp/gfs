@@ -1,12 +1,14 @@
 //! Integration: `ManageUsersUseCase` grant / revoke / list_privileges run inside
-//! a real Postgres container — the live proof for RFC 007 story 003. This drives
-//! the REAL use case through the REAL `DockerCompute` (not the mock harness), so
-//! it exercises resolve(.gfs) → provider SQL → `Compute::exec` → engine → map.
+//! a real Postgres container — the live proof for the object-level grant work.
+//! This drives the REAL use case through the REAL `DockerCompute` (not the mock
+//! harness), so it exercises resolve(.gfs) → provider SQL → `Compute::exec` →
+//! engine → map.
 //!
 //! Run: `GFS_DOCKER_IT=1 cargo test -p gfs-compute-docker --test manage_users_it -- --nocapture`
 
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use gfs_compute_docker::DockerCompute;
@@ -18,7 +20,44 @@ use gfs_domain::model::db_user::{
 use gfs_domain::ports::database_provider::InMemoryDatabaseProviderRegistry;
 use gfs_domain::usecases::repository::manage_users_usecase::ManageUsersUseCase;
 
-const CONTAINER: &str = "gfs-it-manage-users";
+/// A container name unique to each call (pid + counter) so tests never collide,
+/// whether run in parallel or back-to-back within one test binary.
+fn unique_container() -> String {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    format!(
+        "gfs-it-manage-users-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Owns a throwaway `postgres:17` container and removes it on drop, so a failed
+/// assertion (panic unwind) can never leak the container.
+struct Postgres {
+    container: String,
+}
+
+impl Postgres {
+    fn start() -> Self {
+        let container = unique_container();
+        start_postgres(&container);
+        Self { container }
+    }
+
+    fn psql(&self, sql: &str) -> String {
+        psql(&self.container, sql)
+    }
+
+    fn name(&self) -> &str {
+        &self.container
+    }
+}
+
+impl Drop for Postgres {
+    fn drop(&mut self) {
+        stop_postgres(&self.container);
+    }
+}
 
 fn docker_ok() -> bool {
     std::env::var("GFS_DOCKER_IT").ok().as_deref() == Some("1")
@@ -54,24 +93,22 @@ fn write_repo(path: &std::path::Path, container: &str) {
 }
 
 /// Independent verification: run scalar SQL directly via `docker exec` psql.
-fn psql(sql: &str) -> String {
+fn psql(container: &str, sql: &str) -> String {
     let out = Command::new("docker")
-        .args(["exec", CONTAINER, "psql", "-U", "postgres", "-tAc", sql])
+        .args(["exec", container, "psql", "-U", "postgres", "-tAc", sql])
         .output()
         .expect("docker exec psql");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-fn start_postgres() {
-    let _ = Command::new("docker")
-        .args(["rm", "-f", CONTAINER])
-        .output();
+fn start_postgres(container: &str) {
+    let _ = Command::new("docker").args(["rm", "-f", container]).output();
     let status = Command::new("docker")
         .args([
             "run",
             "-d",
             "--name",
-            CONTAINER,
+            container,
             "-e",
             "POSTGRES_PASSWORD=postgres",
             "postgres:17",
@@ -80,33 +117,45 @@ fn start_postgres() {
         .expect("docker run");
     assert!(status.success(), "docker run postgres:17 failed");
 
+    // Gate on a real `SELECT 1` over the SAME channel the use case uses —
+    // TCP `-h 127.0.0.1` with the password — not the unix socket. The postgres
+    // image runs a temporary socket-only server during init, so a socket probe
+    // (or `pg_isready`) reports ready while TCP is still refused; the use case
+    // connects over TCP and would race "connection refused" / "starting up".
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let ok = Command::new("docker")
+        let ready = Command::new("docker")
             .args([
                 "exec",
-                CONTAINER,
-                "pg_isready",
+                "-e",
+                "PGPASSWORD=postgres",
+                container,
+                "psql",
+                "-h",
+                "127.0.0.1",
                 "-U",
                 "postgres",
                 "-d",
                 "postgres",
+                "-tAc",
+                "SELECT 1",
             ])
-            .status()
-            .map(|s| s.success())
+            .output()
+            .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "1")
             .unwrap_or(false);
-        if ok {
+        if ready {
             break;
         }
-        assert!(Instant::now() < deadline, "postgres did not become ready");
+        assert!(
+            Instant::now() < deadline,
+            "postgres did not accept queries in time"
+        );
         std::thread::sleep(Duration::from_millis(500));
     }
 }
 
-fn stop_postgres() {
-    let _ = Command::new("docker")
-        .args(["rm", "-f", CONTAINER])
-        .output();
+fn stop_postgres(container: &str) {
+    let _ = Command::new("docker").args(["rm", "-f", container]).output();
 }
 
 #[tokio::test]
@@ -116,13 +165,13 @@ async fn grant_revoke_list_through_real_usecase() {
         return;
     }
 
-    start_postgres();
+    let pg = Postgres::start();
     // Fixtures: a client role + a table to grant on.
-    psql("CREATE ROLE app_ro; CREATE TABLE public.t(id int);");
+    pg.psql("CREATE ROLE app_ro; CREATE TABLE public.t(id int);");
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path();
-    write_repo(repo, CONTAINER);
+    write_repo(repo, pg.name());
 
     let compute = Arc::new(DockerCompute::new().expect("docker compute"));
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
@@ -147,7 +196,7 @@ async fn grant_revoke_list_through_real_usecase() {
     )
     .await
     .expect("uc.grant");
-    let after_grant = psql("SELECT has_table_privilege('app_ro','public.t','SELECT')");
+    let after_grant = pg.psql("SELECT has_table_privilege('app_ro','public.t','SELECT')");
 
     // LIST via the real use case — parses the live engine catalog JSON into
     // Vec<ObjectPrivilege> (the 4-way UNION projection end-to-end).
@@ -171,11 +220,10 @@ async fn grant_revoke_list_through_real_usecase() {
     )
     .await
     .expect("uc.revoke");
-    let after_revoke = psql("SELECT has_table_privilege('app_ro','public.t','SELECT')");
+    let after_revoke = pg.psql("SELECT has_table_privilege('app_ro','public.t','SELECT')");
 
-    // Clean up BEFORE asserting so a failed assert never leaks the container.
-    stop_postgres();
-
+    // The container is removed by `pg`'s Drop on scope exit — including on a
+    // failed assertion below (panic unwind), so nothing leaks either way.
     assert_eq!(after_grant, "t", "SELECT must be granted after uc.grant");
     assert!(
         has_select,
@@ -186,11 +234,11 @@ async fn grant_revoke_list_through_real_usecase() {
 
 /// A preset's `ALTER DEFAULT PRIVILEGES` must be role-scoped to the deploy
 /// `owner` so a preset user automatically sees tables the OWNER creates LATER —
-/// not just the tables that existed at create time. This is the RFC-007 preset
-/// hardening: `create_role` with `default_privileges_owner: Some("owner")` emits
-/// `... FOR ROLE "owner" ...`. The `reader_self` role (owner `None`) is the
-/// control: without `FOR ROLE`, a preset only covers the connecting admin's
-/// future objects, so it must NOT see the owner's future table.
+/// not just the tables that existed at create time: `create_role` with
+/// `default_privileges_owner: Some("owner")` emits `... FOR ROLE "owner" ...`.
+/// The `reader_self` role (owner `None`) is the control: without `FOR ROLE`, a
+/// preset only covers the connecting admin's future objects, so it must NOT see
+/// the owner's future table.
 #[tokio::test]
 async fn preset_default_privileges_follow_owner_future_objects() {
     if !docker_ok() {
@@ -198,14 +246,14 @@ async fn preset_default_privileges_follow_owner_future_objects() {
         return;
     }
 
-    start_postgres();
-    // The customer's object-creating role (RFC 009 deploy owner), with CREATE on
-    // `public` so it can make tables of its own.
-    psql("CREATE ROLE owner LOGIN; GRANT CREATE ON SCHEMA public TO owner;");
+    let pg = Postgres::start();
+    // The customer's object-creating deploy owner, with CREATE on `public` so it
+    // can make tables of its own.
+    pg.psql("CREATE ROLE owner LOGIN; GRANT CREATE ON SCHEMA public TO owner;");
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path();
-    write_repo(repo, CONTAINER);
+    write_repo(repo, pg.name());
 
     let compute = Arc::new(DockerCompute::new().expect("docker compute"));
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
@@ -240,14 +288,11 @@ async fn preset_default_privileges_follow_owner_future_objects() {
     .expect("create reader_self");
 
     // The OWNER creates a FUTURE table (after both presets were applied).
-    psql("SET ROLE owner; CREATE TABLE public.future_t(id int); RESET ROLE;");
+    pg.psql("SET ROLE owner; CREATE TABLE public.future_t(id int); RESET ROLE;");
 
-    let reader_sees = psql("SELECT has_table_privilege('reader','public.future_t','SELECT')");
+    let reader_sees = pg.psql("SELECT has_table_privilege('reader','public.future_t','SELECT')");
     let reader_self_sees =
-        psql("SELECT has_table_privilege('reader_self','public.future_t','SELECT')");
-
-    // Clean up BEFORE asserting so a failed assert never leaks the container.
-    stop_postgres();
+        pg.psql("SELECT has_table_privilege('reader_self','public.future_t','SELECT')");
 
     assert_eq!(
         reader_sees, "t",
@@ -270,15 +315,15 @@ async fn apply_preset_downgrade_revokes_write_privileges() {
         return;
     }
 
-    start_postgres();
+    let pg = Postgres::start();
     // Owner + a pre-existing table the presets act on.
-    psql(
+    pg.psql(
         "CREATE ROLE owner LOGIN; GRANT CREATE ON SCHEMA public TO owner; CREATE TABLE public.t(id int);",
     );
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path();
-    write_repo(repo, CONTAINER);
+    write_repo(repo, pg.name());
 
     let compute = Arc::new(DockerCompute::new().expect("docker compute"));
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
@@ -297,15 +342,13 @@ async fn apply_preset_downgrade_revokes_write_privileges() {
     )
     .await
     .expect("create readwrite");
-    let insert_before = psql("SELECT has_table_privilege('u','public.t','INSERT')");
+    let insert_before = pg.psql("SELECT has_table_privilege('u','public.t','INSERT')");
 
     uc.apply_preset(repo, "u", RolePreset::Readonly, Some("owner"))
         .await
         .expect("apply readonly");
-    let insert_after = psql("SELECT has_table_privilege('u','public.t','INSERT')");
-    let select_after = psql("SELECT has_table_privilege('u','public.t','SELECT')");
-
-    stop_postgres();
+    let insert_after = pg.psql("SELECT has_table_privilege('u','public.t','INSERT')");
+    let select_after = pg.psql("SELECT has_table_privilege('u','public.t','SELECT')");
 
     assert_eq!(insert_before, "t", "readwrite preset must grant INSERT");
     assert_eq!(
