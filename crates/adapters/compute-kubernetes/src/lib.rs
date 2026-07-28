@@ -673,6 +673,17 @@ impl KubernetesCompute {
     /// not-ready pod fails the WebSocket upgrade with `400 Bad Request`.
     async fn wait_ready_pod_name(&self, instance: &str) -> Result<String> {
         use std::time::{Duration, Instant};
+        // Fast-fail if the instance is stopped (StatefulSet scaled to zero): no pod
+        // exists and none is coming, so don't burn the full deadline hanging and
+        // then return a misleading "not Ready" error. Tell the caller to resume it.
+        if let Ok(ss) = self.api_statefulsets().get(instance).await
+            && ss.spec.as_ref().and_then(|s| s.replicas) == Some(0)
+        {
+            return Err(ComputeError::Internal(format!(
+                "instance '{instance}' is stopped (scaled to zero); resume it \
+                 (e.g. `gfs compute start`) before running this operation"
+            )));
+        }
         let api = self.api_pods();
         let lp = ListParams::default().labels(&format!("{INSTANCE_LABEL_KEY}={instance}"));
         let deadline = Instant::now() + Duration::from_secs(120);
