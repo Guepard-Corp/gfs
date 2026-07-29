@@ -170,6 +170,7 @@ CREATE TABLE gfs.source_table_baseline (
     writes   bigint NOT NULL DEFAULT 0,  -- n_tup_ins+upd+del on the source
     live_tup bigint NOT NULL DEFAULT 0,  -- n_live_tup: catches TRUNCATE, which moves no counter
     src_fp   text,                       -- digest of the SOURCE table's columns
+    src_cfp  text,                       -- digest of the SOURCE table's constraints (separate: see relation_cons_fp)
     ft_fp    text,                       -- digest of our FOREIGN TABLE declaration
     loc_fp   text                        -- digest of our LOCAL table
 );
@@ -195,6 +196,17 @@ CREATE FUNCTION gfs.relation_fp(p_rel regclass) RETURNS text LANGUAGE sql STABLE
       FROM pg_attribute a
      WHERE a.attrelid = p_rel AND a.attnum > 0 AND NOT a.attisdropped;
 $$;
+
+-- Constraints, hashed SEPARATELY from columns. They cannot live in relation_fp:
+-- that digest is also compared against our imported FOREIGN table, and a foreign
+-- table never carries constraints, so folding them in made every table look
+-- permanently mismatched. FOREIGN KEYS are excluded because the clone bootstrap
+-- drops them so lazy per-table fetching never trips referential integrity.
+CREATE FUNCTION gfs.relation_cons_fp(p_rel regclass) RETURNS text LANGUAGE sql STABLE AS $$
+    SELECT md5(COALESCE((SELECT string_agg(pg_get_constraintdef(c.oid), ',' ORDER BY pg_get_constraintdef(c.oid))
+                           FROM pg_constraint c
+                          WHERE c.conrelid = p_rel AND c.contype IN ('c','u','p','x')), ''));
+$$;
 COMMENT ON FUNCTION gfs.relation_fp(regclass) IS 'Column digest of a relation (comparable across clone and source)';
 
 -- ONE round trip returning WAL position + per-table counters + schema digests.
@@ -218,13 +230,18 @@ BEGIN
         'schema', COALESCE((SELECT json_agg(y) FROM (
               SELECT n.nspname AS s, c.relname AS r,
                      md5(string_agg(a.attname || ':' || format_type(a.atttypid, a.atttypmod)
-                                    || ':' || a.attnotnull::text, ',' ORDER BY a.attnum)) AS fp
+                                    || ':' || a.attnotnull::text, ',' ORDER BY a.attnum)) AS fp,
+                     md5(COALESCE((SELECT string_agg(k.def, ',' ORDER BY k.def)
+                                     FROM (SELECT pg_get_constraintdef(con.oid) AS def
+                                             FROM pg_constraint con
+                                            WHERE con.conrelid = c.oid
+                                              AND con.contype IN ('c','u','p','x')) k), '')) AS cfp
                 FROM pg_class c
                 JOIN pg_namespace n ON n.oid = c.relnamespace
                 JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
                WHERE c.relkind IN ('r','p')
                  AND n.nspname NOT IN ('pg_catalog','information_schema')
-               GROUP BY 1,2) y), '[]'::json)
+               GROUP BY 1,2, c.oid) y), '[]'::json)
       )::text
     $q$) AS d(probe text);
     RETURN t::jsonb;
@@ -254,9 +271,9 @@ BEGIN
     INSERT INTO gfs.source_baseline(lsn) VALUES (p->>'lsn');
 
     DELETE FROM gfs.source_table_baseline;
-    INSERT INTO gfs.source_table_baseline(relid, writes, live_tup, src_fp, ft_fp, loc_fp)
+    INSERT INTO gfs.source_table_baseline(relid, writes, live_tup, src_fp, src_cfp, ft_fp, loc_fp)
     SELECT m.relid,
-           COALESCE(st.w, 0), COALESCE(st.l, 0), sc.fp,
+           COALESCE(st.w, 0), COALESCE(st.l, 0), sc.fp, sc.cfp,
            gfs.relation_fp(m.ftrel), gfs.relation_fp(m.relid)
       FROM gfs.source_map m
       LEFT JOIN LATERAL (
@@ -264,7 +281,7 @@ BEGIN
               FROM jsonb_array_elements(p->'tables') e
              WHERE e->>'s' = m.src_schema AND e->>'r' = m.src_table) st ON true
       LEFT JOIN LATERAL (
-            SELECT e->>'fp' AS fp
+            SELECT e->>'fp' AS fp, e->>'cfp' AS cfp
               FROM jsonb_array_elements(p->'schema') e
              WHERE e->>'s' = m.src_schema AND e->>'r' = m.src_table) sc ON true;
 END;
@@ -319,9 +336,9 @@ BEGIN
     INSERT INTO gfs_drift_now(kind, src_table, detail)
     SELECT d.kind, q.tbl, d.detail FROM (
         SELECT m.src_schema || '.' || m.src_table AS tbl,
-               b.writes, b.live_tup, b.src_fp,
+               b.writes, b.live_tup, b.src_fp, b.src_cfp,
                COALESCE(st.w, 0) AS w_now, COALESCE(st.l, 0) AS l_now,
-               sc.fp AS fp_now,
+               sc.fp AS fp_now, sc.cfp AS cfp_now,
                gfs.relation_fp(m.ftrel) AS ft_fp_now
           FROM gfs.source_table_baseline b
           JOIN gfs.source_map m ON m.relid = b.relid
@@ -330,7 +347,7 @@ BEGIN
                   FROM jsonb_array_elements(p->'tables') e
                  WHERE e->>'s' = m.src_schema AND e->>'r' = m.src_table) st ON true
           LEFT JOIN LATERAL (
-                SELECT e->>'fp' AS fp
+                SELECT e->>'fp' AS fp, e->>'cfp' AS cfp
                   FROM jsonb_array_elements(p->'schema') e
                  WHERE e->>'s' = m.src_schema AND e->>'r' = m.src_table) sc ON true
     ) q
@@ -341,7 +358,9 @@ BEGIN
                           q.writes, q.w_now, q.live_tup, q.l_now) END),
         ('schema',
          CASE WHEN q.fp_now IS DISTINCT FROM q.src_fp
-              THEN 'the source table''s columns changed since clone time' END),
+              THEN 'the source table''s columns changed since clone time'
+              WHEN q.cfp_now IS DISTINCT FROM q.src_cfp
+              THEN 'the source table''s constraints changed since clone time' END),
         -- NOTE (measured): a column mismatch does NOT break federation wholesale.
         -- postgres_fdw only sends the columns a query actually references, so
         -- count(*) still succeeds while SELECT * or any reference to a changed
@@ -922,6 +941,31 @@ BEGIN
             END;
         END LOOP;
     END IF;
+
+    -- Constraints the source has and we do not. Applying one can legitimately fail
+    -- when rows already stored locally violate it (a CHECK added upstream after
+    -- this clone diverged), which is a conflict for the user to resolve, not
+    -- something to force -- so report it rather than dropping their rows.
+    FOR c IN
+        SELECT d.def FROM dblink('gfs_remote_srv', format($q$
+            SELECT pg_get_constraintdef(con.oid)
+              FROM pg_constraint con
+              JOIN pg_class cl ON cl.oid = con.conrelid
+              JOIN pg_namespace nsp ON nsp.oid = cl.relnamespace
+             WHERE nsp.nspname = %L AND cl.relname = %L
+               AND con.contype IN ('c','u','x')
+        $q$, m.src_schema, m.src_table)) AS d(def text)
+    LOOP
+        CONTINUE WHEN EXISTS (SELECT 1 FROM pg_constraint lc
+                               WHERE lc.conrelid = p_relid
+                                 AND pg_get_constraintdef(lc.oid) = c.def);
+        BEGIN
+            EXECUTE format('ALTER TABLE %s ADD %s', p_relid::text, c.def);
+        EXCEPTION WHEN others THEN
+            RETURN format('conflict: the source added %s but the rows already in this clone do not satisfy it (%s)',
+                          c.def, SQLERRM);
+        END;
+    END LOOP;
 
     -- the shape changed, so whatever was copied is no longer a faithful copy
     PERFORM gfs.resync_table(p_relid);
