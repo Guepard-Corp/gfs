@@ -100,6 +100,16 @@ pub async fn fetch(path: Option<PathBuf>, check: bool, json_output: bool) -> Res
     )
     .await?;
 
+    // findings that belong to no registered table (a new table on the source,
+    // movement nothing accounts for) live in gfs.drift_notes, not drift_state
+    let notes_raw = run_sql(
+        &repo,
+        "SELECT kind, subject, COALESCE(detail,'') FROM gfs.drift_notes ORDER BY kind, subject",
+    )
+    .await
+    .unwrap_or_default();
+    let notes = rows(&notes_raw);
+
     let all = rows(&raw);
     let changed: Vec<&Vec<String>> = all.iter().filter(|r| r[1] == "true").collect();
     let conflicts = changed.iter().filter(|r| r[3] == "true").count();
@@ -127,7 +137,7 @@ pub async fn fetch(path: Option<PathBuf>, check: bool, json_output: bool) -> Res
         return Ok(());
     }
 
-    if changed.is_empty() {
+    if changed.is_empty() && notes.is_empty() {
         println!(
             "  {} source unchanged {}",
             green("✓"),
@@ -155,6 +165,18 @@ pub async fn fetch(path: Option<PathBuf>, check: bool, json_output: bool) -> Res
         println!();
         println!("  {}", dimmed("reads of these tables go to the source, so they are"));
         println!("  {}", dimmed("correct but slower. run `gfs pull` to make them local again."));
+    }
+
+    for n in &notes {
+        let label = match n[0].as_str() {
+            "new_table" => "new table",
+            "unattributed" => "unattributed",
+            _ => "unaccounted",
+        };
+        println!("    {} {}", yellow(label), cyan(&n[1]));
+        if !n[2].is_empty() {
+            println!("      {}", dimmed(&n[2]));
+        }
     }
 
     if !check && !last_checked.is_empty() {

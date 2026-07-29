@@ -355,7 +355,27 @@ BEGIN
     -- Only BASELINE-RELATIVE findings explain this WAL movement. 'schema_mismatch'
     -- is a STANDING hazard (source vs our foreign table), which persists across
     -- checks and would otherwise mask a genuinely unattributed change.
-    SELECT count(*) INTO attributed FROM gfs_drift_now g WHERE g.kind IN ('data','schema');
+    -- Tables created on the source after clone time are not registered here, so
+    -- nothing else in this function looks at them: the clone simply does not know
+    -- they exist and a query gets a bare "relation does not exist". Worse, creating
+    -- one moves the WAL without touching any tracked counter, so it used to trip
+    -- the unattributed blanket below and mark every COPIED table suspect -- a false
+    -- positive about tables that had not changed at all.
+    --
+    -- Scoped to schemas the clone already mirrors: a clone made with ?schema=a,b
+    -- deliberately excludes the rest, and those are not "new".
+    INSERT INTO gfs_drift_now(kind, src_table, detail)
+    SELECT 'new_table', e->>'s' || '.' || (e->>'r'),
+           'created on the source after clone time; this clone does not have it (re-clone to include it)'
+      FROM jsonb_array_elements(p->'schema') e
+     WHERE (e->>'s') IN (SELECT DISTINCT src_schema FROM gfs.source_map)
+       AND NOT EXISTS (SELECT 1 FROM gfs.source_map m
+                        WHERE m.src_schema = e->>'s' AND m.src_table = e->>'r');
+
+    -- 'new_table' counts as attribution: it explains the WAL movement, so the
+    -- blanket below must not also fire and call unrelated tables suspect.
+    SELECT count(*) INTO attributed FROM gfs_drift_now g
+     WHERE g.kind IN ('data','schema','new_table');
 
     -- Attribution is never PROOF that the WAL movement is fully explained: we
     -- cannot map WAL bytes to tables, and several real changes move no counter at
@@ -414,6 +434,18 @@ CREATE TABLE gfs.drift_state (
 );
 COMMENT ON TABLE gfs.drift_state IS 'Per-table "is the local copy stale?" verdict, read by the planner hook';
 
+-- Findings that belong to NO registered table: a table created on the source, or
+-- movement nothing accounts for. gfs.drift_state is keyed by relid and joined to
+-- source_map, so anything not registered has nowhere to live there and would stay
+-- invisible to `gfs fetch` no matter how well it was detected.
+CREATE TABLE gfs.drift_notes (
+    kind     text NOT NULL,
+    subject  text NOT NULL,
+    detail   text,
+    noted_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+COMMENT ON TABLE gfs.drift_notes IS 'Drift findings not attached to a registered table (new source tables, unaccounted movement)';
+
 -- Recompute the verdict from the source. One round trip (gfs.source_drift).
 -- 'unattributed' means the source moved but no table accounts for it, so EVERY
 -- materialized table is marked suspect: failing safe is the entire point.
@@ -462,6 +494,12 @@ BEGIN
             PERFORM gfs.repair_schema(r.relid);
         END LOOP;
     END IF;
+
+    -- keep the non-table findings too, so `gfs fetch` can show them locally
+    DELETE FROM gfs.drift_notes;
+    INSERT INTO gfs.drift_notes(kind, subject, detail)
+    SELECT g.kind, g.src_table, g.detail FROM gfs_drift_scan g
+     WHERE g.kind IN ('new_table','unattributed','unaccounted');
 
     SELECT count(*) INTO n FROM gfs.drift_state WHERE drifted;
     RETURN n;
