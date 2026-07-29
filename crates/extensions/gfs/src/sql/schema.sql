@@ -311,8 +311,9 @@ BEGIN
         RETURN;   -- provably untouched: this clone is a consistent point in time
     END IF;
 
-    CREATE TEMP TABLE IF NOT EXISTS gfs_drift_now (
-        kind text, src_table text, detail text) ON COMMIT DROP;
+    IF to_regclass('pg_temp.gfs_drift_now') IS NULL THEN
+        CREATE TEMP TABLE gfs_drift_now (kind text, src_table text, detail text) ON COMMIT DROP;
+    END IF;
     DELETE FROM gfs_drift_now;
 
     INSERT INTO gfs_drift_now(kind, src_table, detail)
@@ -356,13 +357,23 @@ BEGIN
     -- checks and would otherwise mask a genuinely unattributed change.
     SELECT count(*) INTO attributed FROM gfs_drift_now g WHERE g.kind IN ('data','schema');
 
+    -- Attribution is never PROOF that the WAL movement is fully explained: we
+    -- cannot map WAL bytes to tables, and several real changes move no counter at
+    -- all (a sequence advancing, an enum gaining a label, a table rewrite). Making
+    -- this conditional on `attributed = 0` meant such a change was hidden whenever
+    -- ANY other table happened to move -- i.e. it stopped working precisely on a
+    -- busy source. Report it on its own terms instead.
     IF attributed = 0 THEN
-        -- WAL moved but nothing accounts for it. TRUNCATE and table rewrites
-        -- move no row counter, so this is NOT "nothing changed": treat every
-        -- materialized table as suspect. Failing safe is the whole point.
+        -- nothing at all accounts for the movement: every copied table is suspect
         INSERT INTO gfs_drift_now(kind, src_table, detail)
         VALUES ('unattributed', '(all materialized tables)',
                 format('source moved (WAL %s -> %s) but no table accounts for it; treat every copied table as suspect', base, cur));
+    ELSE
+        -- something is explained, but the rest may not be. Lower severity: it does
+        -- not mark tables suspect, it tells the user what to run to be sure.
+        INSERT INTO gfs_drift_now(kind, src_table, detail)
+        VALUES ('unaccounted', '(objects without row counters)',
+                format('source moved (WAL %s -> %s); %s table(s) explain part of it. Sequences, enum labels and rewrites move no counter -- run `gfs pull` to re-sync them', base, cur, attributed));
     END IF;
 
     RAISE WARNING 'gfs: the source changed since this clone was created (WAL % -> %). This clone may mix data from different points in time.', base, cur;
@@ -409,7 +420,13 @@ COMMENT ON TABLE gfs.drift_state IS 'Per-table "is the local copy stale?" verdic
 CREATE FUNCTION gfs.refresh_drift_state() RETURNS int LANGUAGE plpgsql AS $$
 DECLARE n int; blanket boolean; r record;
 BEGIN
-    CREATE TEMP TABLE IF NOT EXISTS gfs_drift_scan(kind text, src_table text, detail text) ON COMMIT DROP;
+    -- Only create it when it is genuinely absent: CREATE ... IF NOT EXISTS still
+    -- raises a NOTICE when the relation is already there, and gfs.pull() calls
+    -- this twice in one transaction, so a successful command printed a warning
+    -- that looked like something had gone wrong.
+    IF to_regclass('pg_temp.gfs_drift_scan') IS NULL THEN
+        CREATE TEMP TABLE gfs_drift_scan(kind text, src_table text, detail text) ON COMMIT DROP;
+    END IF;
     DELETE FROM gfs_drift_scan;
     INSERT INTO gfs_drift_scan SELECT * FROM gfs.source_drift();
 
@@ -519,6 +536,14 @@ BEGIN
         RETURN NEXT;
     END LOOP;
 
+    -- Enum labels first: a table whose type cannot represent a fetched value is
+    -- unreadable outright, so this has to be repaired before anything refetches.
+    FOR r IN SELECT * FROM gfs.resync_enums() LOOP
+        action := 'enum'; tbl := r.typ;
+        detail := format('added label %s from the source', r.added);
+        RETURN NEXT;
+    END LOOP;
+
     -- Sequences drift silently: nothing reads them, so no row counter moves, yet a
     -- clone whose counter is behind its own fetched rows fails the next insert with
     -- a duplicate key. Re-sync as part of pull, and report it like any other repair.
@@ -610,6 +635,79 @@ CREATE FUNCTION gfs.relation_diverged_sql(p_relid regclass) RETURNS boolean LANG
     SELECT COALESCE((SELECT has_local_writes FROM gfs.clone_source WHERE relid = p_relid), false)
         OR EXISTS (SELECT 1 FROM gfs.tombstone WHERE relid = p_relid);
 $$;
+
+-- ENUM RE-SYNC ----------------------------------------------------------------
+-- Enum types are mirrored once, at clone time. When the source gains a label the
+-- clone's copy of the type cannot represent it, and fetching ANY row of a table
+-- using that type fails -- not just the new row:
+--
+--   ERROR:  invalid input value for enum mood: "excited"
+--
+-- Nothing detects it either: adding an enum label is DDL on a TYPE, so it moves
+-- no row counter and does not change any table's column list.
+--
+-- Add the labels the source has and we do not, preserving the source's ordering
+-- by inserting each one AFTER the label that precedes it there. Only ever adds:
+-- a label the clone has and the source does not is left alone, since removing it
+-- could invalidate rows already stored locally.
+--
+-- Note ALTER TYPE ... ADD VALUE may run inside a transaction (PG12+), but the new
+-- label cannot be USED until that transaction commits. This is called from
+-- gfs.pull(), which only resets catalog state and never fetches rows, so the
+-- label is committed and usable well before the next read needs it.
+CREATE FUNCTION gfs.resync_enums()
+RETURNS TABLE(typ text, added text) LANGUAGE plpgsql AS $$
+DECLARE r record; lbl record; prev text; have boolean;
+BEGIN
+    FOR r IN
+        SELECT n.nspname AS nsp, t.typname AS tname, format('%I.%I', n.nspname, t.typname) AS fq
+          FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+         WHERE t.typtype = 'e'
+           AND n.nspname NOT IN ('pg_catalog','information_schema','gfs','gfs_sync')
+         ORDER BY 1, 2
+    LOOP
+        prev := NULL;
+        FOR lbl IN
+            SELECT * FROM dblink('gfs_remote_srv', format($q$
+                SELECT e.enumlabel::text
+                  FROM pg_enum e
+                  JOIN pg_type t ON t.oid = e.enumtypid
+                  JOIN pg_namespace n ON n.oid = t.typnamespace
+                 WHERE n.nspname = %L AND t.typname = %L
+                 ORDER BY e.enumsortorder
+            $q$, r.nsp, r.tname)) AS s(label text)
+        LOOP
+            SELECT EXISTS (SELECT 1 FROM pg_enum e
+                             JOIN pg_type t2 ON t2.oid = e.enumtypid
+                             JOIN pg_namespace n2 ON n2.oid = t2.typnamespace
+                            WHERE n2.nspname = r.nsp AND t2.typname = r.tname
+                              AND e.enumlabel = lbl.label) INTO have;
+            IF NOT have THEN
+                BEGIN
+                    IF prev IS NULL THEN
+                        EXECUTE format('ALTER TYPE %s ADD VALUE %L BEFORE %L',
+                                       r.fq, lbl.label,
+                                       (SELECT e.enumlabel FROM pg_enum e
+                                          JOIN pg_type t3 ON t3.oid = e.enumtypid
+                                          JOIN pg_namespace n3 ON n3.oid = t3.typnamespace
+                                         WHERE n3.nspname = r.nsp AND t3.typname = r.tname
+                                         ORDER BY e.enumsortorder LIMIT 1));
+                    ELSE
+                        EXECUTE format('ALTER TYPE %s ADD VALUE %L AFTER %L', r.fq, lbl.label, prev);
+                    END IF;
+                    typ := r.fq; added := lbl.label; RETURN NEXT;
+                EXCEPTION WHEN others THEN
+                    typ := r.fq; added := format('FAILED %s (%s)', lbl.label, SQLERRM);
+                    RETURN NEXT;
+                END;
+            END IF;
+            prev := lbl.label;
+        END LOOP;
+    END LOOP;
+END;
+$$;
+COMMENT ON FUNCTION gfs.resync_enums() IS
+  'Add enum labels the source has gained since clone time (never removes), so fetched rows using them are representable';
 
 -- SEQUENCE RE-SYNC ------------------------------------------------------------
 -- Sequence positions are replicated ONCE, at clone time. The source keeps
@@ -734,7 +832,9 @@ BEGIN
     SELECT * INTO m FROM gfs.source_map WHERE relid = p_relid;
     IF m.relid IS NULL THEN RETURN 'conflict: not a registered clone table'; END IF;
 
-    CREATE TEMP TABLE IF NOT EXISTS gfs_srccols(colname text, coltype text) ON COMMIT DROP;
+    IF to_regclass('pg_temp.gfs_srccols') IS NULL THEN
+        CREATE TEMP TABLE gfs_srccols(colname text, coltype text) ON COMMIT DROP;
+    END IF;
     DELETE FROM gfs_srccols;
     BEGIN
         INSERT INTO gfs_srccols SELECT * FROM gfs.source_columns(m.src_schema, m.src_table);

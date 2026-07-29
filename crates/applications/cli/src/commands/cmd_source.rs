@@ -276,7 +276,7 @@ pub async fn pull(
     }
 
     println!();
-    for r in actions.iter().filter(|r| r[0] == "schema" || r[0] == "sequence") {
+    for r in actions.iter().filter(|r| r[0] == "schema" || r[0] == "sequence" || r[0] == "enum") {
         println!("  {} {} {}", green("✓"), cyan(&r[1]), dimmed(&r[2]));
     }
     if actions.is_empty() {
