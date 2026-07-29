@@ -519,6 +519,15 @@ BEGIN
         RETURN NEXT;
     END LOOP;
 
+    -- Sequences drift silently: nothing reads them, so no row counter moves, yet a
+    -- clone whose counter is behind its own fetched rows fails the next insert with
+    -- a duplicate key. Re-sync as part of pull, and report it like any other repair.
+    FOR r IN SELECT * FROM gfs.resync_sequences() LOOP
+        action := 'sequence'; tbl := r.seq;
+        detail := format('advanced %s -> %s to match the source', r.was, r.now_at);
+        RETURN NEXT;
+    END LOOP;
+
     -- Advance the GLOBAL WAL marker ONLY when nothing was skipped.
     --
     -- Why advance at all: otherwise the marker stays at clone time forever, so
@@ -601,6 +610,56 @@ CREATE FUNCTION gfs.relation_diverged_sql(p_relid regclass) RETURNS boolean LANG
     SELECT COALESCE((SELECT has_local_writes FROM gfs.clone_source WHERE relid = p_relid), false)
         OR EXISTS (SELECT 1 FROM gfs.tombstone WHERE relid = p_relid);
 $$;
+
+-- SEQUENCE RE-SYNC ------------------------------------------------------------
+-- Sequence positions are replicated ONCE, at clone time. The source keeps
+-- consuming ids, so the clone's counter falls behind, and once the table's rows
+-- are (re)fetched the clone holds rows whose ids are ABOVE its own sequence. The
+-- next local insert then collides:
+--
+--   ERROR:  duplicate key value violates unique constraint "items_pkey"
+--   DETAIL:  Key (id)=(102) already exists.
+--
+-- which reads like an application bug rather than clone drift.
+--
+-- Advance each local sequence to at least the source's position. Deliberately
+-- monotonic: a clone that has consumed ids of its own must never be wound BACK,
+-- or it would hand out ids it has already used. Reads the source through the
+-- existing gfs_remote_srv server, so no credentials are duplicated (unlike the
+-- bootstrap's replicate_sequences, which needs a connection string).
+--
+-- Returns one row per sequence it moved.
+CREATE FUNCTION gfs.resync_sequences()
+RETURNS TABLE(seq text, was bigint, now_at bigint) LANGUAGE plpgsql AS $$
+DECLARE r record; src record; local_last bigint; local_called boolean;
+BEGIN
+    FOR r IN
+        SELECT n.nspname AS nsp, c.relname AS rel, format('%I.%I', n.nspname, c.relname) AS fq
+          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE c.relkind = 'S' AND n.nspname NOT IN ('pg_catalog','information_schema','gfs','gfs_sync')
+         ORDER BY 1, 2
+    LOOP
+        BEGIN
+            SELECT * INTO src FROM dblink('gfs_remote_srv',
+                format('SELECT last_value, is_called FROM %s', r.fq))
+              AS t(last_value bigint, is_called boolean);
+        EXCEPTION WHEN others THEN
+            CONTINUE;   -- sequence absent on the source (local-only): leave it alone
+        END;
+        CONTINUE WHEN src.last_value IS NULL;
+
+        EXECUTE format('SELECT last_value, is_called FROM %s', r.fq) INTO local_last, local_called;
+        -- only ever move FORWARD
+        CONTINUE WHEN local_last >= src.last_value;
+
+        PERFORM setval(r.fq::regclass, src.last_value, src.is_called);
+        seq := r.fq; was := local_last; now_at := src.last_value;
+        RETURN NEXT;
+    END LOOP;
+END;
+$$;
+COMMENT ON FUNCTION gfs.resync_sequences() IS
+  'Advance local sequences to the source''s positions (never backwards), so local inserts do not collide with fetched rows';
 
 -- SIZE RE-VERIFICATION --------------------------------------------------------
 -- source_rows is captured ONCE at clone time and drives the copy-vs-ask decision.

@@ -258,6 +258,7 @@ pub async fn pull(
     let actions = rows(&raw);
 
     let reset = actions.iter().filter(|r| r[0] == "reset").count();
+    let seqs = actions.iter().filter(|r| r[0] == "sequence").count();
     let conflicts: Vec<&Vec<String>> = actions.iter().filter(|r| r[0] == "conflict").collect();
 
     if json_output {
@@ -275,7 +276,7 @@ pub async fn pull(
     }
 
     println!();
-    for r in actions.iter().filter(|r| r[0] == "schema") {
+    for r in actions.iter().filter(|r| r[0] == "schema" || r[0] == "sequence") {
         println!("  {} {} {}", green("✓"), cyan(&r[1]), dimmed(&r[2]));
     }
     if actions.is_empty() {
@@ -284,6 +285,12 @@ pub async fn pull(
         return Ok(());
     }
 
+    if seqs > 0 && reset == 0 {
+        println!(
+            "    {}",
+            dimmed("local inserts would otherwise have collided with rows fetched from the source")
+        );
+    }
     if reset > 0 {
         println!(
             "  {} {} table(s) back on the lazy path",
