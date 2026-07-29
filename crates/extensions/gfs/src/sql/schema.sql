@@ -383,13 +383,32 @@ BEGIN
     --
     -- Scoped to schemas the clone already mirrors: a clone made with ?schema=a,b
     -- deliberately excludes the rest, and those are not "new".
+    --
+    -- "New" means NOT PRESENT LOCALLY, which is not the same as "absent from
+    -- gfs.source_map". A PARTITIONED PARENT (relkind='p') is replayed onto the
+    -- clone by the faithful dump but is deliberately never registered for
+    -- copy-on-read: it stores no rows of its own, and a query on it prunes to the
+    -- leaf partitions, which ARE registered. gfs.source_map is built from
+    -- clone_source JOIN pg_foreign_table, so a parent can never appear in it, and
+    -- matching on source_map alone reported every partitioned parent as a brand
+    -- new table on every check, forever, against a completely unchanged source.
+    --
+    -- That was not merely noise: 'new_table' counts as attribution just below, so
+    -- a permanent phantom finding kept `attributed` non-zero and the unattributed
+    -- blanket could never fire. On a partitioned clone that MASKED real drift that
+    -- nothing else could account for.
+    --
+    -- Testing local presence instead is both narrower and more honest, and it
+    -- still reports what it should: a genuinely new table (and a genuinely new
+    -- leaf partition, which the dump never created here) has no local relation.
     INSERT INTO gfs_drift_now(kind, src_table, detail)
     SELECT 'new_table', e->>'s' || '.' || (e->>'r'),
            'created on the source after clone time; this clone does not have it (re-clone to include it)'
       FROM jsonb_array_elements(p->'schema') e
      WHERE (e->>'s') IN (SELECT DISTINCT src_schema FROM gfs.source_map)
        AND NOT EXISTS (SELECT 1 FROM gfs.source_map m
-                        WHERE m.src_schema = e->>'s' AND m.src_table = e->>'r');
+                        WHERE m.src_schema = e->>'s' AND m.src_table = e->>'r')
+       AND to_regclass(quote_ident(e->>'s') || '.' || quote_ident(e->>'r')) IS NULL;
 
     -- 'new_table' counts as attribution: it explains the WAL movement, so the
     -- blanket below must not also fire and call unrelated tables suspect.
@@ -512,6 +531,24 @@ BEGIN
             -- for the user, exactly as gfs.pull() reports it
             PERFORM gfs.repair_schema(r.relid);
         END LOOP;
+
+        -- Adopt new partitions / inheritance children here too, not only on an
+        -- explicit pull. Every other kind of drift makes the clone LOUD: a column
+        -- change raises, a data change federates. A missing partition is the one
+        -- case that stays quiet, because the parent still answers and simply
+        -- returns fewer rows than the source has. Leaving that until someone
+        -- happens to run a pull means a clone that is silently short in the
+        -- meantime, which is the failure mode this whole guard exists to prevent.
+        --
+        -- Adding a partition is an ADDITIVE source schema change, which is exactly
+        -- what autoschema opts into, and adoption never writes to the source and
+        -- never touches rows the user already has.
+        --
+        -- Gated on a new_table finding so the ordinary quiet case does not pay for
+        -- an extra source round trip on every background check.
+        IF EXISTS (SELECT 1 FROM gfs_drift_scan WHERE kind = 'new_table') THEN
+            PERFORM gfs.adopt_source_tables();
+        END IF;
     END IF;
 
     -- keep the non-table findings too, so `gfs fetch` can show them locally
@@ -525,6 +562,187 @@ BEGIN
 END;
 $$;
 COMMENT ON FUNCTION gfs.refresh_drift_state() IS 'Recompute the per-table stale verdict the hook reads; returns how many tables are stale';
+
+-- Adopt tables that appeared on the source UNDERNEATH A PARENT THIS CLONE ALREADY
+-- HAS: new partitions of a partitioned table, and new INHERITS children.
+--
+-- These go wrong in a way an ordinary new table does not. A brand new table at
+-- least errors with "relation does not exist" when somebody reads it, so the gap
+-- announces itself. A new partition or child is reached THROUGH a parent the
+-- clone already serves, so the query SUCCEEDS and quietly returns fewer rows: the
+-- clone answers 3 where the source has 5, with nothing to say the answer is short.
+--
+-- Only children of an ALREADY CLONED parent are adopted. A standalone new table
+-- still reports "re-clone to include it": reproducing arbitrary DDL (indexes,
+-- defaults, triggers, grants) is the clone bootstrap's job, whereas a partition
+-- takes its whole shape from its parent and needs only the partition bound.
+--
+-- The adopted table is created EMPTY and registered for copy-on-read, so the very
+-- next read hydrates it from the source through the ordinary lazy path. Nothing
+-- is ever written to the source.
+CREATE FUNCTION gfs.adopt_source_tables()
+RETURNS TABLE(tbl text, detail text) LANGUAGE plpgsql AS $$
+DECLARE
+    r        record;
+    col      record;
+    p        jsonb;
+    local_fq text;
+    ft_fq    text;
+    ftnsp    text;
+    newrel   regclass;
+BEGIN
+    p := gfs.source_probe();
+
+    FOR r IN
+        SELECT * FROM dblink('gfs_remote_srv', $q$
+            SELECT n.nspname::text, c.relname::text, c.relispartition,
+                   pn.nspname::text, pc.relname::text,
+                   CASE WHEN c.relispartition
+                        THEN pg_get_expr(c.relpartbound, c.oid) END,
+                   (SELECT a.attname::text
+                      FROM pg_index i2
+                      JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = i2.indkey[0]
+                     WHERE i2.indrelid = c.oid AND i2.indisunique AND i2.indimmediate
+                       AND i2.indpred IS NULL AND 0 <> ALL (i2.indkey::int[])
+                     ORDER BY i2.indisprimary DESC, i2.indnkeyatts ASC, i2.indexrelid
+                     LIMIT 1)
+              FROM pg_class c
+              JOIN pg_namespace n  ON n.oid = c.relnamespace
+              JOIN pg_inherits ih  ON ih.inhrelid = c.oid
+              JOIN pg_class pc     ON pc.oid = ih.inhparent
+              JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+             WHERE c.relkind = 'r'
+               AND n.nspname NOT IN ('pg_catalog','information_schema')
+        $q$) AS d(nsp text, tab text, is_part boolean,
+                  pnsp text, ptab text, bound text, keycol text)
+    LOOP
+        local_fq := format('%I.%I', r.nsp, r.tab);
+        CONTINUE WHEN to_regclass(local_fq) IS NOT NULL;              -- already here
+        CONTINUE WHEN to_regclass(format('%I.%I', r.pnsp, r.ptab)) IS NULL;  -- parent not cloned
+        -- a clone made with ?schema=a,b deliberately excludes the rest
+        CONTINUE WHEN r.nsp NOT IN (SELECT DISTINCT src_schema FROM gfs.source_map);
+
+        IF r.keycol IS NULL THEN
+            tbl := r.nsp || '.' || r.tab;
+            detail := 'not adopted: no usable unique key on the source, so it cannot be registered for copy-on-read';
+            RETURN NEXT; CONTINUE;
+        END IF;
+
+        ftnsp := 'gfs_remote_' || r.nsp;
+        ft_fq := format('%I.%I', ftnsp, r.tab);
+        BEGIN
+            EXECUTE format('IMPORT FOREIGN SCHEMA %I LIMIT TO (%I) FROM SERVER gfs_remote_srv INTO %I',
+                           r.nsp, r.tab, ftnsp);
+        EXCEPTION WHEN others THEN
+            tbl := r.nsp || '.' || r.tab;
+            detail := format('not adopted: could not import the foreign table (%s)', SQLERRM);
+            RETURN NEXT; CONTINUE;
+        END;
+
+        BEGIN
+            IF r.is_part THEN
+                -- the shape comes from the parent; only the bound is ours to supply
+                EXECUTE format('CREATE TABLE %s PARTITION OF %I.%I %s',
+                               local_fq, r.pnsp, r.ptab, r.bound);
+            ELSE
+                EXECUTE format('CREATE TABLE %s () INHERITS (%I.%I)', local_fq, r.pnsp, r.ptab);
+                -- columns the child adds on top of what it inherits
+                FOR col IN
+                    SELECT a.attname, format_type(a.atttypid, a.atttypmod) AS typ
+                      FROM pg_attribute a
+                     WHERE a.attrelid = ft_fq::regclass AND a.attnum > 0 AND NOT a.attisdropped
+                       AND NOT EXISTS (SELECT 1 FROM pg_attribute la
+                                        WHERE la.attrelid = local_fq::regclass
+                                          AND la.attnum > 0 AND NOT la.attisdropped
+                                          AND la.attname = a.attname)
+                LOOP
+                    EXECUTE format('ALTER TABLE %s ADD COLUMN %I %s', local_fq, col.attname, col.typ);
+                END LOOP;
+                -- copy-on-read needs a unique key of its own, and INHERITS does NOT
+                -- carry the parent's primary key down to the child
+                EXECUTE format('ALTER TABLE %s ADD PRIMARY KEY (%I)', local_fq, r.keycol);
+            END IF;
+        EXCEPTION WHEN others THEN
+            EXECUTE format('DROP FOREIGN TABLE IF EXISTS %s', ft_fq);
+            tbl := r.nsp || '.' || r.tab;
+            detail := format('not adopted: could not create it locally (%s)', SQLERRM);
+            RETURN NEXT; CONTINUE;
+        END;
+
+        newrel := local_fq::regclass;
+        PERFORM gfs.register_clone(newrel, ft_fq, r.keycol);
+
+        -- Anchor a baseline NOW. gfs.source_drift() compares per table by joining
+        -- source_table_baseline, so a registered table with no baseline row would
+        -- never be drift-checked again: adopted once, then never noticed changing.
+        INSERT INTO gfs.source_table_baseline(relid, writes, live_tup, src_fp, src_cfp, ft_fp, loc_fp)
+        SELECT newrel, COALESCE(st.w, 0), COALESCE(st.l, 0), sc.fp, sc.cfp,
+               gfs.relation_fp(ft_fq::regclass), gfs.relation_fp(newrel)
+          FROM (SELECT 1) z
+          LEFT JOIN LATERAL (
+                SELECT (e->>'w')::bigint AS w, (e->>'l')::bigint AS l
+                  FROM jsonb_array_elements(p->'tables') e
+                 WHERE e->>'s' = r.nsp AND e->>'r' = r.tab) st ON true
+          LEFT JOIN LATERAL (
+                SELECT e->>'fp' AS fp, e->>'cfp' AS cfp
+                  FROM jsonb_array_elements(p->'schema') e
+                 WHERE e->>'s' = r.nsp AND e->>'r' = r.tab) sc ON true;
+
+        tbl := r.nsp || '.' || r.tab;
+        detail := format('adopted as a %s of %I.%I; next read fetches its rows',
+                         CASE WHEN r.is_part THEN 'partition' ELSE 'child' END, r.pnsp, r.ptab);
+        RETURN NEXT;
+    END LOOP;
+END;
+$$;
+COMMENT ON FUNCTION gfs.adopt_source_tables() IS 'Adopt new partitions / INHERITS children of an already cloned parent, registered lazily';
+
+-- A matview on the clone is a LOCAL object computed from the clone's own tables,
+-- and those tables are copy-on-read. So a REFRESH here reads current source data
+-- through the ordinary lazy path: no separate fetch of the matview is needed, and
+-- nothing has to be copied from the source's stored matview contents.
+--
+-- Refreshed in dependency order (a matview built on another matview goes last),
+-- otherwise a nested matview would be recomputed from its parent's stale contents
+-- and stay one pull behind.
+CREATE FUNCTION gfs.refresh_clone_matviews()
+RETURNS TABLE(mv text, detail text) LANGUAGE plpgsql AS $$
+DECLARE r record;
+BEGIN
+    FOR r IN
+        WITH RECURSIVE m AS (
+            SELECT c.oid FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE c.relkind = 'm' AND n.nspname NOT IN ('pg_catalog','information_schema')
+        ),
+        edge AS (   -- a matview -> the matview it reads
+            SELECT DISTINCT rw.ev_class AS child, d.refobjid AS parent
+              FROM pg_rewrite rw
+              JOIN pg_depend d ON d.objid = rw.oid AND d.classid = 'pg_rewrite'::regclass
+             WHERE d.refobjid <> rw.ev_class
+               AND d.refobjid IN (SELECT oid FROM m)
+               AND rw.ev_class IN (SELECT oid FROM m)
+        ),
+        lvl AS (
+            SELECT oid, 0 AS depth FROM m WHERE oid NOT IN (SELECT child FROM edge)
+            UNION ALL
+            SELECT e.child, l.depth + 1 FROM edge e JOIN lvl l ON l.oid = e.parent
+        )
+        SELECT oid::regclass::text AS fq, max(depth) AS depth
+          FROM lvl GROUP BY 1 ORDER BY 2, 1
+    LOOP
+        BEGIN
+            EXECUTE format('REFRESH MATERIALIZED VIEW %s', r.fq);
+            mv := r.fq; detail := 'recomputed from this clone''s tables';
+        EXCEPTION WHEN others THEN
+            -- e.g. a base table still blocked by an unresolved schema conflict
+            mv := r.fq; detail := format('could not refresh (%s)', SQLERRM);
+        END;
+        RETURN NEXT;
+    END LOOP;
+END;
+$$;
+COMMENT ON FUNCTION gfs.refresh_clone_matviews() IS 'Recompute local matviews from the clone tables, in dependency order';
 
 -- gfs pull: put stale tables BACK ON THE LAZY PATH.
 -- It copies nothing itself. It clears the cached state so the table looks
@@ -547,6 +765,15 @@ BEGIN
     -- point, so it becomes the new "accounted for up to here" marker at the end.
     seen := gfs.source_lsn();
     PERFORM gfs.refresh_drift_state();
+
+    -- Adopt new partitions / inheritance children FIRST. They are reached through
+    -- a parent this clone already serves, so until they exist locally the parent
+    -- silently answers with fewer rows than the source has. Doing it before the
+    -- reset loop also means an adopted table is in place for everything below.
+    FOR r IN SELECT * FROM gfs.adopt_source_tables() LOOP
+        action := 'adopt'; tbl := r.tbl; detail := r.detail;
+        RETURN NEXT;
+    END LOOP;
 
     FOR r IN
         SELECT d.relid, d.reason, m.src_schema || '.' || m.src_table AS name,
@@ -607,6 +834,14 @@ BEGIN
     FOR r IN SELECT * FROM gfs.resync_sequences() LOOP
         action := 'sequence'; tbl := r.seq;
         detail := format('advanced %s -> %s to match the source', r.was, r.now_at);
+        RETURN NEXT;
+    END LOOP;
+
+    -- Matviews LAST: they are recomputed from the clone's tables, so every table
+    -- reset, adoption and enum repair above has to have happened first or the
+    -- matview would be rebuilt from data we are about to replace.
+    FOR r IN SELECT * FROM gfs.refresh_clone_matviews() LOOP
+        action := 'matview'; tbl := r.mv; detail := r.detail;
         RETURN NEXT;
     END LOOP;
 

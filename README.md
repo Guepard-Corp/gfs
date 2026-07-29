@@ -379,6 +379,44 @@ usually the better setting.
 > instant. Clone from a frozen source (a storage snapshot, backup, or paused
 > replica) if you need reproducibility.
 
+##### New partitions, inherited children and materialized views
+
+Most source changes announce themselves: a changed column raises a clear error, a
+changed row set reads from the source. A **new partition** is the quiet one. It is
+reached through a parent the clone already has, so the query still succeeds and
+simply returns fewer rows than the source holds.
+
+`gfs pull` handles all three:
+
+| what changed on the source | what `pull` does |
+| --- | --- |
+| a new partition of a partitioned table | creates it locally with the source's bound and registers it for copy-on-read |
+| a new `INHERITS` child | creates it under the same parent, with its own key, and registers it |
+| a materialized view refreshed upstream | recomputes the clone's own matview from the clone's tables |
+
+A matview on a clone is a **local** object built from copy-on-read tables, so
+recomputing it locally is what makes it current; nothing is copied from the
+source's stored matview contents.
+
+Adoption only applies to children of a parent the clone already has. A brand new
+standalone table still reports `re-clone to include it`, because reproducing
+arbitrary DDL (indexes, defaults, triggers, grants) is the clone bootstrap's job,
+whereas a partition takes its whole shape from its parent.
+
+```bash
+gfs query "SELECT * FROM gfs.pull();"   # action = 'adopt' / 'matview'
+```
+
+With `autoschema` on, new partitions and children are adopted in the background
+too, so reads never go quietly short:
+
+```bash
+gfs query "UPDATE gfs.sync_policy SET autoschema = true;"
+```
+
+With `autoschema` off (the default), the gap is reported by `gfs fetch --check`
+but reads of the parent stay short until you run `gfs pull`.
+
 ### `gfs status`
 
 Show the current state of storage and compute resources.
