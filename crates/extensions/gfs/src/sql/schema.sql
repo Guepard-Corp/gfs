@@ -602,6 +602,37 @@ CREATE FUNCTION gfs.relation_diverged_sql(p_relid regclass) RETURNS boolean LANG
         OR EXISTS (SELECT 1 FROM gfs.tombstone WHERE relid = p_relid);
 $$;
 
+-- SIZE RE-VERIFICATION --------------------------------------------------------
+-- source_rows is captured ONCE at clone time and drives the copy-vs-ask decision.
+-- A live source keeps growing, so a table that was small when you cloned can be
+-- millions of rows later while the router still believes the old number and
+-- happily copies the whole thing over the link. Same failure class as #112/#114,
+-- reached through drift instead of a bad initial measurement.
+--
+-- Measure the real size with count(*), which postgres_fdw pushes down to the
+-- source (one round trip, no data transfer), and WRITE IT BACK so the next query
+-- uses the fresh number instead of measuring again. Bounded by a timeout; on
+-- failure return -1 and let the caller keep its existing estimate.
+CREATE FUNCTION gfs.verify_source_rows(p_relid regclass) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE src text; n bigint;
+BEGIN
+    SELECT source_ref INTO src FROM gfs.clone_source WHERE relid = p_relid;
+    IF src IS NULL OR to_regclass(src) IS NULL THEN RETURN -1; END IF;
+    BEGIN
+        SET LOCAL statement_timeout = '30s';
+        EXECUTE format('SELECT count(*) FROM %s', src) INTO n;
+        SET LOCAL statement_timeout = '0';
+    EXCEPTION WHEN others THEN
+        RETURN -1;   -- unreachable or too slow: keep the estimate we already had
+    END;
+    UPDATE gfs.clone_source SET source_rows = GREATEST(n, 0) WHERE relid = p_relid;
+    RETURN GREATEST(n, 0);
+END;
+$$;
+COMMENT ON FUNCTION gfs.verify_source_rows(regclass) IS
+  'Measure the source table''s real row count and store it (guards the copy-vs-ask decision against size drift)';
+
 -- SCHEMA REPAIR ---------------------------------------------------------------
 -- The clone's description of each source table (its imported FOREIGN TABLE) is
 -- written ONCE at clone time and never refreshed. When the source changes shape,

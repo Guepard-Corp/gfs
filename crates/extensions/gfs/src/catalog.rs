@@ -193,6 +193,36 @@ pub(crate) unsafe fn gfs_run_upkeep(relid: pg_sys::Oid, kind: &str) {
     pg_sys::SPI_finish();
 }
 
+/// Measure the source table's CURRENT row count (pushed down to the source) and
+/// store it, returning the fresh value. `None` when it could not be measured.
+///
+/// Called only when the router is about to copy a table WHOLE, which is the one
+/// moment a stale size does real damage: believing a now-huge table is small is
+/// exactly how a clone drags gigabytes over a slow link. Writing the value back
+/// means the next query reads the corrected number and does not measure again.
+pub(crate) unsafe fn gfs_verify_source_rows(relid: pg_sys::Oid) -> Option<f64> {
+    if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
+        return None;
+    }
+    let q = CString::new(format!(
+        "SELECT gfs.verify_source_rows({}::oid::regclass)::text",
+        u32::from(relid)
+    ))
+    .unwrap();
+    let mut out = None;
+    if pg_sys::SPI_execute(q.as_ptr(), false, 1) == pg_sys::SPI_OK_SELECT as i32
+        && pg_sys::SPI_processed == 1
+    {
+        let tt = pg_sys::SPI_tuptable;
+        let row = *(*tt).vals;
+        out = spi_text(pg_sys::SPI_getvalue(row, (*tt).tupdesc, 1))
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| *v >= 0.0);
+    }
+    pg_sys::SPI_finish();
+    out
+}
+
 /// Increment the per-table access counter (drives the amortization horizon H).
 pub(crate) unsafe fn bump_access(relid: pg_sys::Oid) {
     if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {

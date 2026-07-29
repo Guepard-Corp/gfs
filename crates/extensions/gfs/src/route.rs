@@ -10,6 +10,7 @@ use pgrx::PgList;
 use crate::base_plan;
 use crate::catalog::{
     bump_access, gfs_enqueue_copy, gfs_enqueue_partial, gfs_is_covered, gfs_lookup_clone,
+    gfs_verify_source_rows,
     gfs_note_pred_seen, gfs_pred_count, gfs_pred_state, gfs_set_no_partial, gfs_throttle,
     gfs_mark_local_write, gfs_sync_flags, gfs_time_queued, gfs_whole_queued, relation_diverged,
 };
@@ -355,10 +356,34 @@ unsafe fn classify_scan(
     //    ownable table into partial. This is the line that keeps the benchmark at
     //    source_ops=12 and makes the cost-v3 ordering regression structurally
     //    impossible.
-    let whole_own_cost = info.w_net * b * tr;
-    let fed_call = info.w_source * tr.max(1.0);
-    let whole_ownable = whole_own_cost <= info.w_negligible
+    let mut tr = tr;
+    let mut whole_own_cost = info.w_net * b * tr;
+    let mut fed_call = info.w_source * tr.max(1.0);
+    let mut whole_ownable = whole_own_cost <= info.w_negligible
         || (whole_own_cost <= info.w_ceiling && whole_own_cost <= (h + 1.0) * fed_call);
+
+    // SIZE DRIFT GUARD. source_rows was measured once, at clone time, and the
+    // source keeps growing: a table that was small then can be millions of rows
+    // now, and this gate would cheerfully copy all of it. Re-measure at the ONE
+    // moment a stale size does damage -- just before committing to a whole copy --
+    // and decide again on the real number. Cheap relative to what it guards (one
+    // pushed-down count against a transfer of the entire table), and it only runs
+    // for a table we were about to copy anyway; a table already known to be big
+    // never reaches here. verify_source_rows writes the value back, so the next
+    // query reads the corrected size instead of measuring again.
+    if whole_ownable && !info.no_partial {
+        if let Some(fresh) = gfs_verify_source_rows(relid) {
+            if fresh > tr {
+                tr = fresh;
+                whole_own_cost = info.w_net * b * tr;
+                fed_call = info.w_source * tr.max(1.0);
+                whole_ownable = whole_own_cost <= info.w_negligible
+                    || (whole_own_cost <= info.w_ceiling
+                        && whole_own_cost <= (h + 1.0) * fed_call);
+            }
+        }
+    }
+
     if whole_ownable || info.no_partial {
         // push_by_cost(Tr) owns iff whole_ownable, else federates -- never partial.
         push_by_cost(ctx, tr, b, tr, h, &info, mk(0, 0, true, s(), s(), 0));
