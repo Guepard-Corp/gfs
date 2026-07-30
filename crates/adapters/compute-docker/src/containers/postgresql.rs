@@ -34,6 +34,28 @@ const DEFAULT_USER: &str = "postgres";
 const DEFAULT_PASSWORD: &str = "postgres";
 const DEFAULT_DB: &str = "postgres";
 
+/// Shell fragment (POSIX `sh`) run at deploy bootstrap to confine the management
+/// superuser (`${POSTGRES_USER}`) to the container's loopback. It prepends four
+/// rules ahead of the existing pg_hba entries — `local`/`127.0.0.1`/`::1` allow,
+/// then a non-loopback `reject` — so, under pg_hba first-match, the management
+/// role authenticates over the loopback exec seam but is refused over the exposed
+/// endpoint, while every client role falls through to the catch-all unchanged.
+/// The rewrite truncates the file in place to preserve its owner and `0600` mode,
+/// is guarded by a marker line for idempotency, and leaves the reload to the
+/// caller (a following `SELECT pg_reload_conf()`).
+const RESTRICT_MGMT_ROLE_TO_LOOPBACK: &str = concat!(
+    r#"HBA="${PGDATA:-/var/lib/postgresql/data}/pg_hba.conf"; "#,
+    r#"ADMIN="${POSTGRES_USER:-postgres}"; "#,
+    r#"if ! grep -q "gfs-managed loopback-only ${ADMIN}" "$HBA" 2>/dev/null; then "#,
+    r#"{ printf '# gfs-managed loopback-only %s\n' "$ADMIN"; "#,
+    r#"printf 'local all "%s" trust\n' "$ADMIN"; "#,
+    r#"printf 'host all "%s" 127.0.0.1/32 trust\n' "$ADMIN"; "#,
+    r#"printf 'host all "%s" ::1/128 trust\n' "$ADMIN"; "#,
+    r#"printf 'host all "%s" all reject\n' "$ADMIN"; "#,
+    r#"cat "$HBA"; } > "$HBA.gfs" && cat "$HBA.gfs" > "$HBA" && rm -f "$HBA.gfs"; "#,
+    r#"fi"#,
+);
+
 /// PostgreSQL compute definition provider. Supplies the definition and
 /// provider-specific behaviour (connection string, name, default port).
 #[derive(Debug)]
@@ -750,7 +772,19 @@ impl DatabaseProvider for PostgresqlProvider {
              COMMIT;",
             pw = sql_lit(&spec.owner_password),
         );
-        self.query_in_instance_command(&sql, None)
+        let bootstrap = self.query_in_instance_command(&sql, None)?;
+        // Confine the management superuser (`${POSTGRES_USER}`) to the container's
+        // loopback exec seam. It is the platform's management root and is never
+        // handed to a client, so even a leaked credential must not reach the
+        // database over the exposed endpoint. pg_hba is not settable via SQL, so
+        // rewrite it in the running instance: prepend loopback allow rules + a
+        // non-loopback reject for the management role ahead of the catch-all
+        // (pg_hba is first-match), preserving the file's owner/perms via an
+        // in-place truncate, then reload. Client roles (the owner + created users)
+        // fall through to the catch-all and keep authenticating over the endpoint.
+        // Idempotent (guarded by a marker) and fail-closed (`set -e`).
+        let reload = self.query_in_instance_command("SELECT pg_reload_conf();", None)?;
+        Ok(format!("set -e\n{bootstrap}\n{RESTRICT_MGMT_ROLE_TO_LOOPBACK}\n{reload}\n"))
     }
 
     fn grant_command(&self, spec: &GrantSpec) -> std::result::Result<String, ProviderError> {
@@ -1706,6 +1740,24 @@ mod tests {
         assert!(
             !cmd.to_uppercase().contains("REVOKE"),
             "no manual public lock"
+        );
+        // management super confined to loopback: pg_hba rewrite (loopback allow +
+        // non-loopback reject for ${POSTGRES_USER}) ahead of the catch-all, then
+        // reload — fail-closed under `set -e`.
+        assert!(cmd.starts_with("set -e"), "bootstrap must be fail-closed");
+        assert!(cmd.contains("pg_hba.conf"), "must rewrite pg_hba");
+        assert!(
+            cmd.contains(r#"host all "%s" all reject"#)
+                && cmd.contains(r#""${POSTGRES_USER:-postgres}""#),
+            "management role must be rejected off-loopback"
+        );
+        assert!(
+            cmd.contains(r#"host all "%s" 127.0.0.1/32 trust"#),
+            "management role must stay allowed on loopback"
+        );
+        assert!(
+            cmd.contains("pg_reload_conf()"),
+            "pg_hba change must be reloaded"
         );
     }
 
