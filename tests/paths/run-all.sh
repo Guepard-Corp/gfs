@@ -21,14 +21,15 @@ C1 C2 C3 C4 C5 C6 C7 C8 \
 D1 D2 D3 D4 D5 D6 D7 D8 D9 \
 E1 E2 F1 F2 F3 G1 G2"
 
-script_for(){ ls "$1"_*.sh 2>/dev/null | head -1; }
+# Each case lives in its own folder: <CASE>_<slug>/test.sh, beside its README.
+script_for(){ ls -d "$1"_*/test.sh 2>/dev/null | head -1; }
 
 if [ "${1:-}" = "--list" ]; then
   printf "%-6s %-10s %s\n" CASE STATUS SCRIPT
   have=0; miss=0
   for c in $DOC_CASES; do
     s=$(script_for "$c")
-    if [ -n "$s" ]; then printf "%-6s %-10s %s\n" "$c" "covered" "$s"; have=$((have+1))
+    if [ -n "$s" ]; then printf "%-6s %-10s %s\n" "$c" "covered" "$(dirname "$s")/"; have=$((have+1))
     else                printf "%-6s %-10s %s\n" "$c" "MISSING" "-";   miss=$((miss+1)); fi
   done
   echo
@@ -39,10 +40,18 @@ fi
 # Which scripts to run
 SEL=()
 if [ $# -eq 0 ]; then
-  while IFS= read -r f; do SEL+=("$f"); done < <(ls [A-G]*_*.sh 2>/dev/null | sort -V)
+  while IFS= read -r f; do SEL+=("$f"); done < <(ls -d [A-G]*_*/test.sh 2>/dev/null | sort -V)
 else
+  # Match a single LETTER as a family (B -> every B case), anything else as an
+  # EXACT case id. Prefix matching would make "B1" also run B10, B11, B12 ... B19,
+  # which silently turns a one-test check into a twelve-test sweep.
   for a in "$@"; do
-    while IFS= read -r f; do [ -n "$f" ] && SEL+=("$f"); done < <(ls "$a"*_*.sh 2>/dev/null | sort -V)
+    if [[ "$a" =~ ^[A-G]$ ]]; then
+      pat="$a[0-9]*_*/test.sh"
+    else
+      pat="${a}_*/test.sh"
+    fi
+    while IFS= read -r f; do [ -n "$f" ] && SEL+=("$f"); done < <(ls -d $pat 2>/dev/null | sort -V)
   done
 fi
 [ ${#SEL[@]} -eq 0 ] && { echo "no matching path scripts"; exit 1; }
@@ -58,10 +67,10 @@ for s in "${SEL[@]}"; do
   bash "$s"
   rc=$?
   case $rc in
-    0) PASSED+=("$s") ;;
-    3) OPENFIXED+=("$s") ;;
-    90) ABORTED+=("$s") ;;
-    *) FAILED+=("$s") ;;
+    0) PASSED+=("$(dirname "$s")") ;;
+    3) OPENFIXED+=("$(dirname "$s")") ;;
+    90) ABORTED+=("$(dirname "$s")") ;;
+    *) FAILED+=("$(dirname "$s")") ;;
   esac
   # keep the VM from filling mid-sweep
   docker ps -a --filter status=exited --format '{{.Names}}' | grep -E '^gfs-postgres-[0-9]+$' | xargs -r docker rm -f >/dev/null 2>&1
