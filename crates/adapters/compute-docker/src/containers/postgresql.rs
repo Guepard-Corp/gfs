@@ -784,7 +784,9 @@ impl DatabaseProvider for PostgresqlProvider {
         // fall through to the catch-all and keep authenticating over the endpoint.
         // Idempotent (guarded by a marker) and fail-closed (`set -e`).
         let reload = self.query_in_instance_command("SELECT pg_reload_conf();", None)?;
-        Ok(format!("set -e\n{bootstrap}\n{RESTRICT_MGMT_ROLE_TO_LOOPBACK}\n{reload}\n"))
+        Ok(format!(
+            "set -e\n{bootstrap}\n{RESTRICT_MGMT_ROLE_TO_LOOPBACK}\n{reload}\n"
+        ))
     }
 
     fn grant_command(&self, spec: &GrantSpec) -> std::result::Result<String, ProviderError> {

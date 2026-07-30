@@ -102,7 +102,9 @@ fn psql(container: &str, sql: &str) -> String {
 }
 
 fn start_postgres(container: &str) {
-    let _ = Command::new("docker").args(["rm", "-f", container]).output();
+    let _ = Command::new("docker")
+        .args(["rm", "-f", container])
+        .output();
     let status = Command::new("docker")
         .args([
             "run",
@@ -155,7 +157,9 @@ fn start_postgres(container: &str) {
 }
 
 fn stop_postgres(container: &str) {
-    let _ = Command::new("docker").args(["rm", "-f", container]).output();
+    let _ = Command::new("docker")
+        .args(["rm", "-f", container])
+        .output();
 }
 
 #[tokio::test]
