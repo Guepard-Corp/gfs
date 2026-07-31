@@ -211,6 +211,38 @@ pub struct QueryRequest {
 }
 
 #[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+pub struct UserRequest {
+    #[schemars(
+        description = "action: create | list | drop | set_password | apply_preset | grant | revoke | list_privs"
+    )]
+    pub action: String,
+    #[schemars(description = "username (required for every action except list)")]
+    pub username: Option<String>,
+    #[schemars(description = "role preset for create: readonly | readwrite | admin")]
+    pub preset: Option<String>,
+    #[schemars(description = "password (optional; generated and returned once if omitted)")]
+    pub password: Option<String>,
+    #[schemars(
+        description = "grant/revoke target object, JSON {type: database|schema|table|all_tables_in_schema|sequence|all_sequences_in_schema, schema?, name?}"
+    )]
+    pub object: Option<serde_json::Value>,
+    #[schemars(
+        description = "grant/revoke privileges: array or CSV, e.g. [\"SELECT\",\"INSERT\"] or \"ALL\""
+    )]
+    pub privileges: Option<serde_json::Value>,
+    #[schemars(description = "grant: allow the grantee to re-grant (WITH GRANT OPTION)")]
+    pub with_grant_option: Option<bool>,
+    #[schemars(
+        description = "grant: also cover future objects created by this grantor role (all-in-schema scopes only)"
+    )]
+    pub apply_to_future: Option<String>,
+    #[schemars(description = "revoke: cascade to dependent grants (default RESTRICT)")]
+    pub cascade: Option<bool>,
+    #[schemars(description = "repo root path")]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 pub struct ExtractSchemaRequest {
     #[schemars(description = "repo root path")]
     pub path: Option<String>,
@@ -478,6 +510,30 @@ impl GfsMcpHandler {
     }
 
     #[tool(
+        description = "Manage database users/roles inside the running instance. action = create | list | drop | set_password | apply_preset | grant | revoke | list_privs. create and set_password return the password once. Params: action (required); username (all except list); preset (create: readonly|readwrite|admin); password (optional, generated once if omitted); object (grant/revoke: JSON {type: database|schema|table|all_tables_in_schema|sequence|all_sequences_in_schema, schema?, name?}); privileges (grant/revoke: array or CSV, e.g. [\"SELECT\",\"INSERT\"] or \"ALL\"); with_grant_option, apply_to_future (grant); cascade (revoke); path (repo root). Equivalent to gfs user."
+    )]
+    async fn user(
+        &self,
+        Parameters(req): Parameters<UserRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let args = json!({
+            "action": req.action,
+            "username": req.username,
+            "preset": req.preset,
+            "password": req.password,
+            "object": req.object,
+            "privileges": req.privileges,
+            "with_grant_option": req.with_grant_option,
+            "apply_to_future": req.apply_to_future,
+            "cascade": req.cascade,
+            "path": req.path,
+        });
+        let result = do_user(&args).await;
+        self.track_mcp("user", &result);
+        result
+    }
+
+    #[tool(
         description = "Extract database schema metadata from the running database instance. Returns complete schema including schemas, tables, columns, constraints, and relationships as structured JSON. Use this to understand the database structure before writing queries or making changes. Optional: path (repo root). Equivalent to gfs schema extract."
     )]
     async fn extract_schema(
@@ -565,8 +621,9 @@ impl ServerHandler for GfsMcpHandler {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "GFS MCP server. Tools: list_providers, status, commit, log, checkout, init, compute, export_database, import_database, query, extract_schema, show_schema, diff_schema. \
+                "GFS MCP server. Tools: list_providers, status, commit, log, checkout, init, compute, user, export_database, import_database, query, extract_schema, show_schema, diff_schema. \
                  Schema versioning: commits automatically capture database schemas. Use show_schema to view schema at any commit, diff_schema to compare schema evolution. \
+                 Database users/roles: use the user tool (actions create, list, drop, set_password, grant, revoke, list_privs, apply_preset) to manage least-privilege login roles and presets. \
                  Use path to target a repo or set GFS_REPO_PATH."
                     .into(),
             ),
@@ -1252,6 +1309,238 @@ async fn do_import(args: &serde_json::Value) -> Result<CallToolResult, McpError>
     }))
 }
 
+/// Parse the `object` arg into a [`GrantableObject`] (internally-tagged JSON,
+/// e.g. `{"type":"table","schema":"public","name":"t"}`).
+fn parse_grant_object(
+    args: &serde_json::Value,
+) -> Result<gfs_domain::model::db_user::GrantableObject, McpError> {
+    match args.get("object") {
+        Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+            to_error_data(format!(
+                "invalid 'object' (expected {{type, schema?, name?}}): {e}"
+            ))
+        }),
+        None => Err(to_error_data(
+            "action requires 'object', e.g. {\"type\":\"table\",\"schema\":\"public\",\"name\":\"t\"}"
+                .to_string(),
+        )),
+    }
+}
+
+/// Parse the `privileges` arg (JSON array or comma-separated string), case-insensitive.
+fn parse_grant_privileges(
+    args: &serde_json::Value,
+) -> Result<Vec<gfs_domain::model::db_user::Privilege>, McpError> {
+    use gfs_domain::model::db_user::Privilege;
+    let raw: Vec<String> = match args.get("privileges") {
+        Some(serde_json::Value::Array(a)) => a
+            .iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect(),
+        Some(serde_json::Value::String(s)) => s
+            .split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    };
+    if raw.is_empty() {
+        return Err(to_error_data(
+            "action requires 'privileges' (array or comma-separated string)".to_string(),
+        ));
+    }
+    raw.iter()
+        .map(|p| {
+            Privilege::parse(&p.to_lowercase())
+                .ok_or_else(|| to_error_data(format!("unknown privilege '{p}'")))
+        })
+        .collect()
+}
+
+async fn do_user(args: &serde_json::Value) -> Result<CallToolResult, McpError> {
+    use gfs_domain::model::db_user::{GrantSpec, RevokeSpec, RolePreset, RoleSpec};
+    use gfs_domain::usecases::repository::manage_users_usecase::ManageUsersUseCase;
+
+    let args = if args.is_object() { args } else { &json!({}) };
+    let repo_path = repo_path_from_value(args);
+    let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+    let username = args
+        .get("username")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let password = args
+        .get("password")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    GfsConfig::load(&repo_path).map_err(|e| to_error_data(format!("not a GFS repository: {e}")))?;
+
+    let compute = runtime_compute().await?;
+    let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
+    containers::register_all(registry.as_ref())
+        .map_err(|e| to_error_data(format!("register providers: {e}")))?;
+    let use_case = ManageUsersUseCase::new(compute, registry);
+
+    let gen_password = || uuid::Uuid::new_v4().simple().to_string();
+    let require_username = || {
+        username
+            .clone()
+            .ok_or_else(|| to_error_data(format!("action '{action}' requires 'username'")))
+    };
+
+    match action {
+        "create" => {
+            let username = require_username()?;
+            let preset = match args.get("preset").and_then(|v| v.as_str()) {
+                Some(p) => Some(
+                    RolePreset::parse(p)
+                        .ok_or_else(|| to_error_data(format!("unknown preset '{p}'")))?,
+                ),
+                None => None,
+            };
+            let password = password.unwrap_or_else(gen_password);
+            // Scope a preset's default privileges to the deploy owner (the role that
+            // creates the customer's future tables), not the connecting admin, so a
+            // preset user isn't blind to owner's later tables (see cmd_user / F-03).
+            let default_privileges_owner = if preset.is_some() {
+                use_case.detect_deploy_owner(&repo_path).await
+            } else {
+                None
+            };
+            use_case
+                .create_role(
+                    &repo_path,
+                    &RoleSpec {
+                        username: username.clone(),
+                        password: password.clone(),
+                        preset,
+                        default_privileges_owner,
+                    },
+                )
+                .await
+                .map_err(|e| to_error_data(e.to_string()))?;
+            Ok(CallToolResult::success(vec![Content::text(
+                json!({ "username": username, "password": password }).to_string(),
+            )]))
+        }
+        "list" => {
+            let roles = use_case
+                .list_roles(&repo_path)
+                .await
+                .map_err(|e| to_error_data(e.to_string()))?;
+            Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string(&roles).unwrap_or_default(),
+            )]))
+        }
+        "drop" => {
+            let username = require_username()?;
+            use_case
+                .drop_role(&repo_path, &username)
+                .await
+                .map_err(|e| to_error_data(e.to_string()))?;
+            Ok(CallToolResult::success(vec![Content::text(
+                json!({ "username": username, "dropped": true }).to_string(),
+            )]))
+        }
+        "set_password" => {
+            let username = require_username()?;
+            let password = password.unwrap_or_else(gen_password);
+            use_case
+                .set_password(&repo_path, &username, &password)
+                .await
+                .map_err(|e| to_error_data(e.to_string()))?;
+            Ok(CallToolResult::success(vec![Content::text(
+                json!({ "username": username, "password": password }).to_string(),
+            )]))
+        }
+        "apply_preset" => {
+            let username = require_username()?;
+            let preset = args
+                .get("preset")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| to_error_data("action 'apply_preset' requires 'preset'"))?;
+            let preset = RolePreset::parse(preset)
+                .ok_or_else(|| to_error_data(format!("unknown preset '{preset}'")))?;
+            // Scope defaults to the deploy owner's future objects (same as create).
+            let owner = use_case.detect_deploy_owner(&repo_path).await;
+            use_case
+                .apply_preset(&repo_path, &username, preset, owner.as_deref())
+                .await
+                .map_err(|e| to_error_data(e.to_string()))?;
+            Ok(CallToolResult::success(vec![Content::text(
+                json!({ "username": username, "preset_applied": true }).to_string(),
+            )]))
+        }
+        "grant" => {
+            let username = require_username()?;
+            let object = parse_grant_object(args)?;
+            let privileges = parse_grant_privileges(args)?;
+            let with_grant_option = args
+                .get("with_grant_option")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let apply_to_future = args
+                .get("apply_to_future")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            use_case
+                .grant(
+                    &repo_path,
+                    &GrantSpec {
+                        role: username.clone(),
+                        object,
+                        privileges,
+                        with_grant_option,
+                        apply_to_future,
+                    },
+                )
+                .await
+                .map_err(|e| to_error_data(e.to_string()))?;
+            Ok(CallToolResult::success(vec![Content::text(
+                json!({ "username": username, "granted": true }).to_string(),
+            )]))
+        }
+        "revoke" => {
+            let username = require_username()?;
+            let object = parse_grant_object(args)?;
+            let privileges = parse_grant_privileges(args)?;
+            let cascade = args
+                .get("cascade")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            use_case
+                .revoke(
+                    &repo_path,
+                    &RevokeSpec {
+                        role: username.clone(),
+                        object,
+                        privileges,
+                        cascade,
+                    },
+                )
+                .await
+                .map_err(|e| to_error_data(e.to_string()))?;
+            Ok(CallToolResult::success(vec![Content::text(
+                json!({ "username": username, "revoked": true }).to_string(),
+            )]))
+        }
+        "list_privs" => {
+            let username = require_username()?;
+            let privileges = use_case
+                .list_privileges(&repo_path, &username)
+                .await
+                .map_err(|e| to_error_data(e.to_string()))?;
+            Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string(&privileges).unwrap_or_default(),
+            )]))
+        }
+        other => Err(to_error_data(format!(
+            "unknown user action '{other}' \
+             (create|list|drop|set_password|grant|revoke|list_privs)"
+        ))),
+    }
+}
+
 async fn do_query(args: &serde_json::Value) -> Result<CallToolResult, McpError> {
     let args = if args.is_object() { args } else { &json!({}) };
     let repo_path = repo_path_from_value(args);
@@ -1556,5 +1845,130 @@ mod tests {
             instructions.contains("list_providers"),
             "instructions should mention list_providers"
         );
+    }
+
+    // EMPIRICAL (Docker-gated): the MCP `user` tool's grant/revoke actions change
+    // real privileges. Drives the actual `do_user` handler (JSON args → parse →
+    // ManageUsersUseCase → real DockerCompute) against a live Postgres 17, and
+    // verifies with `has_table_privilege`. Skips (does not fail) without Docker.
+    // Run: GFS_DOCKER_IT=1 cargo test -p gfs-mcp user_tool_grant_revoke -- --nocapture
+    fn mcp_docker_ok() -> bool {
+        std::env::var("GFS_DOCKER_IT").ok().as_deref() == Some("1")
+            && std::process::Command::new("docker")
+                .arg("info")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn user_tool_grant_revoke_changes_real_privileges() {
+        use gfs_domain::model::config::{EnvironmentConfig, RuntimeConfig};
+        if !mcp_docker_ok() {
+            eprintln!(
+                "SKIP user_tool_grant_revoke_changes_real_privileges: set GFS_DOCKER_IT=1 + docker"
+            );
+            return;
+        }
+        let cn = format!("gfs-mcp-it-user-{}", std::process::id());
+        let docker = |args: &[&str]| {
+            std::process::Command::new("docker")
+                .args(args)
+                .output()
+                .expect("docker")
+        };
+        let psql = |sql: &str| {
+            let o = std::process::Command::new("docker")
+                .args(["exec", &cn, "psql", "-U", "postgres", "-tAc", sql])
+                .output()
+                .expect("psql");
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+
+        let _ = docker(&["rm", "-f", &cn]);
+        assert!(
+            docker(&[
+                "run",
+                "-d",
+                "--rm",
+                "--name",
+                &cn,
+                "-e",
+                "POSTGRES_PASSWORD=postgres",
+                "postgres:17",
+            ])
+            .status
+            .success(),
+            "docker run postgres:17 failed"
+        );
+        let mut ready = false;
+        for _ in 0..30 {
+            if docker(&["exec", &cn, "pg_isready", "-U", "postgres"])
+                .status
+                .success()
+            {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        let _ = psql("CREATE ROLE app_ro; CREATE TABLE public.t(id int)");
+
+        // A .gfs repo pointing at the container (no tempfile dep — manual temp dir).
+        let repo = std::env::temp_dir().join(format!("gfs-mcp-it-{}", std::process::id()));
+        std::fs::create_dir_all(repo.join(".gfs")).expect("mkdir .gfs");
+        GfsConfig {
+            mount_point: None,
+            version: String::new(),
+            description: String::new(),
+            user: None,
+            environment: Some(EnvironmentConfig {
+                database_provider: "postgres".into(),
+                database_version: "17".into(),
+                database_port: None,
+                display_name: None,
+            }),
+            runtime: Some(RuntimeConfig {
+                runtime_provider: "docker".into(),
+                runtime_version: "latest".into(),
+                container_name: cn.clone(),
+            }),
+            storage: None,
+            compute: None,
+        }
+        .save(&repo)
+        .expect("save .gfs config");
+        let repo_str = repo.to_str().unwrap();
+
+        // Drive the ACTUAL MCP handler.
+        let grant = do_user(&serde_json::json!({
+            "action": "grant", "username": "app_ro",
+            "object": {"type": "table", "schema": "public", "name": "t"},
+            "privileges": ["SELECT"], "path": repo_str,
+        }))
+        .await;
+        let after_grant = psql("SELECT has_table_privilege('app_ro','public.t','SELECT')");
+        let list = do_user(
+            &serde_json::json!({"action":"list_privs","username":"app_ro","path": repo_str}),
+        )
+        .await;
+        let revoke = do_user(&serde_json::json!({
+            "action": "revoke", "username": "app_ro",
+            "object": {"type": "table", "schema": "public", "name": "t"},
+            "privileges": ["SELECT"], "path": repo_str,
+        }))
+        .await;
+        let after_revoke = psql("SELECT has_table_privilege('app_ro','public.t','SELECT')");
+
+        // Clean up before asserting so a failed assert never leaks resources.
+        let _ = docker(&["rm", "-f", &cn]);
+        let _ = std::fs::remove_dir_all(&repo);
+
+        assert!(ready, "postgres never became ready");
+        assert!(grant.is_ok(), "MCP grant errored: {:?}", grant.err());
+        assert_eq!(after_grant, "t", "MCP user grant must set SELECT");
+        assert!(list.is_ok(), "MCP list_privs errored: {:?}", list.err());
+        assert!(revoke.is_ok(), "MCP revoke errored: {:?}", revoke.err());
+        assert_eq!(after_revoke, "f", "MCP user revoke must remove SELECT");
     }
 }

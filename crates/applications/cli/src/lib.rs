@@ -67,6 +67,128 @@ pub enum SchemaAction {
 }
 
 // ---------------------------------------------------------------------------
+// User subcommands (`gfs user`)
+// ---------------------------------------------------------------------------
+
+#[derive(Subcommand)]
+pub enum UserAction {
+    /// Create a login user, optionally with a role preset
+    Create {
+        /// Username (letters, digits, underscore; up to 63 chars)
+        username: String,
+        /// Role preset: readonly | readwrite | admin
+        #[arg(long)]
+        preset: Option<String>,
+        /// Password (a strong one is generated and shown once if omitted)
+        #[arg(long)]
+        password: Option<String>,
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    /// List database users
+    List {
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    /// Drop a user
+    Drop {
+        username: String,
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    /// Set / rotate a user's password
+    SetPassword {
+        username: String,
+        #[arg(long)]
+        password: Option<String>,
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    /// Apply (or change) a role preset on an existing user. A downgrade (e.g.
+    /// readwrite → readonly) revokes the privileges the higher preset granted.
+    ApplyPreset {
+        /// Target username
+        username: String,
+        /// Role preset: readonly | readwrite | admin
+        preset: String,
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    /// Grant object-level privileges to a user
+    Grant {
+        /// Grantee username
+        username: String,
+        /// Grant on the whole database
+        #[arg(long)]
+        on_database: bool,
+        /// Grant on a schema
+        #[arg(long, value_name = "SCHEMA")]
+        on_schema: Option<String>,
+        /// Grant on a table (or view): schema.name
+        #[arg(long, value_name = "SCHEMA.TABLE")]
+        on_table: Option<String>,
+        /// Grant on all existing tables in a schema
+        #[arg(long, value_name = "SCHEMA")]
+        on_all_tables_in_schema: Option<String>,
+        /// Grant on a sequence: schema.name
+        #[arg(long, value_name = "SCHEMA.SEQUENCE")]
+        on_sequence: Option<String>,
+        /// Grant on all existing sequences in a schema
+        #[arg(long, value_name = "SCHEMA")]
+        on_all_sequences_in_schema: Option<String>,
+        /// Comma-separated privileges, e.g. SELECT,INSERT (or ALL)
+        #[arg(long)]
+        privileges: String,
+        /// Allow the grantee to re-grant these privileges
+        #[arg(long)]
+        with_grant_option: bool,
+        /// Also cover future objects created by this grantor role (all-in-schema scopes only)
+        #[arg(long, value_name = "GRANTOR")]
+        apply_to_future: Option<String>,
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    /// Revoke object-level privileges from a user
+    Revoke {
+        /// Target username
+        username: String,
+        /// Revoke on the whole database
+        #[arg(long)]
+        on_database: bool,
+        /// Revoke on a schema
+        #[arg(long, value_name = "SCHEMA")]
+        on_schema: Option<String>,
+        /// Revoke on a table (or view): schema.name
+        #[arg(long, value_name = "SCHEMA.TABLE")]
+        on_table: Option<String>,
+        /// Revoke on all existing tables in a schema
+        #[arg(long, value_name = "SCHEMA")]
+        on_all_tables_in_schema: Option<String>,
+        /// Revoke on a sequence: schema.name
+        #[arg(long, value_name = "SCHEMA.SEQUENCE")]
+        on_sequence: Option<String>,
+        /// Revoke on all existing sequences in a schema
+        #[arg(long, value_name = "SCHEMA")]
+        on_all_sequences_in_schema: Option<String>,
+        /// Comma-separated privileges, e.g. SELECT,INSERT (or ALL)
+        #[arg(long)]
+        privileges: String,
+        /// Cascade to dependent grants (default RESTRICT)
+        #[arg(long)]
+        cascade: bool,
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    /// List a user's effective object privileges
+    ListPrivs {
+        /// Username
+        username: String,
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+}
+
+// ---------------------------------------------------------------------------
 // Compute subcommands (used by commands)
 // ---------------------------------------------------------------------------
 
@@ -454,7 +576,7 @@ enum TopLevel {
         action: StorageAction,
     },
 
-    /// Compute instance management (Docker containers)
+    /// Compute instance lifecycle (start/stop/restart) for the active runtime (Docker or Kubernetes)
     Compute {
         /// Path to the GFS repository root (default: current directory). When set, --id may be omitted and the container name is read from .gfs/config.toml (runtime.container_name).
         #[arg(long)]
@@ -498,6 +620,12 @@ enum TopLevel {
     Schema {
         #[command(subcommand)]
         action: SchemaAction,
+    },
+
+    /// Manage database users/roles (create, list, drop, set-password)
+    User {
+        #[command(subcommand)]
+        action: UserAction,
     },
 
     /// Print the CLI version
@@ -577,6 +705,7 @@ fn command_name(cmd: &TopLevel) -> &'static str {
         TopLevel::Status { .. } => "status",
         TopLevel::Query { .. } => "query",
         TopLevel::Schema { .. } => "schema",
+        TopLevel::User { .. } => "user",
         TopLevel::Storage { .. } => "storage",
         TopLevel::Compute { .. } => "compute",
         TopLevel::Mcp { .. } => "mcp",
@@ -806,6 +935,110 @@ where
                     let no_color = no_color || color == ColorMode::Never;
                     commands::cmd_schema::run_diff(commit1, commit2, path, pretty, json, no_color)
                         .await
+                }
+            },
+            TopLevel::User { action } => match action {
+                UserAction::Create {
+                    username,
+                    preset,
+                    password,
+                    path,
+                } => {
+                    commands::cmd_user::run_create(path, username, preset, password, json_output)
+                        .await?;
+                    Ok(0)
+                }
+                UserAction::List { path } => {
+                    commands::cmd_user::run_list(path, json_output).await?;
+                    Ok(0)
+                }
+                UserAction::Drop { username, path } => {
+                    commands::cmd_user::run_drop(path, username, json_output).await?;
+                    Ok(0)
+                }
+                UserAction::SetPassword {
+                    username,
+                    password,
+                    path,
+                } => {
+                    commands::cmd_user::run_set_password(path, username, password, json_output)
+                        .await?;
+                    Ok(0)
+                }
+                UserAction::ApplyPreset {
+                    username,
+                    preset,
+                    path,
+                } => {
+                    commands::cmd_user::run_apply_preset(path, username, preset, json_output)
+                        .await?;
+                    Ok(0)
+                }
+                UserAction::Grant {
+                    username,
+                    on_database,
+                    on_schema,
+                    on_table,
+                    on_all_tables_in_schema,
+                    on_sequence,
+                    on_all_sequences_in_schema,
+                    privileges,
+                    with_grant_option,
+                    apply_to_future,
+                    path,
+                } => {
+                    commands::cmd_user::run_grant(
+                        path,
+                        username,
+                        commands::cmd_user::ObjectFlags {
+                            on_database,
+                            on_schema,
+                            on_table,
+                            on_all_tables_in_schema,
+                            on_sequence,
+                            on_all_sequences_in_schema,
+                        },
+                        privileges,
+                        with_grant_option,
+                        apply_to_future,
+                        json_output,
+                    )
+                    .await?;
+                    Ok(0)
+                }
+                UserAction::Revoke {
+                    username,
+                    on_database,
+                    on_schema,
+                    on_table,
+                    on_all_tables_in_schema,
+                    on_sequence,
+                    on_all_sequences_in_schema,
+                    privileges,
+                    cascade,
+                    path,
+                } => {
+                    commands::cmd_user::run_revoke(
+                        path,
+                        username,
+                        commands::cmd_user::ObjectFlags {
+                            on_database,
+                            on_schema,
+                            on_table,
+                            on_all_tables_in_schema,
+                            on_sequence,
+                            on_all_sequences_in_schema,
+                        },
+                        privileges,
+                        cascade,
+                        json_output,
+                    )
+                    .await?;
+                    Ok(0)
+                }
+                UserAction::ListPrivs { username, path } => {
+                    commands::cmd_user::run_list_privs(path, username, json_output).await?;
+                    Ok(0)
                 }
             },
             TopLevel::Storage { action } => {

@@ -177,7 +177,7 @@ fn collect_dag(
     }
 
     // Sort by timestamp descending (newest first)
-    commits.sort_by(|a, b| b.commit.author_date.cmp(&a.commit.author_date));
+    commits.sort_by_key(|c| std::cmp::Reverse(c.commit.author_date));
 
     Ok(commits)
 }

@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
+use crate::model::db_user::{DeployEnvSpec, GrantSpec, RevokeSpec, RolePreset, RoleSpec};
 use crate::ports::compute::ComputeDefinition;
 
 // ---------------------------------------------------------------------------
@@ -413,6 +414,104 @@ pub trait DatabaseProvider: Send + Sync {
     ) -> std::result::Result<String, ProviderError> {
         let _ = (sql, database);
         Err(ProviderError::UnsupportedFormat("query_in_instance".into()))
+    }
+
+    // -----------------------------------------------------------------------
+    // User / role management (`gfs user`)
+    // -----------------------------------------------------------------------
+    //
+    // Each returns a full shell command to run **inside** the instance via
+    // [`crate::ports::compute::Compute::exec`] (loopback client, container admin
+    // env creds) — the same shape as `query_in_instance_command`. The password
+    // and identifiers must be validated + quoted by the implementation. Default
+    // impls report the feature as unsupported so non-implementing providers cost
+    // nothing.
+
+    /// In-instance command that creates a login role from `spec`.
+    fn create_role_command(&self, spec: &RoleSpec) -> std::result::Result<String, ProviderError> {
+        let _ = spec;
+        Err(ProviderError::UnsupportedFormat("create_role".into()))
+    }
+
+    /// In-instance command that sets/rotates `username`'s password.
+    fn alter_password_command(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> std::result::Result<String, ProviderError> {
+        let _ = (username, password);
+        Err(ProviderError::UnsupportedFormat("alter_password".into()))
+    }
+
+    /// In-instance command that drops `username`.
+    fn drop_role_command(&self, username: &str) -> std::result::Result<String, ProviderError> {
+        let _ = username;
+        Err(ProviderError::UnsupportedFormat("drop_role".into()))
+    }
+
+    /// In-instance command that lists login roles as JSON (parsed into
+    /// [`crate::model::db_user::RoleInfo`]). Never includes a password.
+    fn list_roles_command(&self) -> std::result::Result<String, ProviderError> {
+        Err(ProviderError::UnsupportedFormat("list_roles".into()))
+    }
+
+    /// In-instance command that applies `preset`'s privilege bundle to `username`.
+    ///
+    /// `default_privileges_owner`, when set, is the role whose FUTURE objects the
+    /// preset's `ALTER DEFAULT PRIVILEGES` should cover (the customer's `owner`
+    /// role in a deploy) so a preset user sees tables the owner creates later.
+    fn apply_preset_command(
+        &self,
+        username: &str,
+        preset: RolePreset,
+        default_privileges_owner: Option<&str>,
+    ) -> std::result::Result<String, ProviderError> {
+        let _ = (username, preset, default_privileges_owner);
+        Err(ProviderError::UnsupportedFormat("apply_preset".into()))
+    }
+
+    /// Build the in-instance command that bootstraps a database's deploy
+    /// environment (RFC 009): create the `NOLOGIN` group + the least-privileged
+    /// `owner` login, grant the owner `CONNECT` + `USAGE,CREATE ON SCHEMA public`
+    /// and group membership, and set role-scoped default privileges so future
+    /// owner objects flow to the group — all in one transaction. Emits nothing
+    /// that makes the owner a superuser or the database owner. Optional-defaulted
+    /// so non-Postgres providers cost nothing until phase 2.
+    fn bootstrap_deploy_env_command(
+        &self,
+        spec: &DeployEnvSpec,
+    ) -> std::result::Result<String, ProviderError> {
+        let _ = spec;
+        Err(ProviderError::UnsupportedFormat(
+            "bootstrap_deploy_env".into(),
+        ))
+    }
+
+    /// In-instance command that grants `spec.privileges` on `spec.object` to
+    /// `spec.role` (optionally `WITH GRANT OPTION` and role-scoped default
+    /// privileges for future objects). Identifiers must be validated + quoted
+    /// and every privilege re-checked against the object type by the
+    /// implementation; the whole grant runs in one transaction. Optional-
+    /// defaulted so non-Postgres providers cost nothing until their phase.
+    fn grant_command(&self, spec: &GrantSpec) -> std::result::Result<String, ProviderError> {
+        let _ = spec;
+        Err(ProviderError::UnsupportedFormat("grant".into()))
+    }
+
+    /// In-instance command that revokes `spec.privileges` on `spec.object` from
+    /// `spec.role` (default `RESTRICT`, or `CASCADE` when `spec.cascade`). Same
+    /// validation/quoting/transaction contract as [`Self::grant_command`].
+    fn revoke_command(&self, spec: &RevokeSpec) -> std::result::Result<String, ProviderError> {
+        let _ = spec;
+        Err(ProviderError::UnsupportedFormat("revoke".into()))
+    }
+
+    /// In-instance command that lists `role`'s effective object privileges as
+    /// JSON (parsed into [`crate::model::db_user::ObjectPrivilege`]), read live
+    /// from the engine catalog. Never includes a secret.
+    fn list_privileges_command(&self, role: &str) -> std::result::Result<String, ProviderError> {
+        let _ = role;
+        Err(ProviderError::UnsupportedFormat("list_privileges".into()))
     }
 
     // -----------------------------------------------------------------------

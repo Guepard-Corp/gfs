@@ -673,6 +673,20 @@ impl KubernetesCompute {
     /// not-ready pod fails the WebSocket upgrade with `400 Bad Request`.
     async fn wait_ready_pod_name(&self, instance: &str) -> Result<String> {
         use std::time::{Duration, Instant};
+        // Fast-fail if the instance is stopped (StatefulSet scaled to zero): no pod
+        // exists and none is coming, so don't burn the full deadline hanging and
+        // then return a misleading "not Ready" error. Tell the caller to resume it.
+        if let Ok(ss) = self.api_statefulsets().get(instance).await
+            && ss.spec.as_ref().and_then(|s| s.replicas) == Some(0)
+        {
+            // NotAvailable has a bare `{0}` Display: this is an expected state, not an
+            // internal fault, so avoid the misleading "internal error:" prefix while
+            // keeping the actionable "resume it" guidance intact.
+            return Err(ComputeError::NotAvailable(format!(
+                "instance '{instance}' is stopped (scaled to zero); resume it \
+                 (e.g. `gfs compute start`) before running this operation"
+            )));
+        }
         let api = self.api_pods();
         let lp = ListParams::default().labels(&format!("{INSTANCE_LABEL_KEY}={instance}"));
         let deadline = Instant::now() + Duration::from_secs(120);
@@ -1173,8 +1187,9 @@ impl Compute for KubernetesCompute {
             }
         };
 
-        // Take the status channel before draining stdout/stderr; await it after
-        // (the streams close on process exit, at which point the status is ready).
+        // Take the status channel BEFORE draining stdout/stderr; the kubelet sends
+        // the exec `Status` (carrying the real exit code) on the v4 error channel
+        // when the process exits. Awaited after the streams are fully read.
         let status_fut = attached.take_status();
 
         let mut stdout = String::new();
@@ -1203,8 +1218,11 @@ impl Compute for KubernetesCompute {
         // can't tell a failed SQL statement from an empty result.
         let exit_code = match status_fut {
             Some(fut) => exit_code_from_exec_status(fut.await),
-            None => 0,
+            // No status channel at all (should not happen for a normal exec) —
+            // treat as failure rather than a silent success (RFC 009 §9.7 caveat 1).
+            None => 1,
         };
+
         Ok(ExecOutput {
             exit_code,
             stdout,

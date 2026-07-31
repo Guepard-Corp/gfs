@@ -2,6 +2,7 @@ pub mod branch;
 pub mod commit;
 pub mod config;
 pub mod datasource;
+pub mod db_user;
 pub mod errors;
 pub mod layout;
 pub mod ref_info;
