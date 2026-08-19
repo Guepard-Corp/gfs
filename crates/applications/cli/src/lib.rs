@@ -840,7 +840,12 @@ where
                 commands::cmd_source::fetch(path, check, json_output).await?;
                 Ok(0)
             }
-            TopLevel::Pull { path, force, auto, auto_schema } => {
+            TopLevel::Pull {
+                path,
+                force,
+                auto,
+                auto_schema,
+            } => {
                 commands::cmd_source::pull(path, force, auto, auto_schema, json_output).await?;
                 Ok(0)
             }

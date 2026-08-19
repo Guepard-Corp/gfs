@@ -154,7 +154,10 @@ pub async fn fetch(path: Option<PathBuf>, check: bool, json_output: bool) -> Res
         for r in &changed {
             if r[3] == "true" {
                 println!("    {} {}", red("conflict"), cyan(&r[0]));
-                println!("      {}", dimmed("you have local writes AND the source changed"));
+                println!(
+                    "      {}",
+                    dimmed("you have local writes AND the source changed")
+                );
             } else {
                 println!("    {} {}", yellow("changed "), cyan(&r[0]));
                 if !r[2].is_empty() {
@@ -163,8 +166,14 @@ pub async fn fetch(path: Option<PathBuf>, check: bool, json_output: bool) -> Res
             }
         }
         println!();
-        println!("  {}", dimmed("reads of these tables go to the source, so they are"));
-        println!("  {}", dimmed("correct but slower. run `gfs pull` to make them local again."));
+        println!(
+            "  {}",
+            dimmed("reads of these tables go to the source, so they are")
+        );
+        println!(
+            "  {}",
+            dimmed("correct but slower. run `gfs pull` to make them local again.")
+        );
     }
 
     for n in &notes {
@@ -219,12 +228,23 @@ pub async fn pull(
     // not change under you unless you ask.
     if let Some(a) = auto_schema {
         let on = parse_on(&a, "--auto-schema")?;
-        run_sql(&repo, &format!("UPDATE gfs.sync_policy SET autoschema = {on};")).await?;
+        run_sql(
+            &repo,
+            &format!("UPDATE gfs.sync_policy SET autoschema = {on};"),
+        )
+        .await?;
         if json_output {
-            println!("{}", serde_json::to_string_pretty(&json!({ "autoschema": on }))?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({ "autoschema": on }))?
+            );
         } else {
             println!();
-            println!("  {} auto schema repair {}", green("✓"), bold(if on { "on" } else { "off" }));
+            println!(
+                "  {} auto schema repair {}",
+                green("✓"),
+                bold(if on { "on" } else { "off" })
+            );
             println!(
                 "    {}",
                 dimmed(if on {
@@ -235,7 +255,9 @@ pub async fn pull(
             );
             println!(
                 "    {}",
-                dimmed("a column dropped on the source is never applied automatically: that could destroy local data")
+                dimmed(
+                    "a column dropped on the source is never applied automatically: that could destroy local data"
+                )
             );
             println!();
         }
@@ -251,7 +273,10 @@ pub async fn pull(
         )
         .await?;
         if json_output {
-            println!("{}", serde_json::to_string_pretty(&json!({ "autopull": on }))?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({ "autopull": on }))?
+            );
         } else {
             println!();
             println!(
@@ -298,7 +323,10 @@ pub async fn pull(
     }
 
     println!();
-    for r in actions.iter().filter(|r| r[0] == "schema" || r[0] == "sequence" || r[0] == "enum") {
+    for r in actions
+        .iter()
+        .filter(|r| r[0] == "schema" || r[0] == "sequence" || r[0] == "enum")
+    {
         println!("  {} {} {}", green("✓"), cyan(&r[1]), dimmed(&r[2]));
     }
     if actions.is_empty() {
@@ -322,7 +350,10 @@ pub async fn pull(
         for r in actions.iter().filter(|r| r[0] == "reset") {
             println!("    {} {}", dimmed("reset"), cyan(&r[1]));
         }
-        println!("    {}", dimmed("the next read of each fetches from the source"));
+        println!(
+            "    {}",
+            dimmed("the next read of each fetches from the source")
+        );
     }
 
     if !conflicts.is_empty() {
@@ -392,7 +423,9 @@ pub(crate) async fn materialize_clone(repo_path: &Path, quiet: bool) -> Result<i
         "SELECT gfs.warm(relid) FROM gfs.clone_source WHERE NOT whole_cached",
     )
     .await
-    .context("failed to materialize the clone; export aborted rather than write an incomplete dump")?;
+    .context(
+        "failed to materialize the clone; export aborted rather than write an incomplete dump",
+    )?;
 
     Ok(pending)
 }
