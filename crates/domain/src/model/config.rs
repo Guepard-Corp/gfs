@@ -25,7 +25,7 @@ pub struct EnvironmentConfig {
     pub database_version: String,
     #[serde(default)]
     pub database_port: Option<u16>,
-    /// Optional human-readable display label.
+    /// Console-provided deployment label (`deployment_request.label_name`).
     #[serde(default)]
     pub display_name: Option<String>,
 }
@@ -38,7 +38,7 @@ pub struct RuntimeConfig {
     pub container_name: String,
 }
 
-/// Remote runtime target.
+/// Console-mediated remote target (no local k3s API).
 impl fmt::Display for RuntimeConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -159,9 +159,32 @@ impl RepoCredentials {
         repo_path.join(GFS_DIR).join("credentials.toml")
     }
 
+    /// Restrict the credentials sidecar to the owner (0600). It holds the
+    /// management role's password in cleartext, so it must never be world- or
+    /// group-readable. A no-op when the mode is already 0600.
+    #[cfg(unix)]
+    fn restrict_to_owner(path: &Path) -> std::io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path)?.permissions();
+        if perms.mode() & 0o777 != 0o600 {
+            perms.set_mode(0o600);
+            std::fs::set_permissions(path, perms)?;
+        }
+        Ok(())
+    }
+
     /// Load persisted credentials, tolerating a missing/invalid file.
     pub fn load(repo_path: &Path) -> Self {
-        std::fs::read_to_string(Self::path(repo_path))
+        let path = Self::path(repo_path);
+        // Self-heal the mode: a sidecar written before 0600 was enforced lands
+        // at the default umask (0644, world-readable). Tighten it whenever gfs
+        // reads the repo (e.g. at checkout), so existing repos converge to 0600
+        // without needing a re-save.
+        #[cfg(unix)]
+        if path.exists() {
+            let _ = Self::restrict_to_owner(&path);
+        }
+        std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| toml::from_str(&s).ok())
             .unwrap_or_default()
@@ -170,7 +193,12 @@ impl RepoCredentials {
     pub fn save(&self, repo_path: &Path) -> Result<(), RepoError> {
         let content =
             toml::to_string_pretty(self).map_err(|e| RepoError::InvalidConfig(e.to_string()))?;
-        std::fs::write(Self::path(repo_path), content)?;
+        let path = Self::path(repo_path);
+        std::fs::write(&path, content)?;
+        // Re-pin on every write: a fresh write lands at the default umask
+        // (0644) and an overwrite does not reset an existing file's mode.
+        #[cfg(unix)]
+        Self::restrict_to_owner(&path)?;
         Ok(())
     }
 
@@ -442,5 +470,71 @@ mod tests {
         assert!(s.contains("docker"));
         assert!(s.contains("24"));
         assert!(s.contains("abc123"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_credentials_saved_at_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(GFS_DIR)).unwrap();
+        let creds = RepoCredentials {
+            user: Some("guepard-admin".into()),
+            password: Some("s3cr3t".into()),
+            name: Some("postgres".into()),
+        };
+        creds.save(dir.path()).unwrap();
+        let path = dir.path().join(GFS_DIR).join("credentials.toml");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "credentials.toml must be 0600, got {mode:o}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_credentials_save_repins_0600_on_overwrite() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(GFS_DIR)).unwrap();
+        let creds = RepoCredentials {
+            user: Some("guepard-admin".into()),
+            password: Some("first".into()),
+            name: None,
+        };
+        creds.save(dir.path()).unwrap();
+        let path = dir.path().join(GFS_DIR).join("credentials.toml");
+        // Loosen the mode behind save's back, then an overwrite must re-pin 0600.
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&path, perms).unwrap();
+        creds.save(dir.path()).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "overwrite must re-pin 0600, got {mode:o}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_credentials_load_self_heals_world_readable_sidecar() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(GFS_DIR)).unwrap();
+        let creds = RepoCredentials {
+            user: Some("guepard-admin".into()),
+            password: Some("s3cr3t".into()),
+            name: Some("postgres".into()),
+        };
+        creds.save(dir.path()).unwrap();
+        let path = dir.path().join(GFS_DIR).join("credentials.toml");
+        // Simulate a legacy sidecar written before 0600 was enforced.
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&path, perms).unwrap();
+        // Loading must tighten it back to 0600 and still parse correctly.
+        let loaded = RepoCredentials::load(dir.path());
+        assert_eq!(loaded.password.as_deref(), Some("s3cr3t"));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "load must self-heal a 0644 sidecar, got {mode:o}"
+        );
     }
 }

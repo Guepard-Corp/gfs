@@ -48,7 +48,7 @@ fn k8s_pvc_size_gi() -> String {
         .unwrap_or_else(|| DEFAULT_PVC_SIZE_GI.to_string())
 }
 
-/// Pin Postgres to a worker node (e.g. `guepard-dp-01` on Multipass; AWS DP hostname).
+/// Pin Postgres to a worker node (e.g. `worker-node-01` on Multipass; worker node hostname).
 fn k8s_schedule_node_name() -> Option<String> {
     std::env::var("GFS_K8S_NODE_NAME")
         .ok()
@@ -91,7 +91,7 @@ fn is_valid_k8s_node_port(port: i32) -> bool {
     (30000..=32767).contains(&port)
 }
 
-/// hostPort on the pod (the requested node port or `GFS_INSTANCE_NODE_PORT`).
+/// hostPort on the pod (console `deployment_request.port` or `GFS_INSTANCE_NODE_PORT`).
 fn host_port_from_mapping(mapping: &PortMapping) -> Option<i32> {
     mapping
         .host_port
@@ -304,8 +304,8 @@ fn decode_secret_values(secret: Secret) -> BTreeMap<String, String> {
 /// cannot change the advertised password. `optional: true` keeps pods of
 /// pre-Secret instances schedulable: with the var unset, the engine
 /// entrypoint skips it (the restored data dir is already initialised) and
-/// the platform reports a blank — not wrong — password, which the caller
-/// preserves.
+/// the platform reports a blank — not wrong — password, which the control
+/// plane preserves.
 fn container_env_for(
     instance: &str,
     def: &ComputeDefinition,
@@ -430,13 +430,13 @@ impl KubernetesCompute {
             })
             .collect();
 
-        let mounts = vec![VolumeMount {
+        let mut mounts = vec![VolumeMount {
             name: "data".to_string(),
             mount_path: def.data_dir.to_string_lossy().into_owned(),
             ..Default::default()
         }];
 
-        let volumes = vec![Volume {
+        let mut volumes = vec![Volume {
             name: "data".to_string(),
             persistent_volume_claim: Some(
                 k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
@@ -447,6 +447,48 @@ impl KubernetesCompute {
             ..Default::default()
         }];
 
+        let mut args = def.args.clone();
+        let mut init_containers: Vec<Container> = Vec::new();
+
+        // Startup seal: boot Postgres with a node-controlled `hba_file`
+        // that trusts ONLY loopback, so NO network path (NodePort / hostPort /
+        // in-cluster ClusterIP) can authenticate with the credentials a snapshot
+        // restore rolls back. The reconciler runs over the loopback exec seam while
+        // sealed; the node opens external auth (appends `host all all all
+        // scram-sha-256` + `pg_reload_conf`) only AFTER reconcile completes. An
+        // initContainer populates the file in a shared emptyDir before Postgres starts,
+        // so the seal is airtight from the pod's first byte on the wire.
+        if def.image.contains("postgres") {
+            mounts.push(VolumeMount {
+                name: "gfs-hba".to_string(),
+                mount_path: "/gfs-hba".to_string(),
+                ..Default::default()
+            });
+            volumes.push(Volume {
+                name: "gfs-hba".to_string(),
+                empty_dir: Some(Default::default()),
+                ..Default::default()
+            });
+            init_containers.push(Container {
+                name: "gfs-seal-hba".to_string(),
+                image: Some(def.image.clone()),
+                image_pull_policy: Some("IfNotPresent".to_string()),
+                command: Some(vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "printf 'local all all trust\\nhost all all 127.0.0.1/32 trust\\nhost all all ::1/128 trust\\n' > /gfs-hba/pg_hba.conf".to_string(),
+                ]),
+                volume_mounts: Some(vec![VolumeMount {
+                    name: "gfs-hba".to_string(),
+                    mount_path: "/gfs-hba".to_string(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            });
+            args.push("-c".to_string());
+            args.push("hba_file=/gfs-hba/pg_hba.conf".to_string());
+        }
+
         let container = Container {
             name: "db".to_string(),
             image: Some(def.image.clone()),
@@ -454,11 +496,7 @@ impl KubernetesCompute {
             env: Some(env),
             ports: Some(container_ports),
             volume_mounts: Some(mounts),
-            args: if def.args.is_empty() {
-                None
-            } else {
-                Some(def.args.clone())
-            },
+            args: if args.is_empty() { None } else { Some(args) },
             ..Default::default()
         };
 
@@ -498,6 +536,11 @@ impl KubernetesCompute {
                             run_as_user: Some(0),
                             ..Default::default()
                         }),
+                        init_containers: if init_containers.is_empty() {
+                            None
+                        } else {
+                            Some(init_containers)
+                        },
                         containers: vec![container],
                         volumes: Some(volumes),
                         node_selector: k8s_schedule_node_name()
@@ -738,7 +781,7 @@ impl KubernetesCompute {
         // A pod scaled to zero (replicas=0) keeps phase=Running throughout its
         // termination grace period. Surface a pod that is being deleted as
         // Stopping, not Running, so callers don't mistake a terminating pod for a
-        // live instance — this is what lets the engine auto-resume re-scale a
+        // live instance — this is what lets the auto-resume path re-scale a
         // db whose previous op just re-paused it, instead of skipping the wake
         // (which left replicas=0 and hung the next op waiting for a pod that
         // would never be created).
@@ -871,7 +914,7 @@ impl KubernetesCompute {
     /// When the source has no Secret (pre-Secret deploy), the target's own
     /// Secret is deleted instead — its freshly generated password is
     /// guaranteed stale once the volume is swapped, and an absent Secret
-    /// yields a blank (caller-preserved) report rather than a wrong one.
+    /// yields a blank (control-plane-preserved) report rather than a wrong one.
     pub async fn adopt_credentials_secret(
         &self,
         source_instance: &str,
@@ -996,7 +1039,7 @@ impl KubernetesCompute {
     /// [`Self::teardown_instance_keep_snapshots`] does, plus reclaim the
     /// per-commit VolumeSnapshots sourced from these PVCs — one ZFS snapshot per
     /// commit would otherwise leak. Consumers that DESTROY a database call this
-    /// (the CLI via `remove_instance`, and the engine/host daemon directly);
+    /// (the CLI via `remove_instance`, and the node daemon directly);
     /// consumers that RESTORE from a snapshot MUST use
     /// `teardown_instance_keep_snapshots` instead.
     pub async fn remove_instance_with_pvcs(

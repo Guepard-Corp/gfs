@@ -167,8 +167,7 @@ pub struct SchemaExtractionSpec {
 
 /// A read-only remote database to lazily clone from (copy-on-read).
 ///
-/// Only `SELECT` access is assumed; nothing is created on the remote. See
-/// `docs/rfcs/008-remote-clone.md`.
+/// Only `SELECT` access is assumed; nothing is created on the remote.
 #[derive(Debug, Clone)]
 pub struct RemoteSource {
     pub host: String,
@@ -449,10 +448,59 @@ pub trait DatabaseProvider: Send + Sync {
         Err(ProviderError::UnsupportedFormat("drop_role".into()))
     }
 
+    /// In-instance command that **neutralizes** `username` without dropping it:
+    /// disable login and overwrite its password with `new_password`. Used as the
+    /// reconcile fallback when a surplus role cannot be dropped (it owns objects in
+    /// the restored older data version) — access is removed by disabling the role
+    /// (a cheap, dependency-free op) rather than by mutating customer data, and the
+    /// fresh password destroys the resurrected snapshot credential.
+    fn quarantine_role_command(
+        &self,
+        username: &str,
+        new_password: &str,
+    ) -> std::result::Result<String, ProviderError> {
+        let _ = (username, new_password);
+        Err(ProviderError::UnsupportedFormat("quarantine_role".into()))
+    }
+
     /// In-instance command that lists login roles as JSON (parsed into
     /// [`crate::model::db_user::RoleInfo`]). Never includes a password.
     fn list_roles_command(&self) -> std::result::Result<String, ProviderError> {
         Err(ProviderError::UnsupportedFormat("list_roles".into()))
+    }
+
+    /// In-instance command that prints `username`'s stored password verifier on
+    /// stdout (empty when the role is absent or has no password). It is what the
+    /// durability store keeps at rest instead of the plaintext, and re-key compares
+    /// it by value to detect credential drift. With the default SCRAM-SHA-256
+    /// encryption this verifier is one-way (a store compromise does not yield a
+    /// reusable credential); under the deprecated `password_encryption = md5` the
+    /// stored hash is auth-equivalent, so that at-rest property assumes SCRAM.
+    fn user_verifier_command(&self, username: &str) -> std::result::Result<String, ProviderError> {
+        let _ = username;
+        Err(ProviderError::UnsupportedFormat("user_verifier".into()))
+    }
+
+    /// In-instance command that terminates every live backend belonging to
+    /// `username` except the caller's own, printing the count terminated on stdout.
+    /// Makes an access change (drop / password rotation) take effect on open
+    /// sessions immediately instead of only when they next disconnect.
+    fn terminate_user_sessions_command(
+        &self,
+        username: &str,
+    ) -> std::result::Result<String, ProviderError> {
+        let _ = username;
+        Err(ProviderError::UnsupportedFormat(
+            "terminate_user_sessions".into(),
+        ))
+    }
+
+    /// In-instance command that disables `username`'s ability to open NEW sessions
+    /// (`ALTER ROLE … NOLOGIN`), committed immediately. Used before a drop to close
+    /// the reconnect window while the role's live backends are terminated.
+    fn disable_login_command(&self, username: &str) -> std::result::Result<String, ProviderError> {
+        let _ = username;
+        Err(ProviderError::UnsupportedFormat("disable_login".into()))
     }
 
     /// In-instance command that applies `preset`'s privilege bundle to `username`.

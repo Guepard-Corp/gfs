@@ -39,6 +39,37 @@ impl RolePreset {
             Self::Admin => "admin",
         }
     }
+
+    /// Every preset, for iteration (there is no derive for this).
+    pub const ALL: [RolePreset; 3] = [Self::Readonly, Self::Readwrite, Self::Admin];
+
+    /// The reserved NOLOGIN **group role** whose membership grants this preset's
+    /// privileges. A managed user's level is expressed as membership in exactly
+    /// one of these groups — never as direct object grants on the user — so any
+    /// privilege the customer grants the user directly (via raw SQL) stays
+    /// distinguishable from the platform-managed level and survives a reconcile.
+    pub fn group_role(&self) -> &'static str {
+        match self {
+            Self::Readonly => "gfs_readonly",
+            Self::Readwrite => "gfs_readwrite",
+            Self::Admin => "gfs_admin",
+        }
+    }
+}
+
+/// The reserved NOLOGIN group roles that carry preset privileges. Membership in
+/// one of these is the platform-managed access level; these roles are reserved
+/// (never created, dropped, re-keyed, or tombstoned as ordinary managed users).
+pub const PRESET_GROUP_ROLES: [&str; 3] = ["gfs_readonly", "gfs_readwrite", "gfs_admin"];
+
+/// Whether a stored durability secret is already an engine-computed SCRAM
+/// verifier rather than a legacy pre-verifier plaintext. Postgres stores a
+/// verifier verbatim and would re-hash a plaintext, so only verifier-vs-verifier
+/// is a valid value comparison — re-key uses this to decide whether a stored
+/// secret can be drift-compared against the live catalog (verifier) or must be
+/// applied unconditionally (legacy plaintext).
+pub fn is_scram_verifier(secret: &str) -> bool {
+    secret.starts_with("SCRAM-SHA-256$")
 }
 
 /// Everything needed to create a login role.
@@ -403,5 +434,17 @@ mod tests {
             serde_json::from_str::<GrantableObject>(&json).unwrap(),
             object
         );
+    }
+
+    #[test]
+    fn is_scram_verifier_distinguishes_verifiers_from_plaintext() {
+        assert!(is_scram_verifier(
+            "SCRAM-SHA-256$4096:c2FsdA==$c3RvcmVk:c2VydmVy"
+        ));
+        assert!(!is_scram_verifier("hunter2"));
+        assert!(!is_scram_verifier("md5abc123"));
+        assert!(!is_scram_verifier(""));
+        // A plaintext that merely mentions scram is not the verifier prefix.
+        assert!(!is_scram_verifier("my-SCRAM-SHA-256-password"));
     }
 }

@@ -4,7 +4,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gfs_domain::model::db_user::{
-    DeployEnvSpec, GrantSpec, GrantableObject, Privilege, RevokeSpec, RolePreset, RoleSpec,
+    DeployEnvSpec, GrantSpec, GrantableObject, PRESET_GROUP_ROLES, Privilege, RevokeSpec,
+    RolePreset, RoleSpec,
 };
 use gfs_domain::ports::compute::{ComputeDefinition, EnvVar, PortMapping};
 use gfs_domain::ports::database_provider::{
@@ -43,6 +44,17 @@ const DEFAULT_DB: &str = "postgres";
 /// The rewrite truncates the file in place to preserve its owner and `0600` mode,
 /// is guarded by a marker line for idempotency, and leaves the reload to the
 /// caller (a following `SELECT pg_reload_conf()`).
+///
+/// GUARDRAIL — the loopback allow rules use `trust` (passwordless). That is safe
+/// only while a client role cannot itself open a loopback connection as the
+/// management super: client roles are `NOSUPERUSER`, so they cannot install a
+/// connection-capable extension (`dblink`, `postgres_fdw`), create an untrusted
+/// PL, or `COPY ... PROGRAM`. If any of those ever becomes reachable by a client
+/// (e.g. the platform pre-installs `dblink`/`postgres_fdw` and grants usage),
+/// passwordless loopback `trust` becomes a superuser-escalation path and these
+/// rules MUST switch to `scram-sha-256`. That change is drop-in: the exec seam
+/// always connects with `PGPASSWORD` set (see `query_in_instance_command`), so it
+/// keeps working once the management role has a non-empty password.
 const RESTRICT_MGMT_ROLE_TO_LOOPBACK: &str = concat!(
     r#"HBA="${PGDATA:-/var/lib/postgresql/data}/pg_hba.conf"; "#,
     r#"ADMIN="${POSTGRES_USER:-postgres}"; "#,
@@ -107,7 +119,7 @@ impl PostgresqlProvider {
                 // Listen on all interfaces so the container is reachable via the
                 // k8s Service/NodePort (and Docker port mapping). Without this a
                 // fresh initdb defaults to localhost, so the pod runs healthy but
-                // the CP's connection to the NodePort times out (deploy 500).
+                // the caller's connection to the NodePort times out (deploy 500).
                 name: "-c".into(),
                 value: "listen_addresses=*".into(),
             },
@@ -233,6 +245,15 @@ impl PostgresqlProvider {
         Ok(format!(
             r#"PGPASSWORD="${{POSTGRES_PASSWORD:-postgres}}" psql -h 127.0.0.1 -U "${{POSTGRES_USER:-postgres}}" -d "${{POSTGRES_DB:-postgres}}" -v ON_ERROR_STOP=1 -c "{escaped}""#
         ))
+    }
+
+    /// Wrap a built management command so its `psql` session runs with `search_path`
+    /// pinned to `pg_catalog, pg_temp`. A client role holds `CREATE` on `public`, so
+    /// an unqualified name a privileged statement resolves could otherwise be
+    /// shadowed by a client-created object in `public` (CVE-2018-1058). Customer
+    /// `/query` never goes through this — it keeps the default `search_path`.
+    fn pin_mgmt_search_path(command: String) -> String {
+        format!(r#"PGOPTIONS="-c search_path=pg_catalog,pg_temp" {command}"#)
     }
 }
 
@@ -660,7 +681,11 @@ impl DatabaseProvider for PostgresqlProvider {
                 .map(pg_quote_ident)
                 .transpose()?;
             sql.push('\n');
-            sql.push_str(&pg_preset_sql(&ident, preset, owner.as_deref()));
+            // Level via group membership: ensure the preset groups exist, then
+            // grant the fresh role into exactly the one preset group (no per-user
+            // object grants, so the customer's later direct grants stay theirs).
+            sql.push_str(&pg_preset_groups_ensure_sql(owner.as_deref())?);
+            sql.push_str(&pg_preset_membership_sql(&ident, preset)?);
             // Record the applied preset in the role comment so `list` surfaces it.
             sql.push_str(&format!(
                 "\nCOMMENT ON ROLE {ident} IS 'gfs-preset:{}';",
@@ -668,7 +693,10 @@ impl DatabaseProvider for PostgresqlProvider {
             ));
         }
         // Wrap in a transaction so create+grants are atomic (fixes v2 partial-state).
-        self.query_in_instance_command(&format!("BEGIN;\n{sql}\nCOMMIT;"), None)
+        Ok(Self::pin_mgmt_search_path(self.query_in_instance_command(
+            &format!("BEGIN;\n{sql}\nCOMMIT;"),
+            None,
+        )?))
     }
 
     fn alter_password_command(
@@ -677,10 +705,10 @@ impl DatabaseProvider for PostgresqlProvider {
         password: &str,
     ) -> std::result::Result<String, ProviderError> {
         let ident = pg_quote_ident(username)?;
-        self.query_in_instance_command(
+        Ok(Self::pin_mgmt_search_path(self.query_in_instance_command(
             &format!("ALTER ROLE {ident} WITH PASSWORD '{}';", sql_lit(password)),
             None,
-        )
+        )?))
     }
 
     fn drop_role_command(&self, username: &str) -> std::result::Result<String, ProviderError> {
@@ -693,12 +721,37 @@ impl DatabaseProvider for PostgresqlProvider {
         // created (it now owns no objects, so nothing is destroyed). `DROP ROLE`
         // then succeeds instead of failing with "objects depend on it".
         // Transactional so a partial drop can't leave a half-removed role.
-        self.query_in_instance_command(
+        Ok(Self::pin_mgmt_search_path(self.query_in_instance_command(
             &format!(
                 "BEGIN;\nREASSIGN OWNED BY {ident} TO CURRENT_USER;\nDROP OWNED BY {ident};\nDROP ROLE {ident};\nCOMMIT;"
             ),
             None,
-        )
+        )?))
+    }
+
+    fn quarantine_role_command(
+        &self,
+        username: &str,
+        new_password: &str,
+    ) -> std::result::Result<String, ProviderError> {
+        let ident = pg_quote_ident(username)?;
+        // Neutralize a surplus role we could not DROP (it owns objects in the
+        // restored older data). NOLOGIN denies authentication for the role
+        // cluster-wide — a stronger, dependency-free guarantee than DROP: it needs
+        // no ownership reassignment and touches no customer data. The fresh random
+        // password overwrites the resurrected snapshot verifier so the old
+        // credential is destroyed even if the role is later re-enabled. NOLOGIN
+        // subsumes a per-database `REVOKE CONNECT` (login is refused everywhere), so
+        // we do not enumerate databases. Transactional so a half-applied
+        // neutralization can never leave the role able to log in with its snapshot
+        // password.
+        Ok(Self::pin_mgmt_search_path(self.query_in_instance_command(
+            &format!(
+                "BEGIN;\nALTER ROLE {ident} NOLOGIN;\nALTER ROLE {ident} WITH PASSWORD '{}';\nCOMMIT;",
+                sql_lit(new_password)
+            ),
+            None,
+        )?))
     }
 
     fn list_roles_command(&self) -> std::result::Result<String, ProviderError> {
@@ -706,18 +759,62 @@ impl DatabaseProvider for PostgresqlProvider {
         // filters system `pg_*` roles without LIKE-escape fragility; the private
         // `guepard-admin` management role is never listed.
         const DELIM: &str = "GFS_SQL_EOF";
-        // Exclude system `pg_*` roles and the platform's management/bootstrap
-        // supers (`guepard-admin`, `postgres`) — neither is a client role, and
-        // surfacing the connection superuser invites a wedging `drop` (see
-        // `reject_reserved_role`).
+        // Exclude system `pg_*` roles, the platform's management/bootstrap supers
+        // (`guepard-admin`, `postgres`), and the reserved preset **group** roles
+        // (`gfs_readonly`/`gfs_readwrite`/`gfs_admin`) — none is a client role.
+        // Surfacing the connection superuser invites a wedging `drop` (see
+        // `reject_reserved_role`); surfacing the preset groups would show internal
+        // plumbing as if it were a user. A user's level is still reported via the
+        // `preset` field below.
         // `preset` is read back from the role comment (`gfs-preset:<name>`) set at
         // create/apply time; NULL when the role carries no preset comment.
         let sql = "SELECT COALESCE(json_agg(json_build_object('username', rolname, 'can_login', rolcanlogin, 'is_superuser', rolsuper, 'preset', substring(shobj_description(oid, 'pg_authid') FROM '^gfs-preset:(.*)$')) ORDER BY rolname), '[]'::json) \
-                   FROM pg_roles WHERE left(rolname, 3) <> 'pg_' AND rolname NOT IN ('guepard-admin', 'postgres');";
+                   FROM pg_roles WHERE left(rolname, 3) <> 'pg_' AND rolname NOT IN ('guepard-admin', 'postgres', 'gfs_readonly', 'gfs_readwrite', 'gfs_admin');";
         let body = gfs_domain::utils::shell::sql_heredoc_body(DELIM, sql)?;
         Ok(format!(
             r#"PGPASSWORD="${{POSTGRES_PASSWORD:-postgres}}" psql -h 127.0.0.1 -U "${{POSTGRES_USER:-postgres}}" -d "${{POSTGRES_DB:-postgres}}" -tA -v ON_ERROR_STOP=1 -c "{body}""#
         ))
+    }
+
+    fn user_verifier_command(&self, username: &str) -> std::result::Result<String, ProviderError> {
+        // Superuser-only read of the stored verifier (`pg_authid.rolpassword`). The
+        // management connection is the container superuser. `-tA` yields the bare
+        // verifier on stdout; an absent role or a NULL password yields empty output.
+        const DELIM: &str = "GFS_SQL_EOF";
+        let sql = format!(
+            "SELECT COALESCE(rolpassword, '') FROM pg_authid WHERE rolname = '{}';",
+            sql_lit(username)
+        );
+        let body = gfs_domain::utils::shell::sql_heredoc_body(DELIM, &sql)?;
+        Ok(format!(
+            r#"PGPASSWORD="${{POSTGRES_PASSWORD:-postgres}}" psql -h 127.0.0.1 -U "${{POSTGRES_USER:-postgres}}" -d "${{POSTGRES_DB:-postgres}}" -tA -v ON_ERROR_STOP=1 -c "{body}""#
+        ))
+    }
+
+    fn terminate_user_sessions_command(
+        &self,
+        username: &str,
+    ) -> std::result::Result<String, ProviderError> {
+        // Superuser terminates the role's backends, never its own (`pid <>
+        // pg_backend_pid()` keeps the management session alive). `-tA` prints the
+        // count of backends signalled (death is asynchronous).
+        const DELIM: &str = "GFS_SQL_EOF";
+        let sql = format!(
+            "SELECT count(*)::text FROM (SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = '{}' AND pid <> pg_backend_pid()) AS terminated;",
+            sql_lit(username)
+        );
+        let body = gfs_domain::utils::shell::sql_heredoc_body(DELIM, &sql)?;
+        Ok(format!(
+            r#"PGPASSWORD="${{POSTGRES_PASSWORD:-postgres}}" psql -h 127.0.0.1 -U "${{POSTGRES_USER:-postgres}}" -d "${{POSTGRES_DB:-postgres}}" -tA -v ON_ERROR_STOP=1 -c "{body}""#
+        ))
+    }
+
+    fn disable_login_command(&self, username: &str) -> std::result::Result<String, ProviderError> {
+        let ident = pg_quote_ident(username)?;
+        Ok(Self::pin_mgmt_search_path(self.query_in_instance_command(
+            &format!("ALTER ROLE {ident} WITH NOLOGIN;"),
+            None,
+        )?))
     }
 
     fn apply_preset_command(
@@ -728,21 +825,22 @@ impl DatabaseProvider for PostgresqlProvider {
     ) -> std::result::Result<String, ProviderError> {
         let ident = pg_quote_ident(username)?;
         let owner = default_privileges_owner.map(pg_quote_ident).transpose()?;
-        // Declarative, not additive: reset the role's schema-public privileges
-        // first so a *lower* preset (e.g. readwrite -> readonly) actually removes
-        // the higher grants + default-ACL entries, instead of leaving them (a
-        // downgrade that silently keeps write access). The reset + new grants run
-        // in one transaction. `create_role` does not need this (a fresh role has
-        // nothing to reset).
-        let reset = pg_preset_reset_sql(&ident, owner.as_deref());
-        self.query_in_instance_command(
+        // Declarative via group membership, not per-user object grants. Ensure the
+        // reserved preset groups exist and carry their privileges, then set the
+        // role's membership to exactly one group — revoking the others first so a
+        // *lower* preset (readwrite -> readonly) actually drops the higher level.
+        // Direct grants the customer made on the role are never revoked here, so
+        // they survive; the platform-managed level is only ever the group
+        // membership. All in one transaction.
+        let ensure = pg_preset_groups_ensure_sql(owner.as_deref())?;
+        let membership = pg_preset_membership_sql(&ident, preset)?;
+        Ok(Self::pin_mgmt_search_path(self.query_in_instance_command(
             &format!(
-                "BEGIN;\n{reset}\n{}\nCOMMENT ON ROLE {ident} IS 'gfs-preset:{}';\nCOMMIT;",
-                pg_preset_sql(&ident, preset, owner.as_deref()),
+                "BEGIN;\n{ensure}{membership}\nCOMMENT ON ROLE {ident} IS 'gfs-preset:{}';\nCOMMIT;",
                 preset.as_str()
             ),
             None,
-        )
+        )?))
     }
 
     fn bootstrap_deploy_env_command(
@@ -772,7 +870,7 @@ impl DatabaseProvider for PostgresqlProvider {
              COMMIT;",
             pw = sql_lit(&spec.owner_password),
         );
-        let bootstrap = self.query_in_instance_command(&sql, None)?;
+        let bootstrap = Self::pin_mgmt_search_path(self.query_in_instance_command(&sql, None)?);
         // Confine the management superuser (`${POSTGRES_USER}`) to the container's
         // loopback exec seam. It is the platform's management root and is never
         // handed to a client, so even a leaked credential must not reach the
@@ -801,7 +899,10 @@ impl DatabaseProvider for PostgresqlProvider {
         )?;
         // Transactional so a multi-statement grant (+ optional default-privileges
         // line) is atomic — no partial grant on failure (fixes v2 gap).
-        self.query_in_instance_command(&format!("BEGIN;\n{stmts}\nCOMMIT;"), None)
+        Ok(Self::pin_mgmt_search_path(self.query_in_instance_command(
+            &format!("BEGIN;\n{stmts}\nCOMMIT;"),
+            None,
+        )?))
     }
 
     fn revoke_command(&self, spec: &RevokeSpec) -> std::result::Result<String, ProviderError> {
@@ -814,7 +915,10 @@ impl DatabaseProvider for PostgresqlProvider {
             spec.cascade,
             None,
         )?;
-        self.query_in_instance_command(&format!("BEGIN;\n{stmts}\nCOMMIT;"), None)
+        Ok(Self::pin_mgmt_search_path(self.query_in_instance_command(
+            &format!("BEGIN;\n{stmts}\nCOMMIT;"),
+            None,
+        )?))
     }
 
     fn list_privileges_command(&self, role: &str) -> std::result::Result<String, ProviderError> {
@@ -822,7 +926,7 @@ impl DatabaseProvider for PostgresqlProvider {
         // literal — defence-in-depth (rejects anything outside the ident set).
         pg_quote_ident(role)?;
         const DELIM: &str = "GFS_SQL_EOF";
-        // Live read from the engine catalog (authoritative; no CP mirror). Table
+        // Live read from the engine catalog (authoritative; no cached mirror). Table
         // + sequence grants come from `information_schema.role_*_grants`; schema
         // + database grants are expanded from their ACLs via `aclexplode`. `-tA`
         // + `json_agg` → clean JSON parsed into `Vec<ObjectPrivilege>`. Never a
@@ -1048,38 +1152,56 @@ fn pg_quote_ident(ident: &str) -> std::result::Result<String, ProviderError> {
     }
 }
 
-/// Revoke every privilege a preset could have granted the already-quoted role
-/// `ident` on schema `public`, so [`pg_preset_sql`] can re-apply a preset
-/// declaratively (the role ends at exactly the new preset, never the union of
-/// old + new). Covers ALL table/sequence privileges, `CREATE` on the schema, and
-/// the `ALTER DEFAULT PRIVILEGES` entries — both connecting-role-scoped and, when
-/// `owner` is set, `FOR ROLE owner`. `USAGE ON SCHEMA public` is left alone (every
-/// preset re-grants it). Semicolon-terminated; the caller wraps it in the same
-/// transaction as the re-grant.
-fn pg_preset_reset_sql(ident: &str, owner: Option<&str>) -> String {
-    let mut s = String::new();
-    s.push_str(&format!(
-        "REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM {ident};\n"
-    ));
-    s.push_str(&format!(
-        "REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM {ident};\n"
-    ));
-    s.push_str(&format!("REVOKE CREATE ON SCHEMA public FROM {ident};\n"));
-    s.push_str(&format!(
-        "ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM {ident};\n"
-    ));
-    s.push_str(&format!(
-        "ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON SEQUENCES FROM {ident};"
-    ));
-    if let Some(owner) = owner {
+/// Idempotently ensure the reserved preset **group roles** exist and carry their
+/// preset's privilege bundle. Each `gfs_<preset>` group is `CREATE`d NOLOGIN
+/// (guarded against re-creation) then granted exactly what [`pg_preset_sql`] would
+/// grant a user — but on the group, once. Re-running (every reconcile) re-covers
+/// tables created since, so the group's privileges stay current. `owner` (already
+/// quoted) scopes the `ALTER DEFAULT PRIVILEGES` so the group also covers the
+/// customer's future objects. Semicolon-terminated; the caller wraps it in a
+/// transaction. `CREATE ROLE` runs fine inside a transaction (unlike `CREATE
+/// DATABASE`), and the guarded `DO` block makes bootstrap idempotent across
+/// restored snapshots that already carry the groups.
+fn pg_preset_groups_ensure_sql(owner: Option<&str>) -> std::result::Result<String, ProviderError> {
+    let mut s = String::from("DO $$\nBEGIN\n");
+    for preset in RolePreset::ALL {
+        let name = preset.group_role();
+        let ident = pg_quote_ident(name)?;
         s.push_str(&format!(
-            "\nALTER DEFAULT PRIVILEGES FOR ROLE {owner} IN SCHEMA public REVOKE ALL ON TABLES FROM {ident};\n"
-        ));
-        s.push_str(&format!(
-            "ALTER DEFAULT PRIVILEGES FOR ROLE {owner} IN SCHEMA public REVOKE ALL ON SEQUENCES FROM {ident};"
+            "  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{}') THEN CREATE ROLE {ident} NOLOGIN; END IF;\n",
+            sql_lit(name)
         ));
     }
-    s
+    s.push_str("END $$;\n");
+    for preset in RolePreset::ALL {
+        let ident = pg_quote_ident(preset.group_role())?;
+        s.push_str(&pg_preset_sql(&ident, preset, owner));
+        s.push('\n');
+    }
+    Ok(s)
+}
+
+/// Set the already-quoted login role `ident`'s platform-managed level to exactly
+/// `preset`, expressed as **group membership**. Revokes membership in every preset
+/// group first (so a downgrade actually drops the higher level), then grants the
+/// one target group. This never touches direct object grants on the role, so any
+/// privilege the customer granted the user via raw SQL survives a reconcile — the
+/// whole point of the group model. The role inherits the group's privileges
+/// (roles are `INHERIT` by default). Semicolon-terminated; the caller wraps it in
+/// the same transaction as [`pg_preset_groups_ensure_sql`].
+fn pg_preset_membership_sql(
+    ident: &str,
+    preset: RolePreset,
+) -> std::result::Result<String, ProviderError> {
+    let mut quoted = Vec::with_capacity(PRESET_GROUP_ROLES.len());
+    for g in PRESET_GROUP_ROLES {
+        quoted.push(pg_quote_ident(g)?);
+    }
+    let target = pg_quote_ident(preset.group_role())?;
+    Ok(format!(
+        "REVOKE {} FROM {ident};\nGRANT {target} TO {ident};",
+        quoted.join(", ")
+    ))
 }
 
 /// The allow-listed grant bundle for `preset`, applied to the already-quoted
@@ -1091,8 +1213,8 @@ fn pg_preset_reset_sql(ident: &str, owner: Option<&str>) -> String {
 /// deploy, so a preset user sees the tables the customer creates later. When
 /// `None` the defaults are role-scoped to the connecting role (single-node
 /// gfs). Without this, presets only cover the connecting admin's future tables
-/// — never the customer's — so they behave as one-time snapshots; this
-/// matches the bootstrap's `FOR ROLE owner`.
+/// — never the customer's — so they behave as one-time snapshots. This
+/// matches the deploy bootstrap's `FOR ROLE owner`.
 fn pg_preset_sql(ident: &str, preset: RolePreset, owner: Option<&str>) -> String {
     // `FOR ROLE "owner" ` (trailing space) when a deploy owner is supplied.
     let for_role = owner.map(|o| format!("FOR ROLE {o} ")).unwrap_or_default();
@@ -1303,7 +1425,7 @@ fn pg_privilege_change_sql(
 /// before execution); a source table without a usable unique key is refused
 /// loudly at registration rather than served empty. See
 /// `crates/extensions/gfs/README.md` for the mechanism — the original overlay-view
-/// design in `docs/rfcs/008-remote-clone.md` was superseded by this planner hook.
+/// design was superseded by this planner hook.
 fn build_clone_bootstrap_sql(remote: &RemoteSource) -> String {
     // dblink connection string, used only for read-only introspection of the
     // remote (schema/table/key discovery).
@@ -1576,6 +1698,62 @@ mod tests {
         assert!(cmd_db.contains("-d 'myapp'"));
         assert!(!cmd_db.contains("${POSTGRES_DB"));
         assert!(!cmd.starts_with("psql postgresql://"));
+
+        // Customer `/query` must keep the default search_path (it relies on
+        // resolving unqualified names in `public`) — no management pin.
+        assert!(
+            !cmd.contains("PGOPTIONS"),
+            "customer query path must not pin search_path"
+        );
+    }
+
+    #[test]
+    fn management_ddl_pins_search_path_off_public() {
+        use gfs_domain::model::db_user::{
+            GrantSpec, GrantableObject, Privilege, RolePreset, RoleSpec,
+        };
+        let provider = PostgresqlProvider::new();
+        const PIN: &str = r#"PGOPTIONS="-c search_path=pg_catalog,pg_temp""#;
+
+        // Every privileged DDL builder runs its psql session with search_path
+        // pinned to pg_catalog so a client-created object in `public` cannot
+        // shadow an unqualified name the statement resolves (CVE-2018-1058).
+        let create = provider
+            .create_role_command(&RoleSpec {
+                username: "app_rw".into(),
+                password: "pw".into(),
+                preset: Some(RolePreset::Readwrite),
+                default_privileges_owner: None,
+            })
+            .expect("create");
+        assert!(create.contains(PIN), "create_role pins search_path");
+
+        let alter = provider
+            .alter_password_command("app_rw", "new")
+            .expect("alter");
+        assert!(alter.contains(PIN), "alter_password pins search_path");
+
+        let drop = provider.drop_role_command("app_rw").expect("drop");
+        assert!(drop.contains(PIN), "drop_role pins search_path");
+
+        let preset = provider
+            .apply_preset_command("app_rw", RolePreset::Readonly, Some("owner"))
+            .expect("preset");
+        assert!(preset.contains(PIN), "apply_preset pins search_path");
+
+        let grant = provider
+            .grant_command(&GrantSpec {
+                role: "app_rw".into(),
+                object: GrantableObject::Table {
+                    schema: "public".into(),
+                    name: "t".into(),
+                },
+                privileges: vec![Privilege::Select],
+                with_grant_option: false,
+                apply_to_future: None,
+            })
+            .expect("grant");
+        assert!(grant.contains(PIN), "grant pins search_path");
     }
 
     #[test]
@@ -1600,8 +1778,22 @@ mod tests {
             cmd.contains("BEGIN;"),
             "create+grants must be transactional"
         );
+        // Readwrite level is group membership, not per-user object grants: the
+        // fresh role is granted INTO the reserved group, which itself carries the
+        // privileges. The group is created NOLOGIN, guarded against re-creation.
         assert!(
-            cmd.contains("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public")
+            cmd.contains(r#"CREATE ROLE "gfs_readwrite" NOLOGIN"#),
+            "preset groups must be ensured; got:\n{cmd}"
+        );
+        assert!(
+            cmd.contains(
+                r#"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO "gfs_readwrite""#
+            ),
+            "the group carries the preset privileges; got:\n{cmd}"
+        );
+        assert!(
+            cmd.contains(r#"GRANT "gfs_readwrite" TO "app_rw""#),
+            "the user's level is membership in the group; got:\n{cmd}"
         );
     }
 
@@ -1620,9 +1812,13 @@ mod tests {
         let cmd = provider.create_role_command(&spec).expect("cmd");
         assert!(
             cmd.contains(
-                r#"ALTER DEFAULT PRIVILEGES FOR ROLE "owner" IN SCHEMA public GRANT SELECT ON TABLES TO "reader""#
+                r#"ALTER DEFAULT PRIVILEGES FOR ROLE "owner" IN SCHEMA public GRANT SELECT ON TABLES TO "gfs_readonly""#
             ),
-            "preset defaults must be role-scoped to the deploy owner; got:\n{cmd}"
+            "preset defaults must be role-scoped to the deploy owner, granted to the group; got:\n{cmd}"
+        );
+        assert!(
+            cmd.contains(r#"GRANT "gfs_readonly" TO "reader""#),
+            "the user gets its level via group membership; got:\n{cmd}"
         );
 
         // Without an owner (single-node), no FOR ROLE clause is emitted.
@@ -1637,36 +1833,65 @@ mod tests {
         );
         assert!(
             cmd_none.contains(
-                r#"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO "reader""#
+                r#"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO "gfs_readonly""#
             ),
-            "single-node preset keeps role-scoped-to-self defaults; got:\n{cmd_none}"
+            "single-node preset keeps role-scoped-to-self defaults on the group; got:\n{cmd_none}"
         );
     }
 
     #[test]
-    fn apply_preset_is_declarative_resets_before_granting() {
+    fn apply_preset_sets_group_membership_and_spares_direct_grants() {
         use gfs_domain::model::db_user::RolePreset;
         let provider = PostgresqlProvider::new();
-        // apply_preset must REVOKE the role's existing schema-public privileges
-        // (incl. FOR ROLE owner default-ACLs) BEFORE granting the new preset, so a
-        // downgrade actually reduces privileges.
+        // apply_preset sets the role's level as group membership: revoke every
+        // preset group first (so a downgrade drops the higher level), then grant
+        // exactly one. It must NEVER revoke object privileges from the user, so a
+        // grant the customer made directly on the role survives.
         let cmd = provider
             .apply_preset_command("app_rw", RolePreset::Readonly, Some("owner"))
             .expect("cmd");
         assert!(
-            cmd.contains(r#"REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM "app_rw""#),
-            "must revoke existing table privileges first; got:\n{cmd}"
+            cmd.contains(r#"REVOKE "gfs_readonly", "gfs_readwrite", "gfs_admin" FROM "app_rw""#),
+            "must revoke membership in every preset group first; got:\n{cmd}"
         );
         assert!(
-            cmd.contains(
-                r#"ALTER DEFAULT PRIVILEGES FOR ROLE "owner" IN SCHEMA public REVOKE ALL ON TABLES FROM "app_rw""#
-            ),
-            "must revoke owner-scoped default privileges first; got:\n{cmd}"
+            cmd.contains(r#"GRANT "gfs_readonly" TO "app_rw""#),
+            "must grant membership in exactly the target group; got:\n{cmd}"
         );
-        // The reset precedes the new preset's grant (declarative order).
-        let revoke_at = cmd.find("REVOKE ALL PRIVILEGES ON ALL TABLES").unwrap();
-        let grant_at = cmd.find("GRANT SELECT ON ALL TABLES").unwrap();
-        assert!(revoke_at < grant_at, "reset must run before the re-grant");
+        assert!(
+            !cmd.contains("REVOKE ALL PRIVILEGES ON ALL TABLES"),
+            "must not revoke object privileges from the user — customer direct grants survive; got:\n{cmd}"
+        );
+        // Membership revoke precedes the grant (declarative order).
+        let revoke_at = cmd
+            .find(r#"REVOKE "gfs_readonly", "gfs_readwrite""#)
+            .unwrap();
+        let grant_at = cmd.find(r#"GRANT "gfs_readonly" TO "app_rw""#).unwrap();
+        assert!(revoke_at < grant_at, "revoke-all must run before the grant");
+    }
+
+    #[test]
+    fn preset_groups_are_ensured_idempotently_with_their_privileges() {
+        // Each preset group is created only if absent (guarded, so a restored
+        // snapshot that already carries it is a no-op), then granted its own
+        // privilege bundle — membership in the group is what confers the level.
+        let sql = pg_preset_groups_ensure_sql(None).expect("ensure sql");
+        for g in ["gfs_readonly", "gfs_readwrite", "gfs_admin"] {
+            assert!(
+                sql.contains(&format!(
+                    "IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{g}') THEN CREATE ROLE \"{g}\" NOLOGIN"
+                )),
+                "group {g} must be created only if absent; got:\n{sql}"
+            );
+        }
+        assert!(
+            sql.contains(r#"GRANT SELECT ON ALL TABLES IN SCHEMA public TO "gfs_readonly""#),
+            "readonly group carries SELECT; got:\n{sql}"
+        );
+        assert!(
+            sql.contains(r#"GRANT CREATE ON SCHEMA public TO "gfs_admin""#),
+            "admin group carries CREATE; got:\n{sql}"
+        );
     }
 
     #[test]
@@ -1708,6 +1933,36 @@ mod tests {
         assert!(provider.drop_role_command("bad name").is_err());
         let alter = provider.alter_password_command("app_ro", "new'pw").unwrap();
         assert!(alter.contains(r#"ALTER ROLE "app_ro" WITH PASSWORD 'new''pw';"#));
+    }
+
+    #[test]
+    fn quarantine_role_command_disables_login_and_rotates_password() {
+        let provider = PostgresqlProvider::new();
+        let cmd = provider
+            .quarantine_role_command("app_stale", "thrown'away")
+            .unwrap();
+        assert!(
+            cmd.contains(r#"ALTER ROLE "app_stale" NOLOGIN;"#),
+            "quarantine must disable login (the airtight, cluster-wide access denial)"
+        );
+        assert!(
+            cmd.contains(r#"ALTER ROLE "app_stale" WITH PASSWORD 'thrown''away';"#),
+            "quarantine must overwrite the resurrected snapshot password (literal escaped)"
+        );
+        // NOLOGIN before the password rotation, both inside one transaction, so a
+        // half-applied neutralization can never leave the role able to log in.
+        assert!(
+            cmd.find("NOLOGIN").unwrap() < cmd.find("WITH PASSWORD").unwrap(),
+            "login must be disabled before (or with) the rotation"
+        );
+        assert!(
+            cmd.contains("BEGIN;") && cmd.contains("COMMIT;"),
+            "must be transactional"
+        );
+        assert!(
+            provider.quarantine_role_command("bad name", "x").is_err(),
+            "an invalid identifier must be rejected, never interpolated"
+        );
     }
 
     #[test]
@@ -1784,7 +2039,9 @@ mod tests {
             "list must use tuples-only unaligned output"
         );
         assert!(cmd.contains("json_agg"));
-        assert!(cmd.contains("rolname NOT IN ('guepard-admin', 'postgres')"));
+        assert!(cmd.contains(
+            "rolname NOT IN ('guepard-admin', 'postgres', 'gfs_readonly', 'gfs_readwrite', 'gfs_admin')"
+        ));
         assert!(cmd.contains("left(rolname, 3) <> 'pg_'"));
     }
 
@@ -2439,6 +2696,124 @@ mod tests {
         assert_eq!(
             after_revoke, "f",
             "SELECT must be gone after the emitted REVOKE"
+        );
+    }
+
+    #[test]
+    fn mgmt_pin_blinds_privileged_session_to_public_shadow_on_live_pg() {
+        // CVE-2018-1058 defense, end-to-end on a real server. A privileged
+        // (management) psql session must resolve unqualified names off
+        // `pg_catalog`, so a client-planted object in `public` cannot shadow a
+        // name a privileged statement resolves. The customer `/query` path keeps
+        // `public` (it needs it), so the same planted object stays visible there
+        // — proving the pin is scoped to privileged DDL, not a blanket change.
+        if !docker_available() {
+            eprintln!(
+                "SKIP mgmt_pin_blinds_privileged_session_to_public_shadow_on_live_pg: docker unavailable"
+            );
+            return;
+        }
+        let provider = PostgresqlProvider::new();
+        let cn = format!("gfs-searchpath-live-{}", std::process::id());
+        let docker = |args: &[&str]| {
+            std::process::Command::new("docker")
+                .args(args)
+                .output()
+                .expect("docker")
+        };
+        let exec_sql = |cn: &str, sql: &str| {
+            std::process::Command::new("docker")
+                .args(["exec", cn, "psql", "-U", "postgres", "-tAc", sql])
+                .output()
+                .expect("docker exec psql")
+        };
+        let exec_shell = |cn: &str, cmd: &str| {
+            std::process::Command::new("docker")
+                .args(["exec", cn, "sh", "-c", cmd])
+                .output()
+                .expect("docker exec sh")
+        };
+
+        let _ = docker(&["rm", "-f", &cn]);
+        let run = docker(&[
+            "run",
+            "-d",
+            "--rm",
+            "--name",
+            &cn,
+            "-e",
+            "POSTGRES_PASSWORD=postgres",
+            "postgres:17",
+        ]);
+        assert!(
+            run.status.success(),
+            "docker run: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+
+        let mut ready = false;
+        for _ in 0..30 {
+            if docker(&["exec", &cn, "pg_isready", "-U", "postgres"])
+                .status
+                .success()
+            {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+
+        // An attacker with CREATE on `public` plants a function whose unqualified
+        // name a naive privileged statement might resolve.
+        exec_sql(
+            &cn,
+            "CREATE FUNCTION public.evil() RETURNS text LANGUAGE sql AS $$ SELECT 'PWNED'::text $$;",
+        );
+
+        // A management-pinned session reports its locked-down search_path.
+        let show_pinned = PostgresqlProvider::pin_mgmt_search_path(
+            provider
+                .query_in_instance_command("SHOW search_path;", None)
+                .unwrap(),
+        );
+        let show_pinned_out = exec_shell(&cn, &show_pinned);
+
+        // Unqualified resolution of the planted object across both paths.
+        let sel = "SELECT evil();";
+        let customer = provider.query_in_instance_command(sel, None).unwrap();
+        let mgmt = PostgresqlProvider::pin_mgmt_search_path(
+            provider.query_in_instance_command(sel, None).unwrap(),
+        );
+        let customer_out = exec_shell(&cn, &customer);
+        let mgmt_out = exec_shell(&cn, &mgmt);
+
+        // Clean up BEFORE asserting so a failed assert never leaks the container.
+        let _ = docker(&["rm", "-f", &cn]);
+
+        assert!(ready, "postgres never became ready");
+
+        let show = String::from_utf8_lossy(&show_pinned_out.stdout);
+        assert!(
+            show.contains("pg_catalog") && !show.contains("public"),
+            "management session must run with search_path pinned off public, got: {show}"
+        );
+        assert!(
+            customer_out.status.success()
+                && String::from_utf8_lossy(&customer_out.stdout).contains("PWNED"),
+            "customer path keeps `public` and resolves the planted object (stdout={}, stderr={})",
+            String::from_utf8_lossy(&customer_out.stdout),
+            String::from_utf8_lossy(&customer_out.stderr),
+        );
+        assert!(
+            !mgmt_out.status.success(),
+            "management pin must make the planted public.evil() unresolvable (stdout={}, stderr={})",
+            String::from_utf8_lossy(&mgmt_out.stdout),
+            String::from_utf8_lossy(&mgmt_out.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&mgmt_out.stderr).contains("does not exist"),
+            "the pinned session must fail with a name-resolution error, got stderr: {}",
+            String::from_utf8_lossy(&mgmt_out.stderr),
         );
     }
 }
