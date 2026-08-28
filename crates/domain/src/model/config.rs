@@ -479,7 +479,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(GFS_DIR)).unwrap();
         let creds = RepoCredentials {
-            user: Some("guepard-admin".into()),
+            user: Some("gfs_super".into()),
             password: Some("s3cr3t".into()),
             name: Some("postgres".into()),
         };
@@ -496,7 +496,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(GFS_DIR)).unwrap();
         let creds = RepoCredentials {
-            user: Some("guepard-admin".into()),
+            user: Some("gfs_super".into()),
             password: Some("first".into()),
             name: None,
         };
@@ -518,7 +518,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(GFS_DIR)).unwrap();
         let creds = RepoCredentials {
-            user: Some("guepard-admin".into()),
+            user: Some("gfs_super".into()),
             password: Some("s3cr3t".into()),
             name: Some("postgres".into()),
         };

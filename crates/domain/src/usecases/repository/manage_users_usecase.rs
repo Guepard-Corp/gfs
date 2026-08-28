@@ -454,19 +454,19 @@ fn require_password(password: &str) -> Result<(), ManageUsersError> {
 }
 
 /// The platform's load-bearing roles, never client roles: the engine
-/// connection superuser `postgres`, the bootstrap super `guepard-admin`, the
+/// connection superuser `postgres`, the bootstrap super `gfs_super`, the
 /// customer's least-privileged login `owner`, and the `developers` group. Client
 /// user management (`gfs user`) refuses to mutate any of them — dropping the
 /// connection superuser makes `DROP OWNED BY` wedge the session; dropping `owner`
 /// destroys the customer's primary login; rotating a password or privileges
 /// out-of-band desyncs the deploy's stored credential/connection string. Fail
 /// fast with a clear message instead.
-const RESERVED_ROLES: [&str; 4] = ["guepard-admin", "postgres", "owner", "developers"];
+const RESERVED_ROLES: [&str; 4] = ["gfs_super", "postgres", "owner", "developers"];
 
 /// The management superusers, whose passwords the platform never rotates through
 /// any user-facing or fresh-reset path — they live in `credentials.toml`, not the
 /// revealable vault.
-const SUPERUSER_ROLES: [&str; 2] = ["guepard-admin", "postgres"];
+const SUPERUSER_ROLES: [&str; 2] = ["gfs_super", "postgres"];
 
 /// Refuse the management superuser (a subset of [`reject_reserved_role`]) while
 /// permitting the platform-provisioned `owner`/`developers`. Used by the
@@ -525,7 +525,7 @@ mod tests {
     fn reserved_roles_cannot_be_dropped() {
         use super::reject_reserved_role;
         assert!(reject_reserved_role("postgres").is_err());
-        assert!(reject_reserved_role("guepard-admin").is_err());
+        assert!(reject_reserved_role("gfs_super").is_err());
         // The customer's load-bearing deploy roles are protected too (F-04).
         assert!(reject_reserved_role("owner").is_err());
         assert!(reject_reserved_role("developers").is_err());
@@ -548,7 +548,7 @@ mod tests {
         assert!(reject_superuser_role("owner").is_ok());
         assert!(reject_superuser_role("developers").is_ok());
         // ...but never the management superuser, in any case.
-        assert!(reject_superuser_role("guepard-admin").is_err());
+        assert!(reject_superuser_role("gfs_super").is_err());
         assert!(reject_superuser_role("postgres").is_err());
         assert!(reject_superuser_role("POSTGRES").is_err());
     }
