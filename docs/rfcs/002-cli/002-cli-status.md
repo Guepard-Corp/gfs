@@ -1,8 +1,8 @@
-# RFC 006 — Data-plane status (CLI)
+# RFC 002: Status (CLI)
 
 ## Overview
 
-The data-plane **status** reports the current state of a GFS repository and its associated compute instance. It is consumed by the CLI (e.g. `gfs status`) and may be exposed via the data-plane API. The response is read-only and aggregates repository, config, and compute runtime data.
+The **status** reports the current state of a GFS repository and its associated compute instance. It is consumed by the CLI (e.g. `gfs status`) and may be exposed via the node's API. The response is read-only and aggregates repository, config, and compute runtime data.
 
 This RFC defines the **payload** and **semantics** of the status response. Implementation follows the hexagonal architecture: a use case in the domain orchestrates the Repository and Compute ports; adapters (e.g. GFS repository, Docker compute) provide the data.
 
@@ -45,7 +45,7 @@ Present only when the repository is a lazy clone (`gfs clone --from`) with a run
 
 ## Connection string
 
-The **connection string** is the canonical way for a client (CLI, app, or control plane) to connect to the database running in the data-plane’s compute instance.
+The **connection string** is the canonical way for a client (CLI, app, or control plane) to connect to the database running in the node’s compute instance.
 
 - **Authority**: Host SHALL be the host the client can reach (e.g. `localhost` for same-machine CLI; node hostname or IP when used from another service). Port SHALL be the **host** port (mapped from the container port), e.g. from the Compute port’s instance config or from runtime config.
 - **Credentials and database name**: Sourced from the compute definition (e.g. env vars `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`) or from repo/config overrides. No secrets SHALL be logged; the status response may expose the connection string only to authorised callers.
@@ -94,7 +94,7 @@ Errors (e.g. repo not found, not a GFS repo, compute not provisioned) SHALL be r
 ## Out of scope
 
 - **History / log**: Commit history or branch list are not part of this status payload; they remain under other commands/RFCs.
-- **Control-plane reporting**: Whether and how the data-plane pushes this status to the control plane is a separate concern (e.g. enrollment, heartbeat).
+- **Reporting**: Whether and how the node reports this status to an external control plane is a separate concern, out of scope for this RFC.
 - **Mutating operations**: Status is read-only; start/stop/restart are separate commands.
 
 ---

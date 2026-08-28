@@ -1,8 +1,8 @@
-# RFC 006 — Data-plane config (CLI)
+# RFC 002: Config (CLI)
 
 ## Overview
 
-The data-plane **config** command lets you read and write configuration, similar to `git config`. The main use is configuring **user.name** and **user.email**, which are used as the default author and author email for every commit (see [006-cli-commit](006-cli-commit.md)).
+The **config** command lets you read and write configuration, similar to `git config`. The main use is configuring **user.name** and **user.email**, which are used as the default author and author email for every commit (see [002-cli-commit](002-cli-commit.md)).
 
 GFS supports two config scopes:
 
@@ -100,7 +100,7 @@ The file is created on first `gfs config --global … <value>` invocation.
 
 ## Integration with commit
 
-Each commit records **author** and **author email** (see [006-cli-commit](006-cli-commit.md)). Those values are resolved in this order:
+Each commit records **author** and **author email** (see [002-cli-commit](002-cli-commit.md)). Those values are resolved in this order:
 
 1. CLI flags `--author` / `--author-email` if present.
 2. `user.name` / `user.email` from `.gfs/config.toml` (repo-local).

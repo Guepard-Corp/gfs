@@ -1,8 +1,8 @@
-# RFC 006 — Data-plane checkout (CLI)
+# RFC 002: Checkout (CLI)
 
 ## Overview
 
-The data-plane **checkout** switches the active branch or commit (HEAD) and updates the active workspace so that the working tree reflects the chosen revision. It is invoked via `gfs checkout <revision>` and follows the same hexagonal architecture as the rest of the data-plane: a use case in the domain orchestrates the Repository port; the GFS adapter satisfies that port. Optionally, Storage may be involved to materialise snapshot data into the workspace. No Compute is required for the checkout itself (the database may need to be restarted or re-attached to the new workspace by the user or a separate flow).
+The **checkout** switches the active branch or commit (HEAD) and updates the active workspace so that the working tree reflects the chosen revision. It is invoked via `gfs checkout <revision>` and follows the same hexagonal architecture as the rest of GFS: a use case in the domain orchestrates the Repository port; the GFS adapter satisfies that port. Optionally, Storage may be involved to materialise snapshot data into the workspace. No Compute is required for the checkout itself (the database may need to be restarted or re-attached to the new workspace by the user or a separate flow).
 
 This RFC defines the **command interface**, **behaviour**, and **output** of `gfs checkout`.
 

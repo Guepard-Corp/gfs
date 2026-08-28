@@ -1,4 +1,4 @@
-## Guepard Repository Layout
+## GFS Repository Layout
 
 ```
 ~/.gfs/

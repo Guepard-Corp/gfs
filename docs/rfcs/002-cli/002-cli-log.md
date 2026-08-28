@@ -1,8 +1,8 @@
-# RFC 006 — Data-plane log (CLI)
+# RFC 002: Log (CLI)
 
 ## Overview
 
-The data-plane **log** displays commit history reachable from HEAD (or a given revision). It is invoked via `gfs log` and follows the same hexagonal architecture as the rest of the data-plane: a use case in the domain orchestrates the Repository port; the GFS adapter satisfies that port. No Compute or Storage is involved.
+The **log** displays commit history reachable from HEAD (or a given revision). It is invoked via `gfs log` and follows the same hexagonal architecture as the rest of GFS: a use case in the domain orchestrates the Repository port; the GFS adapter satisfies that port. No Compute or Storage is involved.
 
 This RFC defines the **command interface**, **behaviour**, and **output** of `gfs log`.
 

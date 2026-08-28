@@ -1,6 +1,6 @@
-# RFC 007: Storage
+# RFC 003: Storage
 
-This RFC describes storage backends for the data plane: volume and directory-level operations (mount, snapshot, clone, quota) and how they map to different filesystems.
+This RFC describes storage backends for GFS: volume and directory-level operations (mount, snapshot, clone, quota) and how they map to different filesystems.
 
 ## Filesystem comparison
 
