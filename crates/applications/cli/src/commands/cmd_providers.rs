@@ -1,4 +1,4 @@
-//! `gfs providers` — list database providers and their supported versions (RFC 006).
+//! `gfs providers` — list database providers and their supported versions.
 
 use std::sync::Arc;
 

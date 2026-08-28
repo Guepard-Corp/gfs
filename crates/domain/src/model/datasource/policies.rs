@@ -1,4 +1,4 @@
-//! RLS policy metadata. Mirrors `@domain/entities/datasource-meta` Policy (Zod).
+//! RLS policy metadata. Mirrors the datasource metadata schema.
 
 use serde::{Deserialize, Serialize};
 

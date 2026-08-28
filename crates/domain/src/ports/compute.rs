@@ -105,7 +105,7 @@ pub enum InstanceState {
 }
 
 impl InstanceState {
-    /// Returns the RFC 006 status string (snake_case) for this state.
+    /// Returns the status string (snake_case) for this state.
     pub fn as_status_str(&self) -> &'static str {
         match self {
             InstanceState::Starting => "starting",

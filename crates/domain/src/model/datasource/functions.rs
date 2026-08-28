@@ -1,4 +1,4 @@
-//! Function metadata. Mirrors `@domain/entities/datasource-meta` Function (Zod).
+//! Function metadata. Mirrors the datasource metadata schema.
 
 use serde::{Deserialize, Serialize};
 

@@ -25,7 +25,7 @@ pub struct EnvironmentConfig {
     pub database_version: String,
     #[serde(default)]
     pub database_port: Option<u16>,
-    /// Console-provided deployment label (`deployment_request.label_name`).
+    /// Optional human-readable display label.
     #[serde(default)]
     pub display_name: Option<String>,
 }
@@ -38,7 +38,7 @@ pub struct RuntimeConfig {
     pub container_name: String,
 }
 
-/// Console-mediated remote target (no local k3s API).
+/// Remote runtime target.
 impl fmt::Display for RuntimeConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(

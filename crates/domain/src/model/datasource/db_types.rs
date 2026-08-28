@@ -1,5 +1,5 @@
 //! Custom type metadata (database types, not Rust types).
-//! Mirrors `@domain/entities/datasource-meta` Type (Zod). Module named db_types to avoid Rust keyword.
+//! Mirrors the datasource metadata schema. Module named db_types to avoid Rust keyword.
 
 use serde::{Deserialize, Serialize};
 

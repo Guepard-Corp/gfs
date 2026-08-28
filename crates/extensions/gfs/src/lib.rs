@@ -1,6 +1,6 @@
 #![allow(static_mut_refs)]
 #![allow(non_snake_case)]
-//! gfs — lazy copy-on-read clone of an external PostgreSQL (RFC 008), in Rust/pgrx.
+//! gfs — lazy copy-on-read clone of an external PostgreSQL, in Rust/pgrx.
 //!
 //! The source is reachable only over SQL (a `postgres_fdw` foreign table), so the
 //! clone is logical, not physical. Each table is a real local heap table (indexes,

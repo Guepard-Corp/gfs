@@ -1,4 +1,4 @@
-//! Publication metadata. Mirrors `@domain/entities/datasource-meta` Publication (Zod).
+//! Publication metadata. Mirrors the datasource metadata schema.
 
 use serde::{Deserialize, Serialize};
 

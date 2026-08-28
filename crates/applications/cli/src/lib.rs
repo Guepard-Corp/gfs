@@ -1,4 +1,4 @@
-//! `gfs` – Guepard data-plane CLI library.
+//! `gfs` – GFS command-line interface library.
 //!
 //! Provides a programmatic interface to run the CLI. Use `run()` for testing or embedding.
 

@@ -1,4 +1,4 @@
-//! Use case for reporting data-plane status (RFC 006).
+//! Use case for reporting status.
 //!
 //! Aggregates repository (current branch), config (provider, version), and compute
 //! runtime (container status, id, connection string) into a read-only status response.

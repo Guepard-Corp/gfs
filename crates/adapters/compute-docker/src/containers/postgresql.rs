@@ -482,7 +482,7 @@ impl DatabaseProvider for PostgresqlProvider {
     }
 
     // -----------------------------------------------------------------------
-    // Lazy clone (RFC 008)
+    // Lazy clone
     // -----------------------------------------------------------------------
 
     fn clone_bootstrap_spec(
@@ -752,7 +752,7 @@ impl DatabaseProvider for PostgresqlProvider {
         let owner = pg_quote_ident(&spec.owner)?;
         let group = pg_quote_ident(&spec.group)?;
         let database = pg_quote_ident(&spec.database)?;
-        // RFC 009 §5.1, hardened + transactional. The owner is LOGIN NOSUPERUSER
+        // Hardened + transactional. The owner is LOGIN NOSUPERUSER
         // NOCREATEROLE NOCREATEDB and is NOT made the database owner — it keeps
         // `public` (explicit USAGE,CREATE + CONNECT, since roles don't inherit
         // CONNECT once PUBLIC's default is revoked) but cannot DROP DATABASE or
@@ -1017,7 +1017,7 @@ pub fn register(registry: &impl DatabaseProviderRegistry) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Lazy-clone bootstrap SQL generation (RFC 008)
+// Lazy-clone bootstrap SQL generation
 // ---------------------------------------------------------------------------
 
 /// The copy-on-read bootstrap template, kept as a real `.sql` file (proper syntax
@@ -1091,8 +1091,8 @@ fn pg_preset_reset_sql(ident: &str, owner: Option<&str>) -> String {
 /// deploy, so a preset user sees the tables the customer creates later. When
 /// `None` the defaults are role-scoped to the connecting role (single-node
 /// gfs). Without this, presets only cover the connecting admin's future tables
-/// — never the customer's — so they behave as one-time snapshots (RFC 007
-/// hardening; matches the RFC 009 bootstrap's `FOR ROLE owner`).
+/// — never the customer's — so they behave as one-time snapshots; this
+/// matches the bootstrap's `FOR ROLE owner`.
 fn pg_preset_sql(ident: &str, preset: RolePreset, owner: Option<&str>) -> String {
     // `FOR ROLE "owner" ` (trailing space) when a deploy owner is supplied.
     let for_role = owner.map(|o| format!("FOR ROLE {o} ")).unwrap_or_default();
@@ -1905,7 +1905,7 @@ mod tests {
         assert_eq!(spec.definition.image, provider.definition().image);
     }
 
-    // -- lazy clone (RFC 008) ------------------------------------------------
+    // -- lazy clone ----------------------------------------------------------
 
     fn sample_remote() -> RemoteSource {
         RemoteSource {

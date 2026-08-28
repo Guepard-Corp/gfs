@@ -1,4 +1,4 @@
-//! Extension metadata (e.g. Postgres extensions). Mirrors `@domain/entities/datasource-meta` DatasourceExtension (Zod).
+//! Extension metadata (e.g. Postgres extensions). Mirrors the datasource metadata schema.
 
 use serde::{Deserialize, Serialize};
 

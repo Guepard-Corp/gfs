@@ -1,4 +1,4 @@
-//! Table privilege metadata. Mirrors `@domain/entities/datasource-meta` TablePrivileges (Zod).
+//! Table privilege metadata. Mirrors the datasource metadata schema.
 
 use serde::{Deserialize, Serialize};
 

@@ -47,7 +47,7 @@ fn to_error_data(msg: impl Into<std::borrow::Cow<'static, str>>) -> McpError {
     McpError::internal_error(msg, None)
 }
 
-/// Build the compute backend for the active runtime. Mirrors the CLI/data-plane:
+/// Build the compute backend for the active runtime. Mirrors the CLI:
 /// honors `GFS_RUNTIME_PROVIDER` (`kubernetes`/`k8s`/`k3s` → Kubernetes, else
 /// Docker) instead of hardcoding Docker, so the MCP tools operate on the k8s
 /// runtime rather than silently talking to — or spinning up — a Docker container.
@@ -1401,7 +1401,7 @@ async fn do_user(args: &serde_json::Value) -> Result<CallToolResult, McpError> {
             let password = password.unwrap_or_else(gen_password);
             // Scope a preset's default privileges to the deploy owner (the role that
             // creates the customer's future tables), not the connecting admin, so a
-            // preset user isn't blind to owner's later tables (see cmd_user / F-03).
+            // preset user isn't blind to owner's later tables.
             let default_privileges_owner = if preset.is_some() {
                 use_case.detect_deploy_owner(&repo_path).await
             } else {

@@ -1,4 +1,4 @@
-//! Role metadata. Mirrors `@domain/entities/datasource-meta` Role (Zod).
+//! Role metadata. Mirrors the datasource metadata schema.
 
 use serde::{Deserialize, Serialize};
 

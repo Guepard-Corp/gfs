@@ -1,8 +1,8 @@
-//! Per-repository credential vault (RFC 008): a database's passwords live in
-//! `{repo}/.gfs/secrets/<name>` on the data-plane node, at mode `0600` — never in
+//! Per-repository credential vault: a database's passwords live in
+//! `{repo}/.gfs/secrets/<name>` on the engine node, at mode `0600` — never in
 //! the cloud. This is a dumb typed key/value store over the filesystem; it holds
 //! no tenant, policy, or encryption concept — the node filesystem plus `0600` are
-//! the trust boundary (RFC 008 §7). Mirrors the plain `io::Result` style of the
+//! the trust boundary. Mirrors the plain `io::Result` style of the
 //! sibling `utils/data_dir.rs`.
 
 use std::io;

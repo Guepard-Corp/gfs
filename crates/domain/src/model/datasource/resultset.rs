@@ -1,5 +1,5 @@
 //! Query result set types for datasources.
-//! Mirrors `@domain/entities/datasource-meta` DatasourceResultSet, ColumnHeader, etc. (Zod).
+//! Mirrors the datasource metadata schema.
 
 use serde::{Deserialize, Serialize};
 

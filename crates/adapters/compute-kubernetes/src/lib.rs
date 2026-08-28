@@ -91,7 +91,7 @@ fn is_valid_k8s_node_port(port: i32) -> bool {
     (30000..=32767).contains(&port)
 }
 
-/// hostPort on the pod (console `deployment_request.port` or `GFS_INSTANCE_NODE_PORT`).
+/// hostPort on the pod (the requested node port or `GFS_INSTANCE_NODE_PORT`).
 fn host_port_from_mapping(mapping: &PortMapping) -> Option<i32> {
     mapping
         .host_port
@@ -304,8 +304,8 @@ fn decode_secret_values(secret: Secret) -> BTreeMap<String, String> {
 /// cannot change the advertised password. `optional: true` keeps pods of
 /// pre-Secret instances schedulable: with the var unset, the engine
 /// entrypoint skips it (the restored data dir is already initialised) and
-/// the platform reports a blank — not wrong — password, which the control
-/// plane preserves.
+/// the platform reports a blank — not wrong — password, which the caller
+/// preserves.
 fn container_env_for(
     instance: &str,
     def: &ComputeDefinition,
@@ -738,7 +738,7 @@ impl KubernetesCompute {
         // A pod scaled to zero (replicas=0) keeps phase=Running throughout its
         // termination grace period. Surface a pod that is being deleted as
         // Stopping, not Running, so callers don't mistake a terminating pod for a
-        // live instance — this is what lets the data-plane auto-resume re-scale a
+        // live instance — this is what lets the engine auto-resume re-scale a
         // db whose previous op just re-paused it, instead of skipping the wake
         // (which left replicas=0 and hung the next op waiting for a pod that
         // would never be created).
@@ -871,7 +871,7 @@ impl KubernetesCompute {
     /// When the source has no Secret (pre-Secret deploy), the target's own
     /// Secret is deleted instead — its freshly generated password is
     /// guaranteed stale once the volume is swapped, and an absent Secret
-    /// yields a blank (control-plane-preserved) report rather than a wrong one.
+    /// yields a blank (caller-preserved) report rather than a wrong one.
     pub async fn adopt_credentials_secret(
         &self,
         source_instance: &str,
@@ -996,7 +996,7 @@ impl KubernetesCompute {
     /// [`Self::teardown_instance_keep_snapshots`] does, plus reclaim the
     /// per-commit VolumeSnapshots sourced from these PVCs — one ZFS snapshot per
     /// commit would otherwise leak. Consumers that DESTROY a database call this
-    /// (the CLI via `remove_instance`, and the data-plane daemon directly);
+    /// (the CLI via `remove_instance`, and the engine/host daemon directly);
     /// consumers that RESTORE from a snapshot MUST use
     /// `teardown_instance_keep_snapshots` instead.
     pub async fn remove_instance_with_pvcs(
@@ -1219,7 +1219,7 @@ impl Compute for KubernetesCompute {
         let exit_code = match status_fut {
             Some(fut) => exit_code_from_exec_status(fut.await),
             // No status channel at all (should not happen for a normal exec) —
-            // treat as failure rather than a silent success (RFC 009 §9.7 caveat 1).
+            // treat as failure rather than a silent success.
             None => 1,
         };
 

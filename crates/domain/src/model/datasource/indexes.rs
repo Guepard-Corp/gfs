@@ -1,4 +1,4 @@
-//! Index metadata. Mirrors `@domain/entities/datasource-meta` Index (Zod).
+//! Index metadata. Mirrors the datasource metadata schema.
 
 use serde::{Deserialize, Serialize};
 

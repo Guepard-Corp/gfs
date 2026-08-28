@@ -1,7 +1,7 @@
 //! Datasource metadata and result set types.
 //!
-//! Plain Rust mirror of `@domain/entities/datasource-meta` (Zod) for use in the platform.
-//! JSON (de)serialization is compatible with the TS drivers so metadata/resultset can be
+//! Plain Rust mirror of the datasource metadata schema.
+//! JSON (de)serialization follows the same shape so metadata/resultset can be
 //! exchanged or validated on the Rust side when needed.
 
 mod column_privileges;

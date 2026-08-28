@@ -68,7 +68,7 @@ pub struct RoleInfo {
     pub preset: Option<String>,
 }
 
-/// Everything needed to bootstrap a database's deploy environment (RFC 009): a
+/// Everything needed to bootstrap a database's deploy environment: a
 /// `NOLOGIN` group carrying the shared CRUD baseline, an `owner` login (the
 /// least-privileged customer role that keeps `public`), the owner's membership
 /// in the group, and role-scoped default privileges so future owner objects

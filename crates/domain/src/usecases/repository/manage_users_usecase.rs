@@ -159,7 +159,7 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
         expect_success(self.run(&container, &command).await?)
     }
 
-    /// Bootstrap a database's deploy environment (RFC 009): create the `NOLOGIN`
+    /// Bootstrap a database's deploy environment: create the `NOLOGIN`
     /// group + the least-privileged `owner` login + grants + role-scoped default
     /// privileges, in one transaction, as the management superuser via the exec
     /// seam. Idempotency is the caller's concern (run on fresh deploy only).
@@ -188,7 +188,7 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
             .map_err(|e| ManageUsersError::Parse(e.to_string()))
     }
 
-    /// Detect the deploy's object-creating `owner` role (RFC 009 §5.1) so a
+    /// Detect the deploy's object-creating `owner` role so a
     /// preset's `ALTER DEFAULT PRIVILEGES` covers the customer's future tables,
     /// not the connecting admin's. The CLI/MCP don't know the deploy owner: if the
     /// conventional `owner` role exists, scope preset defaults to it; otherwise
@@ -294,7 +294,7 @@ fn require_password(password: &str) -> Result<(), ManageUsersError> {
     }
 }
 
-/// The platform's load-bearing roles (RFC 009), never client roles: the engine
+/// The platform's load-bearing roles, never client roles: the engine
 /// connection superuser `postgres`, the bootstrap super `guepard-admin`, the
 /// customer's least-privileged login `owner`, and the `developers` group. Client
 /// user management (`gfs user`) refuses to mutate any of them — dropping the
@@ -339,7 +339,7 @@ mod tests {
         use super::reject_reserved_role;
         assert!(reject_reserved_role("postgres").is_err());
         assert!(reject_reserved_role("guepard-admin").is_err());
-        // The customer's load-bearing deploy roles are protected too (F-04).
+        // The customer's load-bearing deploy roles are protected too.
         assert!(reject_reserved_role("owner").is_err());
         assert!(reject_reserved_role("developers").is_err());
         // Case variants of a reserved name are refused (no confusing look-alikes).
