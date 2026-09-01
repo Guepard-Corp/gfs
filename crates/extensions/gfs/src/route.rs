@@ -10,8 +10,9 @@ use pgrx::PgList;
 use crate::base_plan;
 use crate::catalog::{
     bump_access, gfs_enqueue_copy, gfs_enqueue_partial, gfs_is_covered, gfs_lookup_clone,
+    gfs_verify_source_rows,
     gfs_note_pred_seen, gfs_pred_count, gfs_pred_state, gfs_set_no_partial, gfs_throttle,
-    gfs_mark_local_write, gfs_time_queued, gfs_whole_queued, relation_diverged,
+    gfs_mark_local_write, gfs_sync_flags, gfs_time_queued, gfs_whole_queued, relation_diverged,
 };
 use crate::federate::swap_clone_rtes_to_foreign;
 use crate::hydrate::do_hydrate;
@@ -216,9 +217,81 @@ unsafe fn classify_scan(
     if info.collist.is_empty() {
         return;
     }
+
+    // FROZEN CLONE (#132). A frozen clone is a sealed snapshot: it NEVER
+    // contacts the source again. Returning here -- before the drift gate, the
+    // sync-flag read, both background enqueues, the size re-measurement and
+    // every cost path -- means no federation, no hydration, no driftcheck, no
+    // worker spawn: every registered table (diverged ones included) is served
+    // from the local heap exactly as it stood at freeze time, source up or not.
+    if info.frozen {
+        return;
+    }
     bump_access(relid);
-    if info.whole_cached {
-        return; // owned -> serve local
+
+    // SOURCE DRIFT GATE. `drifted` means the SOURCE changed this table since we
+    // copied it, so our local rows are stale and serving them would silently
+    // return data that no longer exists upstream. A DIVERGED table (local
+    // writes/tombstones) is excluded: the source lacks our writes, so federating
+    // it would lose them -- that is a conflict, and it keeps serving local.
+    //
+    // When `drifted` is false this is a no-op and every path below behaves
+    // exactly as before, which is what confines the blast radius of this change.
+    let stale = info.drifted && !relation_diverged(relid);
+
+    // QUERY-TRIGGERED UPKEEP. Both are enqueue+spawn: they never block this query
+    // and the hook itself does no network I/O. An idle clone therefore costs
+    // nothing, because no queries means no checks.
+    //   * verdict older than check_interval -> re-check drift in the background
+    //   * stale AND autopull on             -> queue a resync that puts the table
+    //                                          back on the lazy path, so federation
+    //                                          is a short bridge and not a permanent
+    //                                          state (always federating defeats the
+    //                                          point of having a clone at all)
+    let (autopull, verdict_stale, autoschema) = gfs_sync_flags(relid);
+    if verdict_stale {
+        gfs_enqueue_copy(relid, "driftcheck", 0, 0);
+        worker::spawn();
+    }
+
+    // SCHEMA DRIFT. The source changed this table's SHAPE, so our imported
+    // definition no longer describes it and a federated read fails on the remote
+    // with a raw `column "..." does not exist` naming SQL the user never wrote.
+    // Say what actually happened instead, and what to run.
+    //
+    // Deliberately aligned with the data-drift policy: repair only when the user
+    // opted in (autoschema, off by default, same as autopull), and never apply a
+    // destructive change automatically -- gfs.repair_schema refuses to drop a
+    // local column, exactly as a diverged table is never auto-reset.
+    //
+    // The repair cannot run inside this query (re-importing takes locks the
+    // reading query already holds), so it is queued and the caller retries.
+    if info.schema_drifted {
+        // NOTE: we cannot queue the repair from here. Enqueuing writes a row in THIS
+        // transaction, and the error below aborts it, so the job would be rolled back
+        // and never run -- the query would report "queued" forever while nothing
+        // happened. The repair therefore lives in gfs.refresh_drift_state(), which the
+        // background drift check runs in a transaction that actually commits.
+        if autoschema {
+            pgrx::error!(
+                "gfs: the source schema for {} changed; automatic repair runs on the next \
+                 background check, or run `gfs pull` to do it now",
+                info.local_ref
+            );
+        }
+        pgrx::error!(
+            "gfs: the source schema for {} changed, so this clone's definition of it is stale. \
+             Run `gfs pull` to re-import it, or enable automatic repair with `gfs pull --auto-schema on`.",
+            info.local_ref
+        );
+    }
+    if stale && autopull {
+        gfs_enqueue_copy(relid, "resync", 0, 0);
+        worker::spawn();
+    }
+
+    if info.whole_cached && !stale {
+        return; // owned and still matches the source -> serve local
     }
 
     let b = info.row_bytes.max(1) as f64; // bytes/row
@@ -240,6 +313,18 @@ unsafe fn classify_scan(
         time_key: false,
         key_type: info.key_type.clone(),
     };
+
+    // 0. STALE -> ask the SOURCE. This must precede every local-serving path
+    //    below (whole_cached above, range elision and predicate completeness
+    //    further down): each of those would otherwise answer from rows we
+    //    already know are out of date. Federating is correct by construction,
+    //    costs O(query) instead of O(table), moves no data and takes no locks,
+    //    so it is safe to decide here, mid-plan. `gfs.pull()` later resets the
+    //    table to "never fetched" and the lazy path makes it fast again.
+    if stale {
+        ctx.federate_targets.push(mk(0, 0, true, s(), s(), 0));
+        return;
+    }
 
     // 1. RANGE-key bound (id BETWEEN / placed_at BETWEEN) -> range model: covered ->
     //    local (elision), else fetch the missing key span. INTEGER keys size the
@@ -281,10 +366,34 @@ unsafe fn classify_scan(
     //    ownable table into partial. This is the line that keeps the benchmark at
     //    source_ops=12 and makes the cost-v3 ordering regression structurally
     //    impossible.
-    let whole_own_cost = info.w_net * b * tr;
-    let fed_call = info.w_source * tr.max(1.0);
-    let whole_ownable = whole_own_cost <= info.w_negligible
+    let mut tr = tr;
+    let mut whole_own_cost = info.w_net * b * tr;
+    let mut fed_call = info.w_source * tr.max(1.0);
+    let mut whole_ownable = whole_own_cost <= info.w_negligible
         || (whole_own_cost <= info.w_ceiling && whole_own_cost <= (h + 1.0) * fed_call);
+
+    // SIZE DRIFT GUARD. source_rows was measured once, at clone time, and the
+    // source keeps growing: a table that was small then can be millions of rows
+    // now, and this gate would cheerfully copy all of it. Re-measure at the ONE
+    // moment a stale size does damage -- just before committing to a whole copy --
+    // and decide again on the real number. Cheap relative to what it guards (one
+    // pushed-down count against a transfer of the entire table), and it only runs
+    // for a table we were about to copy anyway; a table already known to be big
+    // never reaches here. verify_source_rows writes the value back, so the next
+    // query reads the corrected size instead of measuring again.
+    if whole_ownable && !info.no_partial {
+        if let Some(fresh) = gfs_verify_source_rows(relid) {
+            if fresh > tr {
+                tr = fresh;
+                whole_own_cost = info.w_net * b * tr;
+                fed_call = info.w_source * tr.max(1.0);
+                whole_ownable = whole_own_cost <= info.w_negligible
+                    || (whole_own_cost <= info.w_ceiling
+                        && whole_own_cost <= (h + 1.0) * fed_call);
+            }
+        }
+    }
+
     if whole_ownable || info.no_partial {
         // push_by_cost(Tr) owns iff whole_ownable, else federates -- never partial.
         push_by_cost(ctx, tr, b, tr, h, &info, mk(0, 0, true, s(), s(), 0));

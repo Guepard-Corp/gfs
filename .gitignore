@@ -31,3 +31,16 @@ docs/k3s-architecture.md
 docs/k3s-architecture.docx
 
 lcov.info
+
+# Local working areas (scratch reports, benchmark runs, throwaway clones)
+reports/
+benchmarks/
+
+# LaTeX build artefacts
+*.aux
+*.synctex.gz
+*.toc
+*.out
+
+# python bytecode (tests/paths/make_docs.py)
+__pycache__/

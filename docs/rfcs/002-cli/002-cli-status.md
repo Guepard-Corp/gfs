@@ -30,6 +30,17 @@ The status response SHALL include the following top-level fields.
 
 If no compute has been provisioned yet (e.g. repo just initialised), the **compute** section MAY be omitted or the fields MAY be null/empty with clear semantics (e.g. `container_status: "not_provisioned"` or a dedicated `compute: null`).
 
+### Source (lazy clones only)
+
+Present only when the repository is a lazy clone (`gfs clone --from`) with a running database; **omitted** otherwise (never `null`), so non-clone output is unchanged. This is the clone's **cached** drift verdict: producing it makes no network round trip (`gfs fetch --check` refreshes it). Counts are table-granular -- GFS has no per-row change log (RFC 007).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `tracked` | integer | Tables registered for drift tracking (`gfs.clone_source`). `0` means nothing has been compared yet, not "up to date". |
+| `behind` | integer | Tables whose rows changed on the source since last synced (`gfs.drift_state.drifted`). |
+| `diverged` | integer | Subset of `behind` that also has local writes; `gfs pull` refuses these without `--force`. |
+| `last_checked` | string | When the verdict was last computed (`YYYY-MM-DD HH:MM:SS`). Omitted until the first check. Deliberately named `last_checked` (the underlying column is `checked_at`) so `gfs status --output json` and `gfs fetch --json` agree on one field name. |
+
 ---
 
 ## Connection string

@@ -57,8 +57,14 @@ pub(crate) unsafe fn gfs_mark_local_write(relid: pg_sys::Oid) {
         return;
     }
     let q = CString::new(format!(
+        // session_replication_role = 'replica' means REPLAYED rows, not user
+        // writes: gfs.warm() copies under it precisely so its INSERT of the
+        // source's own rows is not mistaken for local divergence (#132 -- a
+        // freeze/export that warmed a table used to flag it diverged forever).
+        // #130's write-log triggers rely on the same convention.
         "UPDATE gfs.clone_source SET has_local_writes = true \
-           WHERE relid::oid = {} AND NOT has_local_writes",
+           WHERE relid::oid = {} AND NOT has_local_writes \
+             AND current_setting('session_replication_role') <> 'replica'",
         u32::from(relid)
     ))
     .unwrap();
@@ -83,7 +89,10 @@ pub(crate) unsafe fn gfs_lookup_clone(relid: pg_sys::Oid) -> Option<CloneInfo> {
                 s.partial_rows::text, s.no_partial::int::text, \
                 x.partial_max_frac::text, x.promote_frac::text, x.max_partial_preds::text, \
                 COALESCE((SELECT t.typname FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid \
-                            WHERE a.attrelid = s.relid AND a.attname = s.key_col), '') \
+                            WHERE a.attrelid = s.relid AND a.attname = s.key_col), ''), \
+                COALESCE((SELECT d.drifted FROM gfs.drift_state d WHERE d.relid = s.relid), false)::int::text, \
+                COALESCE((SELECT d.schema_drifted FROM gfs.drift_state d WHERE d.relid = s.relid), false)::int::text, \
+                COALESCE((SELECT m.frozen FROM gfs.clone_mode m LIMIT 1), false)::int::text \
            FROM gfs.clone_source s, gfs.cost x \
           WHERE s.relid::oid = {} AND to_regclass(s.source_ref) IS NOT NULL",
         u32::from(relid)
@@ -123,8 +132,125 @@ pub(crate) unsafe fn gfs_lookup_clone(relid: pg_sys::Oid) -> Option<CloneInfo> {
                 w_partial_max_frac: num(18),
                 w_promote_frac: num(19),
                 w_max_partial_preds: num(20) as i64,
+                // SOURCE DRIFT: does the source no longer match our local copy?
+                // Read from a LOCAL table (gfs.drift_state) so the planner hook
+                // never does network I/O. false => behaviour identical to before.
+                drifted: g(22).as_deref() == Some("1"),
+                // The source's SHAPE changed. Distinct from `drifted` (rows): a
+                // stale definition makes federated reads fail outright rather
+                // than merely return old data.
+                schema_drifted: g(23).as_deref() == Some("1"),
+                // #132: frozen (detached snapshot). Local single-row read
+                // (gfs.clone_mode); the hook stays free of network I/O.
+                frozen: g(24).as_deref() == Some("1"),
             });
         }
+    }
+    pg_sys::SPI_finish();
+    out
+}
+
+/// (autopull_on, verdict_is_stale_dated, autoschema_on) for this table, in ONE
+/// local query.
+/// The planner hook calls this on a scan, so it must never touch the network:
+/// both answers come from local catalog tables.
+pub(crate) unsafe fn gfs_sync_flags(relid: pg_sys::Oid) -> (bool, bool, bool) {
+    if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
+        return (false, false, false);
+    }
+    let q = CString::new(format!(
+        "SELECT p.autopull::int::text, \
+                COALESCE((SELECT (d.checked_at < clock_timestamp() - p.check_interval) \
+                            FROM gfs.drift_state d WHERE d.relid::oid = {}), true)::int::text, \
+                p.autoschema::int::text \
+           FROM gfs.sync_policy p LIMIT 1",
+        u32::from(relid)
+    ))
+    .unwrap();
+    let mut out = (false, false, false);
+    if pg_sys::SPI_execute(q.as_ptr(), true, 1) == pg_sys::SPI_OK_SELECT as i32
+        && pg_sys::SPI_processed == 1
+    {
+        let tt = pg_sys::SPI_tuptable;
+        let row = *(*tt).vals;
+        let td = (*tt).tupdesc;
+        out = (
+            spi_text(pg_sys::SPI_getvalue(row, td, 1)).as_deref() == Some("1"),
+            spi_text(pg_sys::SPI_getvalue(row, td, 2)).as_deref() == Some("1"),
+            spi_text(pg_sys::SPI_getvalue(row, td, 3)).as_deref() == Some("1"),
+        );
+    }
+    pg_sys::SPI_finish();
+    out
+}
+
+/// #132: is this clone frozen (a detached snapshot)? Local single-row read; on
+/// any failure says false so a healthy lazy clone is never wrongly muted.
+pub(crate) unsafe fn gfs_is_frozen() -> bool {
+    if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
+        return false;
+    }
+    let q = CString::new(
+        "SELECT COALESCE((SELECT frozen FROM gfs.clone_mode LIMIT 1), false)::int::text",
+    )
+    .unwrap();
+    let mut frozen = false;
+    if pg_sys::SPI_execute(q.as_ptr(), true, 1) == pg_sys::SPI_OK_SELECT as i32
+        && pg_sys::SPI_processed == 1
+    {
+        let tt = pg_sys::SPI_tuptable;
+        let row = *(*tt).vals;
+        let td = (*tt).tupdesc;
+        frozen = spi_text(pg_sys::SPI_getvalue(row, td, 1)).as_deref() == Some("1");
+    }
+    pg_sys::SPI_finish();
+    frozen
+}
+
+/// Run one unit of async upkeep for the background worker. `resync` puts a single
+/// table back on the lazy path (truncate + clear cached state + re-anchor just that
+/// table); `driftcheck` recomputes the stale verdicts. Both are plain SQL so the
+/// logic lives next to the catalog it mutates.
+pub(crate) unsafe fn gfs_run_upkeep(relid: pg_sys::Oid, kind: &str) {
+    if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
+        return;
+    }
+    let sql = match kind {
+        "resync" => format!("SELECT gfs.resync_table({}::oid::regclass)", u32::from(relid)),
+        "schemafix" => format!("SELECT gfs.repair_schema({}::oid::regclass)", u32::from(relid)),
+        _ => "SELECT gfs.refresh_drift_state()".to_string(),
+    };
+    if let Ok(q) = CString::new(sql) {
+        pg_sys::SPI_execute(q.as_ptr(), false, 0);
+    }
+    pg_sys::SPI_finish();
+}
+
+/// Measure the source table's CURRENT row count (pushed down to the source) and
+/// store it, returning the fresh value. `None` when it could not be measured.
+///
+/// Called only when the router is about to copy a table WHOLE, which is the one
+/// moment a stale size does real damage: believing a now-huge table is small is
+/// exactly how a clone drags gigabytes over a slow link. Writing the value back
+/// means the next query reads the corrected number and does not measure again.
+pub(crate) unsafe fn gfs_verify_source_rows(relid: pg_sys::Oid) -> Option<f64> {
+    if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
+        return None;
+    }
+    let q = CString::new(format!(
+        "SELECT gfs.verify_source_rows({}::oid::regclass)::text",
+        u32::from(relid)
+    ))
+    .unwrap();
+    let mut out = None;
+    if pg_sys::SPI_execute(q.as_ptr(), false, 1) == pg_sys::SPI_OK_SELECT as i32
+        && pg_sys::SPI_processed == 1
+    {
+        let tt = pg_sys::SPI_tuptable;
+        let row = *(*tt).vals;
+        out = spi_text(pg_sys::SPI_getvalue(row, (*tt).tupdesc, 1))
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| *v >= 0.0);
     }
     pg_sys::SPI_finish();
     out

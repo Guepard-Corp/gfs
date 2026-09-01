@@ -34,6 +34,15 @@ unsafe fn record_whole_or_range(h: &Hydration, n: i64) {
         format!("SELECT gfs.note_range({}::oid::regclass, {}, {})", u32::from(h.relid), h.lo, h.hi)
     };
     pg_sys::SPI_execute(CString::new(rec).unwrap().as_ptr(), false, 0);
+    // #131: stamp the copy event (where the source was when these rows landed).
+    // Only the WHOLE branch stamps here -- gfs.note_range stamps range fetches
+    // itself, so adding one for them too would probe the source twice. An
+    // explicit call, not a trigger: this runs inside the replica-role window,
+    // where ordinary triggers silently do not fire.
+    if h.whole {
+        let wm = CString::new(format!("SELECT gfs.note_copy({}::oid::regclass)", u32::from(h.relid))).unwrap();
+        pg_sys::SPI_execute(wm.as_ptr(), false, 0);
+    }
     hydrate_finish(h, n);
 }
 
@@ -476,6 +485,11 @@ pub(crate) unsafe fn do_hydrate(h: &Hydration) -> bool {
             )
         };
         pg_sys::SPI_execute(CString::new(rec).unwrap().as_ptr(), false, 0);
+        // #131: a partial fetch is a copy event too -- overflow included: its
+        // <=cap+1 inserted rows stay in the heap under ON CONFLICT DO NOTHING,
+        // so they date the table exactly like a completed slice does.
+        let wm = CString::new(format!("SELECT gfs.note_copy({}::oid::regclass)", u32::from(h.relid))).unwrap();
+        pg_sys::SPI_execute(wm.as_ptr(), false, 0);
         if !overflow && !DEFER_BOOKKEEPING {
             let pr = CString::new(format!(
                 "UPDATE gfs.clone_source SET partial_rows = partial_rows + {} WHERE relid::oid = {}",
@@ -526,6 +540,12 @@ pub(crate) unsafe fn do_hydrate(h: &Hydration) -> bool {
         if !overflow {
             let nr = CString::new(format!("SELECT gfs.note_range({}::oid::regclass, {}, {})", u32::from(h.relid), h.lo, h.hi)).unwrap();
             pg_sys::SPI_execute(nr.as_ptr(), false, 0);
+        } else {
+            // #131: the overflowed slice still inserted up to cap+1 real rows
+            // (kept forever under ON CONFLICT DO NOTHING) -- a copy event, even
+            // though no coverage is claimed. note_range stamps the other branch.
+            let wm = CString::new(format!("SELECT gfs.note_copy({}::oid::regclass)", u32::from(h.relid))).unwrap();
+            pg_sys::SPI_execute(wm.as_ptr(), false, 0);
         }
         hydrate_finish(h, inserted);
         spi_set_repl_role(&prior_srr);

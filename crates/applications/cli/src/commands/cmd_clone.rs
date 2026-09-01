@@ -43,6 +43,9 @@ pub async fn clone(
     image: Option<String>,
     platform: Option<String>,
     port: Option<u16>,
+    snapshot: bool,
+    max_bytes: Option<u64>,
+    force: bool,
     json_output: bool,
 ) -> Result<(), CmdError> {
     let remote = parse_postgres_url(&from).map_err(|e| e.to_string())?;
@@ -106,7 +109,7 @@ pub async fn clone(
 
     let output = use_case.run(&target_path, remote).await?;
 
-    if json_output {
+    if json_output && !snapshot {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
@@ -115,7 +118,7 @@ pub async fn clone(
                 "mode": "lazy-clone",
             }))?
         );
-    } else {
+    } else if !json_output {
         println!();
         println!(
             "  {} Lazy clone ready from {}",
@@ -129,6 +132,38 @@ pub async fn clone(
     }
     if !output.stderr.is_empty() {
         eprintln!("{}", output.stderr.trim_end());
+    }
+
+    // #132: `--snapshot` = clone + freeze, the exact `gfs freeze` a user could
+    // run later. The clone above is COMPLETE either way: if the freeze is
+    // refused (copy budget) or fails, the repository stays a working LAZY
+    // clone, and the error says so instead of pretending the clone broke.
+    if snapshot {
+        if !json_output {
+            println!();
+            println!("  {} taking the snapshot (gfs freeze)...", dimmed("\u{b7}"));
+        }
+        if let Err(e) = crate::commands::cmd_freeze::freeze(
+            Some(target_path.clone()),
+            max_bytes,
+            force,
+            json_output,
+        )
+        .await
+        {
+            return Err(format!(
+                "the clone succeeded and remains a working LAZY clone, \
+                 but the snapshot step failed: {e:#}"
+            )
+            .into());
+        }
+        if !json_output {
+            println!(
+                "  {} Snapshot clone ready {}",
+                green("\u{2713}"),
+                dimmed("(a point in time, detached from its source)")
+            );
+        }
     }
 
     Ok(())

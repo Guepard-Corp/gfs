@@ -1,0 +1,42 @@
+# G1: a copied table still answers when the source is unreachable
+
+## Why this test exists
+
+G1: with the source unreachable, an already-copied table must still answer.
+This is the entire promise of holding a local copy.
+
+## The scenario
+
+**The source starts with:**
+
+```
+orders(id, customer, total) with 3 rows: Alice 50, Bob 30, Carol 20
+notes(id, body) with 1 row
+other(id, v) with 1 row, used only to trigger background checks
+```
+
+The source is not modified: this test is about what the clone does on its own.
+
+## What is asserted
+
+- answered offline
+
+## Running it
+
+```bash
+tests/paths/run-all.sh G1          # through the runner
+bash tests/paths/G1_source_unreachable_cached/test.sh   # directly
+```
+
+Each test builds its **own** throwaway source and its **own** clone, so it can be
+run alone and cannot be affected by any other test.
+
+## Harness helpers used
+
+| helper | what it does |
+| --- | --- |
+| `clone_now` | clones the source and waits until the clone is queryable |
+| `val` | reads through the gfs CLI and returns one value |
+
+See [`../lib/common.sh`](../lib/common.sh) for the harness, and
+[`../README.md`](../README.md) for the traps that have produced false results here.

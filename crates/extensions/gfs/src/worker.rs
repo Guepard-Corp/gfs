@@ -25,8 +25,8 @@ use pgrx::prelude::*;
 use pgrx::PgTryBuilder;
 
 use crate::catalog::{
-    gfs_claim_copy, gfs_claim_copy_job, gfs_clear_copy_job, gfs_clear_queued, gfs_lookup_clone,
-    spi_text,
+    gfs_claim_copy, gfs_claim_copy_job, gfs_clear_copy_job, gfs_clear_queued, gfs_is_frozen,
+    gfs_lookup_clone, gfs_run_upkeep, spi_text,
 };
 use crate::hydrate::do_hydrate;
 use crate::model::{CloneInfo, Hydration};
@@ -188,8 +188,28 @@ unsafe fn try_drain_lock() -> bool {
 unsafe fn drain_one() -> bool {
     // (1) typed copy_queue jobs (kind = whole | time) -- drained the same way.
     if let Some((relid, kind, lo, hi)) = gfs_claim_copy_job() {
+        // Source-sync upkeep: not a copy, so it never goes through do_hydrate.
+        // `resync` is the autopull unit of work -- it runs HERE, off the query
+        // that noticed the drift, because TRUNCATE needs a lock that cannot be
+        // taken on a table the current query is reading.
+        if kind == "resync" || kind == "driftcheck" || kind == "schemafix" {
+            // #132: a frozen clone does no source upkeep. A job enqueued just
+            // before the freeze committed may still be sitting here (freeze
+            // deletes the queue inside its own transaction, but an enqueue can
+            // land after that snapshot); drop it instead of running it.
+            if gfs_is_frozen() {
+                gfs_clear_copy_job(relid, &kind, lo, hi);
+                return true;
+            }
+            gfs_run_upkeep(relid, &kind);
+            log!("gfs: {} done for {}", kind, relid_text(relid));
+            gfs_clear_copy_job(relid, &kind, lo, hi);
+            return true;
+        }
         if let Some(info) = gfs_lookup_clone(relid) {
-            if !info.whole_cached {
+            // #132: never copy into a frozen clone -- a straggler job would
+            // splice post-freeze rows into the sealed snapshot.
+            if !info.whole_cached && !info.frozen {
                 let hyd = build_copy_hydration(&info, relid, &kind, lo, hi);
                 do_hydrate(&hyd);
                 log!("gfs: async copy done for {} ({} job)", relid_text(relid), kind);
@@ -204,7 +224,8 @@ unsafe fn drain_one() -> bool {
     };
     debug1!("gfs: claimed copy job: {} pred {}", relid_text(relid), pred);
     if let Some(info) = gfs_lookup_clone(relid) {
-        if !info.whole_cached {
+        // #132: same rule for predicate partials -- a frozen clone copies nothing.
+        if !info.whole_cached && !info.frozen {
             // Same capped slice the synchronous path used: ceil(partial_max_frac * Tr).
             let cap = (info.w_partial_max_frac * info.source_rows.max(0) as f64)
                 .floor()

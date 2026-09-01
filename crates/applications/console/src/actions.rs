@@ -53,7 +53,14 @@ pub async fn clone(req: CloneRequest) -> ActionResult {
         None,
         None,
         req.port,
-        true,
+        // #132 added snapshot mode to `gfs clone`. The console's clone stays
+        // LAZY: freezing copies every table up front, which is the opposite of
+        // the "instant clone" this endpoint promises. A console caller that
+        // wants a snapshot should run `gfs freeze` against the result.
+        false, // snapshot
+        None,  // max_bytes (unused while snapshot is false)
+        false, // force
+        true,  // json_output
     )
     .await
     {

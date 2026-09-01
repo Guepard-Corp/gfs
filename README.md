@@ -42,6 +42,7 @@
 - [Configuration](#configuration)
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
+- [Known limitations](#known-limitations)
 - [Contributing](#contributing)
 - [Community](#community)
 - [Roadmap](#roadmap)
@@ -97,7 +98,8 @@ Run `gfs providers` to see all available providers and their supported versions.
 - Query database directly from CLI (SQL execution and interactive mode)
 - Schema extraction, show, and diff between commits
 - Export and import data (SQL, custom, CSV)
-- Lazily clone a remote PostgreSQL database (copy-on-read, experimental)
+- Lazily clone a remote PostgreSQL database (copy-on-read, experimental), with
+  detection of source changes so a clone never serves stale rows
 - Compute container management (start, stop, logs)
 - Repository config (user.name, user.email)
 
@@ -322,9 +324,205 @@ schemas. Cloned tables are views: plain CRUD works unchanged, but DDL and
 `SELECT … FOR UPDATE` are not supported on them. Quote the URL if the password
 contains shell metacharacters.
 
+#### When the source changes
+
+A clone copies each table the first time you read it. If the source changes that
+table afterwards, the clone notices and reads from the source instead, so a query
+never returns rows that no longer exist upstream:
+
+| situation | what you get | speed |
+| --- | --- | --- |
+| source unchanged | the local copy (provably identical to the source) | fast, no network |
+| source changed | read from the source | slower |
+| source changed **and** you wrote to that table | **your** version, plus a conflict warning | — |
+
+**Correct data is automatic.** You never have to run anything to avoid stale
+results; the last row is a conflict, and GFS always keeps your local writes
+rather than silently discarding them.
+
+Inspect what moved:
+
+```bash
+# has the source been written to at all? (a "false" is a guarantee it has not)
+gfs query "SELECT gfs.source_changed();"
+
+# which tables changed, and how
+gfs query "SELECT * FROM gfs.source_drift();"
+```
+
+Reading from the source is correct but slower. To go fast again, put the changed
+tables back on the lazy path so the next read re-copies them:
+
+```bash
+gfs query "SELECT * FROM gfs.pull();"
+```
+
+`pull` copies nothing itself: it clears the cached state and the normal
+cost model decides again on the next read (small table → copy, huge table → keep
+reading from the source). Tables you have written to are never reset, since that
+would discard your work; they are reported as conflicts for you to resolve.
+
+To have that happen on its own, without running anything:
+
+```bash
+gfs query "UPDATE gfs.sync_policy SET autopull = true;"
+```
+
+With autopull on, a changed table costs **one** query answered from the source,
+then it is re-copied in the background and later reads are local again. It is
+**off by default** because a clone is a branch: data shifting under a running
+test breaks reproducibility. For a read-only clone (analytics, dashboards) it is
+usually the better setting.
+
+
+##### All source-sync settings
+
+Everything above is stored in one row of `gfs.sync_policy`:
+
+```bash
+gfs query "SELECT * FROM gfs.sync_policy;"
+```
+
+| setting | default | what it controls |
+| --- | --- | --- |
+| `autopull` | `false` | after a changed table costs one federated read, re-copy it in the background so later reads are local |
+| `autoschema` | `false` | apply **additive** source schema changes automatically (a new column, a new partition). Never destructive: a column drop stays a conflict for a human |
+| `check_interval` | `5 min` | how stale a drift verdict may be before a read triggers a fresh background check |
+| `autopull_interval` | `1 min` | minimum gap between background re-copies of the same table |
+| `autopull_max_bytes` | (see table) | ceiling on how much data background work will re-copy unattended |
+
+Both automatic behaviours are **off by default** because a clone is a branch: data
+shifting under a running test breaks reproducibility. For a read-only clone
+(analytics, dashboards) turning them on is usually the better choice.
+
+> A clone is **not** a point-in-time snapshot of a changing source. Because
+> tables are copied at different moments, a clone of a source that is still being
+> written to can hold a combination of rows that never existed there at one
+> instant. Clone from a frozen source (a storage snapshot, backup, or paused
+> replica) if you need reproducibility.
+
+##### New partitions, inherited children and materialized views
+
+Most source changes announce themselves: a changed column raises a clear error, a
+changed row set reads from the source. A **new partition** is the quiet one. It is
+reached through a parent the clone already has, so the query still succeeds and
+simply returns fewer rows than the source holds.
+
+`gfs pull` handles all three:
+
+| what changed on the source | what `pull` does |
+| --- | --- |
+| a new partition of a partitioned table | creates it locally with the source's bound and registers it for copy-on-read |
+| a new `INHERITS` child | creates it under the same parent, with its own key, and registers it |
+| a materialized view refreshed upstream | recomputes the clone's own matview from the clone's tables |
+
+A matview on a clone is a **local** object built from copy-on-read tables, so
+recomputing it locally is what makes it current; nothing is copied from the
+source's stored matview contents.
+
+Adoption only applies to children of a parent the clone already has. A brand new
+standalone table still reports `re-clone to include it`, because reproducing
+arbitrary DDL (indexes, defaults, triggers, grants) is the clone bootstrap's job,
+whereas a partition takes its whole shape from its parent.
+
+```bash
+gfs query "SELECT * FROM gfs.pull();"   # action = 'adopt' / 'matview'
+```
+
+With `autoschema` on, new partitions and children are adopted in the background
+too, so reads never go quietly short:
+
+```bash
+gfs query "UPDATE gfs.sync_policy SET autoschema = true;"
+```
+
+With `autoschema` off (the default), the gap is reported by `gfs fetch --check`
+but reads of the parent stay short until you run `gfs pull`.
+
+### `gfs fetch`
+
+Ask whether the source has changed, without changing anything locally. This is the
+read-only half of the source-sync pair: it reports, `gfs pull` acts.
+
+```bash
+gfs fetch                 # use the last cached verdict (no network)
+gfs fetch --check         # probe the source right now
+```
+
+`--check` forces a fresh probe. Without it you get the verdict from the last
+background check, which is cheap but only as current as `check_interval`.
+
+What it reports:
+
+| output | meaning |
+| --- | --- |
+| `source unchanged` | a guarantee nothing was written upstream since the last anchor |
+| `N of M tables changed on the source` | which tables drifted, and why |
+| `new table <name>` | a table exists upstream that this clone does not have |
+| `changed, unattributed` | the source moved but nothing accounts for it, so every copied table is suspect |
+| `this clone spans N source moments` | tables were copied at different moments while the source moved; a JOIN across them can return combinations that never existed at the source (run `gfs freeze`) |
+| `all copied data is from one source moment` | possibly stale, but coherent: everything copied reflects one instant |
+
+### `gfs pull`
+
+Put tables the source has changed back on the lazy path, so the next read is local
+again. `pull` copies nothing itself: it clears cached state and the normal cost model
+decides again on the next read.
+
+```bash
+gfs pull                      # reconcile now
+gfs pull --force              # also reset tables YOU wrote to, discarding your changes
+gfs pull --auto on|off        # turn automatic pulling on or off
+gfs pull --auto-schema on|off # turn automatic schema repair on or off
+```
+
+Each line of output names an action:
+
+| action | what happened |
+| --- | --- |
+| `adopt` | a new partition or inheritance child of a table you already have was created locally and registered |
+| `schema` | the table's shape was repaired (a column the source added was applied) |
+| `reset` | the table is back on the lazy path; the next read refetches it |
+| `enum` | a label the source added was replicated, in the source's own order |
+| `sequence` | a local sequence was advanced to match the source |
+| `matview` | a materialized view was recomputed from this clone's tables |
+| `conflict` | **needs you.** Either you wrote to a table the source also changed, or the source made a destructive change. Nothing was touched |
+
+A table you have written to is **never** reset without `--force`, because that would
+discard your work. It is reported as a conflict, the way git refuses to clobber local
+changes.
+
+### `gfs remote`
+
+Show the source a clone reads from. Like `git remote`, it makes no network round
+trip: it reports what is recorded locally and leaves probing to `gfs fetch --check`.
+The source password is never printed.
+
+```bash
+gfs remote           # origin postgres://user@host:5432/db (fetch only)
+gfs remote --json
+```
+
+### Why there is no `gfs push`
+
+The sync verbs are deliberately asymmetric: `fetch` and `pull` exist, `push` never
+will. The source is typically a production database; pushing a clone's test data
+into it is exactly the foot-gun GFS exists to prevent. **"The source is never
+written to" is a hard rule of the system** -- enforced end-to-end and asserted on
+every path in the test suite (`assert_source_untouched`), not a missing feature.
+Resolving diverged tables (`merge`/`rebase`) is future work blocked on row-level
+change tracking (see RFC 007). And there is no separate `gfs diff`: GFS has no
+per-row change log on either side, so `gfs fetch` already shows everything a diff
+could know (which tables changed, and why).
+
 ### `gfs status`
 
-Show the current state of storage and compute resources.
+Show the current state of storage and compute resources. On a lazy clone, a
+**Source** section reports where the clone stands: tracked tables, how many are
+behind the source, how many have diverged (changed both locally and upstream),
+and when that verdict was last checked. The same fields appear as a `source`
+object in `--output json` (`tracked`, `behind`, `diverged`, `last_checked`);
+the object is omitted when the repository is not a clone.
 
 ```bash
 gfs status
@@ -389,6 +587,13 @@ gfs export --output-dir <dir> --format <fmt>
 ```
 
 Formats: `sql` (plain-text SQL), `custom` (PostgreSQL binary dump)
+
+> **Known issue on lazy clones.** `gfs export` dumps what the clone holds
+> *locally*. A lazy clone only holds rows for tables it has actually read, so
+> exporting one can produce a valid-looking file with entire tables empty, with
+> no warning. Read every table you need first, or export from a normal (non-clone)
+> repository. Tracked in
+> [#116](https://github.com/Guepard-Corp/gfs/issues/116).
 
 ### `gfs import`
 
@@ -492,6 +697,49 @@ cargo test -- --nocapture         # Run with output
 - [cargo-nextest](https://nexte.st/): Faster, clearer test output. Install with `cargo install cargo-nextest`, then run `cargo nextest run` or `cargo nt`.
 - [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov): Code coverage. Install with `cargo install cargo-llvm-cov` (requires `rustup component add llvm-tools-preview`). Run `cargo llvm-cov --html --open` for an HTML report.
 
+#### Clone behaviour suites
+
+The lazy clone has its own suites, because most of what can go wrong needs a real
+source database and a real clone container rather than a unit test.
+
+```bash
+cargo build --release                                    # the suites run the real binary
+docker build -t gfs-postgres:16 crates/extensions/gfs    # and the real image
+
+tests/paths/run-all.sh          # one test per documented clone behaviour
+tests/paths/run-all.sh B        # one family
+tests/paths/run-all.sh B4 D3    # specific cases
+tests/paths/run-all.sh --list   # what is covered, runs nothing
+```
+
+`tests/paths/` has one script per path a clone can take, so a failure names the exact
+case rather than "the drift suite broke". Each script builds its own throwaway source
+and its own clone, so they cannot contaminate each other. See
+[`tests/paths/README.md`](tests/paths/README.md) for what every test proves and for the
+traps that have produced false results here (for example: `psql` inside a clone still
+goes through the planner hook, so it will hydrate the table you were trying to inspect).
+
+Three statuses matter:
+
+| status | meaning |
+| --- | --- |
+| `FAIL` | a real product defect |
+| `ABORT` | the **environment** failed (a container never came up). Never a product defect |
+| `known-open now passes` | a test that documents an unfixed behaviour started passing. Either a fix landed or the assertion is too weak |
+
+To test against a **real** remote database rather than a throwaway container:
+
+```bash
+# safe on production-shaped data: asserts router decisions, writes nothing upstream
+scripts/e2e-clone-remote-source.sh readonly "postgresql://user:pw@host:5432/db?sslmode=require"
+
+# mutates, but only inside its own gfs_test_<pid> schema, dropped on exit
+scripts/e2e-clone-remote-source.sh drift "postgresql://user:pw@host:5432/db?sslmode=require"
+```
+
+This is the only way to exercise the cost model at real scale, since the copy-vs-ask
+decision depends on measured link speed and real table sizes.
+
 ### Building for release
 
 ```bash
@@ -499,6 +747,63 @@ cargo build --release
 ```
 
 The binary will be available at `target/release/gfs`.
+
+## Known limitations
+
+These are real and deliberately documented rather than left for you to discover.
+
+### A lazy clone is not a point-in-time snapshot (but it knows when it stopped being one)
+
+Tables are copied at the moment you first read them, so different tables can come from
+different moments, and the combination may be a state the source never actually had.
+
+Concretely: read `orders` at 10:00, the source inserts order #4 with its items at 10:05,
+you read `order_items` at 10:10. Your clone now holds items belonging to an order it
+does not have. A join silently drops those rows, and each table on its own looks
+perfectly consistent.
+
+This cannot be *prevented* on a live source — you cannot read the past of a database
+that has already thrown the past away — but it is **detected** (#131): every copy
+event records where the source's WAL was when those rows arrived (`gfs.copy_watermark`),
+so "this clone spans WAL X..Y" is a computable fact rather than a guess. `gfs fetch`
+reports the span, `gfs status` shows a `Moments` row, and the drift warning now
+distinguishes *torn* (mixes moments) from *stale* (a coherent view of one earlier
+moment) — drift and tornness are different facts, and each can occur without the other.
+A chunked table gets a min..max span and a moment count, not per-row provenance: which
+individual row came from which moment is unknowable once ranges coalesce.
+
+The way out is `gfs freeze` ([#132](https://github.com/Guepard-Corp/gfs/issues/132)):
+re-copy everything from one instant and detach; a frozen clone reports a single moment
+by construction. `gfs pull` alone does **not** end a tear — it resets changed tables to
+be refetched lazily, which narrows the span only if the next reads happen while the
+source holds still.
+
+Detection is [#131](https://github.com/Guepard-Corp/gfs/issues/131); the snapshot mode
+is [#132](https://github.com/Guepard-Corp/gfs/issues/132). The two properties genuinely
+conflict: staying *current* and holding *still* cannot both be true of a source you do
+not control, so it is a choice — per clone, per moment you freeze it.
+
+### Table inheritance with unkeyed children cannot be cloned
+
+Copy-on-read needs a unique key per table, and PostgreSQL does not carry a parent's
+primary key down to a child created with `INHERITS`. A child without its own key cannot
+be registered, and the clone refuses to build rather than leaving it as a silently empty
+table. The refusal is correct, but there is no fallback yet.
+Tracked as [#139](https://github.com/Guepard-Corp/gfs/issues/139).
+
+### An idle source can make every table look changed
+
+An idle PostgreSQL server still advances its WAL position (checkpoints, autovacuum). If
+that movement cannot be attributed to any table, the safe response is to treat every
+copied table as suspect, which sends reads back to the source. So a clone can drift into
+federating everything shortly after a `gfs pull`, even with no user activity upstream.
+Tracked as [#140](https://github.com/Guepard-Corp/gfs/issues/140).
+
+### With `autoschema` off, a new partition reads short
+
+`gfs fetch --check` reports the new partition, but reads of the parent return fewer rows
+than the source holds until you run `gfs pull`. Every other kind of drift is loud; this
+one is quiet, because the parent still answers. Turning on `autoschema` closes it.
 
 ## Contributing
 

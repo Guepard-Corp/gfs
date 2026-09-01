@@ -346,6 +346,83 @@ BEGIN
 END
 $fn$;
 
+-- A table with no usable unique key: copy it WHOLE at clone time instead of
+-- refusing to build the clone at all (#139).
+--
+-- Copy-on-read needs a unique key to fetch "the rows this query wants" and to
+-- dedupe what it already has. A wholesale copy needs neither: take every row
+-- once, mark the table fully materialized, and the router serves it locally
+-- from then on without ever going back to the source for rows.
+--
+-- This is not a niche shape. PostgreSQL does not propagate a parent's PRIMARY
+-- KEY to a child created with INHERITS, so `CREATE TABLE kid() INHERITS(base)`
+-- -- the ordinary way people use inheritance -- yields a child with no index of
+-- its own. Before this, such a source could not be cloned at all: the safeguard
+-- from #106 fired and the whole bootstrap aborted, leaving no partial result.
+--
+-- The safeguard was right and is kept. Its purpose was to stop an unregistered
+-- table being served as a silently empty heap, which is the worst failure this
+-- system has. Copying the table eagerly satisfies that purpose directly -- the
+-- rows are all there -- rather than weakening the check.
+--
+-- The cost is paid at clone time rather than lazily, which is the trade: a
+-- keyless table is no longer free to clone. That is acceptable because the
+-- alternative on offer is not a cheaper clone, it is no clone.
+CREATE OR REPLACE FUNCTION gfs_sync.materialize_unkeyed(p_nsp text, p_tab text)
+RETURNS boolean
+LANGUAGE plpgsql AS $fn$
+DECLARE
+  store_fq  text := format('%I.%I', p_nsp, p_tab);
+  fq_remote text := format('%I.%I', 'gfs_remote_' || p_nsp, p_tab);
+  fk        record;
+  n         bigint;
+BEGIN
+  IF to_regclass(store_fq) IS NULL OR to_regclass(fq_remote) IS NULL THEN
+    RETURN false;
+  END IF;
+
+  -- Same reason as build_clone: per-table copying must not trip referential
+  -- integrity against tables that have not been copied yet.
+  FOR fk IN SELECT conname FROM pg_constraint
+             WHERE conrelid = store_fq::regclass AND contype = 'f'
+  LOOP
+    EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', store_fq, fk.conname);
+  END LOOP;
+
+  -- No ONLY on either side, and both for the same reason: inheritance expands
+  -- DOWNWARD only. INSERT never cascades to children, so `INSERT INTO ONLY` is
+  -- not even valid syntax; and the child's foreign table resolves to the child
+  -- on the source, which does not expand to include its parent. The row set is
+  -- therefore exactly the child's own.
+  --
+  -- The direction that DOES need care is the parent: hydrating a parent pulls
+  -- its children's rows into the parent's own heap, which is #108. That is
+  -- handled on the lazy path; a keyed parent never reaches this function.
+  EXECUTE format('INSERT INTO %s SELECT * FROM %s', store_fq, fq_remote);
+  GET DIAGNOSTICS n = ROW_COUNT;
+
+  -- Registered so the rest of the system can see it: drift detection, export
+  -- and `gfs status` all read gfs.clone_source, and a table missing from it is
+  -- invisible to every one of them. `key_col` is never used while whole_cached
+  -- is true -- it exists for the lazy path, which this table does not take.
+  INSERT INTO gfs.clone_source(relid, source_ref, key_col, chunk_kind, whole_cached, source_rows)
+  VALUES (store_fq::regclass, fq_remote, '', 'whole', true, n)
+  ON CONFLICT (relid) DO UPDATE
+     SET whole_cached = true, chunk_kind = 'whole', source_rows = EXCLUDED.source_rows;
+
+  -- #131: this eager bootstrap copy is a copy event like any other; stamp it so
+  -- the moment verdict covers keyless tables too. Guarded: an older image whose
+  -- extension predates gfs.note_copy must still bootstrap (observation only).
+  BEGIN
+    PERFORM gfs.note_copy(store_fq::regclass);
+  EXCEPTION WHEN undefined_function THEN NULL;
+  END;
+
+  RAISE NOTICE 'gfs: %.% has no unique key; copied % row(s) eagerly and marked it fully materialized', p_nsp, p_tab, n;
+  RETURN true;
+END
+$fn$;
+
 -- Bug B safeguard: a source table with no usable unique key is skipped by the keycol
 -- query in clone() (it needs a unique, non-deferrable, non-partial, non-expression
 -- index -- a DEFERRABLE-only table cannot arbitrate the hydration inserts), so it is
@@ -375,7 +452,7 @@ BEGIN
     IF to_regclass(fq) IS NULL THEN
       problems := problems || format('%s (missing locally)', fq);
     ELSIF NOT EXISTS (SELECT 1 FROM gfs.clone_source WHERE relid = fq::regclass) THEN
-      problems := problems || format('%s (no usable unique key -- needs a unique, non-deferrable, non-partial, non-expression index -> not registered for copy-on-read; would silently return no rows)', fq);
+      problems := problems || format('%s (not registered for copy-on-read and not materialized whole; would silently return no rows)', fq);
     END IF;
   END LOOP;
   IF array_length(problems, 1) > 0 THEN
@@ -507,8 +584,26 @@ BEGIN
   -- exist from the faithful replay.
   PERFORM gfs_sync.replicate_sequences(p_conn, target_schemas);
 
-  -- Bug B safeguard: every ordinary source table must register for copy-on-read; a
-  -- table with no usable unique key would otherwise be a silent empty heap. Fail loud.
+  -- Any source table the keycol query could not key -- most often an INHERITS
+  -- child, since PostgreSQL does not pass a parent's PRIMARY KEY down to it --
+  -- is copied whole here instead of blocking the clone (#139). Must run BEFORE
+  -- the safeguard below, which is what would otherwise abort the bootstrap.
+  FOR rec IN
+    SELECT r.nsp, r.tab FROM dblink(p_conn, format($q$
+      SELECT n.nspname::text AS nsp, c.relname::text AS tab
+        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE c.relkind = 'r' AND NOT c.relispartition AND n.nspname IN (%s)
+    $q$, schlist)) AS r(nsp text, tab text)
+   WHERE to_regclass(format('%I.%I', r.nsp, r.tab)) IS NOT NULL
+     AND NOT EXISTS (SELECT 1 FROM gfs.clone_source cs
+                      WHERE cs.relid = format('%I.%I', r.nsp, r.tab)::regclass)
+  LOOP
+    PERFORM gfs_sync.materialize_unkeyed(rec.nsp, rec.tab);
+  END LOOP;
+
+  -- Bug B safeguard: every ordinary source table must be accounted for -- either
+  -- registered for copy-on-read, or copied whole above. One that is neither would
+  -- be a silent empty heap. Fail loud.
   PERFORM gfs_sync.verify_tables_registered(p_conn, target_schemas);
 
   -- Fail loudly if any partitioned table did not fully round-trip (a leaf missing
@@ -534,3 +629,16 @@ EXCEPTION WHEN others THEN
   RAISE NOTICE 'gfs: cost calibration skipped (%)', SQLERRM;
 END
 $cal$;
+
+-- Record where the source is right now (WAL position + per-table write counters).
+-- A copy-on-read clone is only a consistent point in time while the source holds
+-- still; this baseline is what lets gfs.source_changed() / gfs.source_drift()
+-- later tell the user the source moved instead of silently serving a torn view.
+-- Best-effort: a clone without a baseline still works, it just cannot detect drift.
+DO $drift$
+BEGIN
+  PERFORM gfs.capture_source_baseline();
+EXCEPTION WHEN others THEN
+  RAISE NOTICE 'gfs: source drift baseline not captured (%)', SQLERRM;
+END
+$drift$;
