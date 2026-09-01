@@ -202,8 +202,13 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
             );
         }
         let (provider, container) = self.resolve(path)?;
+        // Reassign the role's objects to the deploy `owner` (the customer's own
+        // role) rather than the management superuser running this exec, so a
+        // dropped user's tables don't silently move to an unusable platform role.
+        // Falls back to CURRENT_USER when the owner can't be resolved.
+        let reassign_owner = self.detect_deploy_owner(path).await;
         let command = provider
-            .drop_role_command(username)
+            .drop_role_command(username, reassign_owner.as_deref())
             .map_err(map_provider_err)?;
         expect_success(self.run(&container, &command).await?)
     }
@@ -768,9 +773,16 @@ mod tests {
             self.guard()?;
             Ok(format!("MOCK-ALTER:{username}"))
         }
-        fn drop_role_command(&self, username: &str) -> std::result::Result<String, ProviderError> {
+        fn drop_role_command(
+            &self,
+            username: &str,
+            reassign_owned_to: Option<&str>,
+        ) -> std::result::Result<String, ProviderError> {
             self.guard()?;
-            Ok(format!("MOCK-DROP:{username}"))
+            Ok(format!(
+                "MOCK-DROP:{username}:reassign={}",
+                reassign_owned_to.unwrap_or("CURRENT_USER")
+            ))
         }
         fn list_roles_command(&self) -> std::result::Result<String, ProviderError> {
             self.guard()?;

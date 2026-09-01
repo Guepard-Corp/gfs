@@ -442,9 +442,14 @@ pub trait DatabaseProvider: Send + Sync {
         Err(ProviderError::UnsupportedFormat("alter_password".into()))
     }
 
-    /// In-instance command that drops `username`.
-    fn drop_role_command(&self, username: &str) -> std::result::Result<String, ProviderError> {
-        let _ = username;
+    /// In-instance command that drops `username`, reassigning any objects it owns
+    /// to `reassign_owned_to` (the deploy owner) when set, else to `CURRENT_USER`.
+    fn drop_role_command(
+        &self,
+        username: &str,
+        reassign_owned_to: Option<&str>,
+    ) -> std::result::Result<String, ProviderError> {
+        let _ = (username, reassign_owned_to);
         Err(ProviderError::UnsupportedFormat("drop_role".into()))
     }
 

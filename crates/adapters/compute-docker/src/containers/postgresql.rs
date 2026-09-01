@@ -711,19 +711,29 @@ impl DatabaseProvider for PostgresqlProvider {
         )?))
     }
 
-    fn drop_role_command(&self, username: &str) -> std::result::Result<String, ProviderError> {
+    fn drop_role_command(
+        &self,
+        username: &str,
+        reassign_owned_to: Option<&str>,
+    ) -> std::result::Result<String, ProviderError> {
         let ident = pg_quote_ident(username)?;
-        // Non-destructive drop. `REASSIGN OWNED` first hands every object the
-        // role owns (tables, sequences, …) to the management role executing this
-        // — so dropping a user NEVER deletes its data, unlike a bare
+        // Non-destructive drop. `REASSIGN OWNED` first hands every object the role
+        // owns (tables, sequences, …) to the deploy owner when known — so a dropped
+        // user's data lands on the customer's own role rather than the management
+        // role executing this exec — else to `CURRENT_USER` as a fallback. Either
+        // way dropping a user NEVER deletes its data, unlike a bare
         // `DROP OWNED`/cascade. `DROP OWNED` then clears what's left: the role's
         // granted privileges and the `ALTER DEFAULT PRIVILEGES` entries a preset
         // created (it now owns no objects, so nothing is destroyed). `DROP ROLE`
         // then succeeds instead of failing with "objects depend on it".
         // Transactional so a partial drop can't leave a half-removed role.
+        let reassign_target = match reassign_owned_to {
+            Some(role) => pg_quote_ident(role)?,
+            None => "CURRENT_USER".to_string(),
+        };
         Ok(Self::pin_mgmt_search_path(self.query_in_instance_command(
             &format!(
-                "BEGIN;\nREASSIGN OWNED BY {ident} TO CURRENT_USER;\nDROP OWNED BY {ident};\nDROP ROLE {ident};\nCOMMIT;"
+                "BEGIN;\nREASSIGN OWNED BY {ident} TO {reassign_target};\nDROP OWNED BY {ident};\nDROP ROLE {ident};\nCOMMIT;"
             ),
             None,
         )?))
@@ -1733,7 +1743,7 @@ mod tests {
             .expect("alter");
         assert!(alter.contains(PIN), "alter_password pins search_path");
 
-        let drop = provider.drop_role_command("app_rw").expect("drop");
+        let drop = provider.drop_role_command("app_rw", None).expect("drop");
         assert!(drop.contains(PIN), "drop_role pins search_path");
 
         let preset = provider
@@ -1915,10 +1925,10 @@ mod tests {
     #[test]
     fn drop_and_alter_password_quote_identifier_and_literal() {
         let provider = PostgresqlProvider::new();
-        let drop = provider.drop_role_command("app_ro").unwrap();
+        let drop = provider.drop_role_command("app_ro", None).unwrap();
         assert!(
             drop.contains(r#"REASSIGN OWNED BY "app_ro" TO CURRENT_USER;"#),
-            "must reassign owned objects before dropping so no data is destroyed"
+            "with no owner, reassign owned objects to CURRENT_USER before dropping"
         );
         assert!(
             drop.contains(r#"DROP OWNED BY "app_ro";"#),
@@ -1930,7 +1940,18 @@ mod tests {
             drop.find("REASSIGN OWNED").unwrap() < drop.find("DROP OWNED").unwrap(),
             "REASSIGN must run before DROP OWNED"
         );
-        assert!(provider.drop_role_command("bad name").is_err());
+        // With a deploy owner, objects are reassigned to it (quoted), not to the
+        // management superuser executing the drop.
+        let drop_to_owner = provider.drop_role_command("app_ro", Some("owner")).unwrap();
+        assert!(
+            drop_to_owner.contains(r#"REASSIGN OWNED BY "app_ro" TO "owner";"#),
+            "with a deploy owner, reassign owned objects to it, not CURRENT_USER"
+        );
+        assert!(
+            !drop_to_owner.contains("TO CURRENT_USER"),
+            "must not fall back to CURRENT_USER when the owner is known"
+        );
+        assert!(provider.drop_role_command("bad name", None).is_err());
         let alter = provider.alter_password_command("app_ro", "new'pw").unwrap();
         assert!(alter.contains(r#"ALTER ROLE "app_ro" WITH PASSWORD 'new''pw';"#));
     }
