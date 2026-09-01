@@ -1,18 +1,18 @@
-# D1: disjoint edits are reported as a conflict because tracking is per table
+# D1: disjoint edits are reported as a conflict, by name, and never silently merged
 
-> **This test is expected to FAIL.** It is marked `--expect open`, which means it
-> asserts what the system does *today* for something that is still unfixed. The
-> suite counts it as passing. If it ever starts passing on its own, the runner
-> exits 3 and tells you the documentation is out of date.
-
-**Related issues:** [#130](https://github.com/Guepard-Corp/gfs/issues/130)
+**Related issues:** [#120](https://github.com/Guepard-Corp/gfs/issues/120), [#130](https://github.com/Guepard-Corp/gfs/issues/130)
 
 ## Why this test exists
 
 D1 (#130): you and the source edited DIFFERENT rows. In principle mergeable,
-but divergence is tracked per TABLE, so this is indistinguishable from a real
-conflict. Declared KNOWN-OPEN. Correctness is fine; the limitation is that a
-mergeable case is treated as a conflict.
+but divergence is tracked per TABLE (gfs.clone_source.has_local_writes), not
+per row, so GFS cannot prove the two edits do not overlap.
+
+It does not pretend otherwise. The bar this path holds it to is AWARENESS, not
+merging: your row survives, both sync verbs name the table as a conflict and
+say WHY, `gfs pull` refuses to touch it rather than silently picking a side,
+and `gfs status` keeps counting it afterwards. Row-level provenance (the basis
+for a real three-way merge) is a separate project -- see #130 and RFC 007.
 
 ## The scenario
 
@@ -33,7 +33,14 @@ UPDATE orders SET total=222 WHERE id=3;
 ## What is asserted
 
 - your row is intact (correctness holds)
-- the disjoint edits were merged rather than treated as a conflict
+- gfs fetch reports the divergence as a conflict
+- gfs fetch names the table it cannot resolve on its own
+- gfs fetch says why: local writes AND a source change
+- gfs pull reports the conflict too
+- gfs pull leaves the diverged table alone
+- gfs pull points at the only way to resolve it
+- your row is still yours after the pull
+- gfs status still counts the diverged table after the pull skipped it
 
 ## Running it
 

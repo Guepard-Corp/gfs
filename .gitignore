@@ -41,3 +41,6 @@ benchmarks/
 *.synctex.gz
 *.toc
 *.out
+
+# python bytecode (tests/paths/make_docs.py)
+__pycache__/

@@ -1,22 +1,15 @@
-# E1: a clone changes under you: the same query gives different answers over time
-
-> **This test is expected to FAIL.** It is marked `--expect open`, which means it
-> asserts what the system does *today* for something that is still unfixed. The
-> suite counts it as passing. If it ever starts passing on its own, the runner
-> exits 3 and tells you the documentation is out of date.
+# E1: a frozen clone holds still: repeated reads agree despite source writes
 
 **Related issues:** [#131](https://github.com/Guepard-Corp/gfs/issues/131), [#132](https://github.com/Guepard-Corp/gfs/issues/132)
 
 ## Why this test exists
 
-E1 (#131): a clone is NOT a point-in-time snapshot.
-
-The property under test is reproducibility, not correctness. Reads ARE kept
-current by drift detection, which is precisely the problem: the same query
-returns different answers over time with no local action at all, so a clone
-cannot be used as a stable branch for a repeatable test run.
-
-Declared KNOWN-OPEN. #132 (snapshot mode) is the fix.
+E1 (#131, fixed by #132): a clone used as a BRANCH must hold still. Before
+snapshot mode this was declared KNOWN-OPEN: drift detection kept reads
+current, which is precisely the problem -- the same query changed answers
+over time with no local action, so no test run was repeatable. `gfs freeze`
+is the fix under test: once frozen, repeated reads agree no matter what the
+source does.
 
 ## The scenario
 
@@ -36,7 +29,7 @@ INSERT INTO orders VALUES (4,'Dave',40);
 
 ## What is asserted
 
-- the clone shifted under the reader ($FIRST then $SECOND) with no local action (#131, fixed by #132)
+- the clone held still: repeated reads agree, so it behaves as a snapshot (#132)
 
 ## Running it
 

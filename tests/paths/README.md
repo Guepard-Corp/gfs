@@ -40,7 +40,7 @@ Environment overrides: `GFS_BIN`, `GFS_IMAGE`, `GFS_SOURCE_IMAGE`,
 | --- | --- |
 | `PASS` / `FAIL` | an assertion about the product |
 | `ABORT` (exit 90) | the **environment** failed (container never came up, clone never completed). Never counted as a product defect |
-| `known-open now passes` (exit 3) | a path declared `--expect open` had every assertion pass. Either a real fix landed, or the assertion is too weak. Update the document |
+| `known-open now passes` (exit 91) | a path declared `--expect open` had every assertion pass. Either a real fix landed, or the assertion is too weak. Update the document |
 
 The runner always prints coverage. All 50 documented paths now have a script; five
 are marked `--expect open`, which means they assert TODAY's behaviour for something

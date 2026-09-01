@@ -89,10 +89,15 @@ case_end(){
     if [ "$fail" -eq 0 ] && [ "$pass" -gt 0 ]; then
       echo "    NOTE  $CASE_ID was declared KNOWN-OPEN but every assertion passed."
       echo "          If this is a real fix, update the document and flip --expect pass."
-      exit 3
+      exit 91
     fi
     exit 0
   fi
+  # The exit code is the failure COUNT, so it must not stray into the runner's
+  # reserved codes: 3 used to mean "known-open now passes", which silently
+  # relabelled any path with exactly three failing assertions as a fixed one.
+  # 90 is ABORT and 91 is now known-open-passes, so failures are clamped below.
+  [ "$fail" -gt 89 ] && exit 89
   exit "$fail"
 }
 
@@ -101,7 +106,11 @@ _start_source(){
   docker rm -f "$SRC_CT" >/dev/null 2>&1
   local i
   for i in $(seq 1 15); do
-    docker run -d --name "$SRC_CT" -p "$PORT:5432" -e POSTGRES_PASSWORD=x "$PGIMAGE" >/dev/null 2>&1 && break
+    # GFS_SOURCE_ARGS passes server settings to the source (unquoted: it is a
+    # word list, e.g. "-c track_counts=off"). Empty for every case but the
+    # ones that need a deliberately unusual source.
+    # shellcheck disable=SC2086
+    docker run -d --name "$SRC_CT" -p "$PORT:5432" -e POSTGRES_PASSWORD=x "$PGIMAGE" ${GFS_SOURCE_ARGS:-} >/dev/null 2>&1 && break
     docker rm -f "$SRC_CT" >/dev/null 2>&1; sleep 2
   done
   docker ps --format '{{.Names}}' | grep -qx "$SRC_CT" || abort "source container did not start"
@@ -179,6 +188,12 @@ clone_must_fail(){   # for paths where refusing to clone IS the correct behaviou
   return 1
 }
 clone_log(){ cat "$WORK/clone.log" 2>/dev/null; }
+
+# Freeze the clone into a detached snapshot (#132). Extra args pass through
+# (e.g. --max-bytes 5, --force). Non-zero rc is a legitimate outcome for the
+# guard tests, so no abort here; freeze_log shows why.
+freeze_now(){ "$BIN" freeze "$@" > "$WORK/freeze.log" 2>&1; }
+freeze_log(){ cat "$WORK/freeze.log" 2>/dev/null; }
 
 # ----------------------------------------------------------------- clone side
 # CAREFUL: P() runs psql INSIDE the clone, where the planner hook is active.

@@ -12,7 +12,15 @@
 E2 (#131): the same tear, inside a single table.
 
 Two halves of one table are observed at different moments. A point-in-time
-clone would show both halves as of ONE instant. Declared KNOWN-OPEN.
+clone would show both halves as of ONE instant. Declared KNOWN-OPEN, and it
+stays that way on purpose: a LAZY clone cannot fix this -- the source has
+already thrown the old row versions away -- so this path keeps asserting what
+actually happens rather than what we wish did.
+
+What IS fixed is the SILENCE. E2b proves the table's own watermark counts the
+moments its rows span, and H8 proves `gfs freeze` (#132) collapses the clone
+back to a single moment. This path is the tear; those two are the awareness
+and the cure.
 
 ## The scenario
 

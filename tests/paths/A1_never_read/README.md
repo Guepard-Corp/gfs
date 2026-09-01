@@ -1,5 +1,7 @@
 # A1: a never-read table holds nothing locally but reads correctly
 
+**Related issues:** [#133](https://github.com/Guepard-Corp/gfs/issues/133)
+
 ## Why this test exists
 
 A1: a table never read cannot be stale. It holds NO rows locally, and the very
@@ -27,6 +29,9 @@ The source is not modified: this test is about what the clone does on its own.
 - orders is not marked whole-cached
 - no partial slice has been pulled either
 - the first read returns the source's rows
+- remote prints the source host and port
+- remote states the fetch-only rule
+- the source password is never printed
 
 ## Running it
 

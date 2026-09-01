@@ -1,10 +1,11 @@
-# B1: source INSERT is visible to the clone
+# H7: clone --snapshot yields a detached point-in-time clone
 
-**Related issues:** [#118](https://github.com/Guepard-Corp/gfs/issues/118), [#133](https://github.com/Guepard-Corp/gfs/issues/133)
+**Related issues:** [#132](https://github.com/Guepard-Corp/gfs/issues/132)
 
 ## Why this test exists
 
-B1 (#118): the source adds a row after the clone cached the table.
+H7 (#132): `gfs clone --snapshot` = clone + freeze in one step. The result is
+born detached: consistent, immune to source writes, and answers offline.
 
 ## The scenario
 
@@ -24,17 +25,17 @@ INSERT INTO orders VALUES (4,'Dave',40);
 
 ## What is asserted
 
-- status JSON includes the source section
-- status JSON counts tracked tables
-- status JSON reports a behind count
-- status JSON carries the verdict timestamp
-- returns the new count, not the cached 3
+- the CLI announces the snapshot
+- the clone is born frozen
+- every table was copied up front
+- source writes after the snapshot are invisible
+- and the snapshot answers with the source stopped
 
 ## Running it
 
 ```bash
-tests/paths/run-all.sh B1          # through the runner
-bash tests/paths/B1_row_added/test.sh   # directly
+tests/paths/run-all.sh H7          # through the runner
+bash tests/paths/H7_snapshot_clone/test.sh   # directly
 ```
 
 Each test builds its **own** throwaway source and its **own** clone, so it can be
@@ -44,10 +45,10 @@ run alone and cannot be affected by any other test.
 
 | helper | what it does |
 | --- | --- |
-| `clone_now` | clones the source and waits until the clone is queryable |
+| `P` | runs SQL directly inside the clone container |
 | `nudge` | reads an unrelated table so a background drift check can run and commit |
 | `src` | runs SQL on the SOURCE database |
-| `val` | reads through the gfs CLI and returns one value |
+| `with_source_down` | evaluates a query with the source stopped, then restarts it |
 
 See [`../lib/common.sh`](../lib/common.sh) for the harness, and
 [`../README.md`](../README.md) for the traps that have produced false results here.

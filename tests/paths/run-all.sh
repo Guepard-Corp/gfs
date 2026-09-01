@@ -16,10 +16,11 @@ cd "$(dirname "$0")" || exit 1
 # Every case ID the document declares, so coverage is measured against the
 # document rather than against whatever scripts happen to exist.
 DOC_CASES="A1 A2 A3 A4 A5 \
-B1 B2 B3 B4 B4b B5 B6 B7 B8 B9 B10 B10b B11 B12 B13 B14 B15 B16 B17 B18 B19 \
+B1 B2 B3 B4 B4b B5 B6 B7 B8 B9 B10 B10b B11 B12 B13 B14 B15 B16 B16b B17 B18 B19 \
 C1 C2 C3 C4 C5 C6 C7 C8 \
 D1 D2 D3 D4 D5 D6 D7 D8 D9 \
-E1 E2 F1 F2 F3 G1 G2"
+E1 E1b E2 E2b F1 F1b F1c F2 F3 G1 G2 \
+H1 H2 H3 H4 H5 H6 H7 H8"
 
 # Each case lives in its own folder: <CASE>_<slug>/test.sh, beside its README.
 script_for(){ ls -d "$1"_*/test.sh 2>/dev/null | head -1; }
@@ -40,13 +41,13 @@ fi
 # Which scripts to run
 SEL=()
 if [ $# -eq 0 ]; then
-  while IFS= read -r f; do SEL+=("$f"); done < <(ls -d [A-G]*_*/test.sh 2>/dev/null | sort -V)
+  while IFS= read -r f; do SEL+=("$f"); done < <(ls -d [A-H]*_*/test.sh 2>/dev/null | sort -V)
 else
   # Match a single LETTER as a family (B -> every B case), anything else as an
   # EXACT case id. Prefix matching would make "B1" also run B10, B11, B12 ... B19,
   # which silently turns a one-test check into a twelve-test sweep.
   for a in "$@"; do
-    if [[ "$a" =~ ^[A-G]$ ]]; then
+    if [[ "$a" =~ ^[A-H]$ ]]; then
       pat="$a[0-9]*_*/test.sh"
     else
       pat="${a}_*/test.sh"
@@ -68,7 +69,7 @@ for s in "${SEL[@]}"; do
   rc=$?
   case $rc in
     0) PASSED+=("$(dirname "$s")") ;;
-    3) OPENFIXED+=("$(dirname "$s")") ;;
+    91) OPENFIXED+=("$(dirname "$s")") ;;
     90) ABORTED+=("$(dirname "$s")") ;;
     *) FAILED+=("$(dirname "$s")") ;;
   esac
