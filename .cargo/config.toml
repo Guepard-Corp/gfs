@@ -1,3 +1,19 @@
+# Windows gives the main thread a 1 MiB stack; Linux and macOS give 8 MiB.
+#
+# `main` is `#[tokio::main]`, which expands to `block_on(...)` polled ON the main
+# thread, so the whole async state machine lives in that 1 MiB alongside rustls
+# / aws-lc-rs provider setup. It does not fit: every `gfs` subcommand aborted at
+# startup with exit code 0xC00000FD (STATUS_STACK_OVERFLOW) before printing
+# anything, which surfaced as all nine `json_output` tests failing identically
+# on windows-latest while Ubuntu and macOS passed.
+#
+# Reserving 8 MiB at link time removes the asymmetry rather than working around
+# it, and it fixes the SHIPPED binary -- not just the tests. The alternative,
+# re-spawning the work on a thread with an explicit stack size, restructures
+# `main` and leaves the released executable's own stack unchanged.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:8388608"]
+
 [alias]
 gfs = ["run", "--bin", "gfs-cli"]
 gfs-mcp = ["run", "--bin", "gfs-mcp"]
