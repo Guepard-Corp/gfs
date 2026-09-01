@@ -159,8 +159,226 @@ COMMENT ON FUNCTION gfs.calibrate(int) IS
 -- Hence the load-bearing rule: WAL moved but nothing attributed means
 -- "changed, unattributed" and every materialized table is suspect. It must
 -- never be read as "nothing changed".
+-- FROZEN / DETACHED STATE (#132) ---------------------------------------------
+-- A frozen clone is a sealed point-in-time snapshot: gfs.freeze_run() re-copied
+-- every non-diverged table from ONE source instant and detached the clone. From
+-- then on NOTHING contacts the source: the planner hook serves every registered
+-- table locally (route.rs consults CloneInfo.frozen), the background worker
+-- drops upkeep jobs, and source_drift/refresh_drift_state/pull/resync_table/warm
+-- all no-op or refuse. Single row, same hot-switch pattern as gfs.cost/budget.
+CREATE TABLE gfs.clone_mode (
+    frozen     boolean NOT NULL DEFAULT false,
+    frozen_at  timestamptz,
+    frozen_lsn text                          -- informational: source WAL position near the freeze instant
+);
+INSERT INTO gfs.clone_mode DEFAULT VALUES;
+COMMENT ON TABLE gfs.clone_mode IS 'Frozen/detached switch (#132): true = sealed snapshot, the source is never contacted again';
+
+CREATE FUNCTION gfs.is_frozen() RETURNS boolean LANGUAGE sql STABLE AS $$
+    SELECT COALESCE((SELECT frozen FROM gfs.clone_mode LIMIT 1), false);
+$$;
+COMMENT ON FUNCTION gfs.is_frozen() IS 'TRUE when this clone is a frozen (detached) snapshot';
+
+-- COPY WATERMARKS (#131) ------------------------------------------------------
+-- Drift (the source moved since clone time) is NOT tornness (this clone mixes
+-- data copied at different source moments). The two disagree in both directions:
+--   * a pull re-anchors the baseline and resets only the FLAGGED tables, so a
+--     clone can be genuinely torn while source_drift() reports a quiet source;
+--   * a clone whose tables were all copied at ONE moment, after which the
+--     source moved, is coherent-but-stale, not torn.
+-- Tornness is therefore recorded at the only place it is knowable: the copy
+-- event itself. Every hydration/warm stamps the table with WHERE THE SOURCE WAS
+-- when its rows arrived, making "this clone spans WAL X..Y" a computable,
+-- source-free fact instead of a guess.
+--
+-- Moment identity follows the same three-signal doctrine as the drift guard:
+-- the WAL position never misses a change but cannot tell housekeeping from a
+-- real write (an idle server advances its own WAL -- the #140 lesson), so two
+-- copy events are "the same moment" when the source-wide row-activity totals
+-- match; the LSN decides only when the totals are unusable (the stats-lost
+-- source measured in #131's sibling work), flagged via lsn_only.
+--
+-- Chunked tables (int/time range keys) get a MIN..MAX span and a moment count,
+-- not per-row provenance: range coalescing merges chunks and ON CONFLICT DO
+-- NOTHING keeps older row versions silently, so which ROW is from which moment
+-- is unknowable without invasive per-row columns. The span is the honest ceiling.
+CREATE TABLE gfs.copy_watermark (
+    relid     regclass PRIMARY KEY REFERENCES gfs.clone_source(relid) ON DELETE CASCADE,
+    first_lsn pg_lsn,                          -- source WAL position at this table's first copy event
+    last_lsn  pg_lsn,                          -- ... and at its latest one (equal = one moment, per lsn)
+    last_w    bigint,                          -- source-wide row-activity totals at the latest event
+    last_l    bigint,                          --   (NULL = totals were unusable for that event)
+    moments   int         NOT NULL DEFAULT 1,  -- distinct user-data moments observed across events
+    lsn_only  boolean     NOT NULL DEFAULT false, -- some event fell back to LSN identity (over-approximate)
+    copies    bigint      NOT NULL DEFAULT 1,
+    first_at  timestamptz NOT NULL DEFAULT clock_timestamp(),
+    last_at   timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+COMMENT ON TABLE gfs.copy_watermark IS
+  'Per-table "as of" watermark: where the source was when this table''s rows were copied (#131 torn-clone detection)';
+
+-- The light probe: WAL position + source-wide activity totals, ONE round trip,
+-- ONE statement = one source snapshot (same discipline as gfs.source_probe, minus
+-- its expensive schema-digest aggregation -- this runs once per COPY EVENT).
+CREATE FUNCTION gfs.source_mark() RETURNS TABLE(lsn pg_lsn, w bigint, l bigint)
+LANGUAGE plpgsql AS $$
+BEGIN
+    RETURN QUERY SELECT t.lsn::pg_lsn, t.w, t.l FROM dblink('gfs_remote_srv', $q$
+        SELECT (CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn()
+                     ELSE pg_current_wal_lsn() END)::text,
+               COALESCE(sum(n_tup_ins + n_tup_upd + n_tup_del), 0)::bigint,
+               COALESCE(sum(n_live_tup), 0)::bigint
+          FROM pg_stat_user_tables
+    $q$) AS t(lsn text, w bigint, l bigint);
+END;
+$$;
+COMMENT ON FUNCTION gfs.source_mark() IS
+  'One light round trip: source WAL position + row-activity totals, from a single snapshot (#131 watermark probe)';
+
+-- Stamp one copy event. Called EXPLICITLY from every copy path (note_range, the
+-- hydration engine, gfs.warm, the bootstrap's eager copies) -- deliberately not
+-- a trigger: hydration runs under session_replication_role='replica', where
+-- ordinary triggers silently do not fire (the codified convention is that
+-- everything fires ORIGIN-enabled). A function call is immune to the role.
+--
+-- Best-effort BY DESIGN: this is observation, and it must never fail a copy
+-- that already landed -- any error degrades to "no mark" (surfaced by
+-- clone_moments as an unknown-moment table, never as a false verdict).
+CREATE FUNCTION gfs.note_copy(p_relid regclass) RETURNS void LANGUAGE plpgsql AS $$
+DECLARE mlsn pg_lsn; mw bigint; ml bigint; usable boolean; cw record; same boolean;
+BEGIN
+    IF NOT COALESCE((SELECT watermarks FROM gfs.sync_policy LIMIT 1), true) THEN
+        RETURN;                                   -- hot kill-switch, no redeploy
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM gfs.clone_source WHERE relid = p_relid) THEN
+        RETURN;                                   -- not a registered clone table
+    END IF;
+
+    IF gfs.is_frozen() THEN
+        -- Inside gfs.freeze_run(): the flag is set at the TOP of its transaction,
+        -- so every warm below it lands here. All rows share the ONE freeze mark
+        -- (probing per table would record the MOVING current LSN and make a
+        -- clone copied from one pinned snapshot look torn). After the freeze the
+        -- clone is detached and no copy path runs at all -- this branch also
+        -- guarantees the watermark machinery never contacts the sealed source.
+        SELECT m.frozen_lsn::pg_lsn INTO mlsn FROM gfs.clone_mode m LIMIT 1;
+        INSERT INTO gfs.copy_watermark(relid, first_lsn, last_lsn, last_w, last_l,
+                                       moments, lsn_only, copies)
+        VALUES (p_relid, mlsn, mlsn, NULL, NULL, 1, false, 1)
+        ON CONFLICT (relid) DO UPDATE
+           SET first_lsn = EXCLUDED.first_lsn, last_lsn = EXCLUDED.last_lsn,
+               last_w = NULL, last_l = NULL, moments = 1, lsn_only = false,
+               copies = gfs.copy_watermark.copies + 1, last_at = clock_timestamp();
+        RETURN;
+    END IF;
+
+    SELECT s.lsn, s.w, s.l INTO mlsn, mw, ml FROM gfs.source_mark() s;
+    IF mlsn IS NULL THEN RETURN; END IF;
+    -- Same trust rule as source_drift's blanket: totals that report zero live
+    -- rows anywhere are a lost stats file, not a quiet source.
+    usable := COALESCE(ml, 0) > 0;
+    IF NOT usable THEN mw := NULL; ml := NULL; END IF;
+
+    SELECT * INTO cw FROM gfs.copy_watermark WHERE relid = p_relid FOR UPDATE;
+    IF NOT FOUND THEN
+        INSERT INTO gfs.copy_watermark(relid, first_lsn, last_lsn, last_w, last_l,
+                                       moments, lsn_only, copies)
+        VALUES (p_relid, mlsn, mlsn, mw, ml, 1, NOT usable, 1)
+        ON CONFLICT (relid) DO NOTHING;   -- concurrent first stamp: drop this one
+        RETURN;
+    END IF;
+
+    -- Same user-data moment? Totals when both events had them; LSN otherwise.
+    IF usable AND cw.last_w IS NOT NULL THEN
+        same := (mw = cw.last_w AND ml = cw.last_l);
+    ELSE
+        same := (mlsn = cw.last_lsn);
+    END IF;
+
+    UPDATE gfs.copy_watermark
+       SET first_lsn = LEAST(first_lsn, mlsn),
+           last_lsn  = GREATEST(last_lsn, mlsn),
+           last_w    = mw, last_l = ml,
+           moments   = moments + CASE WHEN same THEN 0 ELSE 1 END,
+           lsn_only  = lsn_only OR NOT usable,
+           copies    = copies + 1,
+           last_at   = clock_timestamp()
+     WHERE relid = p_relid;
+EXCEPTION WHEN others THEN
+    NULL;   -- observation only: never fail the copy that already landed
+END;
+$$;
+COMMENT ON FUNCTION gfs.note_copy(regclass) IS
+  'Stamp one copy event with where the source was (best-effort; frozen clones share the freeze mark)';
+
+-- The clone-level verdict, computed WITHOUT source contact (usable offline and
+-- from `gfs status`, which never probes). Frozen short-circuits: a frozen clone
+-- is single-moment BY CONSTRUCTION (one pinned remote snapshot), authoritative
+-- over any watermark arithmetic.
+CREATE FUNCTION gfs.clone_moments()
+RETURNS TABLE(state text, span_min pg_lsn, span_max pg_lsn, copied_tables int,
+              torn_tables int, moment_count int, torn boolean,
+              unmarked_tables int, diverged_stale int)
+LANGUAGE plpgsql STABLE AS $$
+DECLARE fl pg_lsn; marked int;
+BEGIN
+    IF gfs.is_frozen() THEN
+        SELECT m.frozen_lsn::pg_lsn INTO fl FROM gfs.clone_mode m LIMIT 1;
+        state := 'frozen'; span_min := fl; span_max := fl;
+        SELECT count(*)::int INTO copied_tables FROM gfs.clone_source;
+        torn_tables := 0; moment_count := 1; torn := false; unmarked_tables := 0;
+        -- Tables the freeze KEPT for local writes: their source-derived rows may
+        -- predate the freeze. Informational, never "torn" -- "the source as of
+        -- freeze time, plus my changes" is the definition of a branch.
+        SELECT count(*)::int INTO diverged_stale
+          FROM gfs.clone_source cs
+          JOIN gfs.copy_watermark w ON w.relid = cs.relid
+         WHERE gfs.relation_diverged_sql(cs.relid)
+           AND (fl IS NULL OR w.last_lsn IS NULL OR w.last_lsn < fl);
+        RETURN NEXT; RETURN;
+    END IF;
+
+    state := 'lazy'; diverged_stale := 0;
+    SELECT min(w.first_lsn), max(w.last_lsn),
+           count(*) FILTER (WHERE w.moments > 1),
+           -- distinct moment identities ACROSS tables: a LOWER bound ("spans at
+           -- least N"). Identity is the totals pair when recorded, LSN otherwise.
+           count(DISTINCT CASE WHEN w.last_w IS NOT NULL
+                               THEN 'w:' || w.last_w || '/' || w.last_l
+                               ELSE 'l:' || COALESCE(w.last_lsn::text, '?') END),
+           count(*)
+      INTO span_min, span_max, torn_tables, moment_count, marked
+      FROM gfs.copy_watermark w;
+
+    -- Copied content with NO watermark (feature off, probe failures): its moment
+    -- is unknown. Reported, and it blocks any "single moment" claim -- absence
+    -- of evidence is not evidence of coherence.
+    SELECT count(*)::int INTO unmarked_tables
+      FROM gfs.clone_source cs
+     WHERE NOT EXISTS (SELECT 1 FROM gfs.copy_watermark w2 WHERE w2.relid = cs.relid)
+       AND (cs.whole_cached OR cs.partial_rows > 0
+            OR EXISTS (SELECT 1 FROM gfs.cached c WHERE c.relid = cs.relid)
+            OR EXISTS (SELECT 1 FROM gfs.cached_predicate cp
+                        WHERE cp.relid = cs.relid AND (cp.complete OR cp.overflowed)));
+
+    copied_tables := marked + unmarked_tables;
+    IF copied_tables = 0 THEN moment_count := 0; END IF;
+    IF torn_tables > 0 THEN moment_count := GREATEST(moment_count, 2); END IF;
+    torn := torn_tables > 0 OR moment_count > 1;
+    RETURN NEXT;
+END;
+$$;
+COMMENT ON FUNCTION gfs.clone_moments() IS
+  'Does this clone mix source moments? Local-only verdict over the copy watermarks (frozen = single moment by construction)';
+
 CREATE TABLE gfs.source_baseline (
     lsn         text        NOT NULL,   -- source WAL position when captured
+    -- Source-wide row-activity totals at the same instant as `lsn`. An idle
+    -- server moves its WAL on its own; these move only when a user table
+    -- actually changed. Comparing them is what stops benign housekeeping from
+    -- marking every copied table suspect.
+    tot_writes  bigint      NOT NULL DEFAULT 0,
+    tot_live    bigint      NOT NULL DEFAULT 0,
     captured_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 COMMENT ON TABLE gfs.source_baseline IS 'Where the source was when this clone was created (drift detection)';
@@ -227,6 +445,17 @@ BEGIN
                      (n_tup_ins + n_tup_upd + n_tup_del)::bigint AS w,
                      n_live_tup::bigint AS l
                 FROM pg_stat_user_tables) x), '[]'::json),
+        -- Source-WIDE totals, across every user table -- including ones this
+        -- clone does not map. An idle PostgreSQL advances its own WAL
+        -- (checkpointer, autovacuum, stats collector), and that movement is
+        -- indistinguishable from a real change if the only evidence is the LSN.
+        -- These two totals move if and only if some user table gained, lost or
+        -- changed a row anywhere on the source, which is what separates benign
+        -- housekeeping from a change worth acting on.
+        'totals', (SELECT json_build_object(
+              'w', COALESCE(sum(n_tup_ins + n_tup_upd + n_tup_del), 0)::bigint,
+              'l', COALESCE(sum(n_live_tup), 0)::bigint)
+             FROM pg_stat_user_tables),
         'schema', COALESCE((SELECT json_agg(y) FROM (
               SELECT n.nspname AS s, c.relname AS r,
                      md5(string_agg(a.attname || ':' || format_type(a.atttypid, a.atttypmod)
@@ -268,7 +497,10 @@ BEGIN
     p := gfs.source_probe();
 
     DELETE FROM gfs.source_baseline;
-    INSERT INTO gfs.source_baseline(lsn) VALUES (p->>'lsn');
+    INSERT INTO gfs.source_baseline(lsn, tot_writes, tot_live)
+    VALUES (p->>'lsn',
+            COALESCE((p->'totals'->>'w')::bigint, 0),
+            COALESCE((p->'totals'->>'l')::bigint, 0));
 
     DELETE FROM gfs.source_table_baseline;
     INSERT INTO gfs.source_table_baseline(relid, writes, live_tup, src_fp, src_cfp, ft_fp, loc_fp)
@@ -314,8 +546,12 @@ COMMENT ON FUNCTION gfs.source_changed() IS 'TRUE if the source was written to s
 CREATE FUNCTION gfs.source_drift()
 RETURNS TABLE(kind text, src_table text, detail text)
 LANGUAGE plpgsql AS $$
-DECLARE base text; p jsonb; cur text; attributed int := 0;
+DECLARE base text; p jsonb; cur text; attributed int := 0; row_activity boolean;
 BEGIN
+    -- #132: a frozen clone is detached; there is no source relationship to drift
+    -- against, and probing would contact a source the user sealed away.
+    IF gfs.is_frozen() THEN RETURN; END IF;
+
     SELECT lsn INTO base FROM gfs.source_baseline LIMIT 1;
     IF base IS NULL THEN
         RAISE WARNING 'gfs: no source baseline recorded; cannot tell whether the source changed';
@@ -421,11 +657,48 @@ BEGIN
     -- this conditional on `attributed = 0` meant such a change was hidden whenever
     -- ANY other table happened to move -- i.e. it stopped working precisely on a
     -- busy source. Report it on its own terms instead.
-    IF attributed = 0 THEN
-        -- nothing at all accounts for the movement: every copied table is suspect
+    -- Did ANY user table on the source actually gain, lose or change a row?
+    -- Compared source-wide, so a change to a table this clone does not map
+    -- still counts.
+    --
+    -- Only trusted when the source's statistics are demonstrably working. A
+    -- real marketplace source measured during this work reported zero live
+    -- tuples across all 138 of its tables while `order_items` alone held 556
+    -- million rows (reltuples), with track_counts=on and stats_reset=never --
+    -- the stats file had been lost to an unclean shutdown. Counters that are
+    -- permanently zero would make every check look quiet, so the blanket would
+    -- never fire and #129 would silently return. Absence of evidence is not
+    -- evidence of quiet: when the stats cannot corroborate, fall back to
+    -- treating the movement as unattributed.
+    SELECT CASE
+             WHEN COALESCE((p->'totals'->>'l')::bigint, 0) = 0 THEN NULL  -- unusable
+             ELSE (b.tot_writes IS DISTINCT FROM (p->'totals'->>'w')::bigint
+                OR b.tot_live   IS DISTINCT FROM (p->'totals'->>'l')::bigint)
+           END
+      INTO row_activity
+      FROM gfs.source_baseline b LIMIT 1;
+
+    IF attributed = 0 AND COALESCE(row_activity, true) THEN
+        -- Nothing this clone maps accounts for the movement, and rows DID change
+        -- somewhere on the source. Every copied table is suspect: see #129, where
+        -- suppressing this hid real drift behind an unrelated finding.
         INSERT INTO gfs_drift_now(kind, src_table, detail)
         VALUES ('unattributed', '(all materialized tables)',
                 format('source moved (WAL %s -> %s) but no table accounts for it; treat every copied table as suspect', base, cur));
+    ELSIF attributed = 0 THEN
+        -- The WAL moved and not one row changed anywhere on the source. This is
+        -- the checkpointer, autovacuum or the stats collector -- an idle server
+        -- advances its own WAL, and treating that as drift marked every table
+        -- suspect, forcing the clone to federate every read and breaking offline
+        -- reads entirely. That is the very failure #119 was meant to end,
+        -- reached through a different door (#140).
+        --
+        -- Deliberately NOT silent: a rewrite, a sequence advance or an enum
+        -- label moves no row counter either, and those are real. They are
+        -- reported at the lower severity that does not mark tables suspect.
+        INSERT INTO gfs_drift_now(kind, src_table, detail)
+        VALUES ('unaccounted', '(objects without row counters)',
+                format('source moved (WAL %s -> %s) but no row changed anywhere on it -- housekeeping, or a change that moves no row counter (sequence, enum label, table rewrite). Run `gfs pull` to re-sync those', base, cur));
     ELSE
         -- something is explained, but the rest may not be. Lower severity: it does
         -- not mark tables suspect, it tells the user what to run to be sure.
@@ -434,7 +707,25 @@ BEGIN
                 format('source moved (WAL %s -> %s); %s table(s) explain part of it. Sequences, enum labels and rewrites move no counter -- run `gfs pull` to re-sync them', base, cur, attributed));
     END IF;
 
-    RAISE WARNING 'gfs: the source changed since this clone was created (WAL % -> %). This clone may mix data from different points in time.', base, cur;
+    -- #131: drift is not tornness -- say which one this is. Whether the clone
+    -- MIXES moments is a local fact over the copy watermarks; the source having
+    -- moved AFTER a coherent set of copies makes the clone stale, not torn. The
+    -- old blanket text misreported that case. Unknown stays unknown: copied
+    -- content without a watermark cannot support either claim.
+    DECLARE cm record;
+    BEGIN
+        SELECT * INTO cm FROM gfs.clone_moments();
+        IF cm.torn THEN
+            RAISE WARNING 'gfs: the source changed since this clone was created (WAL % -> %), and this clone MIXES data from different source moments (copies span % -> %). Run `gfs freeze` to make it one moment again.',
+                base, cur, cm.span_min, cm.span_max;
+        ELSIF COALESCE(cm.unmarked_tables, 1) = 0 THEN
+            RAISE WARNING 'gfs: the source changed since this clone was created (WAL % -> %). Copied tables are a consistent view of an EARLIER moment (stale, not torn).', base, cur;
+        ELSE
+            RAISE WARNING 'gfs: the source changed since this clone was created (WAL % -> %). This clone may mix data from different points in time.', base, cur;
+        END IF;
+    EXCEPTION WHEN others THEN
+        RAISE WARNING 'gfs: the source changed since this clone was created (WAL % -> %). This clone may mix data from different points in time.', base, cur;
+    END;
     RETURN QUERY SELECT g.kind, g.src_table, g.detail FROM gfs_drift_now g ORDER BY g.kind, g.src_table;
 END;
 $$;
@@ -456,7 +747,8 @@ CREATE TABLE gfs.sync_policy (
     autoschema         boolean  NOT NULL DEFAULT false,      -- repair the table's SHAPE automatically (SCHEMA drift)
     autopull_interval  interval NOT NULL DEFAULT '5 min',    -- how often the worker pulls
     autopull_max_bytes bigint   NOT NULL DEFAULT 500000000,  -- never auto-copy a table larger than this
-    check_interval     interval NOT NULL DEFAULT '1 min'     -- how stale the drift verdict may be
+    check_interval     interval NOT NULL DEFAULT '1 min',    -- how stale the drift verdict may be
+    watermarks         boolean  NOT NULL DEFAULT true        -- #131: stamp copy events with the source's position
 );
 INSERT INTO gfs.sync_policy DEFAULT VALUES;
 COMMENT ON TABLE gfs.sync_policy IS 'Source-sync policy (autopull off by default: a clone is a branch, not a mirror)';
@@ -490,6 +782,10 @@ COMMENT ON TABLE gfs.drift_notes IS 'Drift findings not attached to a registered
 CREATE FUNCTION gfs.refresh_drift_state() RETURNS int LANGUAGE plpgsql AS $$
 DECLARE n int; blanket boolean; r record;
 BEGIN
+    -- #132: frozen = detached; the verdict is permanently "not stale" and no
+    -- probe may run (this also disarms stale 'driftcheck' jobs the worker drains).
+    IF gfs.is_frozen() THEN RETURN 0; END IF;
+
     -- Only create it when it is genuinely absent: CREATE ... IF NOT EXISTS still
     -- raises a NOTICE when the relation is already there, and gfs.pull() calls
     -- this twice in one transaction, so a successful command printed a warning
@@ -759,11 +1055,23 @@ COMMENT ON FUNCTION gfs.refresh_clone_matviews() IS 'Recompute local matviews fr
 -- clobber local changes.
 CREATE FUNCTION gfs.pull(force boolean DEFAULT false)
 RETURNS TABLE(action text, tbl text, detail text) LANGUAGE plpgsql AS $$
-DECLARE r record; seen text; skipped int := 0; res text;
+DECLARE r record; seen text; skipped int := 0; res text; snap jsonb;
 BEGIN
+    -- #132: a frozen clone has no source to sync; say so instead of probing.
+    IF gfs.is_frozen() THEN
+        action := 'detached'; tbl := '(all)';
+        detail := 'this clone is frozen; no source to sync';
+        RETURN NEXT; RETURN;
+    END IF;
+
     -- Where the source is as we start. Everything below reconciles against this
     -- point, so it becomes the new "accounted for up to here" marker at the end.
-    seen := gfs.source_lsn();
+    --
+    -- One probe, not two: the LSN and the row-activity totals must come from the
+    -- SAME snapshot, or the marker can be re-anchored to a moment the totals do
+    -- not describe and the next check compares mismatched instants.
+    snap := gfs.source_probe();
+    seen := snap->>'lsn';
     PERFORM gfs.refresh_drift_state();
 
     -- Adopt new partitions / inheritance children FIRST. They are reached through
@@ -862,7 +1170,14 @@ BEGIN
     -- still attributes the source's movement, so the "unattributed" blanket does
     -- not fire on the tables we just reset.
     IF skipped = 0 THEN
-        UPDATE gfs.source_baseline SET lsn = seen;
+        -- The totals move with the marker. Re-anchoring the LSN alone would
+        -- leave them at clone time, so the first benign WAL movement after a
+        -- pull would compare fresh totals against stale ones, conclude rows had
+        -- changed, and blanket every table -- reintroducing #140 one check later.
+        UPDATE gfs.source_baseline b
+           SET lsn        = seen,
+               tot_writes = COALESCE((snap->'totals'->>'w')::bigint, b.tot_writes),
+               tot_live   = COALESCE((snap->'totals'->>'l')::bigint, b.tot_live);
     END IF;
     PERFORM gfs.refresh_drift_state();
 END;
@@ -880,6 +1195,7 @@ CREATE FUNCTION gfs.resync_table(p_relid regclass, p_force boolean DEFAULT false
 RETURNS boolean LANGUAGE plpgsql AS $$
 DECLARE p jsonb; m record;
 BEGIN
+    IF gfs.is_frozen() THEN RETURN false; END IF;   -- #132: detached, never reset
     IF gfs.relation_diverged_sql(p_relid) AND NOT p_force THEN
         RETURN false;   -- local writes: a conflict, never resolved automatically
     END IF;
@@ -893,6 +1209,11 @@ BEGIN
     EXECUTE format('TRUNCATE ONLY %s', p_relid::regclass);  -- ONLY: keep inheritance children
     DELETE FROM gfs.cached           WHERE relid = p_relid;
     DELETE FROM gfs.cached_predicate WHERE relid = p_relid;
+    -- #131: the truncated rows are gone, so their copy moments are too. The next
+    -- hydration re-establishes a fresh single-moment watermark -- this is what
+    -- makes pull + prompt re-reads CONVERGE to "not torn" instead of a span
+    -- accumulating forever.
+    DELETE FROM gfs.copy_watermark   WHERE relid = p_relid;
     UPDATE gfs.clone_source
        SET whole_cached = false, partial_rows = 0, no_partial = false, access_count = 0
      WHERE relid = p_relid;
@@ -1313,6 +1634,9 @@ BEGIN
     DELETE FROM gfs.cached WHERE relid = R;
     INSERT INTO gfs.cached(relid, lo, hi)
         SELECT R, unnest(los), unnest(his);
+    -- #131: every range/time chunk is a copy event; the min..max span over these
+    -- stamps is what makes WITHIN-table tearing (E2) reportable at all.
+    PERFORM gfs.note_copy(R);
 END;
 $$;
 
@@ -1387,10 +1711,18 @@ $$;
 
 -- Force a clone table fully local (and mark it owned -> future queries never hit
 -- the source, even aggregates).
-CREATE FUNCTION gfs.warm(local regclass)
+-- p_freeze/p_conn are for gfs.freeze_run() ONLY: p_freeze bypasses the frozen
+-- guard (freeze marks the clone frozen at the TOP of its transaction, then
+-- warms); p_conn names an open dblink connection whose remote REPEATABLE READ
+-- transaction is already pinned, so an inheritance parent's FROM ONLY read
+-- comes from the freeze snapshot instead of a fresh per-call connection.
+CREATE FUNCTION gfs.warm(local regclass, p_freeze boolean DEFAULT false, p_conn text DEFAULT NULL)
 RETURNS bigint LANGUAGE plpgsql AS $$
 DECLARE src text; cols text; ov text; n bigint; old_srr text; srcfrom text; rqual text; cdef text; oc text; arb text;
 BEGIN
+    IF gfs.is_frozen() AND NOT p_freeze THEN
+        RAISE EXCEPTION 'gfs.warm: this clone is frozen (detached); it never contacts the source again';
+    END IF;
     SELECT source_ref INTO src FROM gfs.clone_source WHERE relid = local;
     IF src IS NULL OR to_regclass(src) IS NULL THEN
         RAISE EXCEPTION 'gfs.warm: % is not a registered clone (or its source is gone)', local;
@@ -1417,7 +1749,8 @@ BEGIN
           INTO cdef
           FROM pg_attribute
          WHERE attrelid = local AND attnum > 0 AND NOT attisdropped AND attgenerated = '';
-        srcfrom := format('dblink(''gfs_remote_srv'', %L) AS s(%s)',
+        srcfrom := format('dblink(%L, %L) AS s(%s)',
+                          COALESCE(p_conn, 'gfs_remote_srv'),
                           format('SELECT %s FROM ONLY %s', cols, rqual), cdef);
     ELSE
         srcfrom := src || ' s';
@@ -1465,6 +1798,12 @@ BEGIN
     GET DIAGNOSTICS n = ROW_COUNT;
     PERFORM set_config('session_replication_role', old_srr, true);
     EXECUTE format('ANALYZE %s', local::text);
+    -- #131: stamp this copy event. Inside freeze_run the clone is already marked
+    -- frozen, which note_copy consults to stamp the shared freeze mark instead
+    -- of probing (separate probes would see the moving LSN, not the pinned
+    -- snapshot). Placed AFTER the role restore only for tidiness -- note_copy is
+    -- an explicit call, so the replica window could not have suppressed it.
+    PERFORM gfs.note_copy(local);
     UPDATE gfs.clone_source SET whole_cached = true WHERE relid = local;
     UPDATE gfs.clone_stats
        SET fetch_calls = fetch_calls + 1, rows_fetched = rows_fetched + n, last_fetch = now()
@@ -1472,8 +1811,233 @@ BEGIN
     RETURN n;
 END;
 $$;
-COMMENT ON FUNCTION gfs.warm(regclass) IS
-  'Fully materialize + own a clone table (served local thereafter, no source contact)';
+COMMENT ON FUNCTION gfs.warm(regclass, boolean, text) IS
+  'Fully materialize + own a clone table (served local thereafter, no source contact); extra args are freeze-internal';
+
+
+-- FREEZE (#132) ----------------------------------------------------------------
+-- Phase A, its OWN committed transaction (the CLI runs it before freeze_run):
+-- fresh drift verdicts, enum labels (which cannot be USED in the transaction
+-- that adds them -- the reason this cannot live inside freeze_run), shape
+-- repairs, and the size estimate that drives the CLI's copy-budget guard.
+-- Everything here is additive/idempotent, so committing it even when the freeze
+-- is then refused or fails is exactly as harmless as a `gfs pull`.
+CREATE FUNCTION gfs.freeze_prepare()
+RETURNS TABLE(already_frozen boolean, n_copy int, n_skip int, n_conflict int, est_bytes bigint)
+LANGUAGE plpgsql AS $$
+DECLARE r record; res text; sized bigint := 0; matched boolean := false;
+BEGIN
+    already_frozen := gfs.is_frozen();
+    n_copy := 0; n_skip := 0; n_conflict := 0; est_bytes := 0;
+    IF already_frozen THEN RETURN NEXT; RETURN; END IF;
+
+    -- Probes the source; fails loudly when unreachable (freezing needs the
+    -- source once more, by definition).
+    PERFORM gfs.refresh_drift_state();
+    PERFORM * FROM gfs.resync_enums();
+
+    -- Same policy as gfs.pull(): additive shape changes applied, destructive
+    -- ones counted as conflicts the user must resolve BEFORE freezing (warming
+    -- through a stale local shape would fail mid-copy anyway).
+    FOR r IN SELECT d.relid FROM gfs.drift_state d WHERE d.schema_drifted LOOP
+        res := gfs.repair_schema(r.relid);
+        IF res LIKE 'conflict:%' THEN n_conflict := n_conflict + 1; END IF;
+    END LOOP;
+
+    SELECT count(*) FILTER (WHERE NOT gfs.relation_diverged_sql(cs.relid)),
+           count(*) FILTER (WHERE gfs.relation_diverged_sql(cs.relid))
+      INTO n_copy, n_skip
+      FROM gfs.clone_source cs;
+
+    -- What freeze_run would copy: REAL bytes from the source, ONE round trip
+    -- (pg_table_size over every user table, summed locally over the mapped
+    -- non-diverged ones -- no data transferred). Fallback when the probe fails:
+    -- the clone-time row/byte estimates, which err large (see register_clone).
+    BEGIN
+        FOR r IN SELECT * FROM dblink('gfs_remote_srv', $q$
+                    SELECT n.nspname::text, c.relname::text, pg_table_size(c.oid)::bigint
+                      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                     WHERE c.relkind IN ('r','p')
+                       AND n.nspname NOT IN ('pg_catalog','information_schema')
+                 $q$) AS t(sch text, tab text, bytes bigint)
+        LOOP
+            IF EXISTS (SELECT 1 FROM gfs.source_map m
+                        WHERE m.src_schema = r.sch AND m.src_table = r.tab
+                          AND NOT gfs.relation_diverged_sql(m.relid)) THEN
+                sized := sized + COALESCE(r.bytes, 0);
+                matched := true;
+            END IF;
+        END LOOP;
+        est_bytes := sized;
+    EXCEPTION WHEN others THEN
+        matched := false;
+    END;
+    IF NOT matched THEN
+        SELECT COALESCE(sum(cs.source_rows * cs.row_bytes), 0) INTO est_bytes
+          FROM gfs.clone_source cs WHERE NOT gfs.relation_diverged_sql(cs.relid);
+    END IF;
+    RETURN NEXT;
+END;
+$$;
+COMMENT ON FUNCTION gfs.freeze_prepare() IS
+  'Freeze phase A (own transaction): fresh verdicts, enum labels, shape repairs, copy-size estimate';
+
+-- Phase B, ONE statement = ONE transaction = atomic: re-copy every non-diverged
+-- table from a single source instant, then detach. On ANY error everything --
+-- the TRUNCATEs, the copies, the coverage bookkeeping and the frozen flag --
+-- rolls back together and the clone is exactly what it was.
+--
+-- Run at the default READ COMMITTED, on purpose. The point-in-time guarantee
+-- is the REMOTE snapshot below, not local isolation -- and a local REPEATABLE
+-- READ actually broke the freeze: its snapshot predates the advisory-lock wait
+-- in (1), the copy worker commits copy_queue deletions during that wait, and
+-- the DELETE in (4) then fails with "could not serialize access due to
+-- concurrent delete".
+--
+-- Snapshot discipline: all ordinary reads go through postgres_fdw, which runs
+-- ONE remote REPEATABLE READ transaction per local transaction, i.e. one source
+-- snapshot for every table (#131's verified detail). The lone exception is an
+-- inheritance parent's FROM ONLY read, which postgres_fdw cannot deparse: those
+-- ride the named dblink connection 'gfs_freeze', whose remote transaction is
+-- pinned back-to-back with the FDW one (millisecond skew, one consistent
+-- snapshot for ALL parents). Clones without INHERITS parents get exactly one
+-- snapshot.
+--
+-- Diverged tables (gfs.relation_diverged_sql: local writes or tombstones) are
+-- KEPT, not copied: "the source as of freeze time, plus my changes" is the
+-- definition of a branch. The planner hook serves them locally once frozen.
+CREATE FUNCTION gfs.freeze_run()
+RETURNS TABLE(action text, tbl text, detail text)
+LANGUAGE plpgsql AS $$
+DECLARE r record; n bigint; src_lsn text; ftref text; copied int := 0; kept int := 0;
+BEGIN
+    -- Visible in pg_stat_activity so tooling/tests can target the freeze backend.
+    PERFORM set_config('application_name', 'gfs_freeze', true);
+
+    -- (1) Exclude the async copy drainer for the whole freeze: same key as
+    -- worker.rs GFS_COPY_LOCK_KEY (0x676673636f7079). Waits for a live drainer
+    -- to exit (it drains, then idles <= 5s); spawn() sees the lock as "a drainer
+    -- is running" and launches nothing while we hold it. Released at txn end.
+    PERFORM pg_advisory_xact_lock(29104568376717433);
+
+    -- (2) Idempotent: freezing a frozen clone is a no-op, not an error.
+    IF gfs.is_frozen() THEN
+        action := 'noop'; tbl := '(clone)';
+        SELECT format('already frozen at %s',
+                      to_char(m.frozen_at, 'YYYY-MM-DD HH24:MI:SS'))
+          INTO detail FROM gfs.clone_mode m;
+        RETURN NEXT; RETURN;
+    END IF;
+
+    -- (3) Replica role for the ENTIRE transaction (SET LOCAL): neither the
+    -- TRUNCATEs below nor warm's re-copied rows fire ORIGIN-enabled triggers,
+    -- so replayed source rows never run user side effects (and #130's future
+    -- write-log triggers, default-enabled, will not record freeze's own copies).
+    PERFORM set_config('session_replication_role', 'replica', true);
+
+    -- (4) Pending async work is dead: those jobs belong to the lazy life.
+    DELETE FROM gfs.copy_queue;
+    DELETE FROM gfs.cached_predicate WHERE queued;
+
+    -- (5a) Pin the dblink snapshot and capture the freeze mark in ONE round
+    -- trip: the first query of the remote REPEATABLE READ transaction both
+    -- fixes its snapshot and returns the source's WAL position.
+    BEGIN PERFORM dblink_disconnect('gfs_freeze'); EXCEPTION WHEN others THEN NULL; END;
+    PERFORM dblink_connect('gfs_freeze', 'gfs_remote_srv');
+    PERFORM dblink_exec('gfs_freeze', 'BEGIN ISOLATION LEVEL REPEATABLE READ');
+    SELECT l INTO src_lsn FROM dblink('gfs_freeze', $q$
+        SELECT (CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn()
+                     ELSE pg_current_wal_lsn() END)::text
+    $q$) AS t(l text);
+
+    -- (5b) Mark frozen NOW, at the TOP of the transaction (#131 mechanism
+    -- reconciliation: their gfs.note_copy() reads gfs.clone_mode directly, so
+    -- every copy event below already sees the frozen state and the shared mark).
+    -- Other backends see frozen=false until COMMIT; on abort this rolls back.
+    UPDATE gfs.clone_mode SET frozen = true, frozen_at = now(), frozen_lsn = src_lsn;
+
+    -- (5c) Pin the FDW snapshot back-to-back with the dblink one.
+    SELECT cs.source_ref INTO ftref FROM gfs.clone_source cs
+     WHERE to_regclass(cs.source_ref) IS NOT NULL
+     ORDER BY cs.source_rows ASC LIMIT 1;
+    IF ftref IS NOT NULL THEN
+        EXECUTE format('SELECT 1 FROM %s LIMIT 1', ftref);
+    END IF;
+
+    -- (6) Reset + re-copy every non-diverged table, deterministic lock order.
+    -- The reset is what makes freeze RE-COPY: warm alone merges under existing
+    -- rows (ON CONFLICT DO NOTHING), which would keep stale versions and rows
+    -- the source has deleted -- complete but still torn.
+    FOR r IN SELECT cs.relid, m.src_schema || '.' || m.src_table AS name
+               FROM gfs.clone_source cs
+               JOIN gfs.source_map m ON m.relid = cs.relid
+              ORDER BY cs.relid
+    LOOP
+        IF gfs.relation_diverged_sql(r.relid) THEN
+            kept := kept + 1;
+            action := 'kept'; tbl := r.name;
+            detail := 'local writes kept: this table is your branch (its source-derived rows may predate the freeze)';
+            RETURN NEXT; CONTINUE;
+        END IF;
+        EXECUTE format('TRUNCATE ONLY %s', r.relid::regclass);
+        DELETE FROM gfs.cached           WHERE relid = r.relid;
+        DELETE FROM gfs.cached_predicate WHERE relid = r.relid;
+        -- #131 clear-then-stamp: this inline reset bypasses gfs.resync_table, so
+        -- the watermark cleanup living there must ALSO happen here; the warm
+        -- below then re-stamps the table with the shared freeze mark.
+        DELETE FROM gfs.copy_watermark WHERE relid = r.relid;
+        UPDATE gfs.clone_source
+           SET whole_cached = false, partial_rows = 0, no_partial = false
+         WHERE relid = r.relid;
+        n := gfs.warm(r.relid, p_freeze => true, p_conn => 'gfs_freeze');
+        copied := copied + 1;
+        action := 'copied'; tbl := r.name;
+        detail := format('%s row(s) from the freeze instant', n);
+        RETURN NEXT;
+    END LOOP;
+
+    -- (7) The drift verdicts no longer apply (nothing will refresh them again).
+    UPDATE gfs.drift_state
+       SET drifted = false, schema_drifted = false, reason = 'frozen',
+           checked_at = clock_timestamp();
+    DELETE FROM gfs.drift_notes;
+
+    -- (8) Matviews are LOCAL objects: recompute them from the just-frozen
+    -- tables (the hook serves those locally -- this backend already sees
+    -- frozen=true), in dependency order, inside this same transaction.
+    FOR r IN SELECT * FROM gfs.refresh_clone_matviews() LOOP
+        action := 'matview'; tbl := r.mv; detail := r.detail;
+        RETURN NEXT;
+    END LOOP;
+
+    -- (9) Sequences, best effort. NOTE setval is NOT undone by rollback; it is
+    -- monotonic-forward only, so a failed freeze leaves sequences advanced --
+    -- harmless, and identical to what a pull would have done.
+    FOR r IN SELECT * FROM gfs.resync_sequences() LOOP
+        action := 'sequence'; tbl := r.seq;
+        detail := format('advanced %s -> %s to match the source', r.was, r.now_at);
+        RETURN NEXT;
+    END LOOP;
+
+    -- (10) Close the pinned source transaction. This is the LAST source contact
+    -- this clone ever makes.
+    PERFORM dblink_exec('gfs_freeze', 'COMMIT');
+    PERFORM dblink_disconnect('gfs_freeze');
+
+    action := 'frozen'; tbl := '(clone)';
+    detail := format('%s table(s) copied from one instant, %s kept; source LSN %s',
+                     copied, kept, src_lsn);
+    RETURN NEXT;
+EXCEPTION WHEN others THEN
+    -- The transaction is aborting (everything above rolls back). Only the named
+    -- dblink connection outlives a rollback; close it so the source is not left
+    -- holding an idle REPEATABLE READ transaction until this session exits.
+    BEGIN PERFORM dblink_disconnect('gfs_freeze'); EXCEPTION WHEN others THEN NULL; END;
+    RAISE;
+END;
+$$;
+COMMENT ON FUNCTION gfs.freeze_run() IS
+  'Freeze phase B (ONE transaction, atomic): re-copy every non-diverged table from a single source instant, then detach';
 
 CREATE VIEW gfs.clones AS
     SELECT s.relid::text AS clone, s.source_ref, s.key_col, s.chunk_kind, s.whole_cached,
@@ -1489,4 +2053,4 @@ CREATE VIEW gfs.clones AS
      ORDER BY s.relid::text;
 
 GRANT USAGE ON SCHEMA gfs TO PUBLIC;
-GRANT SELECT ON gfs.clone_source, gfs.cached, gfs.cached_predicate, gfs.copy_queue, gfs.tombstone, gfs.clone_stats, gfs.cost, gfs.budget, gfs.clones TO PUBLIC;
+GRANT SELECT ON gfs.clone_source, gfs.cached, gfs.cached_predicate, gfs.copy_queue, gfs.tombstone, gfs.clone_stats, gfs.cost, gfs.budget, gfs.clone_mode, gfs.copy_watermark, gfs.clones TO PUBLIC;

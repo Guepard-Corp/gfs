@@ -57,8 +57,14 @@ pub(crate) unsafe fn gfs_mark_local_write(relid: pg_sys::Oid) {
         return;
     }
     let q = CString::new(format!(
+        // session_replication_role = 'replica' means REPLAYED rows, not user
+        // writes: gfs.warm() copies under it precisely so its INSERT of the
+        // source's own rows is not mistaken for local divergence (#132 -- a
+        // freeze/export that warmed a table used to flag it diverged forever).
+        // #130's write-log triggers rely on the same convention.
         "UPDATE gfs.clone_source SET has_local_writes = true \
-           WHERE relid::oid = {} AND NOT has_local_writes",
+           WHERE relid::oid = {} AND NOT has_local_writes \
+             AND current_setting('session_replication_role') <> 'replica'",
         u32::from(relid)
     ))
     .unwrap();
@@ -85,7 +91,8 @@ pub(crate) unsafe fn gfs_lookup_clone(relid: pg_sys::Oid) -> Option<CloneInfo> {
                 COALESCE((SELECT t.typname FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid \
                             WHERE a.attrelid = s.relid AND a.attname = s.key_col), ''), \
                 COALESCE((SELECT d.drifted FROM gfs.drift_state d WHERE d.relid = s.relid), false)::int::text, \
-                COALESCE((SELECT d.schema_drifted FROM gfs.drift_state d WHERE d.relid = s.relid), false)::int::text \
+                COALESCE((SELECT d.schema_drifted FROM gfs.drift_state d WHERE d.relid = s.relid), false)::int::text, \
+                COALESCE((SELECT m.frozen FROM gfs.clone_mode m LIMIT 1), false)::int::text \
            FROM gfs.clone_source s, gfs.cost x \
           WHERE s.relid::oid = {} AND to_regclass(s.source_ref) IS NOT NULL",
         u32::from(relid)
@@ -133,6 +140,9 @@ pub(crate) unsafe fn gfs_lookup_clone(relid: pg_sys::Oid) -> Option<CloneInfo> {
                 // stale definition makes federated reads fail outright rather
                 // than merely return old data.
                 schema_drifted: g(23).as_deref() == Some("1"),
+                // #132: frozen (detached snapshot). Local single-row read
+                // (gfs.clone_mode); the hook stays free of network I/O.
+                frozen: g(24).as_deref() == Some("1"),
             });
         }
     }
@@ -172,6 +182,29 @@ pub(crate) unsafe fn gfs_sync_flags(relid: pg_sys::Oid) -> (bool, bool, bool) {
     }
     pg_sys::SPI_finish();
     out
+}
+
+/// #132: is this clone frozen (a detached snapshot)? Local single-row read; on
+/// any failure says false so a healthy lazy clone is never wrongly muted.
+pub(crate) unsafe fn gfs_is_frozen() -> bool {
+    if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
+        return false;
+    }
+    let q = CString::new(
+        "SELECT COALESCE((SELECT frozen FROM gfs.clone_mode LIMIT 1), false)::int::text",
+    )
+    .unwrap();
+    let mut frozen = false;
+    if pg_sys::SPI_execute(q.as_ptr(), true, 1) == pg_sys::SPI_OK_SELECT as i32
+        && pg_sys::SPI_processed == 1
+    {
+        let tt = pg_sys::SPI_tuptable;
+        let row = *(*tt).vals;
+        let td = (*tt).tupdesc;
+        frozen = spi_text(pg_sys::SPI_getvalue(row, td, 1)).as_deref() == Some("1");
+    }
+    pg_sys::SPI_finish();
+    frozen
 }
 
 /// Run one unit of async upkeep for the background worker. `resync` puts a single

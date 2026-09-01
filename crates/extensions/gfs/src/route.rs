@@ -217,6 +217,16 @@ unsafe fn classify_scan(
     if info.collist.is_empty() {
         return;
     }
+
+    // FROZEN CLONE (#132). A frozen clone is a sealed snapshot: it NEVER
+    // contacts the source again. Returning here -- before the drift gate, the
+    // sync-flag read, both background enqueues, the size re-measurement and
+    // every cost path -- means no federation, no hydration, no driftcheck, no
+    // worker spawn: every registered table (diverged ones included) is served
+    // from the local heap exactly as it stood at freeze time, source up or not.
+    if info.frozen {
+        return;
+    }
     bump_access(relid);
 
     // SOURCE DRIFT GATE. `drifted` means the SOURCE changed this table since we

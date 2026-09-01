@@ -45,4 +45,7 @@ pub(crate) struct CloneInfo {
                                   // copy is stale, so it must not be served (see classify_scan)
     pub(crate) schema_drifted: bool, // the SOURCE changed this table's SHAPE: our imported
                                   // definition is stale, so federating it errors on the remote
+    pub(crate) frozen: bool,      // #132: the clone is a sealed snapshot (gfs.clone_mode); the
+                                  // router serves every registered table locally and NEVER
+                                  // contacts the source -- no federation, no hydration, no checks
 }

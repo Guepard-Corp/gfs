@@ -460,6 +460,8 @@ What it reports:
 | `N of M tables changed on the source` | which tables drifted, and why |
 | `new table <name>` | a table exists upstream that this clone does not have |
 | `changed, unattributed` | the source moved but nothing accounts for it, so every copied table is suspect |
+| `this clone spans N source moments` | tables were copied at different moments while the source moved; a JOIN across them can return combinations that never existed at the source (run `gfs freeze`) |
+| `all copied data is from one source moment` | possibly stale, but coherent: everything copied reflects one instant |
 
 ### `gfs pull`
 
@@ -490,9 +492,37 @@ A table you have written to is **never** reset without `--force`, because that w
 discard your work. It is reported as a conflict, the way git refuses to clobber local
 changes.
 
+### `gfs remote`
+
+Show the source a clone reads from. Like `git remote`, it makes no network round
+trip: it reports what is recorded locally and leaves probing to `gfs fetch --check`.
+The source password is never printed.
+
+```bash
+gfs remote           # origin postgres://user@host:5432/db (fetch only)
+gfs remote --json
+```
+
+### Why there is no `gfs push`
+
+The sync verbs are deliberately asymmetric: `fetch` and `pull` exist, `push` never
+will. The source is typically a production database; pushing a clone's test data
+into it is exactly the foot-gun GFS exists to prevent. **"The source is never
+written to" is a hard rule of the system** -- enforced end-to-end and asserted on
+every path in the test suite (`assert_source_untouched`), not a missing feature.
+Resolving diverged tables (`merge`/`rebase`) is future work blocked on row-level
+change tracking (see RFC 007). And there is no separate `gfs diff`: GFS has no
+per-row change log on either side, so `gfs fetch` already shows everything a diff
+could know (which tables changed, and why).
+
 ### `gfs status`
 
-Show the current state of storage and compute resources.
+Show the current state of storage and compute resources. On a lazy clone, a
+**Source** section reports where the clone stands: tracked tables, how many are
+behind the source, how many have diverged (changed both locally and upstream),
+and when that verdict was last checked. The same fields appear as a `source`
+object in `--output json` (`tracked`, `behind`, `diverged`, `last_checked`);
+the object is omitted when the repository is not a clone.
 
 ```bash
 gfs status
@@ -722,24 +752,36 @@ The binary will be available at `target/release/gfs`.
 
 These are real and deliberately documented rather than left for you to discover.
 
-### A clone is not a point-in-time snapshot
+### A lazy clone is not a point-in-time snapshot (but it knows when it stopped being one)
 
 Tables are copied at the moment you first read them, so different tables can come from
 different moments, and the combination may be a state the source never actually had.
 
 Concretely: read `orders` at 10:00, the source inserts order #4 with its items at 10:05,
 you read `order_items` at 10:10. Your clone now holds items belonging to an order it
-does not have. A join silently drops those rows; nothing warns you, because each table
-on its own looks perfectly consistent.
+does not have. A join silently drops those rows, and each table on its own looks
+perfectly consistent.
 
-The same effect has a second face: the identical query can return a different answer
-later, with no local action, because drift detection fetched newer rows in between. That
-means **a clone is not yet a stable branch** for a repeatable test run.
+This cannot be *prevented* on a live source — you cannot read the past of a database
+that has already thrown the past away — but it is **detected** (#131): every copy
+event records where the source's WAL was when those rows arrived (`gfs.copy_watermark`),
+so "this clone spans WAL X..Y" is a computable fact rather than a guess. `gfs fetch`
+reports the span, `gfs status` shows a `Moments` row, and the drift warning now
+distinguishes *torn* (mixes moments) from *stale* (a coherent view of one earlier
+moment) — drift and tornness are different facts, and each can occur without the other.
+A chunked table gets a min..max span and a moment count, not per-row provenance: which
+individual row came from which moment is unknowable once ranges coalesce.
 
-Tracked as [#131](https://github.com/Guepard-Corp/gfs/issues/131), with snapshot mode
-([#132](https://github.com/Guepard-Corp/gfs/issues/132)) as the fix. Note the two
-properties genuinely conflict: staying *current* and holding *still* cannot both be true
-of a source you do not control, so it has to become a choice.
+The way out is `gfs freeze` ([#132](https://github.com/Guepard-Corp/gfs/issues/132)):
+re-copy everything from one instant and detach; a frozen clone reports a single moment
+by construction. `gfs pull` alone does **not** end a tear — it resets changed tables to
+be refetched lazily, which narrows the span only if the next reads happen while the
+source holds still.
+
+Detection is [#131](https://github.com/Guepard-Corp/gfs/issues/131); the snapshot mode
+is [#132](https://github.com/Guepard-Corp/gfs/issues/132). The two properties genuinely
+conflict: staying *current* and holding *still* cannot both be true of a source you do
+not control, so it is a choice — per clone, per moment you freeze it.
 
 ### Table inheritance with unkeyed children cannot be cloned
 

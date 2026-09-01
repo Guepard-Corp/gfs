@@ -80,6 +80,9 @@ impl<R: DatabaseProviderRegistry> StatusRepoUseCase<R> {
             compute,
             active_workspace_data_dir,
             bind_mismatch_warning,
+            // Populated by the CLI: the drift SQL is a psql-level concern that
+            // lives beside `gfs fetch`/`gfs pull`, not in the domain.
+            source: None,
         })
     }
 }

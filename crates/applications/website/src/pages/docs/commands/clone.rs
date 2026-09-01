@@ -73,6 +73,7 @@ pub fn CommandClone() -> impl IntoView {
                 <li>"Tables with no primary key or unique index are skipped."</li>
                 <li>"Tables whose types need an extension the local image lacks are skipped - pass "<code>"--image"</code>" with an image that ships it."</li>
                 <li>"Auto-increment works locally (sequences start past the remote max, so no key collisions)."</li>
+                <li>"There is deliberately no "<code>"gfs push"</code>" and never will be: the source is read-only by hard rule. "<a href="/docs/commands/fetch">"gfs fetch"</a>" and "<a href="/docs/commands/pull">"gfs pull"</a>" are the sync verbs that do exist."</li>
             </ul>
 
             <h2>"See Also"</h2>

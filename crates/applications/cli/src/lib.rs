@@ -398,6 +398,21 @@ enum TopLevel {
         /// Host port to bind for the local database container
         #[arg(long)]
         port: Option<u16>,
+
+        /// Freeze right after cloning: copy EVERY table from one source instant
+        /// and detach (a true point-in-time snapshot; pays the full copy -- see
+        /// --max-bytes)
+        #[arg(long)]
+        snapshot: bool,
+
+        /// Copy budget in bytes for --snapshot (default 1073741824 = 1 GiB);
+        /// the snapshot is refused above it and the clone stays lazy
+        #[arg(long = "max-bytes")]
+        max_bytes: Option<u64>,
+
+        /// Take the --snapshot copy regardless of its estimated size
+        #[arg(long)]
+        force: bool,
     },
 
     /// Show what has changed on a clone's source (read-only; never modifies the clone)
@@ -428,6 +443,30 @@ enum TopLevel {
         /// Turn automatic SCHEMA repair on or off instead of pulling now (on|off)
         #[arg(long = "auto-schema")]
         auto_schema: Option<String>,
+    },
+
+    /// Show the source a lazy clone reads from (fetch-only: the source is never written to)
+    Remote {
+        /// Path to the GFS repository root (default: current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+
+    /// Freeze a lazy clone into a point-in-time snapshot: re-copy every table
+    /// from ONE source instant, keep your local writes, then detach for good
+    Freeze {
+        /// Path to the GFS repository root (default: current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+
+        /// Copy budget in bytes (default 1073741824 = 1 GiB); the freeze is
+        /// refused above it, because freezing copies EVERYTHING
+        #[arg(long = "max-bytes")]
+        max_bytes: Option<u64>,
+
+        /// Freeze regardless of the estimated copy size
+        #[arg(long)]
+        force: bool,
     },
 
     /// Record a commit of the current repository state
@@ -725,6 +764,8 @@ fn command_name(cmd: &TopLevel) -> &'static str {
         TopLevel::Clone { .. } => "clone",
         TopLevel::Fetch { .. } => "fetch",
         TopLevel::Pull { .. } => "pull",
+        TopLevel::Remote { .. } => "remote",
+        TopLevel::Freeze { .. } => "freeze",
         TopLevel::Commit { .. } => "commit",
         TopLevel::Config { .. } => "config",
         TopLevel::Checkout { .. } => "checkout",
@@ -822,6 +863,9 @@ where
                 image,
                 platform,
                 port,
+                snapshot,
+                max_bytes,
+                force,
             } => {
                 commands::cmd_clone::clone(
                     from,
@@ -830,6 +874,9 @@ where
                     image,
                     platform,
                     port,
+                    snapshot,
+                    max_bytes,
+                    force,
                     json_output,
                 )
                 .await
@@ -847,6 +894,18 @@ where
                 auto_schema,
             } => {
                 commands::cmd_source::pull(path, force, auto, auto_schema, json_output).await?;
+                Ok(0)
+            }
+            TopLevel::Remote { path } => {
+                commands::cmd_source::remote(path, json_output).await?;
+                Ok(0)
+            }
+            TopLevel::Freeze {
+                path,
+                max_bytes,
+                force,
+            } => {
+                commands::cmd_freeze::freeze(path, max_bytes, force, json_output).await?;
                 Ok(0)
             }
             TopLevel::Commit {

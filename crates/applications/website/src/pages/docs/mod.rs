@@ -14,8 +14,8 @@ use ai_agents::{AiAgentsSkills, AiAgentsSubagents};
 use coming_soon::ComingSoon;
 use commands::{
     CommandCheckout, CommandClone, CommandCommit, CommandCompute, CommandConfig, CommandExport,
-    CommandImport, CommandInit, CommandLog, CommandProviders, CommandQuery, CommandSchema,
-    CommandStatus,
+    CommandFetch, CommandImport, CommandInit, CommandLog, CommandProviders, CommandPull,
+    CommandQuery, CommandSchema, CommandStatus,
 };
 use getting_started::GettingStarted;
 use installation::Installation;
@@ -53,6 +53,8 @@ pub fn Docs() -> impl IntoView {
                                 <ul>
                                     <li><A href="/docs/commands/init" class="nav-item">"gfs init"</A></li>
                                     <li><A href="/docs/commands/clone" class="nav-item">"gfs clone"</A></li>
+                                    <li><A href="/docs/commands/fetch" class="nav-item">"gfs fetch"</A></li>
+                                    <li><A href="/docs/commands/pull" class="nav-item">"gfs pull"</A></li>
                                     <li><A href="/docs/commands/status" class="nav-item">"gfs status"</A></li>
                                     <li><A href="/docs/commands/commit" class="nav-item">"gfs commit"</A></li>
                                     <li><A href="/docs/commands/log" class="nav-item">"gfs log"</A></li>
@@ -101,6 +103,8 @@ pub fn Docs() -> impl IntoView {
                             "quick-start" => view! { <QuickStart/> }.into_view(),
                             "commands/init" => view! { <CommandInit/> }.into_view(),
                             "commands/clone" => view! { <CommandClone/> }.into_view(),
+                            "commands/fetch" => view! { <CommandFetch/> }.into_view(),
+                            "commands/pull" => view! { <CommandPull/> }.into_view(),
                             "commands/status" => view! { <CommandStatus/> }.into_view(),
                             "commands/commit" => view! { <CommandCommit/> }.into_view(),
                             "commands/log" => view! { <CommandLog/> }.into_view(),
