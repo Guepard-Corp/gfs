@@ -1,10 +1,23 @@
 #!/usr/bin/env python3
-"""Commit repeatedly while another process writes the database continuously.
+"""Commit repeatedly while the database is written continuously.
 
-Each commit must capture a snapshot that (a) passes PRAGMA integrity_check and
+Usage: sqlite-snapshot-torture.py <repo> <gfs-binary> <rounds> [relative-db-path]
+
+The writer runs in a thread of THIS process, but each `gfs commit` is a
+subprocess, so the contention under test is genuinely cross-process — it is
+SQLite's file locking being exercised, not Python's GIL.
+
+Each commit must capture a snapshot that (a) passes PRAGMA integrity_check,
 (b) holds a row count between the counts observed immediately before and after
-the commit — i.e. a state the database genuinely passed through. A snapshot
-outside that window is one that never existed.
+the commit — a state the database genuinely passed through — and (c) contains
+only whole transactions. The third check matters: a torn transaction leaves a
+database that is structurally valid, so integrity_check calls it ok, and whose
+row count can still fall inside the window. Writing in fixed-size groups makes
+that detectable as a row count that is not a multiple of the group size.
+
+The optional fourth argument is the database path relative to the workspace,
+for layouts that do not use the conventional name — Rails 7.1 keeps it at
+`storage/development.sqlite3`, in a subdirectory.
 
 Commits are mapped to snapshots through the commit object's `snapshot_hash`.
 Sorting snapshot directories by mtime does not work: they are made read-only at
@@ -21,7 +34,9 @@ import threading
 import time
 
 repo, gfs, rounds = sys.argv[1], sys.argv[2], int(sys.argv[3])
-db = os.path.join(open(os.path.join(repo, ".gfs", "WORKSPACE")).read().strip(), "db.sqlite")
+REL = sys.argv[4] if len(sys.argv) > 4 else "db.sqlite"
+GROUP = 300
+db = os.path.join(open(os.path.join(repo, ".gfs", "WORKSPACE")).read().strip(), REL)
 
 
 def count():
@@ -42,10 +57,10 @@ def writer():
     while not stop.is_set():
         try:
             w.execute("BEGIN IMMEDIATE")
-            for _ in range(300):
+            for _ in range(GROUP):
                 w.execute("INSERT INTO ledger(payload) VALUES('y')")
             w.commit()
-            wrote[0] += 300
+            wrote[0] += GROUP
         except sqlite3.OperationalError:
             time.sleep(0.01)
     w.close()
@@ -78,19 +93,20 @@ for i in range(1, rounds + 1):
     head = open(os.path.join(repo, ".gfs", "refs", "heads", "main")).read().strip()
     snap_dir = snapshot_for(head)
     tmp = tempfile.mkdtemp()
-    for f in os.listdir(snap_dir):
-        if f.startswith("db.sqlite"):
-            shutil.copy(os.path.join(snap_dir, f), os.path.join(tmp, f))
-    s = sqlite3.connect(os.path.join(tmp, "db.sqlite"))
+    shutil.copytree(snap_dir, os.path.join(tmp, "snap"))
+    s = sqlite3.connect(os.path.join(tmp, "snap", REL))
     integ = s.execute("PRAGMA integrity_check").fetchone()[0]
     rows = s.execute("SELECT count(*) FROM ledger").fetchone()[0]
     s.close()
-    shutil.rmtree(tmp)
+    shutil.rmtree(tmp, ignore_errors=True)
 
-    ok = integ == "ok" and before <= rows <= after
+    whole = rows % GROUP == 0
+    ok = integ == "ok" and before <= rows <= after and whole
     passed, failed = (passed + 1, failed) if ok else (passed, failed + 1)
     print("  %-7s %-12s %-12s %-12s %-10s %s" % (i, before, after, rows, integ,
-                                                 "pass" if ok else "FAIL (state that never existed)"))
+                                                 "pass" if ok else
+                                                 ("FAIL (torn transaction)" if not whole
+                                                  else "FAIL (state that never existed)")))
 
 stop.set()
 th.join(timeout=10)

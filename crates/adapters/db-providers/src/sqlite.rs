@@ -132,6 +132,54 @@ impl Located {
     }
 }
 
+/// Whether `path` is a symbolic link, without following it.
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+}
+
+/// Whether `candidate` lies inside `root`.
+///
+/// Both sides are canonicalised where possible so `..`, a symlinked workspace
+/// and differing but equivalent spellings all compare correctly; when a path
+/// cannot be canonicalised (it may not exist yet) the lexical form is used.
+fn is_within(root: &Path, candidate: &Path) -> bool {
+    let real = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    real(candidate).starts_with(real(root))
+}
+
+/// Collect every SQLite database under `dir`, recursively.
+///
+/// Recursion is what finds a Rails-style `storage/development.sqlite3`. Depth
+/// is capped and symlinked directories are not followed, so a cyclic or
+/// pathological tree cannot hang a commit. Errors are ignored deliberately:
+/// an unreadable subdirectory should narrow the search, not fail it — the
+/// ambiguity check below still refuses when the result is not a single file.
+fn collect_sqlite_databases(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    const MAX_DEPTH: usize = 16;
+    if depth > MAX_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if is_symlink(&path) {
+            // Not followed, but a symlink that IS the database is reported so
+            // the caller can refuse rather than silently skip it.
+            if entry.metadata().is_ok_and(|m| m.is_file()) && is_sqlite_database(&path) {
+                out.push(path);
+            }
+            continue;
+        }
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => collect_sqlite_databases(&path, depth + 1, out),
+            Ok(t) if t.is_file() && is_sqlite_database(&path) => out.push(path),
+            _ => {}
+        }
+    }
+}
+
 /// Whether `path` is a SQLite database, by its header rather than its name.
 ///
 /// Every SQLite database begins with the 16 bytes `SQLite format 3\0`. Testing
@@ -191,20 +239,43 @@ impl SqliteProvider {
     /// Where this workspace's database is, and whether it exists yet.
     ///
     /// Resolution order: an explicit override, then the conventional
-    /// [`DB_FILENAME`], then a single SQLite file discovered in the workspace,
-    /// then "none yet".
+    /// [`DB_FILENAME`], then a single SQLite file discovered anywhere under the
+    /// workspace, then "none yet".
     ///
     /// Discovery matters because GFS does not create the database — the user's
-    /// application does, under whatever name it likes. A Rails project points
-    /// at `storage/development.sqlite3`; assuming `db.sqlite` meant the guard
-    /// and schema capture both took their "nothing here" path and quietly
-    /// succeeded, so a snapshot was taken mid-transaction and an empty schema
-    /// was recorded with a hash, as though it were the truth.
+    /// application does, under whatever name and in whatever directory it
+    /// likes. Rails 7.1 keeps it at `storage/development.sqlite3`, a
+    /// SUBDIRECTORY, which is why the search recurses: a top-level-only scan
+    /// resolved that layout to "nothing here", so the snapshot guard never ran
+    /// and a mid-transaction copy was recorded as a commit, with an empty
+    /// schema attached, as though it were the truth.
+    ///
+    /// Everything this returns must lie inside the directory the storage layer
+    /// is about to copy. A path outside it would be locked and inspected but
+    /// never snapshotted, so the commit would describe a file it does not
+    /// contain.
     fn resolve(params: &ConnectionParams) -> std::result::Result<Located, ProviderError> {
+        // Optional here: an explicit override may be supplied on its own, in
+        // which case there is no volume to check it against.
+        let dir = params.get_env(LOCAL_DATA_DIR_ENV).map(Path::new);
+
         // A path that exists but is not a regular file is a mistake worth
         // reporting. Treating it as "nothing here yet" would reintroduce the
         // silent no-op this resolver exists to remove.
         let at = |p: PathBuf| -> std::result::Result<Located, ProviderError> {
+            if is_symlink(&p) {
+                // `cp` copies the link, not the target, so a symlinked database
+                // would be committed as a live pointer: mutate the target and
+                // the "snapshot" changes; delete it and the snapshot is
+                // unreadable.
+                return Err(ProviderError::InvalidParams(format!(
+                    "'{}' is a symbolic link. GFS snapshots the workspace by copying it, \
+                     and a link would be copied instead of the database it points at, so \
+                     the commit would not contain any data. Move the database into the \
+                     workspace",
+                    p.display()
+                )));
+            }
             if p.is_file() {
                 Ok(Located::Existing(p))
             } else if p.exists() {
@@ -217,33 +288,41 @@ impl SqliteProvider {
             }
         };
 
-        // An explicit choice always wins, and is never second-guessed.
+        // An explicit choice wins, but is still checked for the one property
+        // the caller cannot waive: it has to be in what gets snapshotted. This
+        // also catches a stale value, since the workspace directory changes on
+        // every checkout while an absolute override does not.
         if let Some(explicit) = params
             .get_env(ENV_DB_PATH)
             .map(str::to_string)
             .or_else(|| std::env::var(ENV_DB_PATH).ok())
             .filter(|v| !v.trim().is_empty())
         {
-            return at(PathBuf::from(explicit));
+            let chosen = PathBuf::from(explicit);
+            if let Some(dir) = dir
+                && !is_within(dir, &chosen)
+            {
+                return Err(ProviderError::InvalidParams(format!(
+                    "{ENV_DB_PATH} points at '{}', which is outside the workspace '{}'. \
+                     Only files inside the workspace are snapshotted, so that database \
+                     would be locked and read but never committed. If this value is left \
+                     over from an earlier checkout, unset it",
+                    chosen.display(),
+                    dir.display()
+                )));
+            }
+            return at(chosen);
         }
 
-        let dir = params
-            .get_env(LOCAL_DATA_DIR_ENV)
-            .ok_or_else(|| ProviderError::MissingEnvVar(LOCAL_DATA_DIR_ENV.to_string()))?;
-        let dir = Path::new(dir);
-
+        let dir =
+            dir.ok_or_else(|| ProviderError::MissingEnvVar(LOCAL_DATA_DIR_ENV.to_string()))?;
         let conventional = dir.join(DB_FILENAME);
-        if conventional.exists() {
+        if conventional.exists() || is_symlink(&conventional) {
             return at(conventional);
         }
 
-        let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| is_sqlite_database(p))
-            .collect();
+        let mut found = Vec::new();
+        collect_sqlite_databases(dir, 0, &mut found);
         found.sort();
 
         match found.len() {
@@ -252,7 +331,12 @@ impl SqliteProvider {
             _ => {
                 let names: Vec<_> = found
                     .iter()
-                    .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .map(|p| {
+                        p.strip_prefix(dir)
+                            .unwrap_or(p)
+                            .to_string_lossy()
+                            .into_owned()
+                    })
                     .collect();
                 Err(ProviderError::InvalidParams(format!(
                     "the workspace holds {} SQLite databases ({}); GFS cannot tell which one \
@@ -1521,7 +1605,7 @@ mod tests {
     }
 
     /// The failure this resolver exists to remove. A Rails project keeps its
-    /// database as `storage/development.sqlite3`; assuming `db.sqlite` meant
+    /// database as `development.sqlite3`; assuming `db.sqlite` meant
     /// the guard took its "nothing here" path and schema capture recorded an
     /// EMPTY schema as a successful commit, with a hash, while the real
     /// database sat beside it.
@@ -1547,6 +1631,119 @@ mod tests {
         assert!(
             guard.is_some(),
             "a database that exists must be quiesced, whatever it is called"
+        );
+    }
+
+    /// Rails 7.1 keeps its database at `storage/development.sqlite3` — a
+    /// SUBDIRECTORY. A top-level-only scan resolved that to "nothing here", so
+    /// no write lock was taken, no refusal fired, and a mid-transaction copy was
+    /// recorded as a commit with an empty schema attached. The doc comment cited
+    /// this very layout while the code could not handle it.
+    #[test]
+    fn a_database_in_a_subdirectory_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("storage");
+        std::fs::create_dir_all(&nested).unwrap();
+        let conn = rusqlite::Connection::open(nested.join("development.sqlite3")).unwrap();
+        conn.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY); INSERT INTO t VALUES(1);")
+            .unwrap();
+        drop(conn);
+
+        let params = params_for_dir(dir.path());
+        let provider = SqliteProvider::new();
+
+        let out = provider.extract_schema(&params).unwrap();
+        assert!(
+            out.contains("\"name\":\"t\""),
+            "a database one directory down must be found:\n{out}"
+        );
+        assert!(
+            LocalEngine::prepare_for_snapshot(&provider, &params)
+                .unwrap()
+                .is_some(),
+            "and it must be quiesced — this is the path that produced torn snapshots"
+        );
+    }
+
+    /// The storage layer copies the workspace, and `cp` copies a link rather
+    /// than its target, so a symlinked database would be committed as a live
+    /// pointer: mutating the target changes the "snapshot", deleting it makes
+    /// the snapshot unreadable.
+    #[test]
+    fn a_symlinked_database_is_refused_rather_than_committed_as_a_pointer() {
+        let outside = tempfile::tempdir().unwrap();
+        let real = outside.path().join("real.db");
+        let conn = rusqlite::Connection::open(&real).unwrap();
+        conn.execute_batch("CREATE TABLE s(v INT); INSERT INTO s VALUES(9);")
+            .unwrap();
+        drop(conn);
+
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join(DB_FILENAME)).unwrap();
+
+        let err = match SqliteProvider::new().extract_schema(&params_for_dir(dir.path())) {
+            Ok(_) => panic!("a symlink must not be accepted as the database"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("symbolic link"), "{err}");
+    }
+
+    /// The workspace directory changes on every checkout while an absolute
+    /// override does not, so a value left over from an earlier branch would be
+    /// locked and read while a different database was snapshotted.
+    #[test]
+    fn an_override_outside_the_workspace_is_refused() {
+        let elsewhere = tempfile::tempdir().unwrap();
+        let stale = elsewhere.path().join("stale.db");
+        let conn = rusqlite::Connection::open(&stale).unwrap();
+        conn.execute_batch("CREATE TABLE decoy(a)").unwrap();
+        drop(conn);
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mut params = params_for_dir(workspace.path());
+        params.env.push((
+            ENV_DB_PATH.to_string(),
+            stale.to_string_lossy().into_owned(),
+        ));
+
+        let err = match SqliteProvider::new().extract_schema(&params) {
+            Ok(_) => panic!("an override outside the snapshotted volume must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("outside the workspace"), "{err}");
+
+        // Inside the workspace it is still honoured.
+        let inside = workspace.path().join("chosen.db");
+        let conn = rusqlite::Connection::open(&inside).unwrap();
+        conn.execute_batch("CREATE TABLE picked(a)").unwrap();
+        drop(conn);
+        let mut ok_params = params_for_dir(workspace.path());
+        ok_params.env.push((
+            ENV_DB_PATH.to_string(),
+            inside.to_string_lossy().into_owned(),
+        ));
+        let out = SqliteProvider::new().extract_schema(&ok_params).unwrap();
+        assert!(out.contains("picked"), "{out}");
+    }
+
+    /// Ambiguity must survive recursion: two databases at different depths are
+    /// still two databases, and the message names them by relative path.
+    #[test]
+    fn two_databases_at_different_depths_are_still_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("storage")).unwrap();
+        for rel in ["alpha.db", "storage/beta.sqlite3"] {
+            let c = rusqlite::Connection::open(dir.path().join(rel)).unwrap();
+            c.execute_batch("CREATE TABLE t(a)").unwrap();
+        }
+        let err = match SqliteProvider::new().extract_schema(&params_for_dir(dir.path())) {
+            Ok(_) => panic!("two candidates must not resolve"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("alpha.db"), "{err}");
+        assert!(
+            err.contains("storage/beta.sqlite3"),
+            "relative path expected: {err}"
         );
     }
 
