@@ -21,7 +21,7 @@
 //! database is whatever process opened the file — typically the user's own
 //! application — no container could freeze it even if one existed. Snapshot
 //! consistency comes from checkpointing the WAL (see
-//! [`SqliteProvider::prepare_for_snapshot_locally`]) and from the storage layer
+//! [`LocalEngine::prepare_for_snapshot`]) and from the storage layer
 //! taking an atomic copy-on-write clone, never from pausing a compute instance.
 
 use std::path::{Path, PathBuf};
@@ -30,7 +30,7 @@ use std::sync::Arc;
 use gfs_domain::ports::compute::{ComputeDefinition, EnvVar, PortMapping};
 use gfs_domain::ports::database_provider::{
     ConnectionParams, DataFormat, DatabaseProvider, DatabaseProviderArg, DatabaseProviderRegistry,
-    ExportSpec, ImportSpec, ProviderError, Result, SupportedFeature,
+    ExportSpec, ImportSpec, LocalEngine, ProviderError, Result, SupportedFeature,
 };
 
 const NAME: &str = "sqlite";
@@ -141,8 +141,8 @@ impl DatabaseProvider for SqliteProvider {
     }
 
     /// SQLite runs in-process against a file. No container, no VM.
-    fn requires_compute(&self) -> bool {
-        false
+    fn local_engine(&self) -> Option<&dyn LocalEngine> {
+        Some(self)
     }
 
     fn definition(&self) -> ComputeDefinition {
@@ -191,35 +191,9 @@ impl DatabaseProvider for SqliteProvider {
     /// Nothing for a compute runtime to execute.
     ///
     /// SQLite has no instance to `exec` into; the equivalent preparation runs in
-    /// this process via [`Self::prepare_for_snapshot_locally`].
+    /// this process via [`LocalEngine::prepare_for_snapshot`].
     fn prepare_for_snapshot(&self, _params: &ConnectionParams) -> Result<Vec<String>> {
         Ok(vec![])
-    }
-
-    /// Collapse the write-ahead log into the main database before a snapshot.
-    ///
-    /// `TRUNCATE` (rather than `PASSIVE`) blocks until every committed frame has
-    /// been written back, then resets the WAL to zero length. That reduces the
-    /// on-disk database to a single file, so the storage layer captures one file
-    /// at one instant instead of three files at three instants.
-    ///
-    /// This does not exclude a concurrent writer for the duration of the
-    /// snapshot: the connection is closed when this returns. Excluding writers
-    /// needs a connection held open across the storage operation, which the
-    /// commit path does not currently offer a seam for.
-    fn prepare_for_snapshot_locally(
-        &self,
-        params: &ConnectionParams,
-    ) -> std::result::Result<bool, ProviderError> {
-        let path = Path::new(Self::db_path(params)?);
-        if !path.exists() {
-            // Nothing has been written yet; there is no WAL to fold in.
-            return Ok(false);
-        }
-        let conn = Self::open(path)?;
-        conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")
-            .map_err(|e| ProviderError::InvalidParams(format!("wal checkpoint failed: {e}")))?;
-        Ok(true)
     }
 
     fn query_client_command(
@@ -318,49 +292,6 @@ impl DatabaseProvider for SqliteProvider {
         queries
     }
 
-    /// Run [`Self::schema_extraction_queries`] against the linked engine and
-    /// emit the delimited output the shared parser consumes.
-    ///
-    /// A repository that has been initialised but never written to has no
-    /// database file yet. That is reported as an empty schema rather than an
-    /// error, so the first `gfs commit` succeeds.
-    fn extract_schema_locally(
-        &self,
-        params: &ConnectionParams,
-    ) -> std::result::Result<Option<String>, ProviderError> {
-        let path = Path::new(Self::db_path(params)?);
-        let queries = self.schema_extraction_queries();
-        let get = |key: &str| -> std::result::Result<String, ProviderError> {
-            queries
-                .get(key)
-                .cloned()
-                .ok_or_else(|| ProviderError::InvalidParams(format!("missing {key} query")))
-        };
-
-        // `rusqlite::version()` reports the linked amalgamation, so the version
-        // is known even when there is no file to open.
-        if !path.exists() {
-            return Ok(Some(render_sections(
-                rusqlite::version(),
-                &format!(r#"[{{"id":1,"name":"{MAIN_SCHEMA}","owner":"{MAIN_SCHEMA}"}}]"#),
-                "[]",
-                "[]",
-                "",
-            )));
-        }
-
-        let conn = Self::open(path)?;
-        let version = Self::scalar(&conn, &get("version")?)?;
-        let schemas = Self::scalar(&conn, &get("schemas")?)?;
-        let tables = Self::scalar(&conn, &get("tables")?)?;
-        let columns = Self::scalar(&conn, &get("columns")?)?;
-        let ddl = Self::scalar(&conn, DDL_QUERY)?;
-
-        Ok(Some(render_sections(
-            &version, &schemas, &tables, &columns, &ddl,
-        )))
-    }
-
     fn supported_export_formats(&self) -> Vec<DataFormat> {
         vec![DataFormat {
             id: "sql".into(),
@@ -424,6 +355,76 @@ impl DatabaseProvider for SqliteProvider {
     }
 }
 
+/// In-process execution against the linked SQLite amalgamation.
+impl LocalEngine for SqliteProvider {
+    /// Run [`SqliteProvider::schema_extraction_queries`] against the linked
+    /// engine and emit the delimited payload the shared parser consumes.
+    ///
+    /// A repository that has been initialised but never written to has no
+    /// database file yet. That is reported as an empty schema rather than an
+    /// error, so the first `gfs commit` succeeds.
+    fn extract_schema(
+        &self,
+        params: &ConnectionParams,
+    ) -> std::result::Result<String, ProviderError> {
+        let path = Path::new(Self::db_path(params)?);
+        let queries = self.schema_extraction_queries();
+        let get = |key: &str| -> std::result::Result<String, ProviderError> {
+            queries
+                .get(key)
+                .cloned()
+                .ok_or_else(|| ProviderError::InvalidParams(format!("missing {key} query")))
+        };
+
+        // `rusqlite::version()` reports the linked amalgamation, so the version
+        // is known even when there is no file to open.
+        if !path.exists() {
+            return Ok(render_sections(
+                rusqlite::version(),
+                &format!(r#"[{{"id":1,"name":"{MAIN_SCHEMA}","owner":"{MAIN_SCHEMA}"}}]"#),
+                "[]",
+                "[]",
+                "",
+            ));
+        }
+
+        let conn = Self::open(path)?;
+        let version = Self::scalar(&conn, &get("version")?)?;
+        let schemas = Self::scalar(&conn, &get("schemas")?)?;
+        let tables = Self::scalar(&conn, &get("tables")?)?;
+        let columns = Self::scalar(&conn, &get("columns")?)?;
+        let ddl = Self::scalar(&conn, DDL_QUERY)?;
+
+        Ok(render_sections(&version, &schemas, &tables, &columns, &ddl))
+    }
+
+    /// Collapse the write-ahead log into the main database before a snapshot.
+    ///
+    /// `TRUNCATE` (rather than `PASSIVE`) blocks until every committed frame has
+    /// been written back, then resets the WAL to zero length. That reduces the
+    /// on-disk database to a single file, so the storage layer captures one file
+    /// at one instant instead of three files at three instants.
+    ///
+    /// Per the trait contract this does not freeze the database: the connection
+    /// closes before the snapshot is taken. Excluding writers would need a
+    /// connection held open across the storage operation, which the commit path
+    /// offers no seam for.
+    fn prepare_for_snapshot(
+        &self,
+        params: &ConnectionParams,
+    ) -> std::result::Result<bool, ProviderError> {
+        let path = Path::new(Self::db_path(params)?);
+        if !path.exists() {
+            // Nothing has been written yet; there is no WAL to fold in.
+            return Ok(false);
+        }
+        let conn = Self::open(path)?;
+        conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")
+            .map_err(|e| ProviderError::InvalidParams(format!("wal checkpoint failed: {e}")))?;
+        Ok(true)
+    }
+}
+
 /// Assemble the delimited schema payload the shared parser expects.
 fn render_sections(version: &str, schemas: &str, tables: &str, columns: &str, ddl: &str) -> String {
     format!(
@@ -474,7 +475,8 @@ mod tests {
     fn registers_as_sqlite_and_needs_no_compute() {
         let p = SqliteProvider::new();
         assert_eq!(p.name(), "sqlite");
-        assert!(!p.requires_compute());
+        assert!(!p.requires_compute(), "derived from local_engine()");
+        assert!(p.local_engine().is_some());
         assert_eq!(p.default_port(), 0);
     }
 
@@ -512,7 +514,7 @@ mod tests {
             Err(ProviderError::MissingEnvVar(_))
         ));
         assert!(matches!(
-            p.extract_schema_locally(&empty),
+            LocalEngine::extract_schema(&p, &empty),
             Err(ProviderError::MissingEnvVar(_))
         ));
     }
@@ -536,7 +538,7 @@ mod tests {
     fn nothing_is_delegated_to_a_compute_runtime() {
         let p = SqliteProvider::new();
         assert!(
-            p.prepare_for_snapshot(&params_with_path("/srv/db.sqlite"))
+            DatabaseProvider::prepare_for_snapshot(&p, &params_with_path("/srv/db.sqlite"))
                 .unwrap()
                 .is_empty(),
             "there is no instance to exec into"
@@ -566,9 +568,7 @@ mod tests {
         );
 
         assert!(
-            SqliteProvider::new()
-                .prepare_for_snapshot_locally(&params)
-                .unwrap(),
+            LocalEngine::prepare_for_snapshot(&SqliteProvider::new(), &params).unwrap(),
             "checkpoint should report that it ran"
         );
         assert_eq!(
@@ -583,9 +583,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let params = params_with_path(dir.path().join(DB_FILENAME).to_str().unwrap());
         assert!(
-            !SqliteProvider::new()
-                .prepare_for_snapshot_locally(&params)
-                .unwrap(),
+            !LocalEngine::prepare_for_snapshot(&SqliteProvider::new(), &params).unwrap(),
             "a commit before the first write must not fail"
         );
     }
@@ -595,8 +593,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let params = seeded_db(dir.path());
         let out = SqliteProvider::new()
-            .extract_schema_locally(&params)
-            .unwrap()
+            .extract_schema(&params)
             .expect("sqlite extracts schema locally");
 
         for delimiter in [
@@ -617,10 +614,7 @@ mod tests {
     fn extracted_sections_are_well_formed_json() {
         let dir = tempfile::tempdir().unwrap();
         let params = seeded_db(dir.path());
-        let out = SqliteProvider::new()
-            .extract_schema_locally(&params)
-            .unwrap()
-            .unwrap();
+        let out = SqliteProvider::new().extract_schema(&params).unwrap();
 
         let section = |name: &str| -> String {
             out.split(&format!("{name}\n"))
@@ -676,10 +670,7 @@ mod tests {
     fn schema_extraction_before_the_first_write_reports_an_empty_schema() {
         let dir = tempfile::tempdir().unwrap();
         let params = params_with_path(dir.path().join(DB_FILENAME).to_str().unwrap());
-        let out = SqliteProvider::new()
-            .extract_schema_locally(&params)
-            .unwrap()
-            .unwrap();
+        let out = SqliteProvider::new().extract_schema(&params).unwrap();
         assert!(out.contains("GFS_SCHEMA_VERSION"));
         assert!(out.contains(rusqlite::version()));
         assert!(out.contains("GFS_SCHEMA_TABLES\n[]"));
@@ -691,10 +682,7 @@ mod tests {
     fn recorded_version_is_the_linked_engine_not_a_host_binary() {
         let dir = tempfile::tempdir().unwrap();
         let params = seeded_db(dir.path());
-        let out = SqliteProvider::new()
-            .extract_schema_locally(&params)
-            .unwrap()
-            .unwrap();
+        let out = SqliteProvider::new().extract_schema(&params).unwrap();
         let reported = out.lines().nth(1).unwrap();
         assert_eq!(reported, rusqlite::version());
     }

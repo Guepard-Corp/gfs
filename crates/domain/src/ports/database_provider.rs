@@ -201,6 +201,54 @@ pub struct CloneSpec {
 pub const SIGTERM: u32 = 15;
 
 // ---------------------------------------------------------------------------
+// Embedded engines
+// ---------------------------------------------------------------------------
+
+/// In-process database operations for providers that have no compute instance.
+///
+/// The rest of this port describes work as commands for a runtime to execute
+/// inside a running database instance. That shape assumes a server. An embedded
+/// engine — SQLite, or a future DuckDB-style provider — has no server: the
+/// database is a file, and the library that reads it is linked into this
+/// binary. Such a provider returns an engine from
+/// [`DatabaseProvider::local_engine`], and the orchestration layers call it
+/// instead of provisioning a container.
+///
+/// Implementations should link the engine rather than shell out to a client
+/// binary. Schema extraction records the engine version into commit metadata,
+/// so depending on whatever client happens to be installed would make the same
+/// schema produce different metadata on different machines.
+pub trait LocalEngine: Send + Sync {
+    /// Extract schema metadata, returning the same delimiter-separated payload
+    /// that a [`SchemaExtractionSpec`] command writes to stdout
+    /// (`GFS_SCHEMA_VERSION`, `GFS_SCHEMA_SCHEMAS`, `GFS_SCHEMA_TABLES`,
+    /// `GFS_SCHEMA_COLUMNS`, and optionally `GFS_SCHEMA_DDL`).
+    ///
+    /// Returning the same format as the container path means both feed one
+    /// parser, rather than each assembling metadata its own way.
+    fn extract_schema(
+        &self,
+        params: &ConnectionParams,
+    ) -> std::result::Result<String, ProviderError>;
+
+    /// Quiesce the database before the storage layer takes a snapshot.
+    ///
+    /// The counterpart to [`DatabaseProvider::prepare_for_snapshot`], whose
+    /// commands a runtime executes inside an instance. Returns whether any
+    /// preparation was actually performed — a repository that has been
+    /// initialised but never written to has nothing to do, and that must not be
+    /// reported as a failure.
+    ///
+    /// This cannot exclude a concurrent writer for the duration of the
+    /// snapshot: it returns before the snapshot is taken. Callers must not treat
+    /// a successful return as a guarantee that the database is frozen.
+    fn prepare_for_snapshot(
+        &self,
+        params: &ConnectionParams,
+    ) -> std::result::Result<bool, ProviderError>;
+}
+
+// ---------------------------------------------------------------------------
 // Provider port
 // ---------------------------------------------------------------------------
 
@@ -263,19 +311,17 @@ pub trait DatabaseProvider: Send + Sync {
 
     /// Whether this provider needs a running compute instance (container or VM).
     ///
-    /// Client/server engines return the default `true`: the database is a
-    /// process that must be provisioned, started, paused and connected to over
-    /// a port. Embedded engines such as SQLite return `false` — the database is
-    /// a file, opened in-process by whichever program uses it, so there is
-    /// nothing to provision and nothing to connect to.
+    /// Client/server engines need one: the database is a process that must be
+    /// provisioned, started, paused and connected to over a port. Embedded
+    /// engines such as SQLite do not — the database is a file, opened
+    /// in-process by whichever program uses it, so there is nothing to
+    /// provision and nothing to connect to.
     ///
-    /// When this is `false` the orchestration layers skip container
-    /// provisioning entirely and use the provider's in-process entry points
-    /// ([`DatabaseProvider::extract_schema_locally`],
-    /// [`DatabaseProvider::prepare_for_snapshot_locally`]) instead of executing
-    /// commands inside an instance.
+    /// Derived from [`DatabaseProvider::local_engine`] rather than declared
+    /// separately, so a provider cannot claim to need no compute while offering
+    /// no way to run without it. Do not override.
     fn requires_compute(&self) -> bool {
-        true
+        self.local_engine().is_none()
     }
 
     /// Build a client connection string from host, port, and optional env (credentials, db name).
@@ -627,44 +673,19 @@ pub trait DatabaseProvider: Send + Sync {
     }
 
     // -----------------------------------------------------------------------
-    // In-process execution (providers with `requires_compute() == false`)
+    // In-process execution
     // -----------------------------------------------------------------------
 
-    /// Extract schema in-process, without a compute instance or a client binary.
+    /// The in-process engine backing this provider, if it has one.
     ///
-    /// Returns the same delimiter-separated text that
-    /// [`DatabaseProvider::schema_extraction_spec`]'s command would print to
-    /// stdout, so both paths feed the identical parser.
+    /// Returning `Some` is what makes a provider embedded: every operation the
+    /// container path performs by executing a command inside an instance, an
+    /// embedded provider performs here instead. See [`LocalEngine`].
     ///
-    /// This exists for embedded providers (SQLite, and any future DuckDB-style
-    /// provider) where there is no server to connect to. Running the queries
-    /// against a library linked into this binary — rather than shelling out to
-    /// whatever client happens to be installed — keeps the recorded engine
-    /// version reproducible across machines. A host binary's version varies per
-    /// developer, which would make the same schema hash to different metadata.
-    ///
-    /// Default: `None` — the provider needs a compute instance.
-    fn extract_schema_locally(
-        &self,
-        _params: &ConnectionParams,
-    ) -> std::result::Result<Option<String>, ProviderError> {
-        Ok(None)
-    }
-
-    /// Quiesce an embedded database on the host before a storage snapshot.
-    ///
-    /// The compute-backed equivalent is
-    /// [`DatabaseProvider::prepare_for_snapshot`], whose commands a runtime
-    /// executes inside the instance. A provider with no compute instance has no
-    /// such runtime, so it performs the preparation itself and reports whether
-    /// it did anything.
-    ///
-    /// Returns `Ok(false)` when the provider has no local preparation to do.
-    fn prepare_for_snapshot_locally(
-        &self,
-        _params: &ConnectionParams,
-    ) -> std::result::Result<bool, ProviderError> {
-        Ok(false)
+    /// Default: `None` — the provider is a client/server database and needs a
+    /// compute instance.
+    fn local_engine(&self) -> Option<&dyn LocalEngine> {
+        None
     }
 
     // -----------------------------------------------------------------------
