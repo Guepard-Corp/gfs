@@ -100,12 +100,35 @@ const IS_UNIQUE: &str = "CASE \
 
 /// SQLite database provider. Implements [`DatabaseProvider`] without requiring
 /// a compute instance.
-#[derive(Debug, Default)]
-pub struct SqliteProvider;
+#[derive(Debug, Clone)]
+pub struct SqliteProvider {
+    /// How long to wait for the write lock before reporting contention.
+    ///
+    /// Injectable so a test can assert real contention against a really-held
+    /// lock without paying the production budget. Weakening the assertion
+    /// instead — asserting on a message, or not holding a lock at all — would
+    /// stop testing the thing that matters.
+    lock_timeout: std::time::Duration,
+}
+
+impl Default for SqliteProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl SqliteProvider {
     pub fn new() -> Self {
-        Self
+        Self {
+            lock_timeout: LOCK_TIMEOUT,
+        }
+    }
+
+    /// A provider that gives up on the write lock after `timeout`.
+    pub fn with_lock_timeout(timeout: std::time::Duration) -> Self {
+        Self {
+            lock_timeout: timeout,
+        }
     }
 
     /// Absolute path of the database file.
@@ -382,11 +405,11 @@ impl LocalEngine for SqliteProvider {
         }
 
         // The lock gets the full budget.
-        conn.busy_timeout(LOCK_TIMEOUT)
+        conn.busy_timeout(self.lock_timeout)
             .map_err(|e| ProviderError::InvalidParams(format!("cannot set busy timeout: {e}")))?;
 
         conn.execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| classify_lock_failure(&path, e))?;
+            .map_err(|e| classify_lock_failure(&path, e, self.lock_timeout))?;
 
         Ok(Some(Box::new(SqliteSnapshotGuard { conn })))
     }
@@ -437,7 +460,11 @@ impl Drop for SqliteSnapshotGuard {
 /// database could not be opened or read — reporting a corrupt file as "another
 /// process is writing" previously invited the operator to set
 /// `GFS_ALLOW_UNFROZEN_SNAPSHOT`, which recorded the corrupt file as a snapshot.
-fn classify_lock_failure(path: &Path, err: rusqlite::Error) -> ProviderError {
+fn classify_lock_failure(
+    path: &Path,
+    err: rusqlite::Error,
+    waited: std::time::Duration,
+) -> ProviderError {
     let busy = matches!(
         err,
         rusqlite::Error::SqliteFailure(e, _)
@@ -446,9 +473,9 @@ fn classify_lock_failure(path: &Path, err: rusqlite::Error) -> ProviderError {
     );
     if busy {
         ProviderError::Busy(format!(
-            "could not acquire the SQLite write lock on '{}' within {}s: {err}",
+            "could not acquire the SQLite write lock on '{}' within {:?}: {err}",
             path.display(),
-            LOCK_TIMEOUT.as_secs()
+            waited
         ))
     } else {
         ProviderError::InvalidParams(format!(
@@ -679,7 +706,8 @@ mod tests {
         let holder = rusqlite::Connection::open(&db).unwrap();
         holder.execute_batch("BEGIN IMMEDIATE").unwrap();
 
-        let err = match LocalEngine::prepare_for_snapshot(&SqliteProvider::new(), &params) {
+        let provider = SqliteProvider::with_lock_timeout(std::time::Duration::from_millis(200));
+        let err = match LocalEngine::prepare_for_snapshot(&provider, &params) {
             Ok(_) => panic!("the lock is held elsewhere"),
             Err(e) => e,
         };
