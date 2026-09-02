@@ -403,6 +403,18 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
         // produces (`schema_hash` is attached at commit-build, after the
         // snapshot). The CHECKPOINT -> snapshot ordering stays inside the
         // snapshot arm regardless of which path runs.
+        // Hold an embedded database still for BOTH phases. Acquiring inside the
+        // snapshot alone left schema extraction outside the lock, so anything a
+        // writer did between the two ended up in the snapshot but not in the
+        // recorded schema — `gfs schema show <commit>` then misdescribed what
+        // that commit contains. On the container path the same ordering is
+        // bounded by `pause()`; here the writer is the user's own application
+        // and nothing bounds it.
+        let _local_guard = match (&runtime_config, &environment) {
+            (None, Some(env)) => self.acquire_local_snapshot_guard(&path, env).await?,
+            _ => None,
+        };
+
         let (schema_hash, snapshot_hash) = if db_live_during_snapshot {
             // Overlap: run both arms to completion, then apply the asymmetry.
             // `join!` (not `try_join!`) is required because schema extraction is
@@ -701,18 +713,9 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
             }
         }
 
-        // 3b. An embedded provider has no instance to pause — and pausing one
-        //     would not help, because the process writing its database is the
-        //     user's own application, outside any runtime GFS controls. The
-        //     engine excludes writers itself and stays held until this guard is
-        //     dropped, which happens when this function returns, after the
-        //     snapshot below. Without this the entire quiescing phase was
-        //     skipped for such providers, including the refusal that protects
-        //     container-backed ones from an unfrozen snapshot.
-        let _local_guard = match (runtime_config, environment) {
-            (None, Some(env)) => self.acquire_local_snapshot_guard(path, env).await?,
-            _ => None,
-        };
+        // An embedded provider's guard is acquired by the caller before schema
+        // extraction and held across this snapshot, so nothing is taken here —
+        // a second `BEGIN IMMEDIATE` would block against our own lock.
 
         // 4. Take a storage snapshot.
         //    The VolumeId is the mount point of the workspace volume.  When no
