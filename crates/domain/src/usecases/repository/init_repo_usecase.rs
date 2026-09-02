@@ -136,7 +136,7 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         // the container credentials or labels. Record the environment and stop.
         // Leaving `RuntimeConfig` absent is the signal the commit, checkout and
         // status paths already read as "no instance to manage".
-        if provider.container().is_none() {
+        if !provider.requires_compute() {
             // The version is taken straight from the caller. Container providers
             // round-trip it through the image tag, which an embedded engine does
             // not have.

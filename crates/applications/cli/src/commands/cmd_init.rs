@@ -61,7 +61,7 @@ pub async fn init(
                 .cloned()
                 .and_then(|n| registry.get(&n))
         })
-        .is_some_and(|p| p.local_engine().is_some());
+        .is_some_and(|p| !p.requires_compute());
 
     let compute: Option<Arc<dyn Compute>> = if database_provider.is_some() && !embedded {
         match runtime_provider.as_str() {

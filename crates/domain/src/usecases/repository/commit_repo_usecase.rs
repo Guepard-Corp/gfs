@@ -488,7 +488,7 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
             || self
                 .registry
                 .get(&environment.database_provider)
-                .is_some_and(|p| p.local_engine().is_some());
+                .is_some_and(|p| !p.requires_compute());
 
         if extractable {
             self.extract_and_store_schema(path).await.ok()

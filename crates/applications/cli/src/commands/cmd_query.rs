@@ -55,6 +55,15 @@ pub async fn run(
     if let Some(provider) = registry.get(provider_name)
         && provider.local_engine().is_some()
     {
+        // The file *is* the database, so there is nothing for `--database` to
+        // select. Say so rather than accepting the flag and ignoring it.
+        if database.is_some() {
+            anyhow::bail!(
+                "--database does not apply to the '{provider_name}' provider: an embedded \
+                 database is a single file, and `gfs query` always uses the one in the \
+                 active workspace"
+            );
+        }
         let params = repo_layout::local_connection_params(&repo_path)
             .context("failed to resolve the active workspace")?;
         return run_client(&*provider, &params, query.as_deref());

@@ -7,8 +7,18 @@
 //! the developer's machine.
 //!
 //! Runs the CLI in-process via `gfs_cli::run()` so coverage is captured.
-//! macOS-only, matching the other commit/checkout suites: commit goes through
-//! the APFS storage backend.
+//!
+//! macOS-only, like the sibling commit/checkout suites, because commit goes
+//! through the platform storage backend and these tests have only been
+//! exercised against APFS.
+//!
+//! That gating has a real cost worth naming: the snapshot guard matters MOST on
+//! Linux, where `storage-file` uses `cp --reflink=auto` and silently degrades
+//! to a deep copy on ext4 — the one case where an unquiesced snapshot tears.
+//! Nothing here runs there. The assertions are about logical behaviour rather
+//! than APFS semantics, so they are expected to pass on Linux; enabling them,
+//! together with a non-copy-on-write variant of the concurrency test, belongs
+//! to the CI task rather than being flipped on unverified.
 
 #![cfg(target_os = "macos")]
 

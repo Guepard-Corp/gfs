@@ -389,9 +389,11 @@ impl DatabaseProvider for SqliteProvider {
         params: &ConnectionParams,
         query: Option<&str>,
     ) -> std::result::Result<std::process::Command, ProviderError> {
-        // The interactive shell is the one place a host `sqlite3` is still used:
-        // it is a REPL, not something this crate reimplements. Everything GFS
-        // itself does runs through the linked engine instead.
+        // `gfs query` is the only thing that still needs a host `sqlite3` —
+        // both the interactive shell and the one-shot form, which is how a
+        // user writes to the database. Everything GFS does on its own behalf
+        // (init, commit, schema, checkout, export, import) runs through the
+        // linked engine and needs nothing installed.
         let mut cmd = std::process::Command::new("sqlite3");
         cmd.arg(Self::db_path(params)?);
         if let Some(q) = query {
@@ -562,11 +564,16 @@ impl LocalEngine for SqliteProvider {
     ///    the transaction; it exists only to hold the lock.
     ///
     /// Step 2 is what makes this correct: the file set stops changing for the
-    /// duration of the copy, so the snapshot is consistent even on a filesystem
-    /// that cannot clone atomically. On a copy-on-write filesystem the clone is
-    /// already point-in-time and the lock adds nothing observable; on a plain
-    /// deep copy — `cp --reflink=auto` on ext4, say — it is the difference
-    /// between a restorable snapshot and a torn one.
+    /// duration of the copy.
+    ///
+    /// That matters on every filesystem, not only the ones that cannot clone.
+    /// A copy-on-write clone is atomic per *file* — the APFS backend runs
+    /// `cp -cRp`, which clones each file separately — so a WAL database, which
+    /// is two or three files, is still not captured at a single instant without
+    /// the lock. The window is small enough that tearing has not been
+    /// reproduced on APFS in practice, but "small" is not "absent", and on a
+    /// plain deep copy (`cp --reflink=auto` degrading on ext4) it is the
+    /// difference between a restorable snapshot and a torn one.
     fn prepare_for_snapshot(
         &self,
         params: &ConnectionParams,
