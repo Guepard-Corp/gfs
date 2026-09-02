@@ -737,7 +737,8 @@ mod tests {
              CREATE TABLE text_pk       (id TEXT PRIMARY KEY, v TEXT);
              CREATE TABLE without_rowid (id TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID;
              CREATE TABLE composite     (a INT, b INT, v TEXT, PRIMARY KEY(a, b));
-             CREATE TABLE uniq_col      (id INTEGER PRIMARY KEY, email TEXT UNIQUE);",
+             CREATE TABLE uniq_col      (id INTEGER PRIMARY KEY, email TEXT UNIQUE);
+             CREATE TABLE uniq_multi    (id INTEGER PRIMARY KEY, x INT, y INT, UNIQUE(x, y));",
         )
         .unwrap();
         drop(conn);
@@ -786,6 +787,13 @@ mod tests {
         assert_eq!(col("uniq_col", "email")["is_unique"], true);
         assert_eq!(col("uniq_col", "email")["is_nullable"], true);
         assert_eq!(col("rowid_alias", "v")["is_unique"], false);
+
+        // A multi-column UNIQUE index constrains the combination, so neither
+        // column is unique on its own — `UNIQUE(x, y)` still admits two rows
+        // sharing an `x`. Treating any covering unique index as proof would get
+        // this wrong.
+        assert_eq!(col("uniq_multi", "x")["is_unique"], false);
+        assert_eq!(col("uniq_multi", "y")["is_unique"], false);
     }
 
     #[test]
