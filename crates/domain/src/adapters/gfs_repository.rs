@@ -470,6 +470,15 @@ impl Repository for GfsRepository {
         // Resolve repo to an absolute path so snapshot_path matches where storage wrote the snapshot.
         let repo = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
 
+        // Refuse to commit at a detached HEAD before writing anything: a commit must
+        // land on a named branch, or it would be unreachable (orphaned). Time-travel
+        // and read-only inspection at a detached commit stay allowed; only the write
+        // is refused. This is the authoritative guard — every caller of the port
+        // reaches the write through here.
+        if let Some(commit) = repo_layout::detached_head_commit(&repo).map_err(map_err)? {
+            return Err(RepositoryError::DetachedHead(commit));
+        }
+
         // 1. Hash the commit content.
         let commit_hash =
             hash_commit(&new_commit).map_err(|e| RepositoryError::Internal(e.to_string()))?;
@@ -525,12 +534,11 @@ impl Repository for GfsRepository {
             .map_err(|e| RepositoryError::Internal(e.to_string()))?;
         fs::write(&object_path, json).map_err(RepositoryError::Io)?;
 
-        // 7. Advance the current branch ref to the new commit.
+        // 7. Advance the current branch ref to the new commit. HEAD is guaranteed
+        // attached to a branch here (a detached HEAD is refused at the top of this
+        // method), so the ref advance is unconditional.
         let branch = repo_layout::get_current_branch(&repo).map_err(map_err)?;
-        // Only update a named branch ref; skip when HEAD is detached (64-char hex).
-        if !(branch.len() == 64 && branch.chars().all(|c| c.is_ascii_hexdigit())) {
-            repo_layout::update_branch_ref(&repo, &branch, &commit_hash).map_err(map_err)?;
-        }
+        repo_layout::update_branch_ref(&repo, &branch, &commit_hash).map_err(map_err)?;
 
         tracing::info!(
             "Committed '{}' on branch '{}' → {}",
@@ -749,6 +757,10 @@ impl Repository for GfsRepository {
         repo_layout::get_current_commit_id(repo).map_err(map_err)
     }
 
+    async fn detached_head_commit(&self, repo: &Path) -> Result<Option<String>> {
+        repo_layout::detached_head_commit(repo).map_err(map_err)
+    }
+
     async fn get_runtime_config(&self, repo: &Path) -> Result<Option<RuntimeConfig>> {
         repo_layout::get_runtime_config(repo).map_err(map_err)
     }
@@ -935,6 +947,110 @@ description = "test"
         )
         .unwrap();
         assert_eq!(ref_content.trim(), hash);
+    }
+
+    /// A commit at a detached HEAD is refused (never orphaned): the engine returns
+    /// `DetachedHead`, writes no object, and leaves HEAD and the branch ref untouched.
+    #[tokio::test]
+    async fn commit_at_detached_head_is_refused_and_writes_no_object() {
+        fn count_objects(repo: &std::path::Path) -> usize {
+            fn walk(d: &std::path::Path) -> usize {
+                std::fs::read_dir(d)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|e| {
+                        let p = e.path();
+                        if p.is_dir() { walk(&p) } else { 1 }
+                    })
+                    .sum()
+            }
+            walk(&repo.join(GFS_DIR).join(OBJECTS_DIR))
+        }
+
+        let tmp = setup_repo();
+        let repo_path = tmp.path();
+        let gfs = GfsRepository::new();
+
+        let first = gfs
+            .commit(repo_path, make_new_commit("first", "snap-1"))
+            .await
+            .unwrap();
+
+        repo_layout::update_head_with_commit(repo_path, &first).unwrap();
+        let head_path = repo_path.join(GFS_DIR).join(HEAD_FILE);
+        assert_eq!(fs::read_to_string(&head_path).unwrap().trim(), first);
+
+        let objects_before = count_objects(repo_path);
+        let main_ref = repo_path
+            .join(GFS_DIR)
+            .join(REFS_DIR)
+            .join(HEADS_DIR)
+            .join(MAIN_BRANCH);
+        let main_before = fs::read_to_string(&main_ref).unwrap();
+
+        let err = gfs
+            .commit(repo_path, make_new_commit("detached-work", "snap-2"))
+            .await
+            .expect_err("commit at a detached HEAD must be refused");
+        assert!(
+            matches!(err, RepositoryError::DetachedHead(ref c) if *c == first),
+            "expected DetachedHead, got {err:?}",
+        );
+
+        assert_eq!(
+            count_objects(repo_path),
+            objects_before,
+            "no new object may be written on a refused commit",
+        );
+        assert_eq!(
+            fs::read_to_string(&head_path).unwrap().trim(),
+            first,
+            "HEAD must be unchanged",
+        );
+        assert_eq!(
+            fs::read_to_string(&main_ref).unwrap(),
+            main_before,
+            "main ref must be unchanged",
+        );
+    }
+
+    /// A branch whose NAME is 64 hex chars (e.g. named after a git SHA) is a
+    /// perfectly valid attached branch and must not be mistaken for a detached
+    /// HEAD: detection reads the raw HEAD form (`ref: refs/heads/...` vs a bare
+    /// hash), not the branch name.
+    #[tokio::test]
+    async fn commit_on_a_hex_named_branch_is_not_mistaken_for_detached() {
+        let tmp = setup_repo();
+        let repo_path = tmp.path();
+        let gfs = GfsRepository::new();
+
+        let first = gfs
+            .commit(repo_path, make_new_commit("first", "snap-1"))
+            .await
+            .unwrap();
+
+        // Attach HEAD to a branch whose name is 64 hex chars.
+        let hex_name = "a".repeat(64);
+        gfs.create_branch(repo_path, &hex_name, &first)
+            .await
+            .unwrap();
+        repo_layout::update_head_with_branch(repo_path, &hex_name).unwrap();
+
+        // A commit on that (attached) branch must succeed and advance it.
+        let second = gfs
+            .commit(repo_path, make_new_commit("second", "snap-2"))
+            .await
+            .expect("commit on a hex-named branch must not be refused as detached");
+        let ref_content = fs::read_to_string(
+            repo_path
+                .join(GFS_DIR)
+                .join(REFS_DIR)
+                .join(HEADS_DIR)
+                .join(&hex_name),
+        )
+        .unwrap();
+        assert_eq!(ref_content.trim(), second, "the hex-named branch advanced");
     }
 
     #[tokio::test]

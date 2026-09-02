@@ -328,6 +328,17 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
         let path = std::fs::canonicalize(&path)
             .map_err(|e| CommitRepoError::Repository(RepositoryError::Io(e)))?;
 
+        // Refuse a commit at a detached HEAD early — before pausing/snapshotting the
+        // database — so no work is wasted and no orphaned snapshot tree is left
+        // behind. Detection goes through the repository port (unambiguous: a branch
+        // whose name is 64 hex chars is not misread as detached), keeping the usecase
+        // pure; the adapter enforces the same invariant as the authoritative backstop.
+        if let Some(commit) = self.repository.detached_head_commit(&path).await? {
+            return Err(CommitRepoError::Repository(RepositoryError::DetachedHead(
+                commit,
+            )));
+        }
+
         // Serialize commits per repository. Held until this function returns,
         // covering pause, snapshot, finalize, and ref advance.
         let _commit_lock = CommitLock::acquire(&path)?;
@@ -886,6 +897,8 @@ mod tests {
         committed: Mutex<Option<NewCommit>>,
         /// When set, `ensure_snapshot_path` returns a path under this directory (for cleanup tests).
         snapshot_root: Option<PathBuf>,
+        /// When `Some`, `detached_head_commit` reports a detached HEAD at this commit.
+        detached_head: Option<String>,
     }
 
     #[async_trait]
@@ -993,6 +1006,13 @@ mod tests {
             _: &std::path::Path,
         ) -> crate::ports::repository::Result<String> {
             Ok(self.current_commit.clone())
+        }
+
+        async fn detached_head_commit(
+            &self,
+            _: &std::path::Path,
+        ) -> crate::ports::repository::Result<Option<String>> {
+            Ok(self.detached_head.clone())
         }
         async fn get_runtime_config(
             &self,
@@ -1461,6 +1481,32 @@ mod tests {
     fn existing_repo_path() -> PathBuf {
         let temp = tempfile::tempdir().expect("tempdir");
         temp.keep()
+    }
+
+    /// The commit use case refuses a detached HEAD *early* — via the repository port,
+    /// before the commit lock / pause / snapshot — so no DB work is wasted. Exercises
+    /// the usecase guard specifically (the adapter backstop is covered separately).
+    #[tokio::test]
+    async fn commit_at_detached_head_is_refused_early() {
+        let compute = MockCompute::default();
+        let repo = MockRepository {
+            commit_hash: "deadbeef".into(),
+            current_commit: "0".into(),
+            detached_head: Some("a".repeat(64)),
+            ..Default::default()
+        };
+        let uc = make_usecase(repo, compute, MockStorage::new("snap-x"));
+        let err = uc
+            .run(existing_repo_path(), "work".into(), None, None, None, None)
+            .await
+            .expect_err("a commit at a detached HEAD must be refused");
+        assert!(
+            matches!(
+                err,
+                CommitRepoError::Repository(RepositoryError::DetachedHead(ref c)) if c.len() == 64
+            ),
+            "expected DetachedHead, got {err:?}",
+        );
     }
 
     #[tokio::test]

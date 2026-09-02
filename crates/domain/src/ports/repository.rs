@@ -36,6 +36,11 @@ pub enum RepositoryError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    #[error(
+        "cannot commit: HEAD is detached at commit '{0}'; create and switch to a branch here first (gfs checkout -b <name>), then commit"
+    )]
+    DetachedHead(String),
 }
 
 pub type Result<T> = std::result::Result<T, RepositoryError>;
@@ -139,6 +144,20 @@ pub trait Repository: Send + Sync {
 
     /// Resolve HEAD to the current commit id (hash or "0" for initial state).
     async fn get_current_commit_id(&self, repo: &Path) -> Result<String>;
+
+    /// `Some(commit)` when HEAD is detached (points at a raw commit hash rather
+    /// than a branch), else `None`. Unambiguous — unlike [`Repository::get_current_branch`],
+    /// a branch whose name happens to be 64 hex chars is not misreported as detached.
+    ///
+    /// The default returns `None` (attached). This powers only the *early* refusal in
+    /// the commit use case — an optimization that avoids pausing/snapshotting the
+    /// database for a commit that would be rejected anyway. It is NOT the guarantee:
+    /// refusing a detached-HEAD commit is enforced by each `commit` implementation
+    /// itself. An implementation whose HEAD can detach should override this so the
+    /// early refusal fires; even if it does not, its `commit` must still refuse.
+    async fn detached_head_commit(&self, _repo: &Path) -> Result<Option<String>> {
+        Ok(None)
+    }
 
     /// Return the runtime config stored in the repo config, if present.
     async fn get_runtime_config(&self, repo: &Path) -> Result<Option<RuntimeConfig>>;

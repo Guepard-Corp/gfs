@@ -206,6 +206,22 @@ pub fn get_current_branch(path: &Path) -> Result<String, RepoError> {
     }
 }
 
+/// `Some(commit)` when HEAD is a raw commit hash (detached); `None` when attached
+/// to a branch. Mirrors the HEAD parsing in [`get_current_branch`]. A malformed HEAD
+/// (neither a `ref:` line nor exactly 64 hex chars) is reported as `None` (attached)
+/// here; the commit path surfaces such corruption separately when it resolves the
+/// current commit id, before any write.
+pub fn detached_head_commit(path: &Path) -> Result<Option<String>, RepoError> {
+    let gfs_dir = path.join(GFS_DIR);
+    let head_content = fs::read_to_string(gfs_dir.join(HEAD_FILE)).map_err(RepoError::from)?;
+    let trimmed = head_content.trim();
+    if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(Some(trimmed.to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
 pub fn update_project_mount_point(repo_path: &Path, mount_point: String) -> Result<(), RepoError> {
     tracing::trace!("Updating project mount point to {}", mount_point);
     let mut config = GfsConfig::load(repo_path)?;
