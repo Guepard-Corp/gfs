@@ -10,7 +10,9 @@ use crate::model::commit::NewCommit;
 use crate::model::config::{EnvironmentConfig, GlobalSettings, RuntimeConfig};
 use crate::model::layout::GFS_DIR;
 use crate::ports::compute::{Compute, ComputeError, InstanceId, InstanceState};
-use crate::ports::database_provider::{ConnectionParams, DatabaseProviderRegistry, SnapshotGuard};
+use crate::ports::database_provider::{
+    ConnectionParams, DatabaseProviderRegistry, ProviderError, SnapshotGuard,
+};
 use crate::ports::repository::{Repository, RepositoryError};
 use crate::ports::storage::{SnapshotOptions, StorageError, StoragePort, VolumeId};
 use crate::repo_utils::repo_layout;
@@ -522,7 +524,7 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
     /// database — this refuses the commit unless `GFS_ALLOW_UNFROZEN_SNAPSHOT`
     /// is set, matching the policy the container path applies to a runtime that
     /// cannot freeze.
-    fn acquire_local_snapshot_guard(
+    async fn acquire_local_snapshot_guard(
         &self,
         path: &Path,
         environment: &EnvironmentConfig,
@@ -530,35 +532,67 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
         let Some(provider) = self.registry.get(&environment.database_provider) else {
             return Ok(None);
         };
-        let Some(engine) = provider.local_engine() else {
+        if provider.local_engine().is_none() {
             return Ok(None);
-        };
+        }
 
         let params = repo_layout::local_connection_params(path)
             .map_err(|e| CommitRepoError::Repository(RepositoryError::Internal(e.to_string())))?;
 
-        match engine.prepare_for_snapshot(&params) {
+        // Acquiring the guard is synchronous and waits on SQLite's own locking,
+        // for up to the engine's full lock budget. In the CLI that would merely
+        // block the one task, but this library is also linked into a long-lived
+        // daemon, where holding an executor thread for seconds would stall
+        // unrelated work. Hand it to a blocking thread instead.
+        let provider_for_task = Arc::clone(&provider);
+        let params_for_task = params.clone();
+        let prepared = tokio::task::spawn_blocking(move || {
+            let engine = provider_for_task
+                .local_engine()
+                .expect("provider had a local engine a moment ago");
+            engine.prepare_for_snapshot(&params_for_task)
+        })
+        .await
+        .map_err(|e| {
+            CommitRepoError::Repository(RepositoryError::Internal(format!(
+                "snapshot preparation task failed: {e}"
+            )))
+        })?;
+
+        match prepared {
             Ok(Some(guard)) => {
                 tracing::debug!(held = %guard.describe(), "database quiesced for snapshot");
                 Ok(Some(guard))
             }
             // Nothing to quiesce: no database has been written yet.
             Ok(None) => Ok(None),
-            Err(e) if unfrozen_snapshot_allowed() => {
+            // Only a *busy* database may be snapshotted unquiesced. The override
+            // deliberately does not apply to any other failure: if the engine could
+            // not open or read the database at all, proceeding would record
+            // something unusable as a commit — and our own error message would have
+            // invited the operator to do it.
+            Err(ProviderError::Busy(e)) if unfrozen_snapshot_allowed() => {
                 tracing::warn!(
                     error = %e,
-                    "could not quiesce the database; proceeding with an UNFROZEN snapshot per \
-                     GFS_ALLOW_UNFROZEN_SNAPSHOT — it may capture a torn copy if another \
-                     process writes during the snapshot"
+                    "database is busy; proceeding with an UNFROZEN snapshot per \
+                     GFS_ALLOW_UNFROZEN_SNAPSHOT — it may capture a torn copy if the \
+                     other process writes during the snapshot"
                 );
                 Ok(None)
             }
+            Err(ProviderError::Busy(e)) => Err(CommitRepoError::Repository(
+                RepositoryError::Internal(format!(
+                    "{e}. Refusing to snapshot a database that is being written: a copy \
+                     taken mid-write can capture a torn file. Options: (1) stop the process \
+                     writing the database and retry; or (2) set GFS_ALLOW_UNFROZEN_SNAPSHOT=1 \
+                     to proceed with a best-effort snapshot that may not be restorable"
+                )),
+            )),
             Err(e) => Err(CommitRepoError::Repository(RepositoryError::Internal(
                 format!(
-                    "{e}. Refusing to snapshot a database that is being written: a copy taken \
-                 mid-write can capture a torn file. Options: (1) stop the process writing \
-                 the database and retry; or (2) set GFS_ALLOW_UNFROZEN_SNAPSHOT=1 to \
-                 proceed with a best-effort snapshot that may not be restorable"
+                    "{e}. Refusing to commit: the database could not be prepared for a \
+                     snapshot, so its contents cannot be trusted. This is not lock \
+                     contention, and GFS_ALLOW_UNFROZEN_SNAPSHOT does not apply"
                 ),
             ))),
         }
@@ -676,7 +710,7 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
         //     skipped for such providers, including the refusal that protects
         //     container-backed ones from an unfrozen snapshot.
         let _local_guard = match (runtime_config, environment) {
-            (None, Some(env)) => self.acquire_local_snapshot_guard(path, env)?,
+            (None, Some(env)) => self.acquire_local_snapshot_guard(path, env).await?,
             _ => None,
         };
 

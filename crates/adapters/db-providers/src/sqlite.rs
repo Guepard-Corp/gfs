@@ -361,22 +361,32 @@ impl LocalEngine for SqliteProvider {
         }
 
         let conn = Self::open(&path)?;
-        conn.busy_timeout(LOCK_TIMEOUT)
-            .map_err(|e| ProviderError::InvalidParams(format!("cannot set busy timeout: {e}")))?;
 
-        // Best-effort: a checkpoint blocked by a long-running reader leaves
-        // frames in the WAL, which is still captured, just less compactly.
+        // A read-only database has no writer to exclude, so taking the lock
+        // would prove nothing — and on some platforms it succeeds while
+        // excluding nobody. Report honestly that there was nothing to quiesce
+        // rather than claim a write lock we do not effectively hold.
+        if conn.is_readonly("main").unwrap_or(false) {
+            tracing::debug!(
+                path = %path.display(),
+                "database is read-only; nothing to quiesce"
+            );
+            return Ok(None);
+        }
+
+        // Compaction first, on its own short budget (see CHECKPOINT_TIMEOUT).
+        conn.busy_timeout(CHECKPOINT_TIMEOUT)
+            .map_err(|e| ProviderError::InvalidParams(format!("cannot set busy timeout: {e}")))?;
         if let Err(e) = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE") {
             tracing::debug!(error = %e, "wal checkpoint did not complete; snapshotting WAL as-is");
         }
 
-        conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| {
-            ProviderError::InvalidParams(format!(
-                "could not acquire the SQLite write lock within {}s: {e}. \
-                 Another process is writing this database",
-                LOCK_TIMEOUT.as_secs()
-            ))
-        })?;
+        // The lock gets the full budget.
+        conn.busy_timeout(LOCK_TIMEOUT)
+            .map_err(|e| ProviderError::InvalidParams(format!("cannot set busy timeout: {e}")))?;
+
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| classify_lock_failure(&path, e))?;
 
         Ok(Some(Box::new(SqliteSnapshotGuard { conn })))
     }
@@ -385,6 +395,16 @@ impl LocalEngine for SqliteProvider {
 /// How long to wait for the write lock before giving up and letting the caller
 /// decide whether an unquiesced snapshot is acceptable.
 const LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long to wait for the WAL checkpoint.
+///
+/// Deliberately short, and separate from [`LOCK_TIMEOUT`]. A `TRUNCATE`
+/// checkpoint waits for readers to drain, so a single long-lived read
+/// transaction — routine for an ORM connection pool — would otherwise burn the
+/// entire lock budget before giving up, after which the write lock is taken
+/// instantly. The checkpoint is compaction, not correctness: failing it costs a
+/// larger WAL in the snapshot, nothing more.
+const CHECKPOINT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Holds SQLite's write lock open for the duration of a storage snapshot.
 struct SqliteSnapshotGuard {
@@ -406,6 +426,35 @@ impl Drop for SqliteSnapshotGuard {
         if let Err(e) = self.conn.execute_batch("ROLLBACK") {
             tracing::debug!(error = %e, "releasing sqlite write lock");
         }
+    }
+}
+
+/// Distinguish "another process holds this database" from every other reason
+/// the write lock could not be taken.
+///
+/// The distinction is load-bearing, not cosmetic: the caller may proceed
+/// without quiescing a merely *busy* database, but must never do so when the
+/// database could not be opened or read — reporting a corrupt file as "another
+/// process is writing" previously invited the operator to set
+/// `GFS_ALLOW_UNFROZEN_SNAPSHOT`, which recorded the corrupt file as a snapshot.
+fn classify_lock_failure(path: &Path, err: rusqlite::Error) -> ProviderError {
+    let busy = matches!(
+        err,
+        rusqlite::Error::SqliteFailure(e, _)
+            if e.code == rusqlite::ErrorCode::DatabaseBusy
+                || e.code == rusqlite::ErrorCode::DatabaseLocked
+    );
+    if busy {
+        ProviderError::Busy(format!(
+            "could not acquire the SQLite write lock on '{}' within {}s: {err}",
+            path.display(),
+            LOCK_TIMEOUT.as_secs()
+        ))
+    } else {
+        ProviderError::InvalidParams(format!(
+            "cannot prepare '{}' for snapshot: {err}",
+            path.display()
+        ))
     }
 }
 
@@ -570,6 +619,124 @@ mod tests {
         contender
             .execute_batch("BEGIN IMMEDIATE; ROLLBACK")
             .expect("write lock released with the guard");
+    }
+
+    /// A corrupt database is not lock contention. Reporting it as "another
+    /// process is writing" previously invited the operator to set
+    /// GFS_ALLOW_UNFROZEN_SNAPSHOT, which recorded the corrupt file as a
+    /// snapshot — so the classification, not just the wording, is the fix.
+    #[test]
+    fn a_corrupt_database_is_not_reported_as_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(DB_FILENAME);
+        std::fs::write(&db, b"this is definitely not a sqlite database").unwrap();
+
+        let err = match LocalEngine::prepare_for_snapshot(
+            &SqliteProvider::new(),
+            &params_with_path(db.to_str().unwrap()),
+        ) {
+            Ok(_) => panic!("a corrupt database must not yield a guard"),
+            Err(e) => e,
+        };
+
+        assert!(
+            !matches!(err, ProviderError::Busy(_)),
+            "corruption must not be classified as contention, or the unfrozen \
+             override would rescue it: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("Another process") && !msg.contains("another process"),
+            "the message must not blame a competing writer: {msg}"
+        );
+    }
+
+    /// A path that is a directory is likewise not contention.
+    #[test]
+    fn a_directory_where_the_database_should_be_is_not_reported_as_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(DB_FILENAME);
+        std::fs::create_dir(&db).unwrap();
+
+        let err = match LocalEngine::prepare_for_snapshot(
+            &SqliteProvider::new(),
+            &params_with_path(db.to_str().unwrap()),
+        ) {
+            Ok(_) => panic!("a directory must not yield a guard"),
+            Err(e) => e,
+        };
+        assert!(!matches!(err, ProviderError::Busy(_)), "got: {err}");
+    }
+
+    /// Genuine contention still classifies as busy, so the override keeps working
+    /// for the case it was designed for.
+    #[test]
+    fn a_database_held_by_another_writer_is_reported_as_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let params = seeded_db(dir.path());
+        let db = dir.path().join(DB_FILENAME);
+
+        let holder = rusqlite::Connection::open(&db).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let err = match LocalEngine::prepare_for_snapshot(&SqliteProvider::new(), &params) {
+            Ok(_) => panic!("the lock is held elsewhere"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, ProviderError::Busy(_)),
+            "real contention must be classified as busy: {err}"
+        );
+    }
+
+    /// A read-only database has no writer to exclude, so claiming a write lock
+    /// would be a false statement about what is guaranteed.
+    #[test]
+    fn a_read_only_database_yields_no_guard_rather_than_a_false_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let params = seeded_db(dir.path());
+        let db = dir.path().join(DB_FILENAME);
+        let mut perms = std::fs::metadata(&db).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&db, perms).unwrap();
+
+        let guard = LocalEngine::prepare_for_snapshot(&SqliteProvider::new(), &params).unwrap();
+        assert!(
+            guard.is_none(),
+            "a read-only database must not report a held write lock"
+        );
+    }
+
+    /// The checkpoint must not consume the lock budget. One open read
+    /// transaction previously cost the full 10s per commit, because TRUNCATE
+    /// waits for readers to drain and the timeout was raised before it ran.
+    #[test]
+    fn an_open_reader_does_not_cost_the_whole_lock_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let params = seeded_db(dir.path());
+        let db = dir.path().join(DB_FILENAME);
+
+        let writer = rusqlite::Connection::open(&db).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        writer
+            .execute("INSERT INTO author (name) VALUES ('ada')", [])
+            .unwrap();
+
+        let reader = rusqlite::Connection::open(&db).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        reader
+            .query_row("SELECT count(*) FROM author", [], |r| r.get::<_, i64>(0))
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let guard = LocalEngine::prepare_for_snapshot(&SqliteProvider::new(), &params).unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(guard.is_some(), "the write lock is still free");
+        assert!(
+            elapsed < LOCK_TIMEOUT,
+            "a blocked checkpoint must not burn the lock budget: took {elapsed:?}"
+        );
     }
 
     #[test]

@@ -37,6 +37,16 @@ pub enum ProviderError {
 
     #[error("unsupported format: '{0}'")]
     UnsupportedFormat(String),
+
+    /// The database is held by another writer and could not be quiesced.
+    ///
+    /// Kept distinct from [`ProviderError::InvalidParams`] because callers may
+    /// reasonably choose to proceed without quiescing when a database is merely
+    /// *busy* — but must never make that choice when the database could not be
+    /// opened or read at all, where proceeding would snapshot something
+    /// unusable.
+    #[error("database is busy: {0}")]
+    Busy(String),
 }
 
 pub type Result<T> = std::result::Result<T, RegistryError>;
