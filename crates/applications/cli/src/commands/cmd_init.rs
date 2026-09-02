@@ -11,6 +11,7 @@ use gfs_domain::ports::database_provider::{
     DatabaseProviderRegistry, InMemoryDatabaseProviderRegistry,
 };
 use gfs_domain::ports::repository::Repository;
+use gfs_domain::repo_utils::repo_layout;
 use gfs_domain::usecases::repository::init_repo_usecase::{
     DatabaseCredentials, InitRepositoryUseCase,
 };
@@ -109,12 +110,21 @@ pub async fn init(
 
     let mut connection_string: Option<String> = None;
     if has_provider && let Some(compute) = compute.clone() {
-        let status_uc = StatusRepoUseCase::new(repository, compute, registry);
+        let status_uc = StatusRepoUseCase::new(repository, compute, registry.clone());
         if let Ok(status) = status_uc.run(&target_path).await {
             connection_string = status
                 .compute
                 .and_then(|c| (!c.connection_string.is_empty()).then_some(c.connection_string));
         }
+    } else if has_provider {
+        // An embedded provider has no compute instance to ask, but the user
+        // still needs to know where the database is in order to point an
+        // application at it — and nothing else in the CLI tells them.
+        connection_string = provider_display
+            .as_deref()
+            .and_then(|name| registry.get(name))
+            .zip(repo_layout::local_connection_params(&target_path).ok())
+            .and_then(|(provider, params)| provider.connection_string(&params).ok());
     }
 
     if json_output {

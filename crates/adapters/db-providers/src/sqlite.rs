@@ -38,10 +38,14 @@ const NAME: &str = "sqlite";
 /// Filename of the database inside the workspace data directory.
 pub const DB_FILENAME: &str = "db.sqlite";
 
-/// Optional override carrying an absolute path to the database file, for
-/// pointing at a database outside the workspace. When absent the file is
-/// resolved as [`LOCAL_DATA_DIR_ENV`] joined with [`DB_FILENAME`].
-pub const ENV_DB_PATH: &str = "SQLITE_DB_PATH";
+/// Escape hatch naming the database file outright.
+///
+/// Read from [`ConnectionParams`] first and then from the process environment,
+/// so it is settable by an operator and not only by a caller — it was
+/// previously documented as an override while being reachable from nothing but
+/// a test helper. Use it when the workspace holds more than one database, or
+/// when the file lives somewhere discovery will not look.
+pub const ENV_DB_PATH: &str = "GFS_SQLITE_DB_PATH";
 
 /// Single namespace SQLite exposes. Mirrors postgres's `public`.
 const MAIN_SCHEMA: &str = "main";
@@ -109,6 +113,43 @@ const IS_UNIQUE: &str = "CASE \
                     AND (SELECT ii.name FROM pragma_index_info(il.name) ii) = p.name) THEN 'true' \
      ELSE 'false' END";
 
+/// Whether the workspace already holds a database, and where.
+///
+/// Kept distinct so "nothing has been written yet" — a legitimate state for a
+/// fresh repository — cannot be confused with "there is a database and I did
+/// not find it", which must never be treated as success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Located {
+    Existing(PathBuf),
+    Absent(PathBuf),
+}
+
+impl Located {
+    fn into_path(self) -> PathBuf {
+        match self {
+            Located::Existing(p) | Located::Absent(p) => p,
+        }
+    }
+}
+
+/// Whether `path` is a SQLite database, by its header rather than its name.
+///
+/// Every SQLite database begins with the 16 bytes `SQLite format 3\0`. Testing
+/// the content means a sidecar `-wal`, `-shm` or `-journal` — which have their
+/// own distinct headers — is never mistaken for the database itself, and a
+/// database under any name is still found.
+fn is_sqlite_database(path: &Path) -> bool {
+    use std::io::Read;
+    if !path.is_file() {
+        return false;
+    }
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut header = [0u8; 16];
+    f.read_exact(&mut header).is_ok() && &header == b"SQLite format 3\0"
+}
+
 /// SQLite database provider. Implements [`DatabaseProvider`] without requiring
 /// a compute instance.
 #[derive(Debug, Clone)]
@@ -147,14 +188,87 @@ impl SqliteProvider {
     /// Normally the workspace data directory the caller supplied, joined with
     /// this provider's filename — the caller deliberately does not know the
     /// filename. [`ENV_DB_PATH`] overrides it outright.
-    fn db_path(params: &ConnectionParams) -> std::result::Result<PathBuf, ProviderError> {
-        if let Some(explicit) = params.get_env(ENV_DB_PATH) {
-            return Ok(PathBuf::from(explicit));
+    /// Where this workspace's database is, and whether it exists yet.
+    ///
+    /// Resolution order: an explicit override, then the conventional
+    /// [`DB_FILENAME`], then a single SQLite file discovered in the workspace,
+    /// then "none yet".
+    ///
+    /// Discovery matters because GFS does not create the database — the user's
+    /// application does, under whatever name it likes. A Rails project points
+    /// at `storage/development.sqlite3`; assuming `db.sqlite` meant the guard
+    /// and schema capture both took their "nothing here" path and quietly
+    /// succeeded, so a snapshot was taken mid-transaction and an empty schema
+    /// was recorded with a hash, as though it were the truth.
+    fn resolve(params: &ConnectionParams) -> std::result::Result<Located, ProviderError> {
+        // A path that exists but is not a regular file is a mistake worth
+        // reporting. Treating it as "nothing here yet" would reintroduce the
+        // silent no-op this resolver exists to remove.
+        let at = |p: PathBuf| -> std::result::Result<Located, ProviderError> {
+            if p.is_file() {
+                Ok(Located::Existing(p))
+            } else if p.exists() {
+                Err(ProviderError::InvalidParams(format!(
+                    "'{}' is not a regular file, so it cannot be a SQLite database",
+                    p.display()
+                )))
+            } else {
+                Ok(Located::Absent(p))
+            }
+        };
+
+        // An explicit choice always wins, and is never second-guessed.
+        if let Some(explicit) = params
+            .get_env(ENV_DB_PATH)
+            .map(str::to_string)
+            .or_else(|| std::env::var(ENV_DB_PATH).ok())
+            .filter(|v| !v.trim().is_empty())
+        {
+            return at(PathBuf::from(explicit));
         }
+
         let dir = params
             .get_env(LOCAL_DATA_DIR_ENV)
             .ok_or_else(|| ProviderError::MissingEnvVar(LOCAL_DATA_DIR_ENV.to_string()))?;
-        Ok(Path::new(dir).join(DB_FILENAME))
+        let dir = Path::new(dir);
+
+        let conventional = dir.join(DB_FILENAME);
+        if conventional.exists() {
+            return at(conventional);
+        }
+
+        let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| is_sqlite_database(p))
+            .collect();
+        found.sort();
+
+        match found.len() {
+            0 => Ok(Located::Absent(conventional)),
+            1 => Ok(Located::Existing(found.remove(0))),
+            _ => {
+                let names: Vec<_> = found
+                    .iter()
+                    .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .collect();
+                Err(ProviderError::InvalidParams(format!(
+                    "the workspace holds {} SQLite databases ({}); GFS cannot tell which one \
+                     to version. Keep one in the workspace, or set {ENV_DB_PATH} to choose",
+                    names.len(),
+                    names.join(", ")
+                )))
+            }
+        }
+    }
+
+    /// The path, existing or not. Callers that only need somewhere to point a
+    /// client use this; callers that must not invent an empty database check
+    /// [`Located`] instead.
+    fn db_path(params: &ConnectionParams) -> std::result::Result<PathBuf, ProviderError> {
+        Ok(Self::resolve(params)?.into_path())
     }
 
     fn open(path: &Path) -> std::result::Result<rusqlite::Connection, ProviderError> {
@@ -353,7 +467,7 @@ impl LocalEngine for SqliteProvider {
         &self,
         params: &ConnectionParams,
     ) -> std::result::Result<String, ProviderError> {
-        let path = Self::db_path(params)?;
+        let located = Self::resolve(params)?;
         let queries = self.schema_extraction_queries();
         let get = |key: &str| -> std::result::Result<String, ProviderError> {
             queries
@@ -364,7 +478,7 @@ impl LocalEngine for SqliteProvider {
 
         // `rusqlite::version()` reports the linked amalgamation, so the version
         // is known even when there is no file to open.
-        if !path.exists() {
+        let Located::Existing(path) = located else {
             return Ok(render_sections(
                 rusqlite::version(),
                 &format!(r#"[{{"id":1,"name":"{MAIN_SCHEMA}","owner":"{MAIN_SCHEMA}"}}]"#),
@@ -372,7 +486,7 @@ impl LocalEngine for SqliteProvider {
                 "[]",
                 "",
             ));
-        }
+        };
 
         let conn = Self::open_read_only(&path)?;
         let version = Self::scalar(&conn, &get("version")?)?;
@@ -411,13 +525,13 @@ impl LocalEngine for SqliteProvider {
         &self,
         params: &ConnectionParams,
     ) -> std::result::Result<Option<Box<dyn SnapshotGuard>>, ProviderError> {
-        let path = Self::db_path(params)?;
-        if !path.exists() {
+        let path = match Self::resolve(params)? {
             // Nothing has been written yet: no WAL to fold in, no writers to
             // exclude. Not an error — the first commit of a fresh repository
             // legitimately lands here.
-            return Ok(None);
-        }
+            Located::Absent(_) => return Ok(None),
+            Located::Existing(p) => p,
+        };
 
         let conn = Self::open(&path)?;
 
@@ -1209,6 +1323,141 @@ mod tests {
             "a live WAL must survive inspection — consuming it changes what the \
              next snapshot captures"
         );
+    }
+
+    /// Params pointing at a workspace directory, the way the domain supplies
+    /// them — no filename, because the caller does not know one.
+    fn params_for_dir(dir: &std::path::Path) -> ConnectionParams {
+        ConnectionParams {
+            host: String::new(),
+            port: 0,
+            env: vec![(
+                LOCAL_DATA_DIR_ENV.to_string(),
+                dir.to_string_lossy().into_owned(),
+            )],
+        }
+    }
+
+    /// The failure this resolver exists to remove. A Rails project keeps its
+    /// database as `storage/development.sqlite3`; assuming `db.sqlite` meant
+    /// the guard took its "nothing here" path and schema capture recorded an
+    /// EMPTY schema as a successful commit, with a hash, while the real
+    /// database sat beside it.
+    #[test]
+    fn a_database_under_another_name_is_found_not_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("development.sqlite3");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY); INSERT INTO t VALUES(1);")
+            .unwrap();
+        drop(conn);
+
+        let params = params_for_dir(dir.path());
+        let provider = SqliteProvider::new();
+
+        let out = provider.extract_schema(&params).unwrap();
+        assert!(
+            out.contains("\"name\":\"t\""),
+            "the real schema must be captured, not an empty one:\n{out}"
+        );
+
+        let guard = LocalEngine::prepare_for_snapshot(&provider, &params).unwrap();
+        assert!(
+            guard.is_some(),
+            "a database that exists must be quiesced, whatever it is called"
+        );
+    }
+
+    /// With nothing written yet there is genuinely nothing to find, and the
+    /// first commit of a fresh repository must still succeed.
+    #[test]
+    fn an_empty_workspace_is_absent_rather_than_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let params = params_for_dir(dir.path());
+        let provider = SqliteProvider::new();
+
+        assert!(
+            LocalEngine::prepare_for_snapshot(&provider, &params)
+                .unwrap()
+                .is_none()
+        );
+        let out = provider.extract_schema(&params).unwrap();
+        assert!(out.contains("GFS_SCHEMA_TABLES\n[]"));
+    }
+
+    /// Two databases and no way to know which is the one under version control.
+    /// Guessing would version the wrong one silently.
+    #[test]
+    fn two_databases_in_a_workspace_are_reported_not_guessed() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["alpha.db", "beta.sqlite3"] {
+            let c = rusqlite::Connection::open(dir.path().join(name)).unwrap();
+            c.execute_batch("CREATE TABLE t(a)").unwrap();
+        }
+
+        let err = match SqliteProvider::new().extract_schema(&params_for_dir(dir.path())) {
+            Ok(_) => panic!("two candidates must not resolve"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("alpha.db") && err.contains("beta.sqlite3"),
+            "{err}"
+        );
+        assert!(
+            err.contains(ENV_DB_PATH),
+            "the message must say how to choose: {err}"
+        );
+    }
+
+    /// Sidecar files are not databases, and must not count as candidates —
+    /// otherwise a WAL database would look like three.
+    #[test]
+    fn wal_and_shm_sidecars_are_not_mistaken_for_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("app.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute_batch("CREATE TABLE t(a); INSERT INTO t VALUES(1);")
+            .unwrap();
+        // hold it open so -wal and -shm are on disk beside the database
+        assert!(dir.path().join("app.db-wal").exists());
+
+        let out = SqliteProvider::new()
+            .extract_schema(&params_for_dir(dir.path()))
+            .expect("one database, two sidecars — not three candidates");
+        assert!(out.contains("\"name\":\"t\""), "{out}");
+    }
+
+    /// The override is reachable from the environment, not only from a caller —
+    /// it was previously documented as an override while nothing but a test
+    /// could set it.
+    #[test]
+    fn the_environment_override_selects_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let chosen = dir.path().join("chosen.db");
+        let c = rusqlite::Connection::open(&chosen).unwrap();
+        c.execute_batch("CREATE TABLE picked(a)").unwrap();
+        drop(c);
+        let other = rusqlite::Connection::open(dir.path().join("other.db")).unwrap();
+        other.execute_batch("CREATE TABLE ignored(a)").unwrap();
+        drop(other);
+
+        // Ambiguous without help.
+        assert!(
+            SqliteProvider::new()
+                .extract_schema(&params_for_dir(dir.path()))
+                .is_err()
+        );
+
+        // Params carry the same key the environment would supply.
+        let mut params = params_for_dir(dir.path());
+        params.env.push((
+            ENV_DB_PATH.to_string(),
+            chosen.to_string_lossy().into_owned(),
+        ));
+        let out = SqliteProvider::new().extract_schema(&params).unwrap();
+        assert!(out.contains("picked"), "{out}");
+        assert!(!out.contains("ignored"), "{out}");
     }
 
     #[test]
