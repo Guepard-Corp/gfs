@@ -13,6 +13,11 @@ GFS provides an MCP (Model Context Protocol) server for AI agent integration, en
 - MySQL (versions 8.0-8.1)
 - SQLite (version 3) — file-based; needs no container runtime
 
+With SQLite, `init`, `commit`, `log`, `status`, `checkout`, `extract_schema`,
+`show_schema`, `diff_schema`, `export_database`, `import_database` and `query`
+all work with no container runtime running. `compute` and `user` do not apply:
+there is no server to start and no roles to manage.
+
 ## Installation
 
 ### 1. Verify GFS CLI is installed
@@ -208,9 +213,17 @@ Executes SQL queries against the database or returns connection information.
 Parameters:
 - `query` (optional) - SQL query to execute (omit for connection info)
 - `path` (optional) - Repository location
-- `database` (optional) - Override database name
+- `database` (optional) - Override database name. Not accepted for SQLite: the
+  file *is* the database, so there is nothing to select, and passing it is an
+  error rather than a silently ignored argument.
 
-Returns: Query results or connection information if no query provided.
+Returns: Query results or connection information if no query provided. For
+SQLite the connection information is a `sqlite:` URL to the file in the active
+workspace, with no host or port.
+
+This tool runs the database's own client on the host — `psql`, `mysql`,
+`sqlite3` — so that binary must be installed. Nothing else in this list needs
+it: GFS reads SQLite through a linked engine.
 
 ### 9. Schema Operations
 

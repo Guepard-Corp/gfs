@@ -441,6 +441,100 @@ pub trait Compute: Send + Sync {
     ) -> Result<ExecOutput>;
 }
 
+pub(crate) fn missing_runtime_error() -> ComputeError {
+    ComputeError::Internal("repository has no configured compute runtime".to_string())
+}
+
+/// The compute backend for a repository that has no container runtime.
+///
+/// An embedded provider such as SQLite is a file the CLI opens in-process, so
+/// there is no daemon to reach and nothing to construct a client for. Building
+/// a real `Compute` for such a repository fails at construction — before the
+/// command can decide it did not need one — which is how every tool in a
+/// process ends up unusable because one of them might have wanted Docker.
+///
+/// This stands in instead. Constructing it always succeeds; every call reports
+/// that the repository has no runtime, at the point where a runtime is actually
+/// required. Callers that never touch compute are unaffected.
+#[derive(Debug, Default)]
+pub struct NoopCompute;
+
+#[async_trait]
+impl Compute for NoopCompute {
+    async fn provision(&self, _definition: &ComputeDefinition) -> Result<InstanceId> {
+        Err(missing_runtime_error())
+    }
+
+    async fn start(&self, _id: &InstanceId, _options: StartOptions) -> Result<InstanceStatus> {
+        Err(missing_runtime_error())
+    }
+
+    async fn stop(&self, _id: &InstanceId) -> Result<InstanceStatus> {
+        Err(missing_runtime_error())
+    }
+
+    async fn restart(&self, _id: &InstanceId) -> Result<InstanceStatus> {
+        Err(missing_runtime_error())
+    }
+
+    async fn status(&self, _id: &InstanceId) -> Result<InstanceStatus> {
+        Err(missing_runtime_error())
+    }
+
+    async fn get_connection_info(
+        &self,
+        _id: &InstanceId,
+        _compute_port: u16,
+    ) -> Result<InstanceConnectionInfo> {
+        Err(missing_runtime_error())
+    }
+
+    async fn prepare_for_snapshot(&self, _id: &InstanceId, _commands: &[String]) -> Result<()> {
+        Err(missing_runtime_error())
+    }
+
+    async fn logs(&self, _id: &InstanceId, _options: LogsOptions) -> Result<Vec<LogEntry>> {
+        Err(missing_runtime_error())
+    }
+
+    async fn pause(&self, _id: &InstanceId) -> Result<InstanceStatus> {
+        Err(missing_runtime_error())
+    }
+
+    async fn unpause(&self, _id: &InstanceId) -> Result<InstanceStatus> {
+        Err(missing_runtime_error())
+    }
+
+    async fn get_instance_data_mount_host_path(
+        &self,
+        _id: &InstanceId,
+        _compute_data_path: &str,
+    ) -> Result<Option<std::path::PathBuf>> {
+        Err(missing_runtime_error())
+    }
+
+    async fn remove_instance(&self, _id: &InstanceId) -> Result<()> {
+        Err(missing_runtime_error())
+    }
+
+    async fn get_task_connection_info(
+        &self,
+        _id: &InstanceId,
+        _compute_port: u16,
+    ) -> Result<InstanceConnectionInfo> {
+        Err(missing_runtime_error())
+    }
+
+    async fn run_task(
+        &self,
+        _definition: &ComputeDefinition,
+        _command: &str,
+        _linked_to: Option<&InstanceId>,
+    ) -> Result<ExecOutput> {
+        Err(missing_runtime_error())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

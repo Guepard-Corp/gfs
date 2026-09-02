@@ -32,6 +32,9 @@ axum = { version = "0.7", features = ["json", "macros"] }
 tokio-util = "0.7"
 atty = "0.2"
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 gfs-storage-apfs = { workspace = true }
 
