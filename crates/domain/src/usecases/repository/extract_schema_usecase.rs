@@ -184,6 +184,9 @@ impl<R: DatabaseProviderRegistry> ExtractSchemaUseCase<R> {
         provider: &dyn DatabaseProvider,
         provider_name: &str,
     ) -> Result<String, ExtractSchemaError> {
+        let container = provider
+            .require_container()
+            .map_err(|e| ExtractSchemaError::NotConfigured(e.to_string()))?;
         let container_name = config
             .runtime
             .as_ref()
@@ -202,7 +205,7 @@ impl<R: DatabaseProviderRegistry> ExtractSchemaUseCase<R> {
         // database on 127.0.0.1 rather than the container's network IP.
         let conn_info = self
             .compute
-            .get_task_connection_info(&instance_id, provider.default_port())
+            .get_task_connection_info(&instance_id, container.default_port())
             .await?;
 
         let params = ConnectionParams {
@@ -211,7 +214,7 @@ impl<R: DatabaseProviderRegistry> ExtractSchemaUseCase<R> {
             env: conn_info.env,
         };
 
-        let spec = provider
+        let spec = container
             .schema_extraction_spec(&params)
             .map_err(|e| ExtractSchemaError::ExtractionFailed(e.to_string()))?
             .ok_or_else(|| {
@@ -371,8 +374,9 @@ mod tests {
         PortMapping, StartOptions,
     };
     use crate::ports::database_provider::{
-        ConnectionParams, DatabaseProvider, DatabaseProviderArg, DatabaseProviderRegistry,
-        ProviderError, Result as RegistryResult, SIGTERM, SchemaExtractionSpec, SupportedFeature,
+        ConnectionParams, ContainerProvider, DatabaseProvider, DatabaseProviderArg,
+        DatabaseProviderRegistry, ProviderError, Result as RegistryResult, SIGTERM,
+        SchemaExtractionSpec, SupportedFeature,
     };
 
     fn existing_repo_path() -> (TempDir, std::path::PathBuf) {
@@ -660,6 +664,35 @@ GFS_SCHEMA_COLUMNS
         fn name(&self) -> &str {
             "mock-schema"
         }
+        fn connection_string(
+            &self,
+            _: &ConnectionParams,
+        ) -> std::result::Result<String, ProviderError> {
+            Ok("mock://localhost:5432".into())
+        }
+        fn supported_versions(&self) -> Vec<String> {
+            vec!["latest".to_string()]
+        }
+        fn supported_features(&self) -> Vec<SupportedFeature> {
+            vec![SupportedFeature {
+                id: "schema".into(),
+                description: "Schema support.".into(),
+            }]
+        }
+        fn query_client_command(
+            &self,
+            _: &ConnectionParams,
+            _: Option<&str>,
+        ) -> std::result::Result<std::process::Command, ProviderError> {
+            Ok(std::process::Command::new("true"))
+        }
+
+        fn container(&self) -> Option<&dyn ContainerProvider> {
+            Some(self)
+        }
+    }
+
+    impl ContainerProvider for MockSchemaProvider {
         fn definition(&self) -> ComputeDefinition {
             ComputeDefinition {
                 labels: Default::default(),
@@ -686,30 +719,8 @@ GFS_SCHEMA_COLUMNS
         fn default_signal(&self) -> u32 {
             SIGTERM
         }
-        fn connection_string(
-            &self,
-            _: &ConnectionParams,
-        ) -> std::result::Result<String, ProviderError> {
-            Ok("mock://localhost:5432".into())
-        }
-        fn supported_versions(&self) -> Vec<String> {
-            vec!["latest".to_string()]
-        }
-        fn supported_features(&self) -> Vec<SupportedFeature> {
-            vec![SupportedFeature {
-                id: "schema".into(),
-                description: "Schema support.".into(),
-            }]
-        }
         fn prepare_for_snapshot(&self, _: &ConnectionParams) -> RegistryResult<Vec<String>> {
             Ok(vec![])
-        }
-        fn query_client_command(
-            &self,
-            _: &ConnectionParams,
-            _: Option<&str>,
-        ) -> std::result::Result<std::process::Command, ProviderError> {
-            Ok(std::process::Command::new("true"))
         }
         fn schema_extraction_spec(
             &self,

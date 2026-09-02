@@ -28,20 +28,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use gfs_domain::ports::compute::{ComputeDefinition, EnvVar, PortMapping};
 use gfs_domain::ports::database_provider::{
-    ConnectionParams, DataFormat, DatabaseProvider, DatabaseProviderArg, DatabaseProviderRegistry,
-    ExportSpec, ImportSpec, LOCAL_DATA_DIR_ENV, LocalEngine, ProviderError, Result, SnapshotGuard,
-    SupportedFeature,
+    ConnectionParams, DataFormat, DatabaseProvider, DatabaseProviderRegistry, LOCAL_DATA_DIR_ENV,
+    LocalEngine, ProviderError, Result, SnapshotGuard, SupportedFeature,
 };
 
 const NAME: &str = "sqlite";
-
-/// Placeholder image. Never pulled: `requires_compute()` is `false`, so nothing
-/// provisions a container from this definition. The tag still matters because
-/// `init` rewrites it to `<base>:<database_version>` and `version_from_image`
-/// reads the version back out of it.
-const DEFAULT_IMAGE: &str = "sqlite:3";
 
 /// Filename of the database inside the workspace data directory.
 pub const DB_FILENAME: &str = "db.sqlite";
@@ -50,9 +42,6 @@ pub const DB_FILENAME: &str = "db.sqlite";
 /// pointing at a database outside the workspace. When absent the file is
 /// resolved as [`LOCAL_DATA_DIR_ENV`] joined with [`DB_FILENAME`].
 pub const ENV_DB_PATH: &str = "SQLITE_DB_PATH";
-
-/// Directory the export/import artifact contract writes to and reads from.
-const ARTIFACT_DIR: &str = "/data";
 
 /// Single namespace SQLite exposes. Mirrors postgres's `public`.
 const MAIN_SCHEMA: &str = "main";
@@ -119,30 +108,6 @@ impl SqliteProvider {
         Self
     }
 
-    fn definition_impl() -> ComputeDefinition {
-        ComputeDefinition {
-            labels: Default::default(),
-            image: DEFAULT_IMAGE.to_string(),
-            env: vec![EnvVar {
-                name: ENV_DB_PATH.to_string(),
-                default: None,
-            }],
-            // `ports` is documented as mandatory and callers iterate over it, so
-            // the list must be non-empty. Port 0 signals "no listener"; nothing
-            // binds it because SQLite has no server to reach.
-            ports: vec![PortMapping {
-                compute_port: 0,
-                host_port: None,
-            }],
-            data_dir: PathBuf::from(ARTIFACT_DIR),
-            host_data_dir: None,
-            user: None,
-            logs_dir: None,
-            conf_dir: None,
-            args: vec![],
-        }
-    }
-
     /// Absolute path of the database file.
     ///
     /// Normally the workspace data directory the caller supplied, joined with
@@ -156,16 +121,6 @@ impl SqliteProvider {
             .get_env(LOCAL_DATA_DIR_ENV)
             .ok_or_else(|| ProviderError::MissingEnvVar(LOCAL_DATA_DIR_ENV.to_string()))?;
         Ok(Path::new(dir).join(DB_FILENAME))
-    }
-
-    /// Single-quote `path` for POSIX `sh`.
-    ///
-    /// The export and import specs embed the database path in a shell string, so
-    /// a path containing a quote, a space or a metacharacter must not be able to
-    /// terminate the argument. The standard POSIX idiom closes the quote, emits
-    /// an escaped quote, and reopens: `it's` becomes `'it'\''s'`.
-    fn shell_quote(path: &str) -> String {
-        format!("'{}'", path.replace('\'', r"'\''"))
     }
 
     fn open(path: &Path) -> std::result::Result<rusqlite::Connection, ProviderError> {
@@ -194,18 +149,6 @@ impl DatabaseProvider for SqliteProvider {
         Some(self)
     }
 
-    fn definition(&self) -> ComputeDefinition {
-        Self::definition_impl()
-    }
-
-    fn default_port(&self) -> u16 {
-        0
-    }
-
-    fn default_args(&self) -> Vec<DatabaseProviderArg> {
-        vec![]
-    }
-
     fn connection_string(
         &self,
         params: &ConnectionParams,
@@ -221,28 +164,10 @@ impl DatabaseProvider for SqliteProvider {
     }
 
     fn supported_features(&self) -> Vec<SupportedFeature> {
-        vec![
-            SupportedFeature {
-                id: "schema".into(),
-                description: "Schema and DDL inspection".into(),
-            },
-            SupportedFeature {
-                id: "import".into(),
-                description: "Import a SQL dump into the database".into(),
-            },
-            SupportedFeature {
-                id: "export".into(),
-                description: "Export the database as a SQL dump".into(),
-            },
-        ]
-    }
-
-    /// Nothing for a compute runtime to execute.
-    ///
-    /// SQLite has no instance to `exec` into; the equivalent preparation runs in
-    /// this process via [`LocalEngine::prepare_for_snapshot`].
-    fn prepare_for_snapshot(&self, _params: &ConnectionParams) -> Result<Vec<String>> {
-        Ok(vec![])
+        vec![SupportedFeature {
+            id: "schema".into(),
+            description: "Schema and DDL inspection".into(),
+        }]
     }
 
     fn query_client_command(
@@ -343,66 +268,17 @@ impl DatabaseProvider for SqliteProvider {
         queries
     }
 
+    /// Nothing yet. Export needs an in-process implementation on
+    /// [`LocalEngine`]; until it exists this advertises nothing, because a
+    /// capability `gfs providers` lists but cannot run is worse than a shorter
+    /// list.
     fn supported_export_formats(&self) -> Vec<DataFormat> {
-        vec![DataFormat {
-            id: "sql".into(),
-            description: "SQLite SQL dump".into(),
-            file_extension: ".sql".into(),
-        }]
+        vec![]
     }
 
+    /// Nothing yet — see [`SqliteProvider::supported_export_formats`].
     fn supported_import_formats(&self) -> Vec<DataFormat> {
-        vec![DataFormat {
-            id: "sql".into(),
-            description: "SQL script".into(),
-            file_extension: ".sql".into(),
-        }]
-    }
-
-    /// Dump the database as SQL into the artifact directory.
-    ///
-    /// The output path is absolute. A redirect relative to the working directory
-    /// would land outside the directory the caller collects the artifact from.
-    fn export_spec(
-        &self,
-        params: &ConnectionParams,
-        format: &str,
-    ) -> std::result::Result<ExportSpec, ProviderError> {
-        let (verb, filename) = match format {
-            "sql" => (".dump", "export.sql"),
-            "schema" => (".schema", "schema.sql"),
-            other => return Err(ProviderError::UnsupportedFormat(other.to_string())),
-        };
-
-        Ok(ExportSpec {
-            definition: Self::definition_impl(),
-            command: format!(
-                "sqlite3 {db} {verb} > {ARTIFACT_DIR}/{filename}",
-                db = Self::shell_quote(&Self::db_path(params)?.to_string_lossy()),
-            ),
-            output_filename: filename.to_string(),
-        })
-    }
-
-    /// Replay a SQL script into the database, reading from an absolute path.
-    fn import_spec(
-        &self,
-        params: &ConnectionParams,
-        format: &str,
-        input_filename: &str,
-    ) -> std::result::Result<ImportSpec, ProviderError> {
-        if format != "sql" {
-            return Err(ProviderError::UnsupportedFormat(format.to_string()));
-        }
-
-        Ok(ImportSpec {
-            definition: Self::definition_impl(),
-            command: format!(
-                "sqlite3 {db} < {ARTIFACT_DIR}/{input_filename}",
-                db = Self::shell_quote(&Self::db_path(params)?.to_string_lossy()),
-            ),
-            input_filename: input_filename.to_string(),
-        })
+        vec![]
     }
 }
 
@@ -579,24 +455,28 @@ mod tests {
         params_with_path(path.to_str().unwrap())
     }
 
+    /// Every advertised capability must have a code path that runs. Export and
+    /// import were once listed here while resolving to container commands that
+    /// could never execute, so `gfs providers` promised what it could not do.
+    #[test]
+    fn advertises_only_capabilities_that_exist() {
+        let p = SqliteProvider::new();
+        let features: Vec<_> = p.supported_features().into_iter().map(|f| f.id).collect();
+        assert_eq!(features, vec!["schema".to_string()]);
+        assert!(p.supported_export_formats().is_empty());
+        assert!(p.supported_import_formats().is_empty());
+    }
+
     #[test]
     fn registers_as_sqlite_and_needs_no_compute() {
         let p = SqliteProvider::new();
         assert_eq!(p.name(), "sqlite");
-        assert!(!p.requires_compute(), "derived from local_engine()");
-        assert!(p.local_engine().is_some());
-        assert_eq!(p.default_port(), 0);
-    }
-
-    #[test]
-    fn definition_carries_labels_and_version_tag() {
-        let p = SqliteProvider::new();
-        let def = p.definition();
-        assert!(def.labels.is_empty(), "labels field must be present");
-        // `init` rewrites the tag to the configured version and reads it back
-        // with `version_from_image`, so the base must be splittable on ':'.
-        assert_eq!(def.image, "sqlite:3");
-        assert_eq!(p.version_from_image(&def), "3");
+        assert!(p.local_engine().is_some(), "sqlite runs in this process");
+        assert!(
+            p.container().is_none(),
+            "there is no container half to fabricate a definition from"
+        );
+        assert!(!p.requires_compute(), "derived from container()");
     }
 
     #[test]
@@ -640,17 +520,6 @@ mod tests {
         let with_query = p.query_client_command(&params, Some("SELECT 1;")).unwrap();
         let args: Vec<_> = with_query.get_args().collect();
         assert_eq!(args, ["/srv/db.sqlite", "SELECT 1;"]);
-    }
-
-    #[test]
-    fn nothing_is_delegated_to_a_compute_runtime() {
-        let p = SqliteProvider::new();
-        assert!(
-            DatabaseProvider::prepare_for_snapshot(&p, &params_with_path("/srv/db.sqlite"))
-                .unwrap()
-                .is_empty(),
-            "there is no instance to exec into"
-        );
     }
 
     #[test]
@@ -892,51 +761,5 @@ mod tests {
         let out = SqliteProvider::new().extract_schema(&params).unwrap();
         let reported = out.lines().nth(1).unwrap();
         assert_eq!(reported, rusqlite::version());
-    }
-
-    #[test]
-    fn export_and_import_use_absolute_artifact_paths() {
-        let p = SqliteProvider::new();
-        let params = params_with_path("/srv/db.sqlite");
-
-        let export = p.export_spec(&params, "sql").unwrap();
-        assert_eq!(export.output_filename, "export.sql");
-        assert!(
-            export.command.contains("> /data/export.sql"),
-            "redirect must be absolute, not relative to the working directory"
-        );
-
-        let schema_only = p.export_spec(&params, "schema").unwrap();
-        assert!(schema_only.command.contains(".schema"));
-        assert_eq!(schema_only.output_filename, "schema.sql");
-
-        let import = p.import_spec(&params, "sql", "seed.sql").unwrap();
-        assert!(import.command.contains("< /data/seed.sql"));
-        assert_eq!(import.input_filename, "seed.sql");
-    }
-
-    #[test]
-    fn shell_metacharacters_in_the_path_cannot_escape_the_quoting() {
-        let p = SqliteProvider::new();
-        let spec = p
-            .export_spec(&params_with_path("/tmp/it's here; rm -rf /"), "sql")
-            .unwrap();
-        // The apostrophe is closed, escaped and reopened, so the `;` stays inside
-        // the quoted argument instead of becoming a command separator.
-        assert!(spec.command.contains(r"'/tmp/it'\''s here; rm -rf /'"));
-    }
-
-    #[test]
-    fn unsupported_formats_are_rejected() {
-        let p = SqliteProvider::new();
-        let params = params_with_path("/srv/db.sqlite");
-        assert!(matches!(
-            p.export_spec(&params, "csv"),
-            Err(ProviderError::UnsupportedFormat(_))
-        ));
-        assert!(matches!(
-            p.import_spec(&params, "csv", "x.csv"),
-            Err(ProviderError::UnsupportedFormat(_))
-        ));
     }
 }

@@ -95,7 +95,7 @@ pub async fn run(
 
     // Get connection info from the running container
     let instance_id = InstanceId(container_name.clone());
-    let default_port = provider.default_port();
+    let default_port = provider.require_container()?.default_port();
 
     let conn_info = compute
         .get_connection_info(&instance_id, default_port)

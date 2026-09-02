@@ -131,8 +131,57 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
                 ))
             })?;
 
+        // An embedded provider has no container to provision, so nothing below
+        // this point applies to it — not the image, not the port mapping, not
+        // the container credentials or labels. Record the environment and stop.
+        // Leaving `RuntimeConfig` absent is the signal the commit, checkout and
+        // status paths already read as "no instance to manage".
+        if provider.container().is_none() {
+            // The version is taken straight from the caller. Container providers
+            // round-trip it through the image tag, which an embedded engine does
+            // not have.
+            let database_version = database_version
+                .filter(|v| !v.is_empty())
+                .ok_or(InitRepoError::DatabaseVersionRequired)?;
+
+            let workspace_data_dir = self
+                .repository
+                .get_workspace_data_dir_for_head(repo_path)
+                .await?;
+            // The engine creates its own files on first write, but the directory
+            // has to exist for that write to land.
+            std::fs::create_dir_all(&workspace_data_dir).map_err(|e| {
+                InitRepoError::Compute(ComputeError::Internal(format!(
+                    "failed to create workspace data dir '{}': {e}",
+                    workspace_data_dir.display()
+                )))
+            })?;
+
+            self.repository
+                .update_environment_config(
+                    repo_path,
+                    EnvironmentConfig {
+                        database_provider: provider.name().to_string(),
+                        database_version,
+                        database_port,
+                        display_name,
+                    },
+                )
+                .await?;
+
+            tracing::info!(
+                provider = provider.name(),
+                "database configured; no compute instance required"
+            );
+            return Ok(());
+        }
+
+        let container = provider
+            .require_container()
+            .map_err(|e| InitRepoError::Compute(ComputeError::Internal(e.to_string())))?;
+
         let params = crate::model::config::GfsConfig::load_compute_params(repo_path);
-        let mut definition = provider.definition_with_overrides(&params);
+        let mut definition = container.definition_with_overrides(&params);
         match image {
             // Explicit image override pins its own version (e.g. an image that
             // bundles an extension the default image lacks, like pgvector).
@@ -152,7 +201,7 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
 
         if let Some(port) = database_port {
             for mapping in &mut definition.ports {
-                if mapping.compute_port == provider.default_port() {
+                if mapping.compute_port == container.default_port() {
                     mapping.host_port = Some(port);
                 }
             }
@@ -195,44 +244,7 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         // without connecting to the database. Caller-supplied labels are merged
         // last and win: a plain `init` stays `gfs.role=source`, while `gfs clone`
         // passes `gfs.role=clone` + `gfs.remote=<host>`.
-        let provider_version = provider.version_from_image(&definition);
-
-        // An embedded provider has no container to provision. Record the
-        // environment and stop: leaving `RuntimeConfig` absent is the signal the
-        // commit, checkout and status paths already read as "no instance to
-        // manage", so no other guard has to learn about this case.
-        if provider.local_engine().is_some() {
-            let workspace_data_dir = self
-                .repository
-                .get_workspace_data_dir_for_head(repo_path)
-                .await?;
-            // The engine creates its own files on first write, but the directory
-            // has to exist for that write to land.
-            std::fs::create_dir_all(&workspace_data_dir).map_err(|e| {
-                InitRepoError::Compute(ComputeError::Internal(format!(
-                    "failed to create workspace data dir '{}': {e}",
-                    workspace_data_dir.display()
-                )))
-            })?;
-
-            self.repository
-                .update_environment_config(
-                    repo_path,
-                    EnvironmentConfig {
-                        database_provider: provider.name().to_string(),
-                        database_version: provider_version,
-                        database_port,
-                        display_name,
-                    },
-                )
-                .await?;
-
-            tracing::info!(
-                provider = provider.name(),
-                "database configured; no compute instance required"
-            );
-            return Ok(());
-        }
+        let provider_version = container.version_from_image(&definition);
 
         let compute = self.compute.as_ref().ok_or_else(|| {
             InitRepoError::Compute(ComputeError::Internal(
@@ -340,8 +352,9 @@ mod tests {
         Compute, ComputeDefinition, InstanceId, InstanceState, InstanceStatus, StartOptions,
     };
     use crate::ports::database_provider::{
-        ConnectionParams, DatabaseProvider, DatabaseProviderArg, DatabaseProviderRegistry,
-        ProviderError, Result as RegistryResult, SIGTERM, SupportedFeature,
+        ConnectionParams, ContainerProvider, DatabaseProvider, DatabaseProviderArg,
+        DatabaseProviderRegistry, ProviderError, Result as RegistryResult, SIGTERM,
+        SupportedFeature,
     };
     use crate::ports::repository::{Repository, RepositoryError};
 
@@ -643,6 +656,32 @@ mod tests {
         fn name(&self) -> &str {
             "postgres"
         }
+        fn connection_string(
+            &self,
+            _: &ConnectionParams,
+        ) -> std::result::Result<String, ProviderError> {
+            Ok("postgres://localhost:5432".into())
+        }
+        fn supported_versions(&self) -> Vec<String> {
+            vec!["17".into()]
+        }
+        fn supported_features(&self) -> Vec<SupportedFeature> {
+            vec![]
+        }
+        fn query_client_command(
+            &self,
+            _: &ConnectionParams,
+            _: Option<&str>,
+        ) -> std::result::Result<std::process::Command, ProviderError> {
+            Ok(std::process::Command::new("true"))
+        }
+
+        fn container(&self) -> Option<&dyn ContainerProvider> {
+            Some(self)
+        }
+    }
+
+    impl ContainerProvider for MockProvider {
         fn definition(&self) -> ComputeDefinition {
             ComputeDefinition {
                 labels: Default::default(),
@@ -666,27 +705,8 @@ mod tests {
         fn default_signal(&self) -> u32 {
             SIGTERM
         }
-        fn connection_string(
-            &self,
-            _: &ConnectionParams,
-        ) -> std::result::Result<String, ProviderError> {
-            Ok("postgres://localhost:5432".into())
-        }
-        fn supported_versions(&self) -> Vec<String> {
-            vec!["17".into()]
-        }
-        fn supported_features(&self) -> Vec<SupportedFeature> {
-            vec![]
-        }
         fn prepare_for_snapshot(&self, _: &ConnectionParams) -> RegistryResult<Vec<String>> {
             Ok(vec![])
-        }
-        fn query_client_command(
-            &self,
-            _: &ConnectionParams,
-            _: Option<&str>,
-        ) -> std::result::Result<std::process::Command, ProviderError> {
-            Ok(std::process::Command::new("true"))
         }
     }
 
@@ -722,26 +742,6 @@ mod tests {
         fn local_engine(&self) -> Option<&dyn crate::ports::database_provider::LocalEngine> {
             Some(self)
         }
-        fn definition(&self) -> ComputeDefinition {
-            ComputeDefinition {
-                labels: Default::default(),
-                image: "embedded:9".into(),
-                env: vec![],
-                ports: vec![],
-                data_dir: PathBuf::from("/data"),
-                host_data_dir: None,
-                user: None,
-                logs_dir: None,
-                conf_dir: None,
-                args: vec![],
-            }
-        }
-        fn default_port(&self) -> u16 {
-            0
-        }
-        fn default_args(&self) -> Vec<DatabaseProviderArg> {
-            vec![]
-        }
         fn connection_string(
             &self,
             _: &ConnectionParams,
@@ -753,9 +753,6 @@ mod tests {
         }
         fn supported_features(&self) -> Vec<SupportedFeature> {
             vec![]
-        }
-        fn prepare_for_snapshot(&self, _: &ConnectionParams) -> RegistryResult<Vec<String>> {
-            Ok(vec![])
         }
         fn query_client_command(
             &self,

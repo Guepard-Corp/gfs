@@ -1133,6 +1133,8 @@ async fn start_or_restart(
         .get(provider_name)
         .ok_or_else(|| to_error_data(format!("unknown database provider: {}", provider_name)))?;
     let compute_data_path = provider
+        .require_container()
+        .map_err(|e| to_error_data(e.to_string()))?
         .definition()
         .data_dir
         .to_string_lossy()
@@ -1153,7 +1155,10 @@ async fn start_or_restart(
             .remove_instance(instance_id)
             .await
             .map_err(|e| to_error_data(e.to_string()))?;
-        let mut definition = provider.definition_with_overrides(&config.compute_params());
+        let mut definition = provider
+            .require_container()
+            .map_err(|e| to_error_data(e.to_string()))?
+            .definition_with_overrides(&config.compute_params());
         if let Some(ref env) = config.environment
             && !env.database_version.is_empty()
         {
@@ -1580,7 +1585,10 @@ async fn do_query(args: &serde_json::Value) -> Result<CallToolResult, McpError> 
 
     // Get connection info from the running container
     let instance_id = InstanceId(container_name.clone());
-    let default_port = provider.default_port();
+    let default_port = provider
+        .require_container()
+        .map_err(|e| to_error_data(e.to_string()))?
+        .default_port();
 
     let conn_info = compute
         .get_connection_info(&instance_id, default_port)

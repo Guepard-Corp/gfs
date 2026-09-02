@@ -135,7 +135,7 @@ async fn remove_gfs_as_root(
 
     // Reuse the repo's own engine image (guaranteed present locally): re-tag the
     // provider default with the configured major version.
-    let mut definition = provider.definition();
+    let mut definition = provider.require_container()?.definition();
     if let Some(env) = config.environment.as_ref()
         && !env.database_version.is_empty()
         && let Some((base, _)) = definition.image.clone().rsplit_once(':')

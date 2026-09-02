@@ -581,16 +581,19 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
             let provider = self.registry.get(&env.database_provider).ok_or_else(|| {
                 CommitRepoError::UnknownDatabaseProvider(env.database_provider.clone())
             })?;
+            let container = provider.require_container().map_err(|e| {
+                CommitRepoError::Repository(RepositoryError::Internal(e.to_string()))
+            })?;
             let conn_info = self
                 .compute
-                .get_connection_info(&instance_id, provider.default_port())
+                .get_connection_info(&instance_id, container.default_port())
                 .await?;
             let params = ConnectionParams {
                 host: conn_info.host,
                 port: conn_info.port,
                 env: conn_info.env,
             };
-            let commands = provider.prepare_for_snapshot(&params).map_err(|e| {
+            let commands = container.prepare_for_snapshot(&params).map_err(|e| {
                 CommitRepoError::Repository(RepositoryError::Internal(e.to_string()))
             })?;
             self.compute
@@ -734,6 +737,10 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                         CommitRepoError::UnknownDatabaseProvider(env.database_provider.clone())
                     })?;
                     let container_data_path = provider
+                        .require_container()
+                        .map_err(|e| {
+                            CommitRepoError::Repository(RepositoryError::Internal(e.to_string()))
+                        })?
                         .definition()
                         .data_dir
                         .to_string_lossy()
@@ -936,8 +943,9 @@ mod tests {
         StartOptions,
     };
     use crate::ports::database_provider::{
-        ConnectionParams, DatabaseProvider, DatabaseProviderArg, DatabaseProviderRegistry,
-        ProviderError, Result as RegistryResult, SIGTERM, SupportedFeature,
+        ConnectionParams, ContainerProvider, DatabaseProvider, DatabaseProviderArg,
+        DatabaseProviderRegistry, ProviderError, Result as RegistryResult, SIGTERM,
+        SupportedFeature,
     };
     use crate::ports::repository::{LogOptions, RemoteOptions, Repository};
     use crate::ports::storage::{
@@ -1429,6 +1437,35 @@ mod tests {
         fn name(&self) -> &str {
             "mock-db"
         }
+        fn connection_string(
+            &self,
+            _: &ConnectionParams,
+        ) -> std::result::Result<String, ProviderError> {
+            Ok("mock://localhost:5432".into())
+        }
+        fn supported_versions(&self) -> Vec<String> {
+            vec!["latest".to_string()]
+        }
+        fn supported_features(&self) -> Vec<SupportedFeature> {
+            vec![SupportedFeature {
+                id: "schema".into(),
+                description: "Schema support.".into(),
+            }]
+        }
+        fn query_client_command(
+            &self,
+            _: &ConnectionParams,
+            _: Option<&str>,
+        ) -> std::result::Result<std::process::Command, ProviderError> {
+            Ok(std::process::Command::new("true"))
+        }
+
+        fn container(&self) -> Option<&dyn crate::ports::database_provider::ContainerProvider> {
+            Some(self)
+        }
+    }
+
+    impl ContainerProvider for MockProvider {
         fn definition(&self) -> ComputeDefinition {
             ComputeDefinition {
                 labels: Default::default(),
@@ -1452,30 +1489,8 @@ mod tests {
         fn default_signal(&self) -> u32 {
             SIGTERM
         }
-        fn connection_string(
-            &self,
-            _: &ConnectionParams,
-        ) -> std::result::Result<String, ProviderError> {
-            Ok("mock://localhost:5432".into())
-        }
-        fn supported_versions(&self) -> Vec<String> {
-            vec!["latest".to_string()]
-        }
-        fn supported_features(&self) -> Vec<SupportedFeature> {
-            vec![SupportedFeature {
-                id: "schema".into(),
-                description: "Schema support.".into(),
-            }]
-        }
         fn prepare_for_snapshot(&self, _: &ConnectionParams) -> RegistryResult<Vec<String>> {
             Ok(vec![])
-        }
-        fn query_client_command(
-            &self,
-            _: &ConnectionParams,
-            _: Option<&str>,
-        ) -> std::result::Result<std::process::Command, ProviderError> {
-            Ok(std::process::Command::new("true"))
         }
     }
 
@@ -2588,6 +2603,32 @@ mod tests {
             fn name(&self) -> &str {
                 PROVIDER_NAME
             }
+            fn connection_string(
+                &self,
+                _: &ConnectionParams,
+            ) -> std::result::Result<String, ProviderError> {
+                Ok("mock://localhost:5432".into())
+            }
+            fn supported_versions(&self) -> Vec<String> {
+                vec!["latest".into()]
+            }
+            fn supported_features(&self) -> Vec<SupportedFeature> {
+                vec![]
+            }
+            fn query_client_command(
+                &self,
+                _: &ConnectionParams,
+                _: Option<&str>,
+            ) -> std::result::Result<std::process::Command, ProviderError> {
+                Ok(std::process::Command::new("true"))
+            }
+
+            fn container(&self) -> Option<&dyn crate::ports::database_provider::ContainerProvider> {
+                Some(self)
+            }
+        }
+
+        impl crate::ports::database_provider::ContainerProvider for OverlapProvider {
             fn definition(&self) -> ComputeDefinition {
                 ComputeDefinition {
                     labels: Default::default(),
@@ -2611,27 +2652,8 @@ mod tests {
             fn default_signal(&self) -> u32 {
                 SIGTERM
             }
-            fn connection_string(
-                &self,
-                _: &ConnectionParams,
-            ) -> std::result::Result<String, ProviderError> {
-                Ok("mock://localhost:5432".into())
-            }
-            fn supported_versions(&self) -> Vec<String> {
-                vec!["latest".into()]
-            }
-            fn supported_features(&self) -> Vec<SupportedFeature> {
-                vec![]
-            }
             fn prepare_for_snapshot(&self, _: &ConnectionParams) -> RegistryResult<Vec<String>> {
                 Ok(vec!["CHECKPOINT".into()])
-            }
-            fn query_client_command(
-                &self,
-                _: &ConnectionParams,
-                _: Option<&str>,
-            ) -> std::result::Result<std::process::Command, ProviderError> {
-                Ok(std::process::Command::new("true"))
             }
             fn schema_extraction_spec(
                 &self,

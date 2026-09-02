@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use gfs_domain::ports::compute::{ComputeDefinition, EnvVar, PortMapping};
 use gfs_domain::ports::database_provider::{
-    ConnectionParams, DataFormat, DatabaseProvider, DatabaseProviderArg, DatabaseProviderRegistry,
-    ExportSpec, ImportSpec, ProviderError, Result, SIGTERM, SchemaExtractionSpec, SupportedFeature,
+    ConnectionParams, ContainerProvider, DataFormat, DatabaseProvider, DatabaseProviderArg,
+    DatabaseProviderRegistry, ExportSpec, ImportSpec, ProviderError, Result, SIGTERM,
+    SchemaExtractionSpec, SupportedFeature,
 };
 
 const NAME: &str = "clickhouse";
@@ -146,22 +147,6 @@ impl DatabaseProvider for ClickhouseProvider {
         NAME
     }
 
-    fn definition(&self) -> ComputeDefinition {
-        Self::definition_impl()
-    }
-
-    fn default_port(&self) -> u16 {
-        9000
-    }
-
-    fn default_args(&self) -> Vec<DatabaseProviderArg> {
-        vec![]
-    }
-
-    fn default_signal(&self) -> u32 {
-        SIGTERM
-    }
-
     fn connection_string(
         &self,
         params: &ConnectionParams,
@@ -193,20 +178,6 @@ impl DatabaseProvider for ClickhouseProvider {
         ]
     }
 
-    fn prepare_for_snapshot(&self, _params: &ConnectionParams) -> Result<Vec<String>> {
-        // `gfs commit` pauses the container before snapshotting. For ClickHouse we currently
-        // rely on that crash-consistent snapshot and do not run extra pre-snapshot commands.
-        Ok(vec![])
-    }
-
-    fn data_dir_owner(&self) -> Option<&'static str> {
-        Some("clickhouse:clickhouse")
-    }
-
-    fn container_startup_probes(&self) -> &'static [&'static str] {
-        &["clickhouse-client --host 127.0.0.1 --query \"SELECT 1\" >/dev/null"]
-    }
-
     fn supported_export_formats(&self) -> Vec<DataFormat> {
         vec![DataFormat {
             id: "schema".into(),
@@ -228,6 +199,130 @@ impl DatabaseProvider for ClickhouseProvider {
                 file_extension: ".csv".into(),
             },
         ]
+    }
+
+    fn query_client_command(
+        &self,
+        params: &ConnectionParams,
+        query: Option<&str>,
+    ) -> std::result::Result<std::process::Command, ProviderError> {
+        let mut cmd = std::process::Command::new("clickhouse-client");
+        cmd.arg("--host").arg(&params.host);
+        cmd.arg("--port").arg(params.port.to_string());
+        cmd.arg("--user").arg(Self::user(params));
+        cmd.arg("--password").arg(Self::password(params));
+        cmd.arg("--database").arg(Self::database(params));
+
+        if let Some(q) = query {
+            cmd.arg("--query").arg(q);
+        }
+
+        Ok(cmd)
+    }
+
+    fn schema_extraction_queries(&self) -> std::collections::HashMap<String, String> {
+        let mut queries = std::collections::HashMap::new();
+
+        queries.insert("version".to_string(), "SELECT version();".to_string());
+
+        queries.insert(
+            "schemas".to_string(),
+            "SELECT
+                toInt64(cityHash64(name) % 9223372036854775807) AS id,
+                name,
+                engine AS owner
+            FROM system.databases
+            WHERE name NOT IN ('system', 'information_schema', 'INFORMATION_SCHEMA')
+            ORDER BY name"
+                .to_string(),
+        );
+
+        queries.insert(
+            "tables".to_string(),
+            "SELECT
+                toInt64(cityHash64(concat(database, '.', name)) % 9223372036854775807) AS id,
+                database AS schema,
+                name,
+                CAST(false AS Bool) AS rls_enabled,
+                CAST(false AS Bool) AS rls_forced,
+                toInt64(ifNull(total_bytes, 0)) AS bytes,
+                concat(toString(ifNull(total_bytes, 0)), ' bytes') AS size,
+                toInt64(ifNull(total_rows, 0)) AS live_rows_estimate,
+                0 AS dead_rows_estimate,
+                nullIf(comment, '') AS comment,
+                [] AS primary_keys,
+                [] AS relationships
+            FROM system.tables
+            WHERE database NOT IN ('system', 'information_schema', 'INFORMATION_SCHEMA')
+                AND is_temporary = 0
+            ORDER BY database, name"
+                .to_string(),
+        );
+
+        queries.insert(
+            "columns".to_string(),
+            "SELECT
+                concat(database, '.', table, '.', name) AS id,
+                toInt64(cityHash64(concat(database, '.', table)) % 9223372036854775807) AS table_id,
+                database AS schema,
+                table AS `table`,
+                name,
+                position AS ordinal_position,
+                type AS data_type,
+                type AS format,
+                CAST(false AS Bool) AS is_identity,
+                CAST(NULL AS Nullable(String)) AS identity_generation,
+                CAST(default_kind != '' AS Bool) AS is_generated,
+                CAST(startsWith(type, 'Nullable(') AS Bool) AS is_nullable,
+                CAST(default_kind != 'ALIAS' AS Bool) AS is_updatable,
+                CAST(false AS Bool) AS is_unique,
+                CAST(NULL AS Nullable(String)) AS `check`,
+                nullIf(default_expression, '') AS default_value,
+                [] AS enums,
+                nullIf(comment, '') AS comment
+            FROM system.columns
+            WHERE database NOT IN ('system', 'information_schema', 'INFORMATION_SCHEMA')
+            ORDER BY database, table, position"
+                .to_string(),
+        );
+
+        queries
+    }
+
+    fn container(&self) -> Option<&dyn ContainerProvider> {
+        Some(self)
+    }
+}
+
+impl ContainerProvider for ClickhouseProvider {
+    fn definition(&self) -> ComputeDefinition {
+        Self::definition_impl()
+    }
+
+    fn default_port(&self) -> u16 {
+        9000
+    }
+
+    fn default_args(&self) -> Vec<DatabaseProviderArg> {
+        vec![]
+    }
+
+    fn default_signal(&self) -> u32 {
+        SIGTERM
+    }
+
+    fn prepare_for_snapshot(&self, _params: &ConnectionParams) -> Result<Vec<String>> {
+        // `gfs commit` pauses the container before snapshotting. For ClickHouse we currently
+        // rely on that crash-consistent snapshot and do not run extra pre-snapshot commands.
+        Ok(vec![])
+    }
+
+    fn data_dir_owner(&self) -> Option<&'static str> {
+        Some("clickhouse:clickhouse")
+    }
+
+    fn container_startup_probes(&self) -> &'static [&'static str] {
+        &["clickhouse-client --host 127.0.0.1 --query \"SELECT 1\" >/dev/null"]
     }
 
     fn export_spec(
@@ -445,25 +540,6 @@ fi"#,
         })
     }
 
-    fn query_client_command(
-        &self,
-        params: &ConnectionParams,
-        query: Option<&str>,
-    ) -> std::result::Result<std::process::Command, ProviderError> {
-        let mut cmd = std::process::Command::new("clickhouse-client");
-        cmd.arg("--host").arg(&params.host);
-        cmd.arg("--port").arg(params.port.to_string());
-        cmd.arg("--user").arg(Self::user(params));
-        cmd.arg("--password").arg(Self::password(params));
-        cmd.arg("--database").arg(Self::database(params));
-
-        if let Some(q) = query {
-            cmd.arg("--query").arg(q);
-        }
-
-        Ok(cmd)
-    }
-
     fn query_in_instance_command(
         &self,
         sql: &str,
@@ -478,75 +554,6 @@ fi"#,
         Ok(format!(
             r#"clickhouse-client --host 127.0.0.1 --user "${{CLICKHOUSE_USER:-default}}" --password "${{CLICKHOUSE_PASSWORD:-clickhouse}}" --database {db} --query "{body}""#
         ))
-    }
-
-    fn schema_extraction_queries(&self) -> std::collections::HashMap<String, String> {
-        let mut queries = std::collections::HashMap::new();
-
-        queries.insert("version".to_string(), "SELECT version();".to_string());
-
-        queries.insert(
-            "schemas".to_string(),
-            "SELECT
-                toInt64(cityHash64(name) % 9223372036854775807) AS id,
-                name,
-                engine AS owner
-            FROM system.databases
-            WHERE name NOT IN ('system', 'information_schema', 'INFORMATION_SCHEMA')
-            ORDER BY name"
-                .to_string(),
-        );
-
-        queries.insert(
-            "tables".to_string(),
-            "SELECT
-                toInt64(cityHash64(concat(database, '.', name)) % 9223372036854775807) AS id,
-                database AS schema,
-                name,
-                CAST(false AS Bool) AS rls_enabled,
-                CAST(false AS Bool) AS rls_forced,
-                toInt64(ifNull(total_bytes, 0)) AS bytes,
-                concat(toString(ifNull(total_bytes, 0)), ' bytes') AS size,
-                toInt64(ifNull(total_rows, 0)) AS live_rows_estimate,
-                0 AS dead_rows_estimate,
-                nullIf(comment, '') AS comment,
-                [] AS primary_keys,
-                [] AS relationships
-            FROM system.tables
-            WHERE database NOT IN ('system', 'information_schema', 'INFORMATION_SCHEMA')
-                AND is_temporary = 0
-            ORDER BY database, name"
-                .to_string(),
-        );
-
-        queries.insert(
-            "columns".to_string(),
-            "SELECT
-                concat(database, '.', table, '.', name) AS id,
-                toInt64(cityHash64(concat(database, '.', table)) % 9223372036854775807) AS table_id,
-                database AS schema,
-                table AS `table`,
-                name,
-                position AS ordinal_position,
-                type AS data_type,
-                type AS format,
-                CAST(false AS Bool) AS is_identity,
-                CAST(NULL AS Nullable(String)) AS identity_generation,
-                CAST(default_kind != '' AS Bool) AS is_generated,
-                CAST(startsWith(type, 'Nullable(') AS Bool) AS is_nullable,
-                CAST(default_kind != 'ALIAS' AS Bool) AS is_updatable,
-                CAST(false AS Bool) AS is_unique,
-                CAST(NULL AS Nullable(String)) AS `check`,
-                nullIf(default_expression, '') AS default_value,
-                [] AS enums,
-                nullIf(comment, '') AS comment
-            FROM system.columns
-            WHERE database NOT IN ('system', 'information_schema', 'INFORMATION_SCHEMA')
-            ORDER BY database, table, position"
-                .to_string(),
-        );
-
-        queries
     }
 
     fn schema_extraction_spec(

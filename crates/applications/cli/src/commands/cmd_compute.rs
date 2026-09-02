@@ -432,6 +432,7 @@ async fn start_restart_or_recreate(
         .get(provider_name)
         .context("unknown database provider")?;
     let compute_data_path = provider
+        .require_container()?
         .definition()
         .data_dir
         .to_string_lossy()
@@ -452,7 +453,9 @@ async fn start_restart_or_recreate(
     compute.stop(instance_id).await?;
     compute.remove_instance(instance_id).await?;
 
-    let mut definition = provider.definition_with_overrides(&config.compute_params());
+    let mut definition = provider
+        .require_container()?
+        .definition_with_overrides(&config.compute_params());
     if let Some(ref env) = config.environment
         && !env.database_version.is_empty()
     {
@@ -539,7 +542,9 @@ async fn container_data_dir(
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
     gfs_db_providers::register_all(registry.as_ref()).ok()?;
     let provider = registry.get(provider_name)?;
+    // An embedded provider has no container data path to report.
     let compute_data_path = provider
+        .container()?
         .definition()
         .data_dir
         .to_string_lossy()

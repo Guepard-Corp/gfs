@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use gfs_domain::ports::compute::{ComputeDefinition, EnvVar, PortMapping};
 use gfs_domain::ports::database_provider::{
-    ConnectionParams, DataFormat, DatabaseProvider, DatabaseProviderArg, DatabaseProviderRegistry,
-    ExportSpec, ImportSpec, ProviderError, Result, SIGTERM, SchemaExtractionSpec, SupportedFeature,
+    ConnectionParams, ContainerProvider, DataFormat, DatabaseProvider, DatabaseProviderArg,
+    DatabaseProviderRegistry, ExportSpec, ImportSpec, ProviderError, Result, SIGTERM,
+    SchemaExtractionSpec, SupportedFeature,
 };
 
 const NAME: &str = "mysql";
@@ -72,6 +73,208 @@ impl DatabaseProvider for MysqlProvider {
         NAME
     }
 
+    fn connection_string(
+        &self,
+        params: &ConnectionParams,
+    ) -> std::result::Result<String, ProviderError> {
+        let user = "root";
+        let password = params
+            .get_env(ENV_ROOT_PASSWORD)
+            .unwrap_or(DEFAULT_ROOT_PASSWORD);
+        let db = params.get_env(ENV_DATABASE).unwrap_or(DEFAULT_DB);
+        Ok(format!(
+            "mysql://{}:{}@{}:{}/{}",
+            user, password, params.host, params.port, db
+        ))
+    }
+
+    fn supported_versions(&self) -> Vec<String> {
+        vec!["8.0".into(), "8.1".into()]
+    }
+
+    fn supported_features(&self) -> Vec<SupportedFeature> {
+        vec![
+            SupportedFeature {
+                id: "tls".into(),
+                description: "TLS/SSL encryption for connections.".into(),
+            },
+            SupportedFeature {
+                id: "schema".into(),
+                description: "Schema and DDL management.".into(),
+            },
+            SupportedFeature {
+                id: "masking".into(),
+                description: "Data masking and redaction.".into(),
+            },
+            SupportedFeature {
+                id: "backup".into(),
+                description: "Backup and restore.".into(),
+            },
+            SupportedFeature {
+                id: "import".into(),
+                description: "Data import from external sources.".into(),
+            },
+        ]
+    }
+
+    // -----------------------------------------------------------------------
+    // Import / Export
+    // -----------------------------------------------------------------------
+
+    fn supported_export_formats(&self) -> Vec<DataFormat> {
+        vec![
+            DataFormat {
+                id: "sql".into(),
+                description: "Plain-text SQL dump (mysqldump).".into(),
+                file_extension: ".sql".into(),
+            },
+            DataFormat {
+                id: "schema".into(),
+                description: "Schema-only DDL dump (mysqldump --no-data).".into(),
+                file_extension: ".sql".into(),
+            },
+        ]
+    }
+
+    fn supported_import_formats(&self) -> Vec<DataFormat> {
+        vec![DataFormat {
+            id: "sql".into(),
+            description: "Plain-text SQL file (loaded via mysql client).".into(),
+            file_extension: ".sql".into(),
+        }]
+    }
+
+    // -----------------------------------------------------------------------
+    // Query / Interactive Terminal
+    // -----------------------------------------------------------------------
+
+    fn query_client_command(
+        &self,
+        params: &ConnectionParams,
+        query: Option<&str>,
+    ) -> std::result::Result<std::process::Command, ProviderError> {
+        let password = params
+            .get_env(ENV_ROOT_PASSWORD)
+            .unwrap_or(DEFAULT_ROOT_PASSWORD);
+        let db = params.get_env(ENV_DATABASE).unwrap_or(DEFAULT_DB);
+
+        // Build mysql command with connection parameters
+        let mut cmd = std::process::Command::new("mysql");
+        cmd.arg("-h").arg(&params.host);
+        cmd.arg("-P").arg(params.port.to_string());
+        cmd.arg("-u").arg("root");
+        cmd.arg(format!("-p{}", password));
+        cmd.arg(db);
+
+        // If a query is provided, execute it with -e; otherwise open interactive terminal
+        if let Some(q) = query {
+            cmd.arg("-e").arg(q);
+        }
+
+        Ok(cmd)
+    }
+
+    // -----------------------------------------------------------------------
+    // Schema Extraction
+    // -----------------------------------------------------------------------
+
+    fn schema_extraction_queries(&self) -> std::collections::HashMap<String, String> {
+        let mut queries = std::collections::HashMap::new();
+
+        // Version query - returns database version string
+        queries.insert("version".to_string(), "SELECT version();".to_string());
+
+        // Schemas query - returns JSON array of schemas
+        queries.insert(
+            "schemas".to_string(),
+            "SELECT COALESCE(
+                JSON_ARRAYAGG(
+                    JSON_OBJECT(
+                        'id', 0,
+                        'name', SCHEMA_NAME,
+                        'owner', ''
+                    )
+                ),
+                JSON_ARRAY()
+            ) as result
+            FROM information_schema.SCHEMATA
+            WHERE SCHEMA_NAME NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+            ORDER BY SCHEMA_NAME;"
+                .to_string(),
+        );
+
+        // Tables query - returns JSON array of tables with metadata
+        queries.insert(
+            "tables".to_string(),
+            "SELECT COALESCE(
+                JSON_ARRAYAGG(
+                    JSON_OBJECT(
+                        'id', 0,
+                        'schema', TABLE_SCHEMA,
+                        'name', TABLE_NAME,
+                        'rls_enabled', false,
+                        'rls_forced', false,
+                        'bytes', COALESCE(DATA_LENGTH + INDEX_LENGTH, 0),
+                        'size', CONCAT(ROUND((DATA_LENGTH + INDEX_LENGTH) / 1024, 2), ' KB'),
+                        'live_rows_estimate', COALESCE(TABLE_ROWS, 0),
+                        'dead_rows_estimate', 0,
+                        'comment', TABLE_COMMENT,
+                        'primary_keys', JSON_ARRAY(),
+                        'relationships', JSON_ARRAY()
+                    )
+                ),
+                JSON_ARRAY()
+            ) as result
+            FROM information_schema.TABLES
+            WHERE TABLE_SCHEMA NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+                AND TABLE_TYPE = 'BASE TABLE'
+            ORDER BY TABLE_SCHEMA, TABLE_NAME;"
+                .to_string(),
+        );
+
+        // Columns query - returns JSON array of columns with full metadata
+        queries.insert(
+            "columns".to_string(),
+            "SELECT COALESCE(
+                JSON_ARRAYAGG(
+                    JSON_OBJECT(
+                        'id', CONCAT(TABLE_SCHEMA, '.', TABLE_NAME, '.', COLUMN_NAME),
+                        'table_id', 0,
+                        'schema', TABLE_SCHEMA,
+                        'table', TABLE_NAME,
+                        'name', COLUMN_NAME,
+                        'ordinal_position', ORDINAL_POSITION,
+                        'data_type', DATA_TYPE,
+                        'format', DATA_TYPE,
+                        'is_identity', IF(EXTRA LIKE '%auto_increment%', true, false),
+                        'identity_generation', NULL,
+                        'is_generated', IF(EXTRA LIKE '%GENERATED%', true, false),
+                        'is_nullable', IF(IS_NULLABLE = 'YES', true, false),
+                        'is_updatable', true,
+                        'is_unique', IF(COLUMN_KEY = 'PRI' OR COLUMN_KEY = 'UNI', true, false),
+                        'check', NULL,
+                        'default_value', COLUMN_DEFAULT,
+                        'enums', JSON_ARRAY(),
+                        'comment', COLUMN_COMMENT
+                    )
+                ),
+                JSON_ARRAY()
+            ) as result
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+            ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION;"
+                .to_string(),
+        );
+
+        queries
+    }
+
+    fn container(&self) -> Option<&dyn ContainerProvider> {
+        Some(self)
+    }
+}
+
+impl ContainerProvider for MysqlProvider {
     fn definition(&self) -> ComputeDefinition {
         let mut def = Self::definition_impl();
         def.args = self
@@ -189,50 +392,6 @@ impl DatabaseProvider for MysqlProvider {
         SIGTERM
     }
 
-    fn connection_string(
-        &self,
-        params: &ConnectionParams,
-    ) -> std::result::Result<String, ProviderError> {
-        let user = "root";
-        let password = params
-            .get_env(ENV_ROOT_PASSWORD)
-            .unwrap_or(DEFAULT_ROOT_PASSWORD);
-        let db = params.get_env(ENV_DATABASE).unwrap_or(DEFAULT_DB);
-        Ok(format!(
-            "mysql://{}:{}@{}:{}/{}",
-            user, password, params.host, params.port, db
-        ))
-    }
-
-    fn supported_versions(&self) -> Vec<String> {
-        vec!["8.0".into(), "8.1".into()]
-    }
-
-    fn supported_features(&self) -> Vec<SupportedFeature> {
-        vec![
-            SupportedFeature {
-                id: "tls".into(),
-                description: "TLS/SSL encryption for connections.".into(),
-            },
-            SupportedFeature {
-                id: "schema".into(),
-                description: "Schema and DDL management.".into(),
-            },
-            SupportedFeature {
-                id: "masking".into(),
-                description: "Data masking and redaction.".into(),
-            },
-            SupportedFeature {
-                id: "backup".into(),
-                description: "Backup and restore.".into(),
-            },
-            SupportedFeature {
-                id: "import".into(),
-                description: "Data import from external sources.".into(),
-            },
-        ]
-    }
-
     fn prepare_for_snapshot(&self, _params: &ConnectionParams) -> Result<Vec<String>> {
         Ok(vec![])
     }
@@ -247,33 +406,6 @@ impl DatabaseProvider for MysqlProvider {
             "MYSQL_PWD=\"$MYSQL_ROOT_PASSWORD\" mysqladmin ping -h 127.0.0.1 -u root --silent",
             "MYSQL_PWD=\"$MYSQL_ROOT_PASSWORD\" mysql -h 127.0.0.1 -u root -e \"SELECT 1;\" >/dev/null",
         ]
-    }
-
-    // -----------------------------------------------------------------------
-    // Import / Export
-    // -----------------------------------------------------------------------
-
-    fn supported_export_formats(&self) -> Vec<DataFormat> {
-        vec![
-            DataFormat {
-                id: "sql".into(),
-                description: "Plain-text SQL dump (mysqldump).".into(),
-                file_extension: ".sql".into(),
-            },
-            DataFormat {
-                id: "schema".into(),
-                description: "Schema-only DDL dump (mysqldump --no-data).".into(),
-                file_extension: ".sql".into(),
-            },
-        ]
-    }
-
-    fn supported_import_formats(&self) -> Vec<DataFormat> {
-        vec![DataFormat {
-            id: "sql".into(),
-            description: "Plain-text SQL file (loaded via mysql client).".into(),
-            file_extension: ".sql".into(),
-        }]
     }
 
     fn export_spec(
@@ -374,36 +506,6 @@ impl DatabaseProvider for MysqlProvider {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Query / Interactive Terminal
-    // -----------------------------------------------------------------------
-
-    fn query_client_command(
-        &self,
-        params: &ConnectionParams,
-        query: Option<&str>,
-    ) -> std::result::Result<std::process::Command, ProviderError> {
-        let password = params
-            .get_env(ENV_ROOT_PASSWORD)
-            .unwrap_or(DEFAULT_ROOT_PASSWORD);
-        let db = params.get_env(ENV_DATABASE).unwrap_or(DEFAULT_DB);
-
-        // Build mysql command with connection parameters
-        let mut cmd = std::process::Command::new("mysql");
-        cmd.arg("-h").arg(&params.host);
-        cmd.arg("-P").arg(params.port.to_string());
-        cmd.arg("-u").arg("root");
-        cmd.arg(format!("-p{}", password));
-        cmd.arg(db);
-
-        // If a query is provided, execute it with -e; otherwise open interactive terminal
-        if let Some(q) = query {
-            cmd.arg("-e").arg(q);
-        }
-
-        Ok(cmd)
-    }
-
     fn query_in_instance_command(
         &self,
         sql: &str,
@@ -418,101 +520,6 @@ impl DatabaseProvider for MysqlProvider {
         Ok(format!(
             r#"MYSQL_PWD="${{MYSQL_ROOT_PASSWORD:-mysql}}" mysql -h 127.0.0.1 -u root {db} -e "{body}""#
         ))
-    }
-
-    // -----------------------------------------------------------------------
-    // Schema Extraction
-    // -----------------------------------------------------------------------
-
-    fn schema_extraction_queries(&self) -> std::collections::HashMap<String, String> {
-        let mut queries = std::collections::HashMap::new();
-
-        // Version query - returns database version string
-        queries.insert("version".to_string(), "SELECT version();".to_string());
-
-        // Schemas query - returns JSON array of schemas
-        queries.insert(
-            "schemas".to_string(),
-            "SELECT COALESCE(
-                JSON_ARRAYAGG(
-                    JSON_OBJECT(
-                        'id', 0,
-                        'name', SCHEMA_NAME,
-                        'owner', ''
-                    )
-                ),
-                JSON_ARRAY()
-            ) as result
-            FROM information_schema.SCHEMATA
-            WHERE SCHEMA_NAME NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
-            ORDER BY SCHEMA_NAME;"
-                .to_string(),
-        );
-
-        // Tables query - returns JSON array of tables with metadata
-        queries.insert(
-            "tables".to_string(),
-            "SELECT COALESCE(
-                JSON_ARRAYAGG(
-                    JSON_OBJECT(
-                        'id', 0,
-                        'schema', TABLE_SCHEMA,
-                        'name', TABLE_NAME,
-                        'rls_enabled', false,
-                        'rls_forced', false,
-                        'bytes', COALESCE(DATA_LENGTH + INDEX_LENGTH, 0),
-                        'size', CONCAT(ROUND((DATA_LENGTH + INDEX_LENGTH) / 1024, 2), ' KB'),
-                        'live_rows_estimate', COALESCE(TABLE_ROWS, 0),
-                        'dead_rows_estimate', 0,
-                        'comment', TABLE_COMMENT,
-                        'primary_keys', JSON_ARRAY(),
-                        'relationships', JSON_ARRAY()
-                    )
-                ),
-                JSON_ARRAY()
-            ) as result
-            FROM information_schema.TABLES
-            WHERE TABLE_SCHEMA NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
-                AND TABLE_TYPE = 'BASE TABLE'
-            ORDER BY TABLE_SCHEMA, TABLE_NAME;"
-                .to_string(),
-        );
-
-        // Columns query - returns JSON array of columns with full metadata
-        queries.insert(
-            "columns".to_string(),
-            "SELECT COALESCE(
-                JSON_ARRAYAGG(
-                    JSON_OBJECT(
-                        'id', CONCAT(TABLE_SCHEMA, '.', TABLE_NAME, '.', COLUMN_NAME),
-                        'table_id', 0,
-                        'schema', TABLE_SCHEMA,
-                        'table', TABLE_NAME,
-                        'name', COLUMN_NAME,
-                        'ordinal_position', ORDINAL_POSITION,
-                        'data_type', DATA_TYPE,
-                        'format', DATA_TYPE,
-                        'is_identity', IF(EXTRA LIKE '%auto_increment%', true, false),
-                        'identity_generation', NULL,
-                        'is_generated', IF(EXTRA LIKE '%GENERATED%', true, false),
-                        'is_nullable', IF(IS_NULLABLE = 'YES', true, false),
-                        'is_updatable', true,
-                        'is_unique', IF(COLUMN_KEY = 'PRI' OR COLUMN_KEY = 'UNI', true, false),
-                        'check', NULL,
-                        'default_value', COLUMN_DEFAULT,
-                        'enums', JSON_ARRAY(),
-                        'comment', COLUMN_COMMENT
-                    )
-                ),
-                JSON_ARRAY()
-            ) as result
-            FROM information_schema.COLUMNS
-            WHERE TABLE_SCHEMA NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
-            ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION;"
-                .to_string(),
-        );
-
-        queries
     }
 
     fn schema_extraction_spec(
