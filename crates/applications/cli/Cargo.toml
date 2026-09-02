@@ -54,6 +54,8 @@ tokio-util         = "0.7"
 owo-colors         = { version = "4", features = ["supports-colors"] }
 rustls             = { version = "0.23", features = ["aws-lc-rs"] }
 [dev-dependencies]
+rusqlite = { workspace = true }
+serde_json = { workspace = true }
 gfs-domain         = { workspace = true }
 tempfile           = { workspace = true }
 once_cell          = "1.21"

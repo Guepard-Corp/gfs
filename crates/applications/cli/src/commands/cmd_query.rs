@@ -15,6 +15,8 @@ use gfs_domain::ports::repository::Repository;
 use gfs_domain::usecases::repository::execute_query_usecase::ExecuteQueryUseCase;
 
 use super::compute_support::compute_for_repo;
+use gfs_domain::repo_utils::repo_layout;
+
 use crate::cli_utils::get_repo_dir;
 
 /// Execute a SQL query against the running database instance.
@@ -41,20 +43,31 @@ pub async fn run(
         .as_ref()
         .context("no database configured (run gfs init with --database-provider)")?;
 
-    let runtime = config
-        .runtime
-        .as_ref()
-        .context("no runtime configured (run gfs init with --database-provider)")?;
-
     let provider_name = &environment.database_provider;
-    let container_name = &runtime.container_name;
-
-    let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
-    let compute = compute_for_repo(&repository, &repo_path).await?;
 
     let registry_impl = InMemoryDatabaseProviderRegistry::new();
     containers::register_all(&registry_impl).context("failed to register database providers")?;
     let registry = Arc::new(registry_impl);
+
+    // An embedded provider opens a file: there is no container to look up, no
+    // connection info to fetch, and no runtime to require. `--database` has no
+    // meaning either, since the file *is* the database.
+    if let Some(provider) = registry.get(provider_name)
+        && provider.local_engine().is_some()
+    {
+        let params = repo_layout::local_connection_params(&repo_path)
+            .context("failed to resolve the active workspace")?;
+        return run_client(&*provider, &params, query.as_deref());
+    }
+
+    let runtime = config
+        .runtime
+        .as_ref()
+        .context("no runtime configured (run gfs init with --database-provider)")?;
+    let container_name = &runtime.container_name;
+
+    let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
+    let compute = compute_for_repo(&repository, &repo_path).await?;
 
     let is_k8s = runtime
         .runtime_provider
@@ -113,12 +126,21 @@ pub async fn run(
         env,
     };
 
-    // Build the query command
+    run_client(&*provider, &params, query.as_deref())
+}
+
+/// Spawn the provider's native client, inheriting stdio so an interactive
+/// session works, and exit with the client's own status code.
+fn run_client(
+    provider: &dyn gfs_domain::ports::database_provider::DatabaseProvider,
+    params: &ConnectionParams,
+    query: Option<&str>,
+) -> Result<()> {
     let mut cmd = provider
-        .query_client_command(&params, query.as_deref())
+        .query_client_command(params, query)
         .context("failed to build query command")?;
 
-    // Execute the command (let the OS handle "command not found" errors)
+    // Let the OS report "command not found" so the hint below is accurate.
     let status = cmd.status().or_else(|e| {
         let client_name = cmd.get_program().to_string_lossy();
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -126,7 +148,9 @@ pub async fn run(
                 "database client '{}' not found. Install it to use 'gfs query'.\n  \
                  - PostgreSQL: install postgresql client tools (psql)\n  \
                  - MySQL: install mysql client tools\n  \
-                 - ClickHouse: install clickhouse client tools (clickhouse-client)",
+                 - ClickHouse: install clickhouse client tools (clickhouse-client)\n  \
+                 - SQLite: install sqlite3 (only the interactive shell needs it; \
+                   gfs itself uses a linked engine)",
                 client_name
             )
         } else {
@@ -134,10 +158,8 @@ pub async fn run(
         }
     })?;
 
-    // Exit with the same code as the native client
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }
-
     Ok(())
 }

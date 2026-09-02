@@ -7,7 +7,9 @@ use gfs_compute_kubernetes::KubernetesCompute;
 use gfs_domain::adapters::gfs_repository::GfsRepository;
 use gfs_domain::model::config::GfsConfig;
 use gfs_domain::ports::compute::Compute;
-use gfs_domain::ports::database_provider::InMemoryDatabaseProviderRegistry;
+use gfs_domain::ports::database_provider::{
+    DatabaseProviderRegistry, InMemoryDatabaseProviderRegistry,
+};
 use gfs_domain::ports::repository::Repository;
 use gfs_domain::usecases::repository::init_repo_usecase::{
     DatabaseCredentials, InitRepositoryUseCase,
@@ -42,7 +44,25 @@ pub async fn init(
         .trim()
         .to_ascii_lowercase();
 
-    let compute: Option<Arc<dyn Compute>> = if database_provider.is_some() {
+    let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
+    containers::register_all(registry.as_ref())?;
+
+    // An embedded provider (SQLite) has nothing to provision, so do not open a
+    // connection to a container runtime that will never be used — that
+    // connection failing is otherwise the first thing a user without Docker
+    // sees, even though no container is involved.
+    let embedded = database_provider
+        .as_deref()
+        .and_then(|name| {
+            let list = registry.list();
+            list.iter()
+                .find(|n| n.eq_ignore_ascii_case(name))
+                .cloned()
+                .and_then(|n| registry.get(&n))
+        })
+        .is_some_and(|p| p.local_engine().is_some());
+
+    let compute: Option<Arc<dyn Compute>> = if database_provider.is_some() && !embedded {
         match runtime_provider.as_str() {
             "kubernetes" | "k8s" | "k3s" => Some(Arc::new(
                 KubernetesCompute::new(None)
@@ -58,9 +78,6 @@ pub async fn init(
     } else {
         None
     };
-
-    let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
-    containers::register_all(registry.as_ref())?;
 
     let use_case =
         InitRepositoryUseCase::new(repository.clone(), compute.clone(), registry.clone());

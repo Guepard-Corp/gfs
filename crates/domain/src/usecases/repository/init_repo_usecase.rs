@@ -345,7 +345,14 @@ mod tests {
     };
     use crate::ports::repository::{Repository, RepositoryError};
 
-    struct MockRepository;
+    /// Records the config writes the use case makes, and can point the workspace
+    /// at a real directory so paths the use case creates are writable.
+    #[derive(Default)]
+    struct MockRepository {
+        data_dir: Option<PathBuf>,
+        environment: std::sync::Mutex<Option<EnvironmentConfig>>,
+        runtime: std::sync::Mutex<Option<RuntimeConfig>>,
+    }
 
     #[async_trait]
     impl Repository for MockRepository {
@@ -360,20 +367,25 @@ mod tests {
             &self,
             _: &std::path::Path,
         ) -> crate::ports::repository::Result<PathBuf> {
-            Ok(PathBuf::from("/workspace/data"))
+            Ok(self
+                .data_dir
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("/workspace/data")))
         }
         async fn update_environment_config(
             &self,
             _: &std::path::Path,
-            _: EnvironmentConfig,
+            config: EnvironmentConfig,
         ) -> crate::ports::repository::Result<()> {
+            *self.environment.lock().unwrap() = Some(config);
             Ok(())
         }
         async fn update_runtime_config(
             &self,
             _: &std::path::Path,
-            _: RuntimeConfig,
+            config: RuntimeConfig,
         ) -> crate::ports::repository::Result<()> {
+            *self.runtime.lock().unwrap() = Some(config);
             Ok(())
         }
         async fn clone_repo(
@@ -699,10 +711,185 @@ mod tests {
         }
     }
 
+    /// A provider with an in-process engine, to prove the use case never reaches
+    /// for compute when one is configured.
+    struct EmbeddedProvider;
+
+    impl DatabaseProvider for EmbeddedProvider {
+        fn name(&self) -> &str {
+            "embedded"
+        }
+        fn local_engine(&self) -> Option<&dyn crate::ports::database_provider::LocalEngine> {
+            Some(self)
+        }
+        fn definition(&self) -> ComputeDefinition {
+            ComputeDefinition {
+                labels: Default::default(),
+                image: "embedded:9".into(),
+                env: vec![],
+                ports: vec![],
+                data_dir: PathBuf::from("/data"),
+                host_data_dir: None,
+                user: None,
+                logs_dir: None,
+                conf_dir: None,
+                args: vec![],
+            }
+        }
+        fn default_port(&self) -> u16 {
+            0
+        }
+        fn default_args(&self) -> Vec<DatabaseProviderArg> {
+            vec![]
+        }
+        fn connection_string(
+            &self,
+            _: &ConnectionParams,
+        ) -> std::result::Result<String, ProviderError> {
+            Ok("embedded:///db".into())
+        }
+        fn supported_versions(&self) -> Vec<String> {
+            vec!["9".into()]
+        }
+        fn supported_features(&self) -> Vec<SupportedFeature> {
+            vec![]
+        }
+        fn prepare_for_snapshot(&self, _: &ConnectionParams) -> RegistryResult<Vec<String>> {
+            Ok(vec![])
+        }
+        fn query_client_command(
+            &self,
+            _: &ConnectionParams,
+            _: Option<&str>,
+        ) -> std::result::Result<std::process::Command, ProviderError> {
+            Ok(std::process::Command::new("true"))
+        }
+    }
+
+    impl crate::ports::database_provider::LocalEngine for EmbeddedProvider {
+        fn extract_schema(
+            &self,
+            _: &ConnectionParams,
+        ) -> std::result::Result<String, ProviderError> {
+            Ok(String::new())
+        }
+        fn prepare_for_snapshot(
+            &self,
+            _: &ConnectionParams,
+        ) -> std::result::Result<
+            Option<Box<dyn crate::ports::database_provider::SnapshotGuard>>,
+            ProviderError,
+        > {
+            Ok(None)
+        }
+    }
+
+    struct EmbeddedRegistry;
+
+    impl DatabaseProviderRegistry for EmbeddedRegistry {
+        fn register(&self, _: Arc<dyn DatabaseProvider>) -> RegistryResult<()> {
+            Ok(())
+        }
+        fn get(&self, name: &str) -> Option<Arc<dyn DatabaseProvider>> {
+            name.eq_ignore_ascii_case("embedded")
+                .then(|| Arc::new(EmbeddedProvider) as Arc<dyn DatabaseProvider>)
+        }
+        fn list(&self) -> Vec<String> {
+            vec!["embedded".into()]
+        }
+        fn unregister(&self, _: &str) -> Option<Arc<dyn DatabaseProvider>> {
+            None
+        }
+    }
+
+    /// The whole point of an embedded provider: `init` succeeds with no compute
+    /// runtime supplied at all, so a machine without Docker can still use it.
+    #[tokio::test]
+    async fn init_with_an_embedded_provider_needs_no_compute() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace/data");
+        let repository = Arc::new(MockRepository {
+            data_dir: Some(workspace.clone()),
+            ..Default::default()
+        });
+
+        let usecase = InitRepositoryUseCase::new(
+            repository.clone(),
+            // No compute at all. A provider that needed one would fail here.
+            None,
+            Arc::new(EmbeddedRegistry),
+        );
+        usecase
+            .run(
+                dir.path().to_path_buf(),
+                None,
+                Some("embedded".into()),
+                Some("9".into()),
+                None,
+                DatabaseCredentials::default(),
+                None,
+                None,
+                Default::default(),
+            )
+            .await
+            .expect("init must not require a compute runtime for an embedded provider");
+
+        let environment = repository.environment.lock().unwrap().clone();
+        let environment = environment.expect("environment config must be written");
+        assert_eq!(environment.database_provider, "embedded");
+        assert_eq!(
+            environment.database_version, "9",
+            "the version must survive the image retag and be read back out of it"
+        );
+
+        assert!(
+            repository.runtime.lock().unwrap().is_none(),
+            "RuntimeConfig must stay absent: its absence is what tells commit, \
+             checkout and status there is no instance to manage"
+        );
+        assert!(
+            workspace.exists(),
+            "the workspace data directory must be created so the first write lands"
+        );
+    }
+
+    /// The container path must be unaffected: a provider without a local engine
+    /// still refuses to deploy when no compute runtime is available.
+    #[tokio::test]
+    async fn init_without_compute_still_fails_for_a_container_provider() {
+        let usecase = InitRepositoryUseCase::new(
+            Arc::new(MockRepository::default()),
+            None,
+            Arc::new(MockRegistry),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let err = usecase
+            .run(
+                dir.path().to_path_buf(),
+                None,
+                Some("postgres".into()),
+                Some("17".into()),
+                None,
+                DatabaseCredentials::default(),
+                None,
+                None,
+                Default::default(),
+            )
+            .await
+            .expect_err("postgres needs a container runtime");
+        assert!(
+            matches!(err, InitRepoError::Compute(_)),
+            "expected a compute error, got: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn init_without_database_provider() {
-        let usecase =
-            InitRepositoryUseCase::new(Arc::new(MockRepository), None, Arc::new(MockRegistry));
+        let usecase = InitRepositoryUseCase::new(
+            Arc::new(MockRepository::default()),
+            None,
+            Arc::new(MockRegistry),
+        );
         let dir = tempfile::tempdir().unwrap();
         let result = usecase
             .run(
@@ -723,7 +910,7 @@ mod tests {
     #[tokio::test]
     async fn init_with_database_provider() {
         let usecase = InitRepositoryUseCase::new(
-            Arc::new(MockRepository),
+            Arc::new(MockRepository::default()),
             Some(Arc::new(MockCompute::default())),
             Arc::new(MockRegistry),
         );
@@ -748,7 +935,7 @@ mod tests {
     async fn init_threads_labels_to_provisioned_definition() {
         let compute = Arc::new(MockCompute::default());
         let usecase = InitRepositoryUseCase::new(
-            Arc::new(MockRepository),
+            Arc::new(MockRepository::default()),
             Some(compute.clone()),
             Arc::new(MockRegistry),
         );
@@ -807,7 +994,7 @@ mod tests {
     async fn caller_labels_override_default_role() {
         let compute = Arc::new(MockCompute::default());
         let usecase = InitRepositoryUseCase::new(
-            Arc::new(MockRepository),
+            Arc::new(MockRepository::default()),
             Some(compute.clone()),
             Arc::new(MockRegistry),
         );
@@ -852,7 +1039,7 @@ mod tests {
     #[tokio::test]
     async fn init_database_version_required() {
         let usecase = InitRepositoryUseCase::new(
-            Arc::new(MockRepository),
+            Arc::new(MockRepository::default()),
             Some(Arc::new(MockCompute::default())),
             Arc::new(MockRegistry),
         );
@@ -879,7 +1066,7 @@ mod tests {
     #[tokio::test]
     async fn init_unknown_database_provider() {
         let usecase = InitRepositoryUseCase::new(
-            Arc::new(MockRepository),
+            Arc::new(MockRepository::default()),
             Some(Arc::new(MockCompute::default())),
             Arc::new(MockRegistry),
         );

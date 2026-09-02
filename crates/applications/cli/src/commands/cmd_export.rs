@@ -4,12 +4,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use gfs_compute_docker::DockerCompute;
 use gfs_domain::ports::database_provider::InMemoryDatabaseProviderRegistry;
 use gfs_domain::usecases::repository::export_repo_usecase::ExportRepoUseCase;
 use serde_json::json;
 
+use gfs_domain::adapters::gfs_repository::GfsRepository;
+use gfs_domain::ports::repository::Repository;
+
 use crate::cli_utils::get_repo_dir;
+use crate::commands::compute_support::compute_for_repo;
 use crate::output::{cyan, green};
 
 pub async fn run(
@@ -21,7 +24,11 @@ pub async fn run(
 ) -> Result<()> {
     let repo_path = path.unwrap_or_else(get_repo_dir);
 
-    let compute = Arc::new(DockerCompute::new().map_err(|e| anyhow::anyhow!("{e}"))?);
+    // Route through the repository's configured runtime. A provider with no
+    // container — SQLite — resolves to a no-op runtime rather than failing to
+    // reach a Docker daemon it never needed.
+    let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
+    let compute = compute_for_repo(&repository, &repo_path).await?;
 
     let _ = id; // container name override is reserved for future use; use case reads from config.
 
