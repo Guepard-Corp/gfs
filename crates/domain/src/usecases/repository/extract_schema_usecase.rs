@@ -15,7 +15,7 @@ use crate::model::config::GfsConfig;
 use crate::model::datasource::{Column, DatasourceMetadata, Schema, Table};
 use crate::ports::compute::{Compute, ComputeError, InstanceId};
 use crate::ports::database_provider::{
-    ConnectionParams, DatabaseProvider, DatabaseProviderRegistry, LOCAL_DATA_DIR_ENV,
+    ConnectionParams, DatabaseProvider, DatabaseProviderRegistry,
 };
 use crate::repo_utils::repo_layout;
 
@@ -126,7 +126,8 @@ impl<R: DatabaseProviderRegistry> ExtractSchemaUseCase<R> {
         //    everything below the branch is shared.
         let stdout = match provider.local_engine() {
             Some(engine) => {
-                let params = local_connection_params(path)?;
+                let params = repo_layout::local_connection_params(path)
+                    .map_err(|e| ExtractSchemaError::NotConfigured(e.to_string()))?;
                 engine
                     .extract_schema(&params)
                     .map_err(|e| ExtractSchemaError::ExtractionFailed(e.to_string()))?
@@ -234,24 +235,6 @@ impl<R: DatabaseProviderRegistry> ExtractSchemaUseCase<R> {
 
         Ok(output.stdout)
     }
-}
-
-/// Connection parameters for an embedded provider.
-///
-/// There is no host, port or credential to supply — the engine opens a file. It
-/// is told which directory the active workspace lives in and derives its own
-/// layout from there, so this function never names a provider's files.
-fn local_connection_params(repo_path: &Path) -> Result<ConnectionParams, ExtractSchemaError> {
-    let data_dir = repo_layout::get_active_workspace_data_dir(repo_path)
-        .map_err(|e| ExtractSchemaError::NotConfigured(e.to_string()))?;
-    Ok(ConnectionParams {
-        host: String::new(),
-        port: 0,
-        env: vec![(
-            LOCAL_DATA_DIR_ENV.to_string(),
-            data_dir.to_string_lossy().into_owned(),
-        )],
-    })
 }
 
 /// Parsed schema output from the extraction sidecar.

@@ -242,21 +242,38 @@ pub trait LocalEngine: Send + Sync {
         params: &ConnectionParams,
     ) -> std::result::Result<String, ProviderError>;
 
-    /// Quiesce the database before the storage layer takes a snapshot.
+    /// Quiesce the database and hold it quiescent until the returned guard is
+    /// dropped.
     ///
     /// The counterpart to [`DatabaseProvider::prepare_for_snapshot`], whose
-    /// commands a runtime executes inside an instance. Returns whether any
-    /// preparation was actually performed — a repository that has been
-    /// initialised but never written to has nothing to do, and that must not be
-    /// reported as a failure.
+    /// commands a runtime executes inside an instance before pausing it. An
+    /// embedded engine has no instance to pause, and — more importantly — the
+    /// process writing the database is the user's own application, which no
+    /// container could freeze either. So the engine must exclude writers itself,
+    /// using whatever locking it provides, and keep them excluded while the
+    /// storage layer copies the files.
     ///
-    /// This cannot exclude a concurrent writer for the duration of the
-    /// snapshot: it returns before the snapshot is taken. Callers must not treat
-    /// a successful return as a guarantee that the database is frozen.
+    /// The caller holds the guard across `snapshot()` and drops it afterwards.
+    /// Returning `Ok(None)` means there was nothing to quiesce — a repository
+    /// initialised but never written to has no database yet, and that must not
+    /// fail the commit.
+    ///
+    /// Implementations should fail rather than block indefinitely when another
+    /// writer holds the database: the caller decides whether an unquiesced
+    /// snapshot is acceptable.
     fn prepare_for_snapshot(
         &self,
         params: &ConnectionParams,
-    ) -> std::result::Result<bool, ProviderError>;
+    ) -> std::result::Result<Option<Box<dyn SnapshotGuard>>, ProviderError>;
+}
+
+/// Holds an embedded database quiescent for the lifetime of the value.
+///
+/// Dropping it releases whatever lock the engine took, so the caller keeps it
+/// alive for exactly as long as the storage snapshot is in progress.
+pub trait SnapshotGuard: Send {
+    /// What is being held, for diagnostics (e.g. `"sqlite write lock"`).
+    fn describe(&self) -> String;
 }
 
 // ---------------------------------------------------------------------------

@@ -20,9 +20,10 @@
 //! One property is worth stating plainly: because the writer of a SQLite
 //! database is whatever process opened the file — typically the user's own
 //! application — no container could freeze it even if one existed. Snapshot
-//! consistency comes from checkpointing the WAL (see
-//! [`LocalEngine::prepare_for_snapshot`]) and from the storage layer
-//! taking an atomic copy-on-write clone, never from pausing a compute instance.
+//! consistency therefore comes from SQLite's own locking:
+//! [`LocalEngine::prepare_for_snapshot`] holds the write lock for as long as the
+//! storage layer is copying, which stops writers cross-process in a way pausing
+//! a compute instance never could.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -30,7 +31,7 @@ use std::sync::Arc;
 use gfs_domain::ports::compute::{ComputeDefinition, EnvVar, PortMapping};
 use gfs_domain::ports::database_provider::{
     ConnectionParams, DataFormat, DatabaseProvider, DatabaseProviderArg, DatabaseProviderRegistry,
-    ExportSpec, ImportSpec, LOCAL_DATA_DIR_ENV, LocalEngine, ProviderError, Result,
+    ExportSpec, ImportSpec, LOCAL_DATA_DIR_ENV, LocalEngine, ProviderError, Result, SnapshotGuard,
     SupportedFeature,
 };
 
@@ -448,30 +449,87 @@ impl LocalEngine for SqliteProvider {
         Ok(render_sections(&version, &schemas, &tables, &columns, &ddl))
     }
 
-    /// Collapse the write-ahead log into the main database before a snapshot.
+    /// Fold the write-ahead log back in, then hold the write lock so the files
+    /// stop changing while they are copied.
     ///
-    /// `TRUNCATE` (rather than `PASSIVE`) blocks until every committed frame has
-    /// been written back, then resets the WAL to zero length. That reduces the
-    /// on-disk database to a single file, so the storage layer captures one file
-    /// at one instant instead of three files at three instants.
+    /// Two steps, and the order is load-bearing:
     ///
-    /// Per the trait contract this does not freeze the database: the connection
-    /// closes before the snapshot is taken. Excluding writers would need a
-    /// connection held open across the storage operation, which the commit path
-    /// offers no seam for.
+    /// 1. `PRAGMA wal_checkpoint(TRUNCATE)` writes committed frames back into
+    ///    the main database and resets the WAL. This must run *before* the
+    ///    transaction below: inside an open write transaction it fails with
+    ///    "database table is locked". It is a compaction, not a correctness
+    ///    step — a writer can append new frames in the window between the
+    ///    checkpoint and the lock, so the snapshot may still carry a non-empty
+    ///    WAL, which is fine because step 2 freezes both files together.
+    /// 2. `BEGIN IMMEDIATE` takes SQLite's write lock. Other processes writing
+    ///    this database — the user's application, not anything GFS controls —
+    ///    block until the returned guard is dropped. Nothing is written under
+    ///    the transaction; it exists only to hold the lock.
+    ///
+    /// Step 2 is what makes this correct: the file set stops changing for the
+    /// duration of the copy, so the snapshot is consistent even on a filesystem
+    /// that cannot clone atomically. On a copy-on-write filesystem the clone is
+    /// already point-in-time and the lock adds nothing observable; on a plain
+    /// deep copy — `cp --reflink=auto` on ext4, say — it is the difference
+    /// between a restorable snapshot and a torn one.
     fn prepare_for_snapshot(
         &self,
         params: &ConnectionParams,
-    ) -> std::result::Result<bool, ProviderError> {
+    ) -> std::result::Result<Option<Box<dyn SnapshotGuard>>, ProviderError> {
         let path = Self::db_path(params)?;
         if !path.exists() {
-            // Nothing has been written yet; there is no WAL to fold in.
-            return Ok(false);
+            // Nothing has been written yet: no WAL to fold in, no writers to
+            // exclude. Not an error — the first commit of a fresh repository
+            // legitimately lands here.
+            return Ok(None);
         }
+
         let conn = Self::open(&path)?;
-        conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")
-            .map_err(|e| ProviderError::InvalidParams(format!("wal checkpoint failed: {e}")))?;
-        Ok(true)
+        conn.busy_timeout(LOCK_TIMEOUT)
+            .map_err(|e| ProviderError::InvalidParams(format!("cannot set busy timeout: {e}")))?;
+
+        // Best-effort: a checkpoint blocked by a long-running reader leaves
+        // frames in the WAL, which is still captured, just less compactly.
+        if let Err(e) = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE") {
+            tracing::debug!(error = %e, "wal checkpoint did not complete; snapshotting WAL as-is");
+        }
+
+        conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| {
+            ProviderError::InvalidParams(format!(
+                "could not acquire the SQLite write lock within {}s: {e}. \
+                 Another process is writing this database",
+                LOCK_TIMEOUT.as_secs()
+            ))
+        })?;
+
+        Ok(Some(Box::new(SqliteSnapshotGuard { conn })))
+    }
+}
+
+/// How long to wait for the write lock before giving up and letting the caller
+/// decide whether an unquiesced snapshot is acceptable.
+const LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Holds SQLite's write lock open for the duration of a storage snapshot.
+struct SqliteSnapshotGuard {
+    conn: rusqlite::Connection,
+}
+
+impl SnapshotGuard for SqliteSnapshotGuard {
+    fn describe(&self) -> String {
+        "sqlite write lock (BEGIN IMMEDIATE) after WAL checkpoint".to_string()
+    }
+}
+
+impl Drop for SqliteSnapshotGuard {
+    fn drop(&mut self) {
+        // The transaction only ever held the lock, so rolling back and
+        // committing are equivalent; rollback is the honest description. A
+        // failure here is not actionable — closing the connection releases the
+        // lock regardless.
+        if let Err(e) = self.conn.execute_batch("ROLLBACK") {
+            tracing::debug!(error = %e, "releasing sqlite write lock");
+        }
     }
 }
 
@@ -596,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_folds_the_wal_back_into_the_database() {
+    fn snapshot_guard_checkpoints_the_wal_and_excludes_other_writers() {
         let dir = tempfile::tempdir().unwrap();
         let params = seeded_db(dir.path());
         let db = dir.path().join(DB_FILENAME);
@@ -617,15 +675,32 @@ mod tests {
             "an open writer should leave frames in the WAL"
         );
 
-        assert!(
-            LocalEngine::prepare_for_snapshot(&SqliteProvider::new(), &params).unwrap(),
-            "checkpoint should report that it ran"
-        );
+        let guard = LocalEngine::prepare_for_snapshot(&SqliteProvider::new(), &params)
+            .unwrap()
+            .expect("an existing database yields a guard");
+        assert!(guard.describe().contains("write lock"));
         assert_eq!(
             std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0),
             0,
             "TRUNCATE must reset the WAL to zero length"
         );
+
+        // While the guard is alive another connection must not be able to write.
+        let contender = rusqlite::Connection::open(&db).unwrap();
+        contender
+            .busy_timeout(std::time::Duration::from_millis(250))
+            .unwrap();
+        let blocked = contender.execute_batch("BEGIN IMMEDIATE");
+        assert!(
+            blocked.is_err(),
+            "a second writer must block while the snapshot guard is held"
+        );
+
+        // Dropping it hands the database back.
+        drop(guard);
+        contender
+            .execute_batch("BEGIN IMMEDIATE; ROLLBACK")
+            .expect("write lock released with the guard");
     }
 
     #[test]
@@ -633,7 +708,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let params = params_with_path(dir.path().join(DB_FILENAME).to_str().unwrap());
         assert!(
-            !LocalEngine::prepare_for_snapshot(&SqliteProvider::new(), &params).unwrap(),
+            LocalEngine::prepare_for_snapshot(&SqliteProvider::new(), &params)
+                .unwrap()
+                .is_none(),
             "a commit before the first write must not fail"
         );
     }

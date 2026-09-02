@@ -10,7 +10,7 @@ use crate::model::commit::NewCommit;
 use crate::model::config::{EnvironmentConfig, GlobalSettings, RuntimeConfig};
 use crate::model::layout::GFS_DIR;
 use crate::ports::compute::{Compute, ComputeError, InstanceId, InstanceState};
-use crate::ports::database_provider::{ConnectionParams, DatabaseProviderRegistry};
+use crate::ports::database_provider::{ConnectionParams, DatabaseProviderRegistry, SnapshotGuard};
 use crate::ports::repository::{Repository, RepositoryError};
 use crate::ports::storage::{SnapshotOptions, StorageError, StoragePort, VolumeId};
 use crate::repo_utils::repo_layout;
@@ -512,6 +512,58 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
     /// `stream_snapshot` fallback), or — under the default safe policy — the
     /// runtime cannot freeze the database and `GFS_ALLOW_UNFROZEN_SNAPSHOT` is
     /// not set.
+    /// Quiesce an embedded provider's database for the duration of the snapshot.
+    ///
+    /// Mirrors what `prepare_for_snapshot` + `pause()` do for a container: fold
+    /// in any write-ahead log and stop writers landing mid-copy. The difference
+    /// is that the engine does it, because the writer is not in a container.
+    ///
+    /// When the engine cannot quiesce — typically another process is holding the
+    /// database — this refuses the commit unless `GFS_ALLOW_UNFROZEN_SNAPSHOT`
+    /// is set, matching the policy the container path applies to a runtime that
+    /// cannot freeze.
+    fn acquire_local_snapshot_guard(
+        &self,
+        path: &Path,
+        environment: &EnvironmentConfig,
+    ) -> Result<Option<Box<dyn SnapshotGuard>>, CommitRepoError> {
+        let Some(provider) = self.registry.get(&environment.database_provider) else {
+            return Ok(None);
+        };
+        let Some(engine) = provider.local_engine() else {
+            return Ok(None);
+        };
+
+        let params = repo_layout::local_connection_params(path)
+            .map_err(|e| CommitRepoError::Repository(RepositoryError::Internal(e.to_string())))?;
+
+        match engine.prepare_for_snapshot(&params) {
+            Ok(Some(guard)) => {
+                tracing::debug!(held = %guard.describe(), "database quiesced for snapshot");
+                Ok(Some(guard))
+            }
+            // Nothing to quiesce: no database has been written yet.
+            Ok(None) => Ok(None),
+            Err(e) if unfrozen_snapshot_allowed() => {
+                tracing::warn!(
+                    error = %e,
+                    "could not quiesce the database; proceeding with an UNFROZEN snapshot per \
+                     GFS_ALLOW_UNFROZEN_SNAPSHOT — it may capture a torn copy if another \
+                     process writes during the snapshot"
+                );
+                Ok(None)
+            }
+            Err(e) => Err(CommitRepoError::Repository(RepositoryError::Internal(
+                format!(
+                    "{e}. Refusing to snapshot a database that is being written: a copy taken \
+                 mid-write can capture a torn file. Options: (1) stop the process writing \
+                 the database and retry; or (2) set GFS_ALLOW_UNFROZEN_SNAPSHOT=1 to \
+                 proceed with a best-effort snapshot that may not be restorable"
+                ),
+            ))),
+        }
+    }
+
     async fn take_snapshot(
         &self,
         path: &Path,
@@ -611,6 +663,19 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                 }
             }
         }
+
+        // 3b. An embedded provider has no instance to pause — and pausing one
+        //     would not help, because the process writing its database is the
+        //     user's own application, outside any runtime GFS controls. The
+        //     engine excludes writers itself and stays held until this guard is
+        //     dropped, which happens when this function returns, after the
+        //     snapshot below. Without this the entire quiescing phase was
+        //     skipped for such providers, including the refusal that protects
+        //     container-backed ones from an unfrozen snapshot.
+        let _local_guard = match (runtime_config, environment) {
+            (None, Some(env)) => self.acquire_local_snapshot_guard(path, env)?,
+            _ => None,
+        };
 
         // 4. Take a storage snapshot.
         //    The VolumeId is the mount point of the workspace volume.  When no
