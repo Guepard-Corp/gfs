@@ -71,6 +71,43 @@ const DDL_QUERY: &str = "SELECT coalesce(group_concat(sql, ';\n'), '') || ';' \
      FROM sqlite_master \
      WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite~_%' ESCAPE '~';";
 
+/// Whether a column can actually hold NULL.
+///
+/// `pragma_table_info.notnull` alone is not enough, because SQLite reports `0`
+/// for a primary key it nonetheless refuses to store NULL in. The distinguishing
+/// fact is whether the primary key is backed by an index:
+///
+/// * `INTEGER PRIMARY KEY` (any case, with or without `AUTOINCREMENT`) is an
+///   alias for the rowid. SQLite creates no index for it, and an inserted NULL
+///   is replaced by a generated rowid — so a NULL can never be read back.
+/// * Every other primary key form gets an `origin='pk'` index, and SQLite's
+///   long-standing behaviour is to permit NULLs in it. That includes
+///   `INTEGER PRIMARY KEY DESC` and `INT PRIMARY KEY` — neither is a rowid
+///   alias, and both genuinely store NULLs.
+/// * `WITHOUT ROWID` tables need no special case: SQLite already reports
+///   `notnull = 1` for their key columns and enforces it.
+///
+/// Verified by inserting NULL into each form and reading it back; the index test
+/// predicts the outcome in every case, without parsing declared type names.
+const IS_NULLABLE: &str = "CASE \
+     WHEN p.\"notnull\" = 1 THEN 'false' \
+     WHEN p.pk > 0 AND NOT EXISTS (\
+         SELECT 1 FROM pragma_index_list(t.name) il WHERE il.origin = 'pk') THEN 'false' \
+     ELSE 'true' END";
+
+/// Whether a column is unique on its own.
+///
+/// A column of a composite primary key is not: `PRIMARY KEY(a, b)` constrains
+/// the pair, and `a` may repeat. So a primary key column qualifies only when it
+/// is the whole key. A single-column `UNIQUE` index qualifies too.
+const IS_UNIQUE: &str = "CASE \
+     WHEN p.pk = 1 AND (SELECT max(pk) FROM pragma_table_info(t.name)) = 1 THEN 'true' \
+     WHEN EXISTS (SELECT 1 FROM pragma_index_list(t.name) il \
+                  WHERE il.\"unique\" = 1 \
+                    AND (SELECT count(*) FROM pragma_index_info(il.name)) = 1 \
+                    AND (SELECT ii.name FROM pragma_index_info(il.name) ii) = p.name) THEN 'true' \
+     ELSE 'false' END";
+
 /// SQLite database provider. Implements [`DatabaseProvider`] without requiring
 /// a compute instance.
 #[derive(Debug, Default)]
@@ -289,14 +326,16 @@ impl DatabaseProvider for SqliteProvider {
                    'is_identity', json('false'), \
                    'identity_generation', null, \
                    'is_generated', json('false'), \
-                   'is_nullable', json(CASE WHEN p.\"notnull\" = 0 THEN 'true' ELSE 'false' END), \
+                   'is_nullable', json({NULLABLE}), \
                    'is_updatable', json('true'), \
-                   'is_unique', json(CASE WHEN p.pk > 0 THEN 'true' ELSE 'false' END), \
+                   'is_unique', json({UNIQUE}), \
                    'check', null, \
                    'default_value', p.dflt_value, \
                    'enums', json('[]'), \
                    'comment', null \
-                 )) FROM ({TABLE_IDS}) t JOIN pragma_table_info(t.name) p;"
+                 )) FROM ({TABLE_IDS}) t JOIN pragma_table_info(t.name) p;",
+                NULLABLE = IS_NULLABLE,
+                UNIQUE = IS_UNIQUE,
             ),
         );
 
@@ -675,6 +714,78 @@ mod tests {
         // A column's table_id must match the id reported for its table.
         let book_id = book["id"].as_i64().unwrap();
         assert_eq!(title["table_id"].as_i64().unwrap(), book_id);
+    }
+
+    /// Nullability and uniqueness must follow what SQLite will actually store,
+    /// not what `pragma_table_info` reports on its own.
+    ///
+    /// Each expectation below was confirmed by inserting NULL into that form and
+    /// reading it back. The surprising ones are `INTEGER PRIMARY KEY DESC` and
+    /// `INT PRIMARY KEY`: neither is a rowid alias, and both really do store
+    /// NULLs, so reporting every primary key as NOT NULL would be wrong.
+    #[test]
+    fn nullability_and_uniqueness_follow_real_sqlite_behaviour() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DB_FILENAME);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE rowid_alias   (id INTEGER PRIMARY KEY, v TEXT);
+             CREATE TABLE autoinc       (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+             CREATE TABLE lower_ip      (id integer primary key, v TEXT);
+             CREATE TABLE alias_desc    (id INTEGER PRIMARY KEY DESC, v TEXT);
+             CREATE TABLE int_pk        (id INT PRIMARY KEY, v TEXT);
+             CREATE TABLE text_pk       (id TEXT PRIMARY KEY, v TEXT);
+             CREATE TABLE without_rowid (id TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID;
+             CREATE TABLE composite     (a INT, b INT, v TEXT, PRIMARY KEY(a, b));
+             CREATE TABLE uniq_col      (id INTEGER PRIMARY KEY, email TEXT UNIQUE);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let out = SqliteProvider::new()
+            .extract_schema(&params_with_path(path.to_str().unwrap()))
+            .unwrap();
+        let section = out
+            .split("GFS_SCHEMA_COLUMNS\n")
+            .nth(1)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        let columns: serde_json::Value = serde_json::from_str(&section).unwrap();
+        let columns = columns.as_array().unwrap();
+
+        let col = |table: &str, name: &str| -> &serde_json::Value {
+            columns
+                .iter()
+                .find(|c| c["table"] == table && c["name"] == name)
+                .unwrap_or_else(|| panic!("missing {table}.{name}"))
+        };
+
+        // Rowid aliases: an inserted NULL is replaced by a generated rowid, so a
+        // NULL can never be read back.
+        for table in ["rowid_alias", "autoinc", "lower_ip"] {
+            assert_eq!(col(table, "id")["is_nullable"], false, "{table}.id");
+            assert_eq!(col(table, "id")["is_unique"], true, "{table}.id");
+        }
+
+        // Not rowid aliases, and SQLite really does store NULLs in them.
+        for table in ["alias_desc", "int_pk", "text_pk"] {
+            assert_eq!(col(table, "id")["is_nullable"], true, "{table}.id");
+        }
+
+        // WITHOUT ROWID enforces NOT NULL, and reports it.
+        assert_eq!(col("without_rowid", "id")["is_nullable"], false);
+
+        // A composite key constrains the pair; neither column is unique alone.
+        assert_eq!(col("composite", "a")["is_unique"], false);
+        assert_eq!(col("composite", "b")["is_unique"], false);
+
+        // A single-column UNIQUE index counts, without being a primary key.
+        assert_eq!(col("uniq_col", "email")["is_unique"], true);
+        assert_eq!(col("uniq_col", "email")["is_nullable"], true);
+        assert_eq!(col("rowid_alias", "v")["is_unique"], false);
     }
 
     #[test]
