@@ -204,6 +204,17 @@ pub const SIGTERM: u32 = 15;
 // Embedded engines
 // ---------------------------------------------------------------------------
 
+/// Key under which [`ConnectionParams::env`] carries the absolute path of the
+/// active workspace's data directory, for providers with a [`LocalEngine`].
+///
+/// The container path passes credentials and a host/port because it is talking
+/// to a server. An embedded engine instead needs to know where the workspace
+/// lives, and derives its own file layout from that directory. Passing the
+/// directory rather than a file path is deliberate: it keeps every filename a
+/// provider chooses inside that provider, so the orchestration layers never
+/// name another engine's files.
+pub const LOCAL_DATA_DIR_ENV: &str = "GFS_LOCAL_DATA_DIR";
+
 /// In-process database operations for providers that have no compute instance.
 ///
 /// The rest of this port describes work as commands for a runtime to execute

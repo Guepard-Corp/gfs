@@ -476,7 +476,19 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
         runtime_config: &Option<RuntimeConfig>,
         environment: &Option<EnvironmentConfig>,
     ) -> Option<String> {
-        if runtime_config.is_some() && environment.is_some() {
+        let environment = environment.as_ref()?;
+
+        // A container-backed provider needs its instance running to be queried.
+        // An embedded provider has no instance and no `RuntimeConfig`, so
+        // requiring one here would silently drop schema capture for every one of
+        // its commits.
+        let extractable = runtime_config.is_some()
+            || self
+                .registry
+                .get(&environment.database_provider)
+                .is_some_and(|p| p.local_engine().is_some());
+
+        if extractable {
             self.extract_and_store_schema(path).await.ok()
         } else {
             None

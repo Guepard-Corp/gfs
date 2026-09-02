@@ -115,12 +115,6 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         image: Option<String>,
         labels: std::collections::BTreeMap<String, String>,
     ) -> std::result::Result<(), InitRepoError> {
-        let compute = self.compute.as_ref().ok_or_else(|| {
-            InitRepoError::Compute(ComputeError::Internal(
-                "database provisioning requires a compute runtime".into(),
-            ))
-        })?;
-
         let list = self.registry.list();
         let matched_name = list
             .iter()
@@ -202,6 +196,50 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         // last and win: a plain `init` stays `gfs.role=source`, while `gfs clone`
         // passes `gfs.role=clone` + `gfs.remote=<host>`.
         let provider_version = provider.version_from_image(&definition);
+
+        // An embedded provider has no container to provision. Record the
+        // environment and stop: leaving `RuntimeConfig` absent is the signal the
+        // commit, checkout and status paths already read as "no instance to
+        // manage", so no other guard has to learn about this case.
+        if provider.local_engine().is_some() {
+            let workspace_data_dir = self
+                .repository
+                .get_workspace_data_dir_for_head(repo_path)
+                .await?;
+            // The engine creates its own files on first write, but the directory
+            // has to exist for that write to land.
+            std::fs::create_dir_all(&workspace_data_dir).map_err(|e| {
+                InitRepoError::Compute(ComputeError::Internal(format!(
+                    "failed to create workspace data dir '{}': {e}",
+                    workspace_data_dir.display()
+                )))
+            })?;
+
+            self.repository
+                .update_environment_config(
+                    repo_path,
+                    EnvironmentConfig {
+                        database_provider: provider.name().to_string(),
+                        database_version: provider_version,
+                        database_port,
+                        display_name,
+                    },
+                )
+                .await?;
+
+            tracing::info!(
+                provider = provider.name(),
+                "database configured; no compute instance required"
+            );
+            return Ok(());
+        }
+
+        let compute = self.compute.as_ref().ok_or_else(|| {
+            InitRepoError::Compute(ComputeError::Internal(
+                "database provisioning requires a compute runtime".into(),
+            ))
+        })?;
+
         let repo_label = repo_path
             .canonicalize()
             .unwrap_or_else(|_| repo_path.to_path_buf())

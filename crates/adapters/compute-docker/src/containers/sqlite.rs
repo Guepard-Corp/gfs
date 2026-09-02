@@ -30,7 +30,8 @@ use std::sync::Arc;
 use gfs_domain::ports::compute::{ComputeDefinition, EnvVar, PortMapping};
 use gfs_domain::ports::database_provider::{
     ConnectionParams, DataFormat, DatabaseProvider, DatabaseProviderArg, DatabaseProviderRegistry,
-    ExportSpec, ImportSpec, LocalEngine, ProviderError, Result, SupportedFeature,
+    ExportSpec, ImportSpec, LOCAL_DATA_DIR_ENV, LocalEngine, ProviderError, Result,
+    SupportedFeature,
 };
 
 const NAME: &str = "sqlite";
@@ -44,7 +45,9 @@ const DEFAULT_IMAGE: &str = "sqlite:3";
 /// Filename of the database inside the workspace data directory.
 pub const DB_FILENAME: &str = "db.sqlite";
 
-/// Environment variable carrying the absolute host path of the database file.
+/// Optional override carrying an absolute path to the database file, for
+/// pointing at a database outside the workspace. When absent the file is
+/// resolved as [`LOCAL_DATA_DIR_ENV`] joined with [`DB_FILENAME`].
 pub const ENV_DB_PATH: &str = "SQLITE_DB_PATH";
 
 /// Directory the export/import artifact contract writes to and reads from.
@@ -102,11 +105,19 @@ impl SqliteProvider {
         }
     }
 
-    /// Absolute path of the database file, from [`ENV_DB_PATH`].
-    fn db_path(params: &ConnectionParams) -> std::result::Result<&str, ProviderError> {
-        params
-            .get_env(ENV_DB_PATH)
-            .ok_or_else(|| ProviderError::MissingEnvVar(ENV_DB_PATH.to_string()))
+    /// Absolute path of the database file.
+    ///
+    /// Normally the workspace data directory the caller supplied, joined with
+    /// this provider's filename — the caller deliberately does not know the
+    /// filename. [`ENV_DB_PATH`] overrides it outright.
+    fn db_path(params: &ConnectionParams) -> std::result::Result<PathBuf, ProviderError> {
+        if let Some(explicit) = params.get_env(ENV_DB_PATH) {
+            return Ok(PathBuf::from(explicit));
+        }
+        let dir = params
+            .get_env(LOCAL_DATA_DIR_ENV)
+            .ok_or_else(|| ProviderError::MissingEnvVar(LOCAL_DATA_DIR_ENV.to_string()))?;
+        Ok(Path::new(dir).join(DB_FILENAME))
     }
 
     /// Single-quote `path` for POSIX `sh`.
@@ -164,7 +175,7 @@ impl DatabaseProvider for SqliteProvider {
         // `sqlite:///` plus an absolute path yields the four-slash form
         // (`sqlite:////var/db.sqlite`) that SQLAlchemy, Diesel and the Rails
         // sqlite3 adapter all accept for an absolute file URL.
-        Ok(format!("sqlite:///{}", Self::db_path(params)?))
+        Ok(format!("sqlite:///{}", Self::db_path(params)?.display()))
     }
 
     fn supported_versions(&self) -> Vec<String> {
@@ -327,7 +338,7 @@ impl DatabaseProvider for SqliteProvider {
             definition: Self::definition_impl(),
             command: format!(
                 "sqlite3 {db} {verb} > {ARTIFACT_DIR}/{filename}",
-                db = Self::shell_quote(Self::db_path(params)?),
+                db = Self::shell_quote(&Self::db_path(params)?.to_string_lossy()),
             ),
             output_filename: filename.to_string(),
         })
@@ -348,7 +359,7 @@ impl DatabaseProvider for SqliteProvider {
             definition: Self::definition_impl(),
             command: format!(
                 "sqlite3 {db} < {ARTIFACT_DIR}/{input_filename}",
-                db = Self::shell_quote(Self::db_path(params)?),
+                db = Self::shell_quote(&Self::db_path(params)?.to_string_lossy()),
             ),
             input_filename: input_filename.to_string(),
         })
@@ -367,7 +378,7 @@ impl LocalEngine for SqliteProvider {
         &self,
         params: &ConnectionParams,
     ) -> std::result::Result<String, ProviderError> {
-        let path = Path::new(Self::db_path(params)?);
+        let path = Self::db_path(params)?;
         let queries = self.schema_extraction_queries();
         let get = |key: &str| -> std::result::Result<String, ProviderError> {
             queries
@@ -388,7 +399,7 @@ impl LocalEngine for SqliteProvider {
             ));
         }
 
-        let conn = Self::open(path)?;
+        let conn = Self::open(&path)?;
         let version = Self::scalar(&conn, &get("version")?)?;
         let schemas = Self::scalar(&conn, &get("schemas")?)?;
         let tables = Self::scalar(&conn, &get("tables")?)?;
@@ -413,12 +424,12 @@ impl LocalEngine for SqliteProvider {
         &self,
         params: &ConnectionParams,
     ) -> std::result::Result<bool, ProviderError> {
-        let path = Path::new(Self::db_path(params)?);
+        let path = Self::db_path(params)?;
         if !path.exists() {
             // Nothing has been written yet; there is no WAL to fold in.
             return Ok(false);
         }
-        let conn = Self::open(path)?;
+        let conn = Self::open(&path)?;
         conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")
             .map_err(|e| ProviderError::InvalidParams(format!("wal checkpoint failed: {e}")))?;
         Ok(true)
