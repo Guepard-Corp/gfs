@@ -11,6 +11,7 @@ GFS provides an MCP (Model Context Protocol) server for AI agent integration, en
 
 - PostgreSQL (versions 13-18)
 - MySQL (versions 8.0-8.1)
+- SQLite (version 3) — file-based; needs no container runtime
 
 ## Installation
 

@@ -15,6 +15,7 @@ use std::sync::Arc;
 use crate::model::config::GfsConfig;
 use crate::ports::compute::{Compute, ComputeError, InstanceId};
 use crate::ports::database_provider::{ConnectionParams, DatabaseProviderRegistry};
+use crate::repo_utils::repo_layout;
 
 // ---------------------------------------------------------------------------
 // Error
@@ -145,6 +146,41 @@ impl<R: DatabaseProviderRegistry> ExportRepoUseCase<R> {
             })?
             .to_string();
 
+        // 2. Resolve provider before looking for a container: an embedded
+        //    provider legitimately has none, and writes the file itself.
+        let provider = self
+            .registry
+            .get(&provider_name)
+            .ok_or_else(|| ExportRepoError::ProviderNotFound(provider_name.clone()))?;
+
+        if let Some(engine) = provider.local_engine() {
+            let params = repo_layout::local_connection_params(path)
+                .map_err(|e| ExportRepoError::NotConfigured(e.to_string()))?;
+            let filename = provider
+                .supported_export_formats()
+                .into_iter()
+                .find(|f| f.id == format)
+                .map(|f| format!("export{}", f.file_extension))
+                .ok_or_else(|| ExportRepoError::UnsupportedFormat(format.to_string()))?;
+
+            std::fs::create_dir_all(&output_dir)
+                .map_err(|e| ExportRepoError::Config(format!("cannot create output dir: {e}")))?;
+            let file_path = output_dir.join(filename);
+            engine.export(&params, format, &file_path).map_err(|e| {
+                ExportRepoError::TaskFailed {
+                    exit_code: 1,
+                    stderr: e.to_string(),
+                }
+            })?;
+
+            return Ok(ExportOutput {
+                file_path,
+                format: format.to_string(),
+                stdout: String::new(),
+                stderr: String::new(),
+            });
+        }
+
         let container_name = config
             .runtime
             .as_ref()
@@ -156,12 +192,6 @@ impl<R: DatabaseProviderRegistry> ExportRepoUseCase<R> {
                 )
             })?
             .to_string();
-
-        // 2. Resolve provider.
-        let provider = self
-            .registry
-            .get(&provider_name)
-            .ok_or_else(|| ExportRepoError::ProviderNotFound(provider_name.clone()))?;
 
         let container = provider
             .require_container()

@@ -11,6 +11,7 @@ GFS brings Git-like version control to your databases. Commit database states, c
 
 - PostgreSQL (versions 13-18)
 - MySQL (versions 8.0-8.1)
+- SQLite (version 3) — file-based; needs no container runtime
 
 ## Installation
 
@@ -551,7 +552,7 @@ If schema is not captured during commit:
 4. **Check status regularly** - Understand current state and container status
 6. **Export before risky operations** - Create backups with `gfs export`
 7. **Use descriptive commit messages** - Makes history navigation easier
-8. **Container must be running** - Most operations require active database container
+8. **Container must be running** - Most operations require active database container. Not for SQLite, which is embedded: `init`, `query`, `commit`, `schema`, `checkout`, `export` and `import` all work with no container runtime at all
 9. **Schema as documentation** - Use `gfs schema show` to document database structure
 
 ## Environment Variables

@@ -6,6 +6,7 @@
 //! [`DatabaseProviderRegistry::get`] / [`DatabaseProviderRegistry::list`] to look them up.
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use crate::model::db_user::{DeployEnvSpec, GrantSpec, RevokeSpec, RolePreset, RoleSpec};
@@ -275,6 +276,36 @@ pub trait LocalEngine: Send + Sync {
         &self,
         params: &ConnectionParams,
     ) -> std::result::Result<Option<Box<dyn SnapshotGuard>>, ProviderError>;
+
+    /// Write the database to `destination` in `format`.
+    ///
+    /// The container path builds an [`ExportSpec`] for a sidecar to run; an
+    /// embedded engine has no sidecar, so it writes the file itself. The
+    /// caller has already decided where the file goes.
+    ///
+    /// Default: the provider advertises no export formats.
+    fn export(
+        &self,
+        params: &ConnectionParams,
+        format: &str,
+        destination: &Path,
+    ) -> std::result::Result<(), ProviderError> {
+        let _ = (params, destination);
+        Err(ProviderError::UnsupportedFormat(format.to_string()))
+    }
+
+    /// Replay `source` into the database.
+    ///
+    /// Default: the provider advertises no import formats.
+    fn import(
+        &self,
+        params: &ConnectionParams,
+        format: &str,
+        source: &Path,
+    ) -> std::result::Result<(), ProviderError> {
+        let _ = (params, source);
+        Err(ProviderError::UnsupportedFormat(format.to_string()))
+    }
 }
 
 /// Holds an embedded database quiescent for the lifetime of the value.

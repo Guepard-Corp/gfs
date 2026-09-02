@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Features
 
+- feat: SQLite provider — a file-based database versioned without any container runtime. `gfs init --database-provider sqlite` provisions nothing; commit, checkout, branching, schema capture, export and import all run against the SQLite amalgamation linked into the binary, so the recorded engine version is reproducible rather than inherited from whatever `sqlite3` the host has. Snapshots are quiesced through SQLite's own write lock, which is what a container could not do for it — the writer is the user's application, not anything GFS controls
 - feat: Native Qwery support — the installer now detects Qwery (`~/.qwery` or the `qwery`/`qwery-tui` CLI) and injects the GFS skills into `~/.qwery/skills/` and the Qwery agent into `~/.qwery/agents/`
 
 ### Bug Fixes

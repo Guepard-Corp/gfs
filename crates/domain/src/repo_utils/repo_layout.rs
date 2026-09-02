@@ -159,11 +159,6 @@ pub fn remove_new_marker(working_dir: &Path) {
     fs::remove_file(&new_marker_path).unwrap();
 }
 
-/// Return the path recorded in `.gfs/WORKSPACE` — the directory where the
-/// database is currently running.
-///
-/// Falls back to the workspace for the current HEAD commit when the
-/// `WORKSPACE` file does not exist (e.g. repos created before this feature).
 /// Connection parameters for a provider with an in-process engine.
 ///
 /// There is no host, port or credential to supply — the engine opens a file. It
@@ -183,6 +178,11 @@ pub fn local_connection_params(
     })
 }
 
+/// Return the path recorded in `.gfs/WORKSPACE` — the directory where the
+/// database is currently running.
+///
+/// Falls back to the workspace for the current HEAD commit when the
+/// `WORKSPACE` file does not exist (e.g. repos created before this feature).
 pub fn get_active_workspace_data_dir(repo_path: &Path) -> Result<std::path::PathBuf, RepoError> {
     let workspace_file = repo_path.join(GFS_DIR).join(WORKSPACE_FILE);
     if workspace_file.exists() {

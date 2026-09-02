@@ -15,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::model::config::GfsConfig;
 use crate::ports::compute::{Compute, ComputeError, InstanceId};
 use crate::ports::database_provider::{ConnectionParams, DatabaseProviderRegistry};
+use crate::repo_utils::repo_layout;
 
 // ---------------------------------------------------------------------------
 // Error
@@ -179,6 +180,30 @@ impl<R: DatabaseProviderRegistry> ImportRepoUseCase<R> {
             format.to_string()
         };
 
+        // 2. Resolve provider before looking for a container: an embedded
+        //    provider legitimately has none, and replays the script itself.
+        let provider = self
+            .registry
+            .get(&provider_name)
+            .ok_or_else(|| ImportRepoError::ProviderNotFound(provider_name.clone()))?;
+
+        if let Some(engine) = provider.local_engine() {
+            let params = repo_layout::local_connection_params(path)
+                .map_err(|e| ImportRepoError::NotConfigured(e.to_string()))?;
+            engine
+                .import(&params, &resolved_format, &input_file)
+                .map_err(|e| ImportRepoError::TaskFailed {
+                    exit_code: 1,
+                    stderr: e.to_string(),
+                })?;
+            return Ok(ImportOutput {
+                format: resolved_format,
+                imported_from: input_file,
+                stdout: String::new(),
+                stderr: String::new(),
+            });
+        }
+
         let container_name = config
             .runtime
             .as_ref()
@@ -190,12 +215,6 @@ impl<R: DatabaseProviderRegistry> ImportRepoUseCase<R> {
                 )
             })?
             .to_string();
-
-        // 2. Resolve provider.
-        let provider = self
-            .registry
-            .get(&provider_name)
-            .ok_or_else(|| ImportRepoError::ProviderNotFound(provider_name.clone()))?;
 
         let container = provider
             .require_container()

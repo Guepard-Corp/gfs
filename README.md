@@ -84,6 +84,7 @@ GFS makes agent-driven database work safe by default:
 
 - **PostgreSQL** (versions 13-18)
 - **MySQL** (versions 8.0-8.1)
+- **SQLite** (version 3) — embedded, so no container runtime is required
 
 Run `gfs providers` to see all available providers and their supported versions.
 

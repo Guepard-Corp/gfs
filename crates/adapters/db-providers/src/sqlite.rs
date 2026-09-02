@@ -271,6 +271,39 @@ impl SqliteProvider {
         Ok(Self::resolve(params)?.into_path())
     }
 
+    /// User tables whose rows should be dumped: no shadow tables, no virtual
+    /// tables (their CREATE rebuilds the content), no sqlite internals.
+    fn real_tables(conn: &rusqlite::Connection) -> std::result::Result<Vec<String>, ProviderError> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM pragma_table_list \
+                 WHERE schema = 'main' AND type = 'table' \
+                   AND name NOT LIKE 'sqlite~_%' ESCAPE '~' ORDER BY name",
+            )
+            .map_err(|e| ProviderError::InvalidParams(format!("listing tables: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| ProviderError::InvalidParams(format!("listing tables: {e}")))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| ProviderError::InvalidParams(format!("listing tables: {e}")))
+    }
+
+    /// Columns that carry stored values. Generated columns (hidden 2 and 3) are
+    /// recomputed on replay, and hidden 1 belongs to a virtual table.
+    fn insertable_columns(
+        conn: &rusqlite::Connection,
+        table: &str,
+    ) -> std::result::Result<Vec<String>, ProviderError> {
+        let mut stmt = conn
+            .prepare("SELECT name FROM pragma_table_xinfo(?1) WHERE hidden = 0 ORDER BY cid")
+            .map_err(|e| ProviderError::InvalidParams(format!("columns of '{table}': {e}")))?;
+        let rows = stmt
+            .query_map([table], |r| r.get::<_, String>(0))
+            .map_err(|e| ProviderError::InvalidParams(format!("columns of '{table}': {e}")))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| ProviderError::InvalidParams(format!("columns of '{table}': {e}")))
+    }
+
     fn open(path: &Path) -> std::result::Result<rusqlite::Connection, ProviderError> {
         rusqlite::Connection::open(path)
             .map_err(|e| ProviderError::InvalidParams(format!("cannot open '{path:?}': {e}")))
@@ -335,10 +368,20 @@ impl DatabaseProvider for SqliteProvider {
     }
 
     fn supported_features(&self) -> Vec<SupportedFeature> {
-        vec![SupportedFeature {
-            id: "schema".into(),
-            description: "Schema and DDL inspection".into(),
-        }]
+        vec![
+            SupportedFeature {
+                id: "schema".into(),
+                description: "Schema and DDL inspection".into(),
+            },
+            SupportedFeature {
+                id: "export".into(),
+                description: "Export the database as a replayable SQL dump".into(),
+            },
+            SupportedFeature {
+                id: "import".into(),
+                description: "Replay a SQL dump into the database".into(),
+            },
+        ]
     }
 
     fn query_client_command(
@@ -441,17 +484,20 @@ impl DatabaseProvider for SqliteProvider {
         queries
     }
 
-    /// Nothing yet. Export needs an in-process implementation on
-    /// [`LocalEngine`]; until it exists this advertises nothing, because a
-    /// capability `gfs providers` lists but cannot run is worse than a shorter
-    /// list.
     fn supported_export_formats(&self) -> Vec<DataFormat> {
-        vec![]
+        vec![DataFormat {
+            id: "sql".into(),
+            description: "SQL dump, replayable into an empty database".into(),
+            file_extension: ".sql".into(),
+        }]
     }
 
-    /// Nothing yet — see [`SqliteProvider::supported_export_formats`].
     fn supported_import_formats(&self) -> Vec<DataFormat> {
-        vec![]
+        vec![DataFormat {
+            id: "sql".into(),
+            description: "SQL script".into(),
+            file_extension: ".sql".into(),
+        }]
     }
 }
 
@@ -563,6 +609,97 @@ impl LocalEngine for SqliteProvider {
 
         Ok(Some(Box::new(SqliteSnapshotGuard { conn })))
     }
+
+    /// Write a SQL dump that recreates the database when replayed.
+    ///
+    /// Values are rendered by SQLite's own `quote()`, which is how the
+    /// `sqlite3` shell builds `.dump`: it emits a correct literal for every
+    /// storage class — `NULL`, integers, reals, `'escaped '' quotes'`, and
+    /// blobs as `X'..'` — so the round trip does not depend on this code
+    /// getting escaping right for each type.
+    ///
+    /// Generated columns are declared but never inserted; their values are
+    /// recomputed on replay. Virtual tables keep their `CREATE`, but their
+    /// content lives in shadow tables that the CREATE rebuilds.
+    fn export(
+        &self,
+        params: &ConnectionParams,
+        format: &str,
+        destination: &Path,
+    ) -> std::result::Result<(), ProviderError> {
+        if format != "sql" {
+            return Err(ProviderError::UnsupportedFormat(format.to_string()));
+        }
+        let Located::Existing(path) = Self::resolve(params)? else {
+            return Err(ProviderError::InvalidParams(
+                "there is no database to export yet".to_string(),
+            ));
+        };
+        let conn = Self::open_read_only(&path)?;
+
+        let mut out = String::from("PRAGMA foreign_keys=OFF;\nBEGIN TRANSACTION;\n");
+        out.push_str(&Self::scalar(&conn, DDL_QUERY)?);
+        out.push('\n');
+
+        for table in Self::real_tables(&conn)? {
+            let cols = Self::insertable_columns(&conn, &table)?;
+            if cols.is_empty() {
+                continue;
+            }
+            let quoted: Vec<String> = cols
+                .iter()
+                .map(|c| format!("quote({})", ident(c)))
+                .collect();
+            // The whole `INSERT INTO "t" VALUES(` prefix is one SQL string
+            // literal; embedding the quoted identifier on its own would end the
+            // literal early and produce a syntax error.
+            let prefix = sql_string_literal(&format!("INSERT INTO {} VALUES(", ident(&table)));
+            let sql = format!(
+                "SELECT {} || {} || ');' FROM {}",
+                prefix,
+                quoted.join(" || ',' || "),
+                ident(&table)
+            );
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| ProviderError::InvalidParams(format!("dump of '{table}': {e}")))?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(|e| ProviderError::InvalidParams(format!("dump of '{table}': {e}")))?;
+            for row in rows {
+                out.push_str(&row.map_err(|e| {
+                    ProviderError::InvalidParams(format!("dump of '{table}': {e}"))
+                })?);
+                out.push('\n');
+            }
+        }
+        out.push_str("COMMIT;\n");
+
+        std::fs::write(destination, out).map_err(|e| {
+            ProviderError::InvalidParams(format!("cannot write '{}': {e}", destination.display()))
+        })
+    }
+
+    /// Replay a SQL script into the database.
+    fn import(
+        &self,
+        params: &ConnectionParams,
+        format: &str,
+        source: &Path,
+    ) -> std::result::Result<(), ProviderError> {
+        if format != "sql" {
+            return Err(ProviderError::UnsupportedFormat(format.to_string()));
+        }
+        let script = std::fs::read_to_string(source).map_err(|e| {
+            ProviderError::InvalidParams(format!("cannot read '{}': {e}", source.display()))
+        })?;
+        // Absent is fine: replaying a dump into a workspace with no database
+        // yet is exactly how a restore starts.
+        let path = Self::resolve(params)?.into_path();
+        let conn = Self::open(&path)?;
+        conn.execute_batch(&script)
+            .map_err(|e| ProviderError::InvalidParams(format!("import failed: {e}")))
+    }
 }
 
 /// How long to wait for the write lock before giving up and letting the caller
@@ -635,6 +772,16 @@ fn classify_lock_failure(
     }
 }
 
+/// Quote a SQLite identifier: wrap in double quotes, doubling any inside.
+fn ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Quote a SQL string literal: wrap in single quotes, doubling any inside.
+fn sql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 /// Assemble the delimited schema payload the shared parser expects.
 fn render_sections(version: &str, schemas: &str, tables: &str, columns: &str, ddl: &str) -> String {
     format!(
@@ -681,16 +828,44 @@ mod tests {
         params_with_path(path.to_str().unwrap())
     }
 
-    /// Every advertised capability must have a code path that runs. Export and
-    /// import were once listed here while resolving to container commands that
-    /// could never execute, so `gfs providers` promised what it could not do.
+    /// Every advertised capability must have a code path that RUNS — not merely
+    /// exist. Export and import were once listed here while resolving to
+    /// container commands that could never execute, so `gfs providers` promised
+    /// what it could not do. Asserting the list alone would not have caught it,
+    /// so each advertised capability is exercised.
     #[test]
-    fn advertises_only_capabilities_that_exist() {
+    fn every_advertised_capability_actually_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let params = seeded_db(dir.path());
         let p = SqliteProvider::new();
-        let features: Vec<_> = p.supported_features().into_iter().map(|f| f.id).collect();
-        assert_eq!(features, vec!["schema".to_string()]);
-        assert!(p.supported_export_formats().is_empty());
-        assert!(p.supported_import_formats().is_empty());
+
+        let features: Vec<String> = p.supported_features().into_iter().map(|f| f.id).collect();
+        assert_eq!(features, ["schema", "export", "import"]);
+
+        for f in &features {
+            match f.as_str() {
+                "schema" => {
+                    p.extract_schema(&params).expect("schema is advertised");
+                }
+                "export" => {
+                    let out = dir.path().join("adv.sql");
+                    let fmt = &p.supported_export_formats()[0].id;
+                    p.export(&params, fmt, &out).expect("export is advertised");
+                    assert!(out.metadata().unwrap().len() > 0);
+                }
+                "import" => {
+                    // Into a fresh workspace: replaying a dump over the tables
+                    // it came from would collide, which says nothing about
+                    // whether import works.
+                    let fresh = tempfile::tempdir().unwrap();
+                    let out = dir.path().join("adv.sql");
+                    let fmt = &p.supported_import_formats()[0].id;
+                    p.import(&params_for_dir(fresh.path()), fmt, &out)
+                        .expect("import is advertised");
+                }
+                other => panic!("unexercised capability advertised: {other}"),
+            }
+        }
     }
 
     #[test]
@@ -1458,6 +1633,116 @@ mod tests {
         let out = SqliteProvider::new().extract_schema(&params).unwrap();
         assert!(out.contains("picked"), "{out}");
         assert!(!out.contains("ignored"), "{out}");
+    }
+
+    /// The only assertion that means anything for export: replay the dump into
+    /// an empty database and compare what comes back. Asserting on the dump
+    /// text — or on a command string, as the previous container-shaped specs
+    /// did — would pass while the feature did not work.
+    #[test]
+    fn a_dump_round_trips_every_storage_class() {
+        let src = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(src.path().join(DB_FILENAME)).unwrap();
+        conn.execute_batch(
+            r#"CREATE TABLE odd(
+                   id INTEGER PRIMARY KEY,
+                   txt TEXT,
+                   num REAL,
+                   blob BLOB,
+                   gen INTEGER GENERATED ALWAYS AS (id * 2) STORED
+               );
+               CREATE TABLE "we'ird ""name"("co'l" TEXT);
+               CREATE INDEX ix_odd ON odd(txt);
+               CREATE VIEW v AS SELECT id FROM odd;"#,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO odd(txt, num, blob) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                "it's a \"quoted\" string\nwith a newline and Ünïcödé ✅",
+                std::f64::consts::PI,
+                vec![0u8, 159, 146, 150, 255]
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO odd(txt, num, blob) VALUES (NULL, NULL, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO \"we'ird \"\"name\" VALUES ('quote '' here')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let dump = src.path().join("dump.sql");
+        SqliteProvider::new()
+            .export(&params_for_dir(src.path()), "sql", &dump)
+            .expect("export");
+
+        // Replay into a genuinely empty workspace.
+        let dst = tempfile::tempdir().unwrap();
+        SqliteProvider::new()
+            .import(&params_for_dir(dst.path()), "sql", &dump)
+            .expect("import");
+
+        let a = rusqlite::Connection::open(src.path().join(DB_FILENAME)).unwrap();
+        let b = rusqlite::Connection::open(dst.path().join(DB_FILENAME)).unwrap();
+
+        /// One row of `odd`, spelled out so the comparison below is readable.
+        type OddRow = (i64, Option<String>, Option<f64>, Option<Vec<u8>>, i64);
+
+        let rows = |c: &rusqlite::Connection| -> Vec<OddRow> {
+            let mut st = c
+                .prepare("SELECT id, txt, num, blob, gen FROM odd ORDER BY id")
+                .unwrap();
+            st.query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        };
+        assert_eq!(
+            rows(&a),
+            rows(&b),
+            "every value must survive the round trip"
+        );
+
+        let weird = |c: &rusqlite::Connection| -> String {
+            c.query_row("SELECT \"co'l\" FROM \"we'ird \"\"name\"", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(weird(&a), weird(&b), "quoted identifiers must survive too");
+
+        // Schema objects, not just rows.
+        let objects = |c: &rusqlite::Connection| -> Vec<String> {
+            let mut st = c
+                .prepare("SELECT type || ':' || name FROM sqlite_master ORDER BY 1")
+                .unwrap();
+            st.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(
+            objects(&a),
+            objects(&b),
+            "indexes and views must be recreated"
+        );
+    }
+
+    #[test]
+    fn export_rejects_a_format_it_does_not_advertise() {
+        let dir = tempfile::tempdir().unwrap();
+        seeded_db(dir.path());
+        let out = dir.path().join("x.dump");
+        assert!(matches!(
+            SqliteProvider::new().export(&params_for_dir(dir.path()), "custom", &out),
+            Err(ProviderError::UnsupportedFormat(_))
+        ));
     }
 
     #[test]
