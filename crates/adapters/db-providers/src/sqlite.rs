@@ -74,6 +74,29 @@ const DDL_QUERY: &str = "SELECT coalesce(group_concat(sql, ';\n'), '') || ';' \
      WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite~_%' ESCAPE '~' \
        AND name NOT IN (SELECT name FROM pragma_table_list WHERE type = 'shadow');";
 
+/// DDL for the objects that must exist BEFORE the data is replayed.
+///
+/// Tables only — including virtual tables, whose `CREATE` builds an empty
+/// index that the inserts below repopulate. Shadow tables are excluded: they
+/// are rebuilt from those inserts.
+const TABLE_DDL_QUERY: &str = "SELECT coalesce(group_concat(sql, ';\n'), '') \
+     FROM sqlite_master \
+     WHERE type = 'table' AND sql IS NOT NULL \
+       AND name NOT LIKE 'sqlite~_%' ESCAPE '~' \
+       AND name NOT IN (SELECT name FROM pragma_table_list WHERE type = 'shadow');";
+
+/// DDL for the objects that must come AFTER the data.
+///
+/// Triggers above all: replaying inserts with an `AFTER INSERT` trigger already
+/// installed fires it for every row, so a restore silently gained rows the
+/// source never had. Real `sqlite3 .dump` emits views, triggers and indexes
+/// last for exactly this reason, and building the indexes after the bulk load
+/// is faster besides.
+const POST_DATA_DDL_QUERY: &str = "SELECT coalesce(group_concat(sql, ';\n'), '') \
+     FROM sqlite_master \
+     WHERE type IN ('view', 'trigger', 'index') AND sql IS NOT NULL \
+       AND name NOT LIKE 'sqlite~_%' ESCAPE '~';";
+
 /// Whether a column can actually hold NULL.
 ///
 /// `pragma_table_info.notnull` alone is not enough, because SQLite reports `0`
@@ -355,13 +378,18 @@ impl SqliteProvider {
         Ok(Self::resolve(params)?.into_path())
     }
 
-    /// User tables whose rows should be dumped: no shadow tables, no virtual
-    /// tables (their CREATE rebuilds the content), no sqlite internals.
-    fn real_tables(conn: &rusqlite::Connection) -> std::result::Result<Vec<String>, ProviderError> {
+    /// Tables whose rows should be dumped: real and virtual, never shadow.
+    ///
+    /// Virtual tables are included because `CREATE VIRTUAL TABLE` builds an
+    /// EMPTY index — the content has to be re-inserted, which re-indexes it.
+    /// Excluding them silently dropped every row of an FTS5 table.
+    fn dumpable_tables(
+        conn: &rusqlite::Connection,
+    ) -> std::result::Result<Vec<String>, ProviderError> {
         let mut stmt = conn
             .prepare(
                 "SELECT name FROM pragma_table_list \
-                 WHERE schema = 'main' AND type = 'table' \
+                 WHERE schema = 'main' AND type IN ('table', 'virtual') \
                    AND name NOT LIKE 'sqlite~_%' ESCAPE '~' ORDER BY name",
             )
             .map_err(|e| ProviderError::InvalidParams(format!("listing tables: {e}")))?;
@@ -709,9 +737,15 @@ impl LocalEngine for SqliteProvider {
     /// blobs as `X'..'` — so the round trip does not depend on this code
     /// getting escaping right for each type.
     ///
+    /// Order matters as much as escaping: tables first, then their rows, then
+    /// views, triggers and indexes. A trigger installed before the rows are
+    /// replayed fires for every one of them, so a restore gained rows the
+    /// source never had.
+    ///
     /// Generated columns are declared but never inserted; their values are
-    /// recomputed on replay. Virtual tables keep their `CREATE`, but their
-    /// content lives in shadow tables that the CREATE rebuilds.
+    /// recomputed on replay. Virtual tables ARE repopulated by insert, which
+    /// rebuilds their index — `CREATE VIRTUAL TABLE` alone produces an empty
+    /// one.
     fn export(
         &self,
         params: &ConnectionParams,
@@ -729,10 +763,13 @@ impl LocalEngine for SqliteProvider {
         let conn = Self::open_read_only(&path)?;
 
         let mut out = String::from("PRAGMA foreign_keys=OFF;\nBEGIN TRANSACTION;\n");
-        out.push_str(&Self::scalar(&conn, DDL_QUERY)?);
-        out.push('\n');
+        let tables_ddl = Self::scalar(&conn, TABLE_DDL_QUERY)?;
+        if !tables_ddl.is_empty() {
+            out.push_str(&tables_ddl);
+            out.push_str(";\n");
+        }
 
-        for table in Self::real_tables(&conn)? {
+        for table in Self::dumpable_tables(&conn)? {
             let cols = Self::insertable_columns(&conn, &table)?;
             if cols.is_empty() {
                 continue;
@@ -744,7 +781,16 @@ impl LocalEngine for SqliteProvider {
             // The whole `INSERT INTO "t" VALUES(` prefix is one SQL string
             // literal; embedding the quoted identifier on its own would end the
             // literal early and produce a syntax error.
-            let prefix = sql_string_literal(&format!("INSERT INTO {} VALUES(", ident(&table)));
+            // Columns are named rather than positional: a table with generated
+            // columns has fewer insertable columns than declared ones, and a
+            // virtual table has hidden ones, so positional values would
+            // misalign.
+            let column_list = cols.iter().map(|c| ident(c)).collect::<Vec<_>>().join(",");
+            let prefix = sql_string_literal(&format!(
+                "INSERT INTO {}({}) VALUES(",
+                ident(&table),
+                column_list
+            ));
             let sql = format!(
                 "SELECT {} || {} || ');' FROM {}",
                 prefix,
@@ -763,6 +809,12 @@ impl LocalEngine for SqliteProvider {
                 })?);
                 out.push('\n');
             }
+        }
+        // Views, triggers and indexes last — see POST_DATA_DDL_QUERY.
+        let post_ddl = Self::scalar(&conn, POST_DATA_DDL_QUERY)?;
+        if !post_ddl.is_empty() {
+            out.push_str(&post_ddl);
+            out.push_str(";\n");
         }
         out.push_str("COMMIT;\n");
 
@@ -1936,6 +1988,128 @@ mod tests {
             objects(&b),
             "indexes and views must be recreated"
         );
+    }
+
+    /// A trigger installed before the rows are replayed fires for every one of
+    /// them, so the restore gains rows the source never had. Real `.dump` emits
+    /// triggers last for exactly this reason.
+    #[test]
+    fn triggers_do_not_fire_while_a_dump_is_replayed() {
+        let src = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(src.path().join(DB_FILENAME)).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE audit_src(id INTEGER PRIMARY KEY, v TEXT);
+             CREATE TABLE audit_log(id INTEGER PRIMARY KEY, note TEXT);
+             CREATE TRIGGER t AFTER INSERT ON audit_src
+                 BEGIN INSERT INTO audit_log(note) VALUES('ins ' || NEW.v); END;
+             INSERT INTO audit_src(v) VALUES('one'),('two');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let dump = src.path().join("d.sql");
+        let p = SqliteProvider::new();
+        p.export(&params_for_dir(src.path()), "sql", &dump).unwrap();
+
+        let dst = tempfile::tempdir().unwrap();
+        p.import(&params_for_dir(dst.path()), "sql", &dump).unwrap();
+
+        let b = rusqlite::Connection::open(dst.path().join(DB_FILENAME)).unwrap();
+        let count = |t: &str| -> i64 {
+            b.query_row(&format!("SELECT count(*) FROM {t}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count("audit_src"), 2);
+        assert_eq!(
+            count("audit_log"),
+            2,
+            "the trigger must not have fired during the replay"
+        );
+
+        // And it must still work afterwards.
+        b.execute("INSERT INTO audit_src(v) VALUES('three')", [])
+            .unwrap();
+        assert_eq!(
+            count("audit_log"),
+            3,
+            "the trigger must survive the restore"
+        );
+    }
+
+    /// `CREATE VIRTUAL TABLE` builds an EMPTY index, so a dump that emits only
+    /// the CREATE loses every row. Re-inserting the content rebuilds the index.
+    #[test]
+    fn virtual_table_content_survives_a_dump() {
+        let src = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(src.path().join(DB_FILENAME)).unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE ft USING fts5(body, title);
+             INSERT INTO ft(body, title) VALUES('alpha beta','one'),('gamma','two');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let dump = src.path().join("d.sql");
+        let p = SqliteProvider::new();
+        p.export(&params_for_dir(src.path()), "sql", &dump).unwrap();
+
+        let dst = tempfile::tempdir().unwrap();
+        p.import(&params_for_dir(dst.path()), "sql", &dump).unwrap();
+
+        let b = rusqlite::Connection::open(dst.path().join(DB_FILENAME)).unwrap();
+        let rows: Vec<(String, String)> = b
+            .prepare("SELECT body, title FROM ft ORDER BY title")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("alpha beta".to_string(), "one".to_string()),
+                ("gamma".to_string(), "two".to_string())
+            ]
+        );
+
+        // The index has to work, not merely the content be present.
+        let hit: String = b
+            .query_row("SELECT body FROM ft WHERE ft MATCH 'beta'", [], |r| {
+                r.get(0)
+            })
+            .expect("full-text search must work on the restored table");
+        assert_eq!(hit, "alpha beta");
+    }
+
+    /// A table with generated columns has fewer insertable columns than declared
+    /// ones, so a positional INSERT would misalign.
+    #[test]
+    fn generated_columns_do_not_misalign_the_dump() {
+        let src = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(src.path().join(DB_FILENAME)).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE g(id INTEGER PRIMARY KEY, p REAL, q INT,
+                 total REAL GENERATED ALWAYS AS (p*q) STORED);
+             INSERT INTO g(p,q) VALUES(2.0, 3), (1.5, 4);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let dump = src.path().join("d.sql");
+        let p = SqliteProvider::new();
+        p.export(&params_for_dir(src.path()), "sql", &dump).unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        p.import(&params_for_dir(dst.path()), "sql", &dump).unwrap();
+
+        let b = rusqlite::Connection::open(dst.path().join(DB_FILENAME)).unwrap();
+        let totals: Vec<f64> = b
+            .prepare("SELECT total FROM g ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(totals, vec![6.0, 6.0], "generated values recomputed");
     }
 
     #[test]

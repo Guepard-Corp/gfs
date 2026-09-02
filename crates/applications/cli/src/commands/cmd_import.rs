@@ -39,10 +39,11 @@ pub async fn run(
     let format_str = format.as_deref().unwrap_or("");
 
     let use_case = ImportRepoUseCase::new(compute, registry);
-    let output = use_case
-        .run(&repo_path, file, format_str)
-        .await
-        .context("import failed")?;
+    // Do not use `.context("import failed")`: anyhow's context Display only prints that
+    // string and hides the underlying `ImportRepoError` message, so an unsupported format,
+    // a missing file, a directory and an invalid script all read identically. The same
+    // trap is documented in cmd_export.rs.
+    let output = use_case.run(&repo_path, file, format_str).await?;
 
     if json_output {
         println!(
