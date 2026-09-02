@@ -304,7 +304,30 @@ fn user_grant_revoke_list_privileges() {
         ));
         run_psql_select(&cid, "CREATE TABLE public.orders(id int);");
 
-        // GRANT SELECT on the table via the CLI.
+        // Baseline from the preset: `readonly` grants SELECT via membership in the
+        // `gfs_readonly` group, but not INSERT. A direct grant/revoke of SELECT would
+        // be masked by the group, so exercise the direct object-grant path on INSERT
+        // (which `readonly` does not provide) to observe the change unambiguously.
+        assert_eq!(
+            run_psql_select(
+                &cid,
+                "SELECT has_table_privilege('app_ro','public.orders','SELECT')"
+            )
+            .trim(),
+            "t",
+            "readonly preset grants SELECT via the gfs_readonly group",
+        );
+        assert_eq!(
+            run_psql_select(
+                &cid,
+                "SELECT has_table_privilege('app_ro','public.orders','INSERT')"
+            )
+            .trim(),
+            "f",
+            "readonly must not grant INSERT",
+        );
+
+        // GRANT INSERT (a direct object grant) via the CLI.
         assert!(gfs_user(
             repo,
             &[
@@ -313,33 +336,23 @@ fn user_grant_revoke_list_privileges() {
                 "--on-table",
                 "public.orders",
                 "--privileges",
-                "SELECT",
+                "INSERT",
             ],
         ));
-        assert_eq!(
-            run_psql_select(
-                &cid,
-                "SELECT has_table_privilege('app_ro','public.orders','SELECT')"
-            )
-            .trim(),
-            "t",
-            "CLI grant must give app_ro SELECT on public.orders",
-        );
-        // Least-privilege preserved: INSERT was NOT granted.
         assert_eq!(
             run_psql_select(
                 &cid,
                 "SELECT has_table_privilege('app_ro','public.orders','INSERT')"
             )
             .trim(),
-            "f",
-            "only SELECT was granted, not INSERT",
+            "t",
+            "CLI grant must give app_ro INSERT on public.orders",
         );
 
         // list-privs runs (authoritative check is the has_table_privilege above).
         assert!(gfs_user(repo, &["list-privs", "app_ro"]));
 
-        // REVOKE SELECT via the CLI.
+        // REVOKE INSERT (the direct grant) via the CLI.
         assert!(gfs_user(
             repo,
             &[
@@ -348,17 +361,27 @@ fn user_grant_revoke_list_privileges() {
                 "--on-table",
                 "public.orders",
                 "--privileges",
-                "SELECT",
+                "INSERT",
             ],
         ));
+        assert_eq!(
+            run_psql_select(
+                &cid,
+                "SELECT has_table_privilege('app_ro','public.orders','INSERT')"
+            )
+            .trim(),
+            "f",
+            "CLI revoke must remove the directly-granted INSERT",
+        );
+        // The group-provided SELECT is untouched by a direct object revoke.
         assert_eq!(
             run_psql_select(
                 &cid,
                 "SELECT has_table_privilege('app_ro','public.orders','SELECT')"
             )
             .trim(),
-            "f",
-            "CLI revoke must remove SELECT",
+            "t",
+            "the group-provided SELECT survives a direct revoke",
         );
     });
 }
