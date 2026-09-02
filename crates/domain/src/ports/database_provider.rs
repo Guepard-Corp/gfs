@@ -261,6 +261,23 @@ pub trait DatabaseProvider: Send + Sync {
         SIGTERM
     }
 
+    /// Whether this provider needs a running compute instance (container or VM).
+    ///
+    /// Client/server engines return the default `true`: the database is a
+    /// process that must be provisioned, started, paused and connected to over
+    /// a port. Embedded engines such as SQLite return `false` — the database is
+    /// a file, opened in-process by whichever program uses it, so there is
+    /// nothing to provision and nothing to connect to.
+    ///
+    /// When this is `false` the orchestration layers skip container
+    /// provisioning entirely and use the provider's in-process entry points
+    /// ([`DatabaseProvider::extract_schema_locally`],
+    /// [`DatabaseProvider::prepare_for_snapshot_locally`]) instead of executing
+    /// commands inside an instance.
+    fn requires_compute(&self) -> bool {
+        true
+    }
+
     /// Build a client connection string from host, port, and optional env (credentials, db name).
     fn connection_string(
         &self,
@@ -610,7 +627,48 @@ pub trait DatabaseProvider: Send + Sync {
     }
 
     // -----------------------------------------------------------------------
-    // Lazy clone
+    // In-process execution (providers with `requires_compute() == false`)
+    // -----------------------------------------------------------------------
+
+    /// Extract schema in-process, without a compute instance or a client binary.
+    ///
+    /// Returns the same delimiter-separated text that
+    /// [`DatabaseProvider::schema_extraction_spec`]'s command would print to
+    /// stdout, so both paths feed the identical parser.
+    ///
+    /// This exists for embedded providers (SQLite, and any future DuckDB-style
+    /// provider) where there is no server to connect to. Running the queries
+    /// against a library linked into this binary — rather than shelling out to
+    /// whatever client happens to be installed — keeps the recorded engine
+    /// version reproducible across machines. A host binary's version varies per
+    /// developer, which would make the same schema hash to different metadata.
+    ///
+    /// Default: `None` — the provider needs a compute instance.
+    fn extract_schema_locally(
+        &self,
+        _params: &ConnectionParams,
+    ) -> std::result::Result<Option<String>, ProviderError> {
+        Ok(None)
+    }
+
+    /// Quiesce an embedded database on the host before a storage snapshot.
+    ///
+    /// The compute-backed equivalent is
+    /// [`DatabaseProvider::prepare_for_snapshot`], whose commands a runtime
+    /// executes inside the instance. A provider with no compute instance has no
+    /// such runtime, so it performs the preparation itself and reports whether
+    /// it did anything.
+    ///
+    /// Returns `Ok(false)` when the provider has no local preparation to do.
+    fn prepare_for_snapshot_locally(
+        &self,
+        _params: &ConnectionParams,
+    ) -> std::result::Result<bool, ProviderError> {
+        Ok(false)
+    }
+
+    // -----------------------------------------------------------------------
+    // Lazy clone (RFC 008)
     // -----------------------------------------------------------------------
 
     /// Whether lazy clone (external read-through) is supported.
