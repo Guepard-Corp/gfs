@@ -48,18 +48,27 @@ const MAIN_SCHEMA: &str = "main";
 
 /// Subquery assigning each user table a stable id.
 ///
+/// Sourced from `pragma_table_list` rather than `sqlite_master` so SQLite can
+/// classify the rows for us: an FTS5 table contributes five `shadow` tables
+/// (`_data`, `_idx`, `_content`, `_docsize`, `_config`) that are implementation
+/// detail, not user schema. `virtual` is kept — the FTS5 table itself is
+/// something the user created and expects to see.
+///
 /// Used verbatim by both the tables and the columns query so a column's
 /// `table_id` refers to the same table the tables section reported. `ORDER BY
 /// name` makes the numbering deterministic across runs, which keeps the schema
 /// hash stable when nothing has actually changed.
 const TABLE_IDS: &str = "SELECT ROW_NUMBER() OVER (ORDER BY name) AS id, name \
-     FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite~_%' ESCAPE '~'";
+     FROM pragma_table_list \
+     WHERE schema = 'main' AND type IN ('table', 'virtual') \
+       AND name NOT LIKE 'sqlite~_%' ESCAPE '~'";
 
 /// Schema-only DDL, in place of the `sqlite3` shell's `.schema` dot-command
 /// (which is a feature of that client, not of the engine).
 const DDL_QUERY: &str = "SELECT coalesce(group_concat(sql, ';\n'), '') || ';' \
      FROM sqlite_master \
-     WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite~_%' ESCAPE '~';";
+     WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite~_%' ESCAPE '~' \
+       AND name NOT IN (SELECT name FROM pragma_table_list WHERE type = 'shadow');";
 
 /// Whether a column can actually hold NULL.
 ///
@@ -89,11 +98,13 @@ const IS_NULLABLE: &str = "CASE \
 ///
 /// A column of a composite primary key is not: `PRIMARY KEY(a, b)` constrains
 /// the pair, and `a` may repeat. So a primary key column qualifies only when it
-/// is the whole key. A single-column `UNIQUE` index qualifies too.
+/// is the whole key. A single-column `UNIQUE` index qualifies too — but only a
+/// total one: `CREATE UNIQUE INDEX ... WHERE deleted = 0` constrains just the
+/// matching rows, and duplicates are genuinely storable outside them.
 const IS_UNIQUE: &str = "CASE \
      WHEN p.pk = 1 AND (SELECT max(pk) FROM pragma_table_info(t.name)) = 1 THEN 'true' \
      WHEN EXISTS (SELECT 1 FROM pragma_index_list(t.name) il \
-                  WHERE il.\"unique\" = 1 \
+                  WHERE il.\"unique\" = 1 AND il.partial = 0 \
                     AND (SELECT count(*) FROM pragma_index_info(il.name)) = 1 \
                     AND (SELECT ii.name FROM pragma_index_info(il.name) ii) = p.name) THEN 'true' \
      ELSE 'false' END";
@@ -149,6 +160,29 @@ impl SqliteProvider {
     fn open(path: &Path) -> std::result::Result<rusqlite::Connection, ProviderError> {
         rusqlite::Connection::open(path)
             .map_err(|e| ProviderError::InvalidParams(format!("cannot open '{path:?}': {e}")))
+    }
+
+    /// Open without the ability to write.
+    ///
+    /// Schema extraction is documented as inspection, so it must not alter what
+    /// a subsequent snapshot would capture. A read-write connection checkpoints
+    /// and deletes the write-ahead log when the last handle closes, rewriting
+    /// the main database and discarding the WAL.
+    ///
+    /// The guarantee this buys is precise: the main database stays byte-for-byte
+    /// identical and a live WAL keeps its contents. It is NOT "touches no files
+    /// at all" — reading a WAL database requires shared memory, so SQLite may
+    /// create a `-shm` (and an empty `-wal`) if none exists. That also means a
+    /// read-only *directory* cannot be inspected while the database is in WAL
+    /// mode; `immutable=1` would lift that restriction but is unsafe here,
+    /// since it promises nothing else is writing, which during a commit is
+    /// exactly what we cannot promise.
+    fn open_read_only(path: &Path) -> std::result::Result<rusqlite::Connection, ProviderError> {
+        rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|e| ProviderError::InvalidParams(format!("cannot read '{path:?}': {e}")))
     }
 
     /// Run a query returning a single text value.
@@ -248,7 +282,8 @@ impl DatabaseProvider for SqliteProvider {
                        'schema', '{MAIN_SCHEMA}', 'table_name', t.name)) \
                      FROM pragma_table_info(t.name) p WHERE p.pk > 0)), \
                    'relationships', json((SELECT json_group_array(json_object(\
-                       'id', f.id, 'constraint_name', '', \
+                       'id', f.id, \
+                       'constraint_name', 'fk_' || t.name || '_' || f.id, \
                        'source_schema', '{MAIN_SCHEMA}', 'source_table_name', t.name, \
                        'source_column_name', f.\"from\", \
                        'target_table_schema', '{MAIN_SCHEMA}', 'target_table_name', f.\"table\", \
@@ -274,7 +309,7 @@ impl DatabaseProvider for SqliteProvider {
                    'format', coalesce(nullif(p.type, ''), 'BLOB'), \
                    'is_identity', json('false'), \
                    'identity_generation', null, \
-                   'is_generated', json('false'), \
+                   'is_generated', json(CASE WHEN p.hidden IN (2, 3) THEN 'true' ELSE 'false' END), \
                    'is_nullable', json({NULLABLE}), \
                    'is_updatable', json('true'), \
                    'is_unique', json({UNIQUE}), \
@@ -282,7 +317,8 @@ impl DatabaseProvider for SqliteProvider {
                    'default_value', p.dflt_value, \
                    'enums', json('[]'), \
                    'comment', null \
-                 )) FROM ({TABLE_IDS}) t JOIN pragma_table_info(t.name) p;",
+                 )) FROM ({TABLE_IDS}) t JOIN pragma_table_xinfo(t.name) p \
+                 WHERE p.hidden <> 1;",
                 NULLABLE = IS_NULLABLE,
                 UNIQUE = IS_UNIQUE,
             ),
@@ -338,7 +374,7 @@ impl LocalEngine for SqliteProvider {
             ));
         }
 
-        let conn = Self::open(&path)?;
+        let conn = Self::open_read_only(&path)?;
         let version = Self::scalar(&conn, &get("version")?)?;
         let schemas = Self::scalar(&conn, &get("schemas")?)?;
         let tables = Self::scalar(&conn, &get("tables")?)?;
@@ -935,6 +971,244 @@ mod tests {
         // this wrong.
         assert_eq!(col("uniq_multi", "x")["is_unique"], false);
         assert_eq!(col("uniq_multi", "y")["is_unique"], false);
+    }
+
+    /// Helper: the columns section, parsed.
+    fn columns_of(dir: &std::path::Path) -> serde_json::Value {
+        let out = SqliteProvider::new()
+            .extract_schema(&params_with_path(dir.join(DB_FILENAME).to_str().unwrap()))
+            .unwrap();
+        let section = out
+            .split("GFS_SCHEMA_COLUMNS\n")
+            .nth(1)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        serde_json::from_str(&section).unwrap()
+    }
+
+    fn tables_of(dir: &std::path::Path) -> serde_json::Value {
+        let out = SqliteProvider::new()
+            .extract_schema(&params_with_path(dir.join(DB_FILENAME).to_str().unwrap()))
+            .unwrap();
+        let section = out
+            .split("GFS_SCHEMA_TABLES\n")
+            .nth(1)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        serde_json::from_str(&section).unwrap()
+    }
+
+    /// A PARTIAL unique index constrains only the rows matching its predicate,
+    /// so duplicates are genuinely storable outside it. Ground-truthed by
+    /// storing three.
+    #[test]
+    fn a_partial_unique_index_does_not_make_a_column_unique() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(DB_FILENAME);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE p(id INTEGER PRIMARY KEY, email TEXT, deleted INT);
+             CREATE UNIQUE INDEX ix ON p(email) WHERE deleted = 0;
+             CREATE TABLE q(id INTEGER PRIMARY KEY, email TEXT UNIQUE);
+             INSERT INTO p(email, deleted) VALUES('a@x',1),('a@x',1),('a@x',1);",
+        )
+        .unwrap();
+        let stored: i64 = conn
+            .query_row("SELECT count(*) FROM p WHERE email='a@x'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, 3, "SQLite really does store the duplicates");
+        drop(conn);
+
+        let cols = columns_of(dir.path());
+        let cols = cols.as_array().unwrap();
+        let find = |t: &str, n: &str| {
+            cols.iter()
+                .find(|c| c["table"] == t && c["name"] == n)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            find("p", "email")["is_unique"],
+            false,
+            "a partial index must not be treated as proof of uniqueness"
+        );
+        assert_eq!(
+            find("q", "email")["is_unique"],
+            true,
+            "a total unique index still counts"
+        );
+    }
+
+    /// `pragma_table_info` omits generated columns entirely, so they vanished
+    /// from the metadata and `schema diff` was blind to adding one.
+    #[test]
+    fn generated_columns_are_reported_with_is_generated() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join(DB_FILENAME)).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE g(id INTEGER PRIMARY KEY, p REAL, q INT,
+                 virt REAL GENERATED ALWAYS AS (p*q) VIRTUAL,
+                 stor REAL GENERATED ALWAYS AS (p+q) STORED);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let cols = columns_of(dir.path());
+        let cols = cols.as_array().unwrap();
+        let names: Vec<_> = cols.iter().map(|c| c["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"virt"), "VIRTUAL column missing: {names:?}");
+        assert!(names.contains(&"stor"), "STORED column missing: {names:?}");
+
+        let get = |n: &str| cols.iter().find(|c| c["name"] == n).unwrap().clone();
+        assert_eq!(get("virt")["is_generated"], true);
+        assert_eq!(get("stor")["is_generated"], true);
+        assert_eq!(get("p")["is_generated"], false, "a plain column is not");
+    }
+
+    /// An FTS5 table contributes five shadow tables that are implementation
+    /// detail. The table the user created should still appear.
+    #[test]
+    fn fts5_shadow_tables_are_not_reported_as_user_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join(DB_FILENAME)).unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE docs USING fts5(body);
+             CREATE TABLE plain(id INTEGER PRIMARY KEY);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let tables = tables_of(dir.path());
+        let names: Vec<_> = tables
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&"docs".to_string()), "got {names:?}");
+        assert!(names.contains(&"plain".to_string()), "got {names:?}");
+        for shadow in [
+            "docs_data",
+            "docs_idx",
+            "docs_content",
+            "docs_docsize",
+            "docs_config",
+        ] {
+            assert!(
+                !names.contains(&shadow.to_string()),
+                "shadow table {shadow} leaked into the schema: {names:?}"
+            );
+        }
+        // The virtual table's hidden columns are implementation detail too.
+        let cols = columns_of(dir.path());
+        let doc_cols: Vec<_> = cols
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["table"] == "docs")
+            .map(|c| c["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(doc_cols, vec!["body".to_string()], "got {doc_cols:?}");
+    }
+
+    /// A composite foreign key is ONE constraint over two columns. Reported as
+    /// two rows with an empty constraint_name it was indistinguishable from two
+    /// independent single-column keys.
+    #[test]
+    fn a_composite_foreign_key_is_distinguishable_from_two_single_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join(DB_FILENAME)).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE parent(a INT, b INT, PRIMARY KEY(a,b));
+             CREATE TABLE other(id INTEGER PRIMARY KEY);
+             CREATE TABLE child(x INT, y INT, z INT,
+                 FOREIGN KEY(x,y) REFERENCES parent(a,b),
+                 FOREIGN KEY(z) REFERENCES other(id));",
+        )
+        .unwrap();
+        drop(conn);
+
+        let tables = tables_of(dir.path());
+        let child = tables
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "child")
+            .unwrap()
+            .clone();
+        let rels = child["relationships"].as_array().unwrap();
+        assert_eq!(rels.len(), 3, "two columns of one key plus one single key");
+
+        let names: Vec<_> = rels
+            .iter()
+            .map(|r| r["constraint_name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            names.iter().all(|n| !n.is_empty()),
+            "every relationship must name its constraint: {names:?}"
+        );
+
+        let composite: Vec<_> = rels
+            .iter()
+            .filter(|r| r["target_table_name"] == "parent")
+            .collect();
+        assert_eq!(composite.len(), 2);
+        assert_eq!(
+            composite[0]["constraint_name"], composite[1]["constraint_name"],
+            "both columns of a composite key share one constraint name"
+        );
+        let single = rels
+            .iter()
+            .find(|r| r["target_table_name"] == "other")
+            .unwrap();
+        assert_ne!(
+            single["constraint_name"], composite[0]["constraint_name"],
+            "a separate key must not share the composite key's name"
+        );
+    }
+
+    /// Extraction must not alter what a snapshot would capture: a read-write
+    /// handle checkpoints and discards the WAL when it closes.
+    #[test]
+    fn schema_extraction_leaves_the_database_and_its_wal_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let params = seeded_db(dir.path());
+        let db = dir.path().join(DB_FILENAME);
+        let wal = dir.path().join(format!("{DB_FILENAME}-wal"));
+
+        // A live writer, so there is a real WAL to consume — held open, because
+        // a clean close would checkpoint it away and there would be nothing to
+        // protect.
+        let writer = rusqlite::Connection::open(&db).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        writer
+            .execute("INSERT INTO author (name) VALUES ('ada')", [])
+            .unwrap();
+
+        let read = |p: &std::path::Path| std::fs::read(p).unwrap();
+        let db_before = read(&db);
+        let wal_before = read(&wal);
+        assert!(!wal_before.is_empty(), "the writer should have left frames");
+
+        SqliteProvider::new().extract_schema(&params).unwrap();
+
+        assert_eq!(
+            db_before,
+            read(&db),
+            "the main database must be byte-identical after inspection"
+        );
+        assert_eq!(
+            wal_before,
+            read(&wal),
+            "a live WAL must survive inspection — consuming it changes what the \
+             next snapshot captures"
+        );
     }
 
     #[test]
