@@ -14,12 +14,12 @@ chrono                    = { workspace = true }
 futures-util              = { version = "0.3" }
 tar                       = { workspace = true }
 gfs-domain = { workspace = true }
-rusqlite                  = { workspace = true }
 thiserror                 = { workspace = true }
 tokio                     = { workspace = true }
 tracing                   = { workspace = true }
 
 [dev-dependencies]
+gfs-db-providers = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio    = { workspace = true }

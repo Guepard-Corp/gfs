@@ -29,7 +29,7 @@ pub async fn run(path: Option<PathBuf>, output: String) -> Result<i32> {
     let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
     let compute = compute_for_repo(&repository, &repo_path).await?;
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
-    gfs_compute_docker::containers::register_all(registry.as_ref())
+    gfs_db_providers::register_all(registry.as_ref())
         .context("failed to register database providers")?;
 
     let use_case = StatusRepoUseCase::new(repository, compute, registry);

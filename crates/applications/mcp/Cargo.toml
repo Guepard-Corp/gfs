@@ -17,6 +17,7 @@ rmcp          = { workspace = true }
 gfs-domain    = { workspace = true }
 gfs-telemetry = { workspace = true }
 gfs-compute-docker = { workspace = true }
+gfs-db-providers   = { workspace = true }
 gfs-compute-kubernetes = { workspace = true }
 gfs-storage-file = { workspace = true }
 tokio = { workspace = true }

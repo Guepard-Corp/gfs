@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use gfs_compute_docker::containers;
+use gfs_db_providers as containers;
 use gfs_domain::adapters::gfs_repository::GfsRepository;
 use gfs_domain::model::config::GfsConfig;
 use gfs_domain::ports::compute::InstanceId;

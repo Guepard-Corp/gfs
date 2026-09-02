@@ -1396,6 +1396,7 @@ dependencies = [
  "gag",
  "gfs-compute-docker",
  "gfs-compute-kubernetes",
+ "gfs-db-providers",
  "gfs-domain",
  "gfs-mcp",
  "gfs-storage-apfs",
@@ -1426,8 +1427,8 @@ dependencies = [
  "bollard",
  "chrono",
  "futures-util",
+ "gfs-db-providers",
  "gfs-domain",
- "rusqlite",
  "serde_json",
  "tar",
  "tempfile",
@@ -1474,6 +1475,7 @@ dependencies = [
  "clap",
  "gfs-cli",
  "gfs-compute-docker",
+ "gfs-db-providers",
  "gfs-domain",
  "reqwest 0.12.28",
  "rust-embed",
@@ -1483,6 +1485,17 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "gfs-db-providers"
+version = "0.4.0"
+dependencies = [
+ "gfs-domain",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -1513,6 +1526,7 @@ dependencies = [
  "chrono",
  "gfs-compute-docker",
  "gfs-compute-kubernetes",
+ "gfs-db-providers",
  "gfs-domain",
  "gfs-storage-apfs",
  "gfs-storage-btrfs",

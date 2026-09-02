@@ -11,7 +11,6 @@
 //! * On Windows, host bind paths are normalized (extended `\\?\` prefixes are
 //!   stripped) so Docker’s bind parser does not mis-handle `host:container` specs.
 
-pub mod containers;
 mod error;
 
 use std::io::ErrorKind;

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use gfs_compute_docker::containers;
+use gfs_db_providers as containers;
 use gfs_domain::adapters::gfs_repository::GfsRepository;
 use gfs_domain::model::config::GfsConfig;
 use gfs_domain::ports::compute::{Compute, InstanceId};

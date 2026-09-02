@@ -427,8 +427,7 @@ async fn start_restart_or_recreate(
     };
 
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
-    gfs_compute_docker::containers::register_all(registry.as_ref())
-        .context("register providers")?;
+    gfs_db_providers::register_all(registry.as_ref()).context("register providers")?;
     let provider = registry
         .get(provider_name)
         .context("unknown database provider")?;
@@ -538,7 +537,7 @@ async fn container_data_dir(
         return None;
     }
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
-    gfs_compute_docker::containers::register_all(registry.as_ref()).ok()?;
+    gfs_db_providers::register_all(registry.as_ref()).ok()?;
     let provider = registry.get(provider_name)?;
     let compute_data_path = provider
         .definition()

@@ -19,7 +19,7 @@ use crate::output::{
 
 pub fn run(provider_name: Option<String>, json_output: bool) -> Result<()> {
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
-    gfs_compute_docker::containers::register_all(registry.as_ref())
+    gfs_db_providers::register_all(registry.as_ref())
         .context("failed to register database providers")?;
 
     match provider_name {
