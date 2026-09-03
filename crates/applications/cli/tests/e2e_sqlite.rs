@@ -611,6 +611,8 @@ fn a_checkout_whose_snapshot_is_missing_fails_instead_of_emptying_the_database()
 ///
 /// So read a pass here as "the invariants still hold", and the script as "and
 /// here is why the guard has to be there".
+// NOT a proof the snapshot guard is needed: this passes with the guard removed.
+// See the doc comment above, and sqlite-snapshot-torture.py for the proof.
 #[test]
 fn commits_under_a_concurrent_writer_capture_only_whole_transactions() {
     use std::sync::Arc;

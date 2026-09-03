@@ -51,6 +51,28 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo fmt -- --check
 
+      # The SQLite suites are cfg(unix), so this job is where the byte-copy
+      # snapshot backend gets exercised — and it is the only place the snapshot
+      # guard is load-bearing. On APFS, `cp -cRp` clones per file, so a snapshot
+      # is largely crash-consistent by construction; `gfs_storage_file` copies
+      # bytes, which is where an unquiesced snapshot tears.
+      #
+      # That coverage is a property of the runner image, not of the code, so it
+      # can vanish silently. Assert it rather than assume it: on a
+      # copy-on-write runner every test would still pass while covering
+      # strictly less.
+      - name: Assert the runner filesystem is not copy-on-write
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          fs=$(stat -f --format=%T .)
+          echo "runner filesystem: $fs"
+          case "$fs" in
+            btrfs|zfs|bcachefs)
+              echo "::error::runner filesystem is $fs (copy-on-write); the byte-copy snapshot path is no longer exercised, so the tests cover strictly less than they appear to"
+              exit 1
+              ;;
+          esac
+
       - name: Run tests
         if: matrix.os == 'ubuntu-latest'
         run: cargo test --verbose

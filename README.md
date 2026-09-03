@@ -764,7 +764,10 @@ scripts/gfs-reclaim-orphan-snapshots.py <repo> [--delete]
 ```
 
 **Coverage note.** The SQLite e2e suites (`e2e_sqlite`, `mcp_sqlite_no_runtime`)
-are `cfg(unix)`, so they run on Linux as well as macOS. That matters more than
+are `cfg(unix)`, so they run on Linux as well as macOS — and CI asserts the
+Linux runner is not on a copy-on-write filesystem, because that coverage is a
+property of the runner image rather than of the code and would otherwise
+disappear in silence with every test still green. That matters more than
 it looks: on Linux `storage-file` uses `cp --reflink=auto`, which silently
 degrades to a deep copy on ext4, and a deep copy of a database being written to
 is where an unquiesced snapshot would tear. The concurrency test there asserts
