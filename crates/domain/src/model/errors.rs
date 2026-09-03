@@ -35,6 +35,8 @@ pub enum CommitError {
 pub enum RepoError {
     #[error("No .gfs repository found in {0} or any parent directory")]
     NoRepoFound(PathBuf),
+    #[error("not a GFS repository: '{0}' has no .gfs directory (run `gfs init` there)")]
+    NotARepository(PathBuf),
     #[error("IO error while searching for repository: {0}")]
     IoError(#[from] io::Error),
     #[error("Invalid repository layout: {0}")]

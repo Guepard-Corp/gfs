@@ -93,6 +93,20 @@ fn json_ok(value: serde_json::Value) -> Result<CallToolResult, McpError> {
     )]))
 }
 
+/// Report a failure of the tool's WORK as a tool result the model can read.
+///
+/// The distinction from [`to_error_data`] is deliberate and is the one MCP
+/// draws: a JSON-RPC error means the request could not be processed at all —
+/// a missing or malformed argument — while a result carrying `isError` means
+/// the tool ran and the operation failed, which is something a model can read
+/// and act on.
+///
+/// The server used to mix these for one class of failure: a missing `message`
+/// on `commit` came back as a JSON-RPC error (rmcp's own schema validation),
+/// while a missing `revision` on `checkout` came back as an `isError` result.
+/// Same kind of mistake, two shapes, and a client had to handle both. Every
+/// argument check now takes the JSON-RPC path, which is what rmcp already does
+/// for the ones declared in the schema.
 fn json_err(message: &str, code: Option<&str>) -> Result<CallToolResult, McpError> {
     let mut obj = json!({ "message": message });
     if let Some(c) = code {
@@ -695,7 +709,7 @@ async fn do_status(args: &serde_json::Value) -> Result<CallToolResult, McpError>
 
 async fn do_commit(args: &serde_json::Value) -> Result<CallToolResult, McpError> {
     let args = if !args.is_object() {
-        return json_err("missing arguments: message required", Some("MISSING_ARGS"));
+        return Err(to_error_data("missing required argument: message"));
     } else {
         args
     };
@@ -705,7 +719,7 @@ async fn do_commit(args: &serde_json::Value) -> Result<CallToolResult, McpError>
         .unwrap_or("")
         .trim();
     if message.is_empty() {
-        return json_err("commit message must be non-empty", Some("INVALID_INPUT"));
+        return Err(to_error_data("invalid argument: message must be non-empty"));
     }
     let repo_path = repo_path_from_value(args);
     let author = args
@@ -876,10 +890,9 @@ async fn do_checkout(args: &serde_json::Value) -> Result<CallToolResult, McpErro
         (None, Some(b)) => (String::new(), Some(b.clone())),
         (Some(r), Some(b)) => (r.clone(), Some(b.clone())),
         (None, None) => {
-            return json_err(
-                "revision required or use create_branch",
-                Some("MISSING_ARGS"),
-            );
+            return Err(to_error_data(
+                "missing required argument: revision (or create_branch to make one)",
+            ));
         }
     };
 
@@ -1082,13 +1095,10 @@ async fn do_compute(args: &serde_json::Value) -> Result<CallToolResult, McpError
             json!({ "entries": lines })
         }
         _ => {
-            return json_err(
-                &format!(
-                    "unknown action: {} (use status, start, stop, restart, pause, unpause, logs)",
-                    action
-                ),
-                Some("INVALID_INPUT"),
-            );
+            return Err(to_error_data(format!(
+                "invalid argument: unknown action '{action}' \
+                 (use status, start, stop, restart, pause, unpause, logs)"
+            )));
         }
     };
 
@@ -1244,10 +1254,9 @@ async fn do_export(args: &serde_json::Value) -> Result<CallToolResult, McpError>
         .unwrap_or("")
         .trim();
     if format.is_empty() {
-        return json_err(
-            "format is required (e.g. sql, custom)",
-            Some("MISSING_ARGS"),
-        );
+        return Err(to_error_data(
+            "missing required argument: format (e.g. sql, custom)",
+        ));
     }
 
     let output_dir = args
