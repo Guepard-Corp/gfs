@@ -17,7 +17,6 @@ use crate::ports::compute::{
 use crate::ports::database_provider::{DatabaseProviderRegistry, ProviderError, SnapshotGuard};
 use crate::ports::repository::{Repository, RepositoryError};
 use crate::repo_utils::repo_layout;
-use crate::repo_utils::repo_lock::{LockError, RepoLock};
 #[cfg(unix)]
 use crate::utils::current_user;
 use crate::utils::data_dir;
@@ -33,16 +32,7 @@ pub enum CheckoutRepoError {
 
     #[error("compute: {0}")]
     Compute(#[from] ComputeError),
-
-    #[error("{0}")]
-    Busy(String),
 }
-
-/// How long a checkout waits for a running commit before giving up.
-///
-/// Long enough for a snapshot of a realistic database, short enough that a
-/// daemon is not parked indefinitely by a commit that has wedged.
-const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
 // ---------------------------------------------------------------------------
 // Use case
@@ -82,25 +72,6 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
         revision: String,
         create_branch: Option<String>,
     ) -> std::result::Result<String, CheckoutRepoError> {
-        // Serialised against commit. A commit reads HEAD's commit as its parent
-        // BEFORE the snapshot and reads HEAD's branch AFTER it, so a checkout
-        // landing in between makes the commit advance the branch it moved TO,
-        // with a parent from the branch it moved FROM — and that branch's
-        // previous tip becomes unreachable from any ref. Reproduced four times
-        // out of four; see repo_utils::repo_lock.
-        //
-        // Waits rather than fails: the commit is the long operation, and a user
-        // switching branches during one wants the switch, not an error.
-        let _repo_lock = RepoLock::acquire_waiting(&path, LOCK_WAIT).map_err(|e| match e {
-            LockError::Busy(_) => CheckoutRepoError::Busy(format!(
-                "a `gfs commit` has been running on this repository for over {} seconds; \
-                 checkout would interleave with it and lose a commit, so it is not started. \
-                 Retry once the commit finishes",
-                LOCK_WAIT.as_secs()
-            )),
-            LockError::Io(e) => CheckoutRepoError::Repository(RepositoryError::Io(e)),
-        })?;
-
         let revision = revision.trim().to_string();
 
         // Validate the target ref BEFORE stopping compute — a bad revision must
