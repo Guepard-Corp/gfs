@@ -764,10 +764,20 @@ scripts/gfs-reclaim-orphan-snapshots.py <repo> [--delete]
 ```
 
 **Coverage note.** The SQLite e2e suites (`e2e_sqlite`, `mcp_sqlite_no_runtime`)
-are `cfg(unix)`, so they run on Linux as well as macOS — and CI asserts the
-Linux runner is not on a copy-on-write filesystem, because that coverage is a
-property of the runner image rather than of the code and would otherwise
-disappear in silence with every test still green. That matters more than
+are `cfg(unix)`, so they run on Linux as well as macOS.
+
+That matters because `storage-file` copies with `cp --reflink=auto`, which asks
+for a clone and *silently falls back to a full byte copy* when the filesystem
+cannot do one. The snapshot guard is only load-bearing on that fallback — a
+byte copy of a database being written to is where an unquiesced snapshot tears.
+Which path you get is a property of the filesystem, not the platform: APFS,
+btrfs, XFS with `reflink=1` (the default on modern `mkfs.xfs`) and recent ZFS
+all clone; **ext4 does not**, and ext4 is the common Linux default.
+
+So CI probes whether a reflink actually succeeds, rather than matching
+filesystem names — a name check reports plain `xfs` either way and would pass
+on a runner that had quietly started cloning, removing this coverage with every
+test still green. That matters more than
 it looks: on Linux `storage-file` uses `cp --reflink=auto`, which silently
 degrades to a deep copy on ext4, and a deep copy of a database being written to
 is where an unquiesced snapshot would tear. The concurrency test there asserts
