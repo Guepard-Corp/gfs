@@ -794,7 +794,7 @@ pub trait ContainerProvider: Send + Sync {
     }
 
     // -----------------------------------------------------------------------
-    // Lazy clone (RFC 008)
+    // Lazy clone
     // -----------------------------------------------------------------------
 
     /// Whether lazy clone (external read-through) is supported.
