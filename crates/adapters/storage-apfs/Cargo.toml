@@ -14,6 +14,3 @@ thiserror            = { workspace = true }
 tokio                = { workspace = true }
 tracing              = { workspace = true }
 chrono               = { workspace = true }
-
-[dev-dependencies]
-tempfile = { workspace = true }

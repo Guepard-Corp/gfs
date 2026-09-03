@@ -3,4 +3,3 @@ pub mod data_dir;
 pub mod hash;
 pub mod remote_source;
 pub mod shell;
-pub mod system_bin;

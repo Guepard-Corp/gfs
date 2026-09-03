@@ -45,7 +45,6 @@ use gfs_domain::ports::storage::{
     CloneOptions, MountStatus, Quota, Result, Snapshot, SnapshotId, SnapshotOptions, StorageError,
     StoragePort, VolumeId, VolumeStatus,
 };
-use gfs_domain::utils::system_bin;
 use tokio::process::Command;
 use tracing::instrument;
 
@@ -199,29 +198,21 @@ async fn copy_dir(src: &str, dst: &str) -> Result<()> {
     #[cfg(target_os = "windows")]
     let (src, dst) = (strip_ext_prefix(src), strip_ext_prefix(dst));
 
-    // `cp` is resolved to a standard location rather than through `PATH`: the
-    // flags below are written for a specific coreutils, and a different `cp`
-    // earlier on `PATH` rejects them and fails every commit. See
-    // `gfs_domain::utils::system_bin`.
     #[cfg(target_os = "macos")]
-    let (prog, args): (std::path::PathBuf, Vec<&str>) =
-        (system_bin::resolve("cp"), vec!["-cRp", src, dst]);
+    let (prog, args): (&str, Vec<&str>) = ("cp", vec!["-cRp", src, dst]);
 
     #[cfg(target_os = "linux")]
-    let (prog, args): (std::path::PathBuf, Vec<&str>) = (
-        system_bin::resolve("cp"),
-        vec!["--reflink=auto", "-a", src, dst],
-    );
+    let (prog, args): (&str, Vec<&str>) = ("cp", vec!["--reflink=auto", "-a", src, dst]);
 
     #[cfg(target_os = "windows")]
-    let (prog, args): (std::path::PathBuf, Vec<&str>) = {
+    let (prog, args): (&str, Vec<&str>) = {
         // /R and /W cap robocopy's default retry behavior (1,000,000 retries
         // × 30s wait) which otherwise hangs indefinitely on any file that is
         // still locked at copy time — e.g. PGDATA files held by the database
         // container if pause did not fully freeze writers under Docker
         // Desktop / WSL2. Three quick retries surface real failures fast.
         (
-            std::path::PathBuf::from("robocopy"),
+            "robocopy",
             vec![
                 src,
                 dst,
@@ -239,10 +230,9 @@ async fn copy_dir(src: &str, dst: &str) -> Result<()> {
     };
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    let (prog, args): (std::path::PathBuf, Vec<&str>) =
-        (system_bin::resolve("cp"), vec!["-R", src, dst]);
+    let (prog, args): (&str, Vec<&str>) = ("cp", vec!["-R", src, dst]);
 
-    let output = Command::new(&prog)
+    let output = Command::new(prog)
         .args(&args)
         // Avoid locale-dependent stderr parsing (permission denied classification).
         .env("LANG", "C")
@@ -1030,70 +1020,5 @@ mod tests {
         let _ = storage;
 
         fs::remove_dir_all(&src).ok();
-    }
-}
-
-#[cfg(all(test, unix))]
-mod path_independence_tests {
-    use super::*;
-    use gfs_domain::ports::storage::{SnapshotOptions, StoragePort, VolumeId};
-
-    /// A `cp` earlier on `PATH` must not be able to break a commit.
-    ///
-    /// This backend is the one reached when the filesystem is neither APFS nor
-    /// btrfs — which is most Linux boxes — and it spawns `cp` with flags
-    /// written for a specific coreutils: `-cRp` on macOS, `--reflink=auto -a`
-    /// on Linux. A different `cp` first on `PATH` rejects them and every commit
-    /// fails, with an error naming a `cp` invocation and nothing about `PATH`.
-    ///
-    /// Shadowing `cp` with a script that always fails asserts the property —
-    /// the adapter does not use whatever `cp` the shell happens to find —
-    /// rather than the absence of one particular error string.
-    #[tokio::test]
-    async fn a_shadowed_cp_on_path_cannot_break_a_snapshot() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let source = dir.path().join("data");
-        std::fs::create_dir_all(&source).expect("source");
-        std::fs::write(source.join("seed.txt"), "v1").expect("seed");
-
-        let shadow = dir.path().join("bin");
-        std::fs::create_dir_all(&shadow).expect("shadow dir");
-        let fake = shadow.join("cp");
-        std::fs::write(&fake, "#!/bin/sh\necho 'cp: bad option' >&2\nexit 1\n")
-            .expect("write fake cp");
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod fake cp");
-
-        let original = std::env::var("PATH").unwrap_or_default();
-        // SAFETY: set once, used immediately, restored before returning; this
-        // test does not run concurrently with another that reads PATH.
-        unsafe {
-            std::env::set_var("PATH", format!("{}:{original}", shadow.display()));
-        }
-
-        let dest = dir.path().join("snap");
-        let result = FileStorage::new()
-            .snapshot(
-                &VolumeId(source.to_string_lossy().into_owned()),
-                SnapshotOptions {
-                    label: Some(dest.to_string_lossy().into_owned()),
-                },
-            )
-            .await;
-
-        unsafe {
-            std::env::set_var("PATH", original);
-        }
-
-        assert!(
-            result.is_ok(),
-            "a `cp` shadowed on PATH must not reach the snapshot: {:?}",
-            result.err()
-        );
-        assert_eq!(
-            std::fs::read_to_string(dest.join("seed.txt")).expect("copied file"),
-            "v1"
-        );
     }
 }
