@@ -35,7 +35,9 @@ use gfs_domain::ports::storage::{
     CloneOptions, MountStatus, Quota, Result, Snapshot, SnapshotId, SnapshotOptions, StorageError,
     StoragePort, VolumeId, VolumeStatus,
 };
+use gfs_domain::utils::system_bin;
 use tokio::process::Command;
+
 use tracing::instrument;
 
 use crate::error::classify_diskutil_stderr;
@@ -157,7 +159,7 @@ impl StoragePort for ApfsStorage {
             }
         };
 
-        let output = Command::new("cp")
+        let output = Command::new(system_bin::resolve("cp"))
             .args(["-cRp", &id.0, dest.to_string_lossy().as_ref()])
             .env("LANG", "C")
             .output()
@@ -215,7 +217,7 @@ impl StoragePort for ApfsStorage {
             .map(|s| s.0.as_str())
             .unwrap_or(&source.0);
 
-        let output = Command::new("cp")
+        let output = Command::new(system_bin::resolve("cp"))
             .args(["-cRp", src, &target_id.0])
             .env("LANG", "C")
             .output()
@@ -374,5 +376,76 @@ fn remap_id(err: StorageError, id: &VolumeId) -> StorageError {
     match err {
         StorageError::Internal(ref msg) => classify_diskutil_stderr(&id.0, msg),
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gfs_domain::ports::storage::{SnapshotOptions, StoragePort, VolumeId};
+
+    /// A `cp` earlier on `PATH` must not be able to break a commit.
+    ///
+    /// `-c` is a BSD flag, so a GNU `cp` — which Homebrew's coreutils puts on
+    /// many developers' `PATH` — rejects it and every snapshot fails. Shadowing
+    /// `cp` with a script that always fails proves the adapter is not reaching
+    /// for whatever `cp` the shell happens to find.
+    ///
+    /// The sibling assertion for `storage-file`, which has its own `cp` spawn
+    /// and is the backend used when the filesystem is neither APFS nor btrfs,
+    /// lives in that crate.
+    #[tokio::test]
+    async fn a_shadowed_cp_on_path_cannot_break_a_snapshot() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let source = dir.path().join("data");
+        std::fs::create_dir_all(&source).expect("source");
+        std::fs::write(source.join("seed.txt"), "v1").expect("seed");
+
+        // A `cp` that refuses everything, exactly as GNU cp refuses `-c`.
+        let shadow = dir.path().join("bin");
+        std::fs::create_dir_all(&shadow).expect("shadow dir");
+        let fake = shadow.join("cp");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\necho \"cp: invalid option -- 'c'\" >&2\nexit 1\n",
+        )
+        .expect("write fake cp");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake cp");
+        }
+
+        let original = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: this test is single-threaded with respect to PATH; it is set
+        // once, used immediately, and restored before returning.
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{original}", shadow.display()));
+        }
+
+        let dest = dir.path().join("snap");
+        let result = ApfsStorage::new()
+            .snapshot(
+                &VolumeId(source.to_string_lossy().into_owned()),
+                SnapshotOptions {
+                    label: Some(dest.to_string_lossy().into_owned()),
+                },
+            )
+            .await;
+
+        unsafe {
+            std::env::set_var("PATH", original);
+        }
+
+        assert!(
+            result.is_ok(),
+            "a `cp` shadowed on PATH must not reach the snapshot: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("seed.txt")).expect("copied file"),
+            "v1"
+        );
     }
 }
