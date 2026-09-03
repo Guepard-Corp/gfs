@@ -211,6 +211,58 @@ meant auto-GC silently never fired for five releases, and a GC that never runs
 is indistinguishable from a GC with nothing to do. Dolt #10463 is the other
 reason: an operator could not answer "is a GC running right now?".
 
+### D9 — working copies are a fifth source of garbage, and usually the largest
+
+**Added after the decisions above; nothing in D1–D8 changes.** The list of four
+sources in "The problem, measured" is incomplete. It counts only things in the
+object graph, and the largest waste in a repository is not in the graph at all.
+
+`.gfs/workspaces/` holds one full copy of the data directory per branch, plus
+one per detached checkout. **Nothing in the product has ever removed one.**
+Measured on a small repository after three detached checkouts:
+
+```
+.gfs total            1.9 MB
+of that, workspaces   1.1 MB      58%
+fsck reclaimable      0 bytes
+fsck verdict          consistent
+```
+
+On a real database each of those is gigabytes rather than kilobytes.
+
+**They are not objects, and must not be reported as unreachable ones.** A
+workspace is a *cache*: `checkout` rebuilds it from the snapshot, so removing a
+stale one costs time, not data. That is a materially different promise from
+removing an unreachable snapshot, which is irreversible, and the report keeps
+the two apart with separate byte totals so neither number misleads.
+
+Liveness, in order:
+
+1. the directory named by `.gfs/WORKSPACE` is live, whatever else is true;
+2. `workspaces/<branch>/` is live while a ref of that name exists — including
+   when it only *contains* live nested branches, since `team/` is a directory
+   holding `team/alpha`;
+3. `workspaces/detached/<prefix>/` is live while a reachable commit begins with
+   that prefix. The path carries a 12-character prefix, not a full hash, so this
+   is a prefix match against the reachable set rather than a lookup.
+
+The grace period of D4 applies here too: a workspace being written right now is
+not garbage.
+
+Two consequences worth stating. A workspace can be stale while its branch's
+*commits* remain perfectly reachable — deleting a branch strands the working
+copy but not the history — so the two findings are independent and a repository
+can have either without the other. And on the Kubernetes runtime, where
+snapshots are `VolumeSnapshot` objects rather than directories, workspaces are
+still ordinary directories, so this check runs there even when the snapshot
+check is suppressed.
+
+Prior art is thin: none of git, Dolt, lakeFS or Nessie has this problem, because
+none of them keeps a full materialised copy of the data per ref. That is a
+consequence of GFS snapshotting a live database directory rather than storing
+content-addressed chunks, and it means this decision is ours to get right rather
+than to borrow.
+
 ## Sequencing
 
 1. `gfs fsck` — read-only, no port change.
