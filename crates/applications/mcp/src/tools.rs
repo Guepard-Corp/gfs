@@ -971,17 +971,30 @@ async fn do_init(args: &serde_json::Value) -> Result<CallToolResult, McpError> {
     // An embedded provider has nothing to provision, and reaching for a
     // container runtime here is what made `init --database-provider sqlite`
     // fail without Docker. Mirrors cmd_init.rs.
-    let embedded = database_provider
-        .as_deref()
-        .and_then(|name| {
-            registry
-                .list()
-                .iter()
-                .find(|n| n.eq_ignore_ascii_case(name))
-                .cloned()
-                .and_then(|n| registry.get(&n))
-        })
-        .is_some_and(|p| !p.requires_compute());
+    let resolved = database_provider.as_deref().and_then(|name| {
+        registry
+            .list()
+            .iter()
+            .find(|n| n.eq_ignore_ascii_case(name))
+            .cloned()
+            .and_then(|n| registry.get(&n))
+    });
+
+    // An unknown name must report the name, not a Docker failure. The use case
+    // refuses it too — that is the guarantee — but only after a compute client
+    // has been built, and building one is what turned `--database-provider
+    // sqlite3`, a plausible typo, into a page of daemon troubleshooting for a
+    // database that needs no daemon.
+    if let Some(name) = database_provider.as_deref()
+        && resolved.is_none()
+    {
+        return Err(to_error_data(format!(
+            "unknown database provider '{name}'. Available: {}",
+            registry.list().join(", ")
+        )));
+    }
+
+    let embedded = resolved.is_some_and(|p| !p.requires_compute());
 
     let compute: Option<Arc<dyn Compute>> = if database_provider.is_some() && !embedded {
         Some(runtime_compute().await?)

@@ -389,3 +389,55 @@ fn status_returns_the_fields_its_documentation_promises() {
         "the CLI reports this and MCP dropped it: {status}"
     );
 }
+
+/// MCP must refuse what the CLI refuses.
+///
+/// Provider and version were validated in `cmd_init.rs` only, so the MCP server
+/// accepted `database_version: "4"` and wrote it to config.toml permanently
+/// while the CLI rejected the same input — and an unknown provider name
+/// reported a Docker daemon failure for a database that needs no daemon. The
+/// authoritative check now lives in `InitRepositoryUseCase`, which both callers
+/// reach; the check here only makes the error name the typo rather than Docker.
+#[test]
+fn init_refuses_what_the_cli_refuses() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut s = McpSession::start();
+
+    let msg = s.call_expecting_error(
+        "init",
+        json!({
+            "path": dir.path().join("bad-version"),
+            "database_provider": "sqlite",
+            "database_version": "4",
+        }),
+    );
+    assert!(
+        msg.contains("not a supported") && msg.contains("Supported: 3"),
+        "should say what is supported: {msg}"
+    );
+
+    let msg = s.call_expecting_error(
+        "init",
+        json!({
+            "path": dir.path().join("bad-provider"),
+            "database_provider": "sqlite3",
+            "database_version": "3",
+        }),
+    );
+    assert!(
+        msg.contains("unknown database provider") && msg.contains("sqlite3"),
+        "should name the typo: {msg}"
+    );
+    assert!(
+        !msg.contains("Docker") && !msg.contains("Podman"),
+        "no container runtime is involved: {msg}"
+    );
+
+    // And the valid form still works.
+    let repo = dir.path().join("good");
+    s.call(
+        "init",
+        json!({ "path": repo, "database_provider": "sqlite", "database_version": "3" }),
+    );
+    assert!(repo.join(".gfs/config.toml").exists());
+}

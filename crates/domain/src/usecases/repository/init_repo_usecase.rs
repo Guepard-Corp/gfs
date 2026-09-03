@@ -29,6 +29,13 @@ pub enum InitRepoError {
 
     #[error("database_version is required when database_provider is set")]
     DatabaseVersionRequired,
+
+    #[error("'{version}' is not a supported {provider} version. Supported: {supported}")]
+    UnsupportedDatabaseVersion {
+        provider: String,
+        version: String,
+        supported: String,
+    },
 }
 
 /// Optional initial database credentials applied to the provisioned container's env.
@@ -84,6 +91,35 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         image: Option<String>,
         labels: std::collections::BTreeMap<String, String>,
     ) -> std::result::Result<(), InitRepoError> {
+        // Validate the provider and version HERE, not only in the caller.
+        //
+        // The CLI checks both before it builds a compute client, so a typo
+        // reports the typo rather than a Docker failure — that is a better
+        // error, not a different guarantee. This is the guarantee: every caller
+        // of this use case reaches the write through here, and the MCP server
+        // reached it without either check, accepting `sqlite 4` and writing it
+        // to config.toml permanently while the CLI refused the same input.
+        if let Some(name) = database_provider.as_deref() {
+            let resolved = self
+                .registry
+                .list()
+                .into_iter()
+                .find(|n| n.eq_ignore_ascii_case(name))
+                .and_then(|n| self.registry.get(&n))
+                .ok_or_else(|| InitRepoError::UnknownDatabaseProvider(name.to_string()))?;
+
+            if let Some(version) = database_version.as_deref() {
+                let supported = resolved.supported_versions();
+                if !supported.is_empty() && !supported.iter().any(|v| v == version) {
+                    return Err(InitRepoError::UnsupportedDatabaseVersion {
+                        provider: resolved.name().to_string(),
+                        version: version.to_string(),
+                        supported: supported.join(", "),
+                    });
+                }
+            }
+        }
+
         self.repository.init(&path, mount_point).await?;
 
         if let Some(provider) = database_provider {

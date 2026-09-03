@@ -111,6 +111,15 @@ const SEQUENCE_QUERY: &str = "SELECT coalesce(group_concat(\
          'INSERT INTO sqlite_sequence(name,seq) VALUES(' || quote(name) || ',' \
          || quote(seq) || ')', ';\n'), '') FROM sqlite_sequence;";
 
+/// Virtual tables whose content cannot be read back out of them.
+///
+/// Named for the error message, so the user is told which table is the problem
+/// rather than that "the database" cannot be exported.
+const OPAQUE_VIRTUAL_TABLE_QUERY: &str = "SELECT coalesce(group_concat(quote(name), ', '), '') \
+     FROM sqlite_master WHERE type = 'table' AND sql IS NOT NULL \
+       AND lower(sql) LIKE 'create virtual table%' \
+       AND gfs_declares_content_option(sql);";
+
 /// Whether a column can actually hold NULL.
 ///
 /// `pragma_table_info.notnull` alone is not enough, because SQLite reports `0`
@@ -212,6 +221,37 @@ fn predicate_is_only_not_null(index_sql: &str, column: &str) -> bool {
         normalised.ends_with(&format!(" where {quoted} is not null"))
             || normalised.ends_with(&format!(" where ({quoted} is not null)"))
     })
+}
+
+/// Whether a virtual table's DDL declares a `content=` option.
+///
+/// FTS5 tables created with `content=''` (contentless) or `content='other'`
+/// (external content) store nothing retrievable of their own: selecting from
+/// them yields NULLs, or values that live in a different table. Repopulating
+/// such a table by inserting what you read back out of it therefore produces an
+/// index full of NULLs — a dump that looks complete, restores without error,
+/// keeps the row count, and returns nothing for every `MATCH`.
+///
+/// The option is matched only where FTS5 accepts one: directly after `(` or a
+/// `,`. Without that boundary a column named `my_content` would be mistaken for
+/// it, and the export of a perfectly ordinary table would be refused.
+fn declares_content_option(ddl: &str) -> bool {
+    let lower = ddl.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut from = 0;
+    while let Some(found) = lower[from..].find("content") {
+        let at = from + found;
+        let before = lower[..at].trim_end().chars().last();
+        let after = lower[at + "content".len()..].trim_start().chars().next();
+        if matches!(before, Some('(') | Some(',')) && after == Some('=') {
+            return true;
+        }
+        from = at + "content".len();
+        if from >= bytes.len() {
+            break;
+        }
+    }
+    false
 }
 
 /// The identifiers inside an index's key list, or `None` when the DDL contains
@@ -406,6 +446,19 @@ fn register_helpers(conn: &rusqlite::Connection) -> std::result::Result<(), Prov
                 return Ok(false);
             };
             Ok(expression_mentions_only(sql, column, columns))
+        },
+    )
+    .map_err(|e| ProviderError::InvalidParams(format!("cannot register schema helper: {e}")))?;
+
+    conn.create_scalar_function(
+        "gfs_declares_content_option",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let Some(ddl) = ctx.get_raw(0).as_str().ok() else {
+                return Ok(false);
+            };
+            Ok(declares_content_option(ddl))
         },
     )
     .map_err(|e| ProviderError::InvalidParams(format!("cannot register schema helper: {e}")))
@@ -1143,6 +1196,23 @@ impl LocalEngine for SqliteProvider {
         let conn = Self::open_read_only(&path)?;
 
         let mut out = String::from("PRAGMA foreign_keys=OFF;\nBEGIN TRANSACTION;\n");
+        // Refuse before writing anything, rather than emit a dump that looks
+        // complete. A contentless or external-content FTS5 table cannot be
+        // repopulated from its own rows, and the alternative — writing shadow
+        // tables raw the way `sqlite3 .dump` does — needs `writable_schema`,
+        // direct `sqlite_schema` writes, defensive mode disabled on restore,
+        // and knowledge of each module's shadow layout. Saying so is better
+        // than any of that, and far better than silence.
+        let opaque = Self::scalar(&conn, OPAQUE_VIRTUAL_TABLE_QUERY)?;
+        if !opaque.is_empty() {
+            return Err(ProviderError::InvalidParams(format!(
+                "cannot export: {opaque} stores no rows of its own (declared with a \
+                 `content=` option), so a SQL dump cannot reproduce it — the restore \
+                 would keep the row count and return nothing for every MATCH. Use \
+                 `sqlite3 <db> .dump`, which writes the index's shadow tables directly"
+            )));
+        }
+
         let tables_ddl = Self::scalar(&conn, TABLE_DDL_QUERY)?;
         if !tables_ddl.is_empty() {
             out.push_str(&tables_ddl);
@@ -2301,6 +2371,66 @@ mod tests {
 
         assert!(unique_of("total"), "IS NOT NULL excludes nothing: {out}");
         assert!(!unique_of("filtered"), "this one really is partial: {out}");
+    }
+
+    /// A dump that cannot reproduce a table must not pretend it did.
+    ///
+    /// A contentless FTS5 table stores nothing retrievable of its own, so
+    /// reading it back gives NULLs — and re-inserting those produced a dump
+    /// that restored without error, kept the row count, and returned nothing
+    /// for every MATCH. Silent, and indistinguishable from success.
+    ///
+    /// A regular FTS5 table is unaffected: it does store its rows, and
+    /// re-inserting them rebuilds the index.
+    #[test]
+    fn a_table_whose_content_cannot_be_read_is_refused_not_silently_emptied() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join(DB_FILENAME)).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE d(id INTEGER PRIMARY KEY, body TEXT);
+             INSERT INTO d(body) VALUES('the quick brown fox');
+             CREATE VIRTUAL TABLE ft USING fts5(body, content='');
+             INSERT INTO ft(rowid, body) SELECT id, body FROM d;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let out = dir.path().join("d.sql");
+        let err = match SqliteProvider::new().export(&params_for_dir(dir.path()), "sql", &out) {
+            Ok(()) => panic!("a dump that cannot reproduce the index must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("'ft'"), "should name the table: {err}");
+        assert!(
+            err.contains("MATCH"),
+            "should say what would be lost: {err}"
+        );
+        assert!(
+            !out.exists(),
+            "nothing should be written for a refused export"
+        );
+    }
+
+    /// The refusal must not catch ordinary tables.
+    #[test]
+    fn only_a_content_option_counts_not_a_column_that_looks_like_one() {
+        for ddl in [
+            "CREATE VIRTUAL TABLE ft USING fts5(body, content='')",
+            "CREATE VIRTUAL TABLE ft USING fts5(body, content='docs')",
+            "CREATE VIRTUAL TABLE ft USING fts5(body,content=\"docs\")",
+            "CREATE VIRTUAL TABLE ft USING fts5(content=\'\')",
+        ] {
+            assert!(declares_content_option(ddl), "should detect: {ddl}");
+        }
+        for ddl in [
+            "CREATE VIRTUAL TABLE ft USING fts5(body)",
+            // columns that merely contain the word
+            "CREATE VIRTUAL TABLE ft USING fts5(my_content, content_type)",
+            "CREATE TABLE t(content TEXT)",
+            "CREATE TABLE t(a TEXT DEFAULT 'content=x')",
+        ] {
+            assert!(!declares_content_option(ddl), "must not detect: {ddl}");
+        }
     }
 
     /// A unique index on an expression makes its column unique — but only when
