@@ -173,3 +173,300 @@ fn checkout_zero_fails() {
         "stderr should mention no commits or 0; got: {stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Workspace identity: a checkout must give you what you asked for, and must
+// not silently destroy work to do it.
+// ---------------------------------------------------------------------------
+
+/// Sorted `name=content` for every file in the active workspace.
+fn workspace_contents(repo_path: &Path) -> String {
+    let dir = read_workspace_path(repo_path);
+    let mut out: Vec<String> = fs::read_dir(&dir)
+        .expect("read workspace")
+        .flatten()
+        .filter(|e| e.path().is_file())
+        .map(|e| {
+            format!(
+                "{}={}",
+                e.file_name().to_string_lossy(),
+                fs::read_to_string(e.path()).unwrap_or_default().trim()
+            )
+        })
+        .collect();
+    out.sort();
+    out.join(" ")
+}
+
+/// Uncommitted work is neither carried across a checkout nor thrown away.
+///
+/// Carrying it made `checkout <branch>` non-deterministic and left state no GFS
+/// command displays. Discarding it is unrecoverable. So checkout refuses,
+/// naming what is in the way, and `--force` is the way to say you meant it.
+#[test]
+fn checkout_refuses_to_overwrite_uncommitted_work_unless_forced() {
+    let tmp = tempdir().expect("create temp dir");
+    let repo_path = tmp.path();
+    assert!(cli_runner::gfs_init(repo_path), "gfs init should succeed");
+
+    let data_dir = workspace_data_dir_main_0(repo_path);
+    fs::write(data_dir.join("seed.txt"), "committed").unwrap();
+    let (ok, _, stderr) = cli_runner::gfs_commit(repo_path, "c1", None, None);
+    assert!(ok, "commit should succeed; stderr: {stderr}");
+
+    // A clean workspace is not in the way.
+    let (ok, _, stderr) = cli_runner::run_gfs([
+        "gfs",
+        "checkout",
+        "--path",
+        repo_path.to_str().unwrap(),
+        "main",
+    ]);
+    assert!(ok, "a clean checkout must not be refused; stderr: {stderr}");
+
+    fs::write(read_workspace_path(repo_path).join("scratch.txt"), "wip").unwrap();
+
+    // Checking out the branch you are already on rebuilds this very directory,
+    // so the work in it is exactly what would be lost.
+    let (ok, _, stderr) = cli_runner::run_gfs([
+        "gfs",
+        "checkout",
+        "--path",
+        repo_path.to_str().unwrap(),
+        "main",
+    ]);
+    assert!(!ok, "uncommitted work must stop the checkout");
+    assert!(
+        stderr.contains("uncommitted changes") && stderr.contains("scratch.txt"),
+        "the refusal should name what is in the way: {stderr}"
+    );
+    assert!(
+        read_workspace_path(repo_path).join("scratch.txt").exists(),
+        "a refused checkout must change nothing"
+    );
+
+    let (ok, _, stderr) = cli_runner::run_gfs([
+        "gfs",
+        "checkout",
+        "--path",
+        repo_path.to_str().unwrap(),
+        "main",
+        "--force",
+    ]);
+    assert!(ok, "--force should go through; stderr: {stderr}");
+    assert_eq!(
+        workspace_contents(repo_path),
+        "seed.txt=committed",
+        "forced checkout restores the commit exactly"
+    );
+}
+
+/// A branch's working copy must not outlive the branch.
+///
+/// The workspace is keyed by branch NAME, so a later branch reusing the name
+/// inherited the dead branch's working copy and `checkout` reported success
+/// while handing over content that branch never contained.
+#[test]
+fn a_recreated_branch_does_not_inherit_the_deleted_one() {
+    let tmp = tempdir().expect("create temp dir");
+    let repo_path = tmp.path();
+    assert!(cli_runner::gfs_init(repo_path), "gfs init should succeed");
+
+    let data_dir = workspace_data_dir_main_0(repo_path);
+    fs::write(data_dir.join("seed.txt"), "v1").unwrap();
+    assert!(cli_runner::gfs_commit(repo_path, "c1", None, None).0);
+    fs::write(data_dir.join("seed.txt"), "v2").unwrap();
+    assert!(cli_runner::gfs_commit(repo_path, "c2", None, None).0);
+    let tip = read_ref(repo_path, "main");
+
+    let repo = repo_path.to_str().unwrap();
+    assert!(cli_runner::run_gfs(["gfs", "checkout", "--path", repo, "-b", "b1"]).0);
+    fs::write(read_workspace_path(repo_path).join("only-on-b1.txt"), "x").unwrap();
+    assert!(cli_runner::gfs_commit(repo_path, "b1 work", None, None).0);
+    fs::write(
+        read_workspace_path(repo_path).join("never-committed.txt"),
+        "y",
+    )
+    .unwrap();
+
+    assert!(cli_runner::run_gfs(["gfs", "checkout", "--path", repo, "main", "--force"]).0);
+    assert!(cli_runner::run_gfs(["gfs", "branch", "--path", repo, "-d", "b1"]).0);
+    assert!(
+        !repo_path.join(".gfs/workspaces/b1").exists(),
+        "the workspace must go with the branch"
+    );
+
+    assert!(cli_runner::run_gfs(["gfs", "branch", "--path", repo, "b1", &tip]).0);
+    assert!(cli_runner::run_gfs(["gfs", "checkout", "--path", repo, "b1"]).0);
+    assert_eq!(
+        workspace_contents(repo_path),
+        "seed.txt=v2",
+        "the new b1 holds its own commit, not the deleted branch's working copy"
+    );
+}
+
+/// Deleting a branch must not destroy the only record of where it pointed.
+///
+/// A commit object stores its parents but no branch name, so once the ref file
+/// is gone the name -> tip binding exists nowhere: the commits survive on disk
+/// and can be found by scanning objects for dangling tips, but nothing says
+/// which of them was "b1". `branch -d` therefore moves the ref aside instead of
+/// unlinking it, and `--restore` puts it back.
+#[test]
+fn a_deleted_branch_can_be_restored_with_its_name_and_tip() {
+    let tmp = tempdir().expect("create temp dir");
+    let repo_path = tmp.path();
+    assert!(cli_runner::gfs_init(repo_path), "gfs init should succeed");
+    let repo = repo_path.to_str().unwrap();
+
+    let data_dir = workspace_data_dir_main_0(repo_path);
+    fs::write(data_dir.join("seed.txt"), "v1").unwrap();
+    assert!(cli_runner::gfs_commit(repo_path, "c1", None, None).0);
+
+    assert!(cli_runner::run_gfs(["gfs", "checkout", "--path", repo, "-b", "b1"]).0);
+    fs::write(read_workspace_path(repo_path).join("only-on-b1.txt"), "x").unwrap();
+    assert!(cli_runner::gfs_commit(repo_path, "b1 work", None, None).0);
+    let b1_tip = read_ref(repo_path, "b1");
+    assert!(cli_runner::run_gfs(["gfs", "checkout", "--path", repo, "main"]).0);
+
+    assert!(cli_runner::run_gfs(["gfs", "branch", "--path", repo, "-d", "b1"]).0);
+    assert!(
+        !repo_path.join(".gfs/refs/heads/b1").exists(),
+        "the live ref should be gone"
+    );
+
+    assert!(cli_runner::run_gfs(["gfs", "branch", "--path", repo, "--restore", "b1"]).0);
+    assert_eq!(
+        read_ref(repo_path, "b1"),
+        b1_tip,
+        "the restored branch must point at the commit it was deleted at"
+    );
+
+    // The workspace went with the branch, so this also proves the restore is
+    // usable rather than just a ref on disk: checkout rebuilds it from the
+    // snapshot.
+    assert!(cli_runner::run_gfs(["gfs", "checkout", "--path", repo, "b1"]).0);
+    assert_eq!(
+        workspace_contents(repo_path),
+        "only-on-b1.txt=x seed.txt=v1",
+        "the restored branch checks out the content it had when deleted"
+    );
+}
+
+/// Restoring must not trade one lost branch for another.
+#[test]
+fn restoring_a_name_that_is_live_again_is_refused() {
+    let tmp = tempdir().expect("create temp dir");
+    let repo_path = tmp.path();
+    assert!(cli_runner::gfs_init(repo_path), "gfs init should succeed");
+    let repo = repo_path.to_str().unwrap();
+
+    let data_dir = workspace_data_dir_main_0(repo_path);
+    fs::write(data_dir.join("seed.txt"), "v1").unwrap();
+    assert!(cli_runner::gfs_commit(repo_path, "c1", None, None).0);
+
+    assert!(cli_runner::run_gfs(["gfs", "checkout", "--path", repo, "-b", "b1"]).0);
+    assert!(cli_runner::run_gfs(["gfs", "checkout", "--path", repo, "main"]).0);
+    assert!(cli_runner::run_gfs(["gfs", "branch", "--path", repo, "-d", "b1"]).0);
+
+    // Same name, live again.
+    assert!(cli_runner::run_gfs(["gfs", "branch", "--path", repo, "b1"]).0);
+    let live_tip = read_ref(repo_path, "b1");
+
+    assert!(
+        !cli_runner::run_gfs(["gfs", "branch", "--path", repo, "--restore", "b1"]).0,
+        "restore must fail rather than overwrite the live branch"
+    );
+    assert_eq!(
+        read_ref(repo_path, "b1"),
+        live_tip,
+        "the live branch must be untouched by the refused restore"
+    );
+}
+
+/// A commit hash names exactly one content state.
+///
+/// The detached workspace is named by the hash, and was reused as-is, so
+/// mutating one and returning to it gave you something other than what
+/// `Switched to <hash>` says you got.
+#[test]
+fn returning_to_a_detached_commit_gives_that_commit() {
+    let tmp = tempdir().expect("create temp dir");
+    let repo_path = tmp.path();
+    assert!(cli_runner::gfs_init(repo_path), "gfs init should succeed");
+
+    let data_dir = workspace_data_dir_main_0(repo_path);
+    fs::write(data_dir.join("seed.txt"), "v1").unwrap();
+    assert!(cli_runner::gfs_commit(repo_path, "c1", None, None).0);
+    let first = read_ref(repo_path, "main");
+    fs::write(data_dir.join("seed.txt"), "v2").unwrap();
+    assert!(cli_runner::gfs_commit(repo_path, "c2", None, None).0);
+
+    let repo = repo_path.to_str().unwrap();
+    assert!(cli_runner::run_gfs(["gfs", "checkout", "--path", repo, &first]).0);
+    assert_eq!(workspace_contents(repo_path), "seed.txt=v1");
+
+    fs::write(read_workspace_path(repo_path).join("poison.txt"), "z").unwrap();
+
+    // Leaving is fine: the detached directory is not the one being rebuilt.
+    assert!(
+        cli_runner::run_gfs(["gfs", "checkout", "--path", repo, "main"]).0,
+        "leaving a dirty workspace overwrites nothing, so it must not be refused"
+    );
+
+    // Returning is where it would be destroyed, so that is where the refusal is.
+    let (ok, _, stderr) = cli_runner::run_gfs(["gfs", "checkout", "--path", repo, &first]);
+    assert!(!ok, "returning would overwrite poison.txt");
+    assert!(stderr.contains("poison.txt"), "{stderr}");
+
+    assert!(cli_runner::run_gfs(["gfs", "checkout", "--path", repo, &first, "--force"]).0);
+    assert_eq!(
+        workspace_contents(repo_path),
+        "seed.txt=v1",
+        "the commit's content, not what was left in its directory"
+    );
+}
+
+/// The refusal has to guard the workspace the restore REBUILDS, not the one
+/// being left behind.
+///
+/// Each branch has its own directory, so leaving a dirty branch overwrites
+/// nothing and must not be refused. The destructive moment is coming BACK: the
+/// target directory is rebuilt from its snapshot, and work left there is gone.
+/// Guarding the wrong side is both too strict and, more seriously, silent —
+/// walk away from dirty work on one branch and return to it from a clean one,
+/// and it is deleted with no refusal at all.
+#[test]
+fn the_refusal_guards_the_workspace_being_rebuilt_not_the_one_being_left() {
+    let tmp = tempdir().expect("create temp dir");
+    let repo_path = tmp.path();
+    assert!(cli_runner::gfs_init(repo_path), "gfs init should succeed");
+    let repo = repo_path.to_str().unwrap();
+
+    fs::write(workspace_data_dir_main_0(repo_path).join("seed.txt"), "v1").unwrap();
+    assert!(cli_runner::gfs_commit(repo_path, "c1", None, None).0);
+
+    assert!(cli_runner::run_gfs(["gfs", "checkout", "--path", repo, "-b", "feature"]).0);
+    let feature_ws = read_workspace_path(repo_path);
+    fs::write(feature_ws.join("scratch.txt"), "wip").unwrap();
+
+    // Leaving: allowed, and the directory is left alone.
+    let (ok, _, stderr) = cli_runner::run_gfs(["gfs", "checkout", "--path", repo, "main"]);
+    assert!(ok, "leaving must not be refused; stderr: {stderr}");
+    assert!(
+        feature_ws.join("scratch.txt").exists(),
+        "leaving must not touch the branch's directory"
+    );
+
+    // Returning: refused, from a workspace that is itself clean.
+    let (ok, _, stderr) = cli_runner::run_gfs(["gfs", "checkout", "--path", repo, "feature"]);
+    assert!(
+        !ok,
+        "returning would rebuild feature's directory and destroy scratch.txt"
+    );
+    assert!(stderr.contains("scratch.txt"), "{stderr}");
+    assert!(
+        feature_ws.join("scratch.txt").exists(),
+        "a refused checkout must change nothing"
+    );
+}

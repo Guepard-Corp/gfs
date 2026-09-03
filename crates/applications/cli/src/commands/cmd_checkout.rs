@@ -30,6 +30,7 @@ pub async fn checkout(
     path: Option<PathBuf>,
     revision: Option<String>,
     create_branch: Option<String>,
+    force: bool,
     json_output: bool,
 ) -> Result<()> {
     let repo_path = path.clone().unwrap_or_else(get_repo_dir);
@@ -130,7 +131,7 @@ pub async fn checkout(
 
         commit_hash
     } else {
-        let use_case = CheckoutRepoUseCase::new(repository, compute, registry);
+        let use_case = CheckoutRepoUseCase::new(repository, compute, registry).with_force(force);
         use_case
             .run(repo_path, revision.clone(), create_branch.clone())
             .await

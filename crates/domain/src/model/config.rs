@@ -100,7 +100,15 @@ pub struct GfsConfig {
     pub storage: Option<StorageConfig>,
     #[serde(default)]
     pub compute: Option<ComputeConfig>,
+    /// How long `gfs branch -d` keeps a deleted branch restorable, in days.
+    /// Absent means the built-in default (see `DEFAULT_DELETED_RETENTION_DAYS`).
+    #[serde(default)]
+    pub deleted_branch_retention_days: Option<u64>,
 }
+
+/// Default window during which a deleted branch can be restored by name.
+/// Thirty days matches the restore window Neon and lakeFS settled on.
+pub const DEFAULT_DELETED_RETENTION_DAYS: u64 = 30;
 
 impl GfsConfig {
     pub fn load(repo_path: &Path) -> Result<Self, RepoError> {
@@ -272,6 +280,7 @@ mod tests {
                 enable_reflink: true,
             }),
             compute: None,
+            deleted_branch_retention_days: None,
         };
         config.save(dir.path()).unwrap();
 
@@ -338,6 +347,7 @@ mod tests {
             runtime: None,
             storage: None,
             compute: Some(ComputeConfig { params }),
+            deleted_branch_retention_days: None,
         };
         config.save(dir.path()).unwrap();
 
@@ -359,6 +369,7 @@ mod tests {
                 runtime: None,
                 storage: None,
                 compute: None,
+                deleted_branch_retention_days: None,
             }
             .compute_params()
             .is_empty()
@@ -377,6 +388,7 @@ mod tests {
             runtime: None,
             storage: None,
             compute: None,
+            deleted_branch_retention_days: None,
         };
         // Pass path where .gfs does not exist; save writes to repo_path/.gfs/config.toml
         let result = config.save(dir.path());

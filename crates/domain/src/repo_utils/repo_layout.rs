@@ -2,14 +2,15 @@ use crate::model::commit::{Commit, FileEntry};
 use crate::model::config::{EnvironmentConfig, GfsConfig, RuntimeConfig, UserConfig};
 use crate::model::errors::RepoError;
 use crate::model::layout::{
-    BRANCH_WORKSPACE_SEGMENT, CONFIG_FILE, DEFAULT_SHORT_HASH_LEN, GFS_DIR, HEAD_FILE, HEADS_DIR,
-    MAIN_BRANCH, MIN_SHORT_HASH_LEN, OBJECTS_DIR, REFS_DIR, SHORT_COMMIT_ID_LEN, SNAPSHOTS_DIR,
-    WORKSPACE_DATA_DIR, WORKSPACE_FILE, WORKSPACES_DIR,
+    BRANCH_WORKSPACE_SEGMENT, CONFIG_FILE, DEFAULT_SHORT_HASH_LEN, DELETED_REFS_DIR, GFS_DIR,
+    HEAD_FILE, HEADS_DIR, MAIN_BRANCH, MIN_SHORT_HASH_LEN, OBJECTS_DIR, REFS_DIR,
+    SHORT_COMMIT_ID_LEN, SNAPSHOTS_DIR, WORKSPACE_DATA_DIR, WORKSPACE_FILE, WORKSPACES_DIR,
 };
 use anyhow::Result;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn validate_repo_layout(gfs_dir: &Path) -> Result<(), RepoError> {
     // Check HEAD file
@@ -133,6 +134,7 @@ pub fn init_repo_layout(working_dir: &Path, mount_point: Option<String>) -> Resu
         runtime: None,
         storage: None,
         compute: None,
+        deleted_branch_retention_days: None,
     };
 
     let config_path = gfs_dir.join(CONFIG_FILE);
@@ -778,6 +780,306 @@ pub fn update_branch_ref(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Soft-deleted branch refs
+// ---------------------------------------------------------------------------
+
+/// A branch ref that `gfs branch -d` moved aside instead of unlinking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletedBranch {
+    /// The branch's original name, including any `/` segments.
+    pub name: String,
+    /// The tip the branch pointed at when it was deleted.
+    pub commit_hash: String,
+    /// Deletion time in milliseconds since the Unix epoch. This is also the
+    /// directory segment the entry lives under.
+    pub deleted_at_ms: u64,
+}
+
+/// Rejects branch names that would escape `refs/heads` when joined onto a path.
+///
+/// A branch name is used as a path segment, so `..`, `.` and absolute paths let
+/// it address files outside the directory it is supposed to live in. Without
+/// this, `branch -d ../heads/main` deletes `main` while the current-branch guard
+/// — which compares the raw string — sees a name that is not the current branch.
+pub fn validate_branch_name(name: &str) -> Result<(), RepoError> {
+    if name.is_empty() {
+        return Err(RepoError::invalid_layout(
+            "branch name is empty".to_string(),
+        ));
+    }
+    if Path::new(name).is_absolute() {
+        return Err(RepoError::invalid_layout(format!(
+            "branch name '{name}' must be relative, not an absolute path"
+        )));
+    }
+    for segment in name.split('/') {
+        if segment.is_empty() {
+            return Err(RepoError::invalid_layout(format!(
+                "branch name '{name}' has an empty path segment"
+            )));
+        }
+        if segment == "." || segment == ".." {
+            return Err(RepoError::invalid_layout(format!(
+                "branch name '{name}' must not contain '.' or '..' segments"
+            )));
+        }
+    }
+    if name.contains('\\') {
+        return Err(RepoError::invalid_layout(format!(
+            "branch name '{name}' must not contain a backslash"
+        )));
+    }
+    Ok(())
+}
+
+/// `<repo>/.gfs/refs/deleted`.
+pub fn deleted_refs_dir(repo_path: &Path) -> PathBuf {
+    repo_path
+        .join(GFS_DIR)
+        .join(REFS_DIR)
+        .join(DELETED_REFS_DIR)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Moves `refs/heads/<branch_name>` aside so the branch can be restored later,
+/// instead of unlinking it.
+///
+/// The ref file holds the only record of which commit a branch pointed at: a
+/// commit object stores its parents but not the name of any branch, so an
+/// unlinked ref makes the name → tip binding unrecoverable even though every
+/// commit survives on disk.
+///
+/// Entries are stored at `refs/deleted/<unix_millis>/<branch path>`, with the
+/// timestamp as the *outer* segment. Putting the name first would break on
+/// nested branches: deleting `a` and then `a/b` would need `a` to be both a
+/// file and a directory. A directory per deletion also lets the same name be
+/// deleted, recreated and deleted again without entries colliding.
+pub fn soft_delete_branch_ref(
+    repo_path: &Path,
+    branch_name: &str,
+) -> Result<DeletedBranch, RepoError> {
+    validate_branch_name(branch_name)?;
+    let ref_path = repo_path
+        .join(GFS_DIR)
+        .join(REFS_DIR)
+        .join(HEADS_DIR)
+        .join(branch_name);
+    let commit_hash = fs::read_to_string(&ref_path)
+        .map_err(RepoError::from)?
+        .trim()
+        .to_string();
+
+    // Two deletions within the same millisecond would otherwise share a
+    // directory; step forward until the slot is free rather than merging them.
+    let mut deleted_at_ms = now_ms();
+    let base = deleted_refs_dir(repo_path);
+    while base
+        .join(deleted_at_ms.to_string())
+        .join(branch_name)
+        .exists()
+    {
+        deleted_at_ms += 1;
+    }
+
+    let target = base.join(deleted_at_ms.to_string()).join(branch_name);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(RepoError::from)?;
+    }
+    fs::rename(&ref_path, &target).map_err(RepoError::from)?;
+
+    Ok(DeletedBranch {
+        name: branch_name.to_string(),
+        commit_hash,
+        deleted_at_ms,
+    })
+}
+
+/// Every recoverable branch, newest deletion first.
+pub fn list_deleted_branch_refs(repo_path: &Path) -> Result<Vec<DeletedBranch>, RepoError> {
+    let base = deleted_refs_dir(repo_path);
+    if !base.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in fs::read_dir(&base).map_err(RepoError::from)? {
+        let entry = entry.map_err(RepoError::from)?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        // A directory whose name is not a timestamp was not written by us; skip
+        // it rather than failing the whole listing.
+        let Some(deleted_at_ms) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        for (name, commit_hash) in collect_branch_refs(&path, "")? {
+            out.push(DeletedBranch {
+                name,
+                commit_hash,
+                deleted_at_ms,
+            });
+        }
+    }
+    out.sort_by(|a, b| {
+        b.deleted_at_ms
+            .cmp(&a.deleted_at_ms)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    Ok(out)
+}
+
+/// Deleted branches still inside `retention_ms`, newest first.
+///
+/// Filtered on read rather than relying on pruning: expiry has to hold even when
+/// nothing has triggered a prune, otherwise the window is advisory and a branch
+/// stays restorable long after it was documented to stop being so.
+pub fn list_recoverable_branch_refs(
+    repo_path: &Path,
+    retention_ms: u64,
+) -> Result<Vec<DeletedBranch>, RepoError> {
+    // Zero is special-cased rather than left to fall out of the comparison. With
+    // `cutoff == now`, an entry deleted in the current millisecond compares as
+    // still inside the window, so "no recovery at all" would depend on whether
+    // the clock ticked between the delete and the read.
+    if retention_ms == 0 {
+        return Ok(Vec::new());
+    }
+    // `>=` here and `<` in `prune_expired_deleted_refs` are complementary, so an
+    // entry exactly on the cutoff is listable rather than falling into a gap
+    // where it is neither shown nor collected.
+    let cutoff = now_ms().saturating_sub(retention_ms);
+    Ok(list_deleted_branch_refs(repo_path)?
+        .into_iter()
+        .filter(|d| d.deleted_at_ms >= cutoff)
+        .collect())
+}
+
+/// Restores the most recent deletion of `branch_name` back to `refs/heads/`.
+///
+/// Refuses when a live branch of that name already exists: the caller asked to
+/// recover a name that is now in use, and silently overwriting the live ref
+/// would trade one lost branch for another.
+pub fn restore_deleted_branch_ref(
+    repo_path: &Path,
+    branch_name: &str,
+    retention_ms: u64,
+) -> Result<DeletedBranch, RepoError> {
+    validate_branch_name(branch_name)?;
+    let live = repo_path
+        .join(GFS_DIR)
+        .join(REFS_DIR)
+        .join(HEADS_DIR)
+        .join(branch_name);
+    // `is_file`, not `exists`: after restoring `a/b`, `refs/heads/a` exists as a
+    // directory holding `b`. Treating that as a live branch would report the
+    // wrong reason, and the two cases need different advice.
+    if live.is_file() {
+        return Err(RepoError::invalid_layout(format!(
+            "branch '{branch_name}' already exists; rename or delete it before restoring the deleted one"
+        )));
+    }
+    if live.is_dir() {
+        return Err(RepoError::invalid_layout(format!(
+            "'{branch_name}' cannot be a branch while branches nested under it exist; \
+             a ref is a file, so it cannot also be a directory"
+        )));
+    }
+
+    // Filtered here rather than only in the caller: retention is part of the
+    // guarantee, and a library consumer that skipped the check would silently
+    // restore branches the window says are gone.
+    let entry = list_recoverable_branch_refs(repo_path, retention_ms)?
+        .into_iter()
+        .find(|d| d.name == branch_name)
+        .ok_or_else(|| RepoError::RevisionNotFound(branch_name.to_string()))?;
+
+    // A tombstone should name a commit. Restoring an unparseable one would
+    // produce a live ref that no command can resolve, and `checkout` would
+    // report a missing *repository* rather than a missing commit.
+    let looks_like_commit = entry.commit_hash == "0"
+        || (entry.commit_hash.len() == 64
+            && entry.commit_hash.chars().all(|c| c.is_ascii_hexdigit()));
+    if !looks_like_commit {
+        return Err(RepoError::invalid_layout(format!(
+            "the stored entry for '{branch_name}' does not name a commit, so restoring it \
+             would create a branch nothing can resolve"
+        )));
+    }
+
+    let base = deleted_refs_dir(repo_path);
+    let stored = base.join(entry.deleted_at_ms.to_string()).join(branch_name);
+    if let Some(parent) = live.parent() {
+        fs::create_dir_all(parent).map_err(RepoError::from)?;
+    }
+    fs::rename(&stored, &live).map_err(RepoError::from)?;
+    // Start at the directory the ref actually sat in, not the timestamp root:
+    // for `a/b` the newly empty directory is `<ts>/a`, and `<ts>` still contains
+    // it, so starting there would find a non-empty directory and stop.
+    if let Some(from) = stored.parent() {
+        prune_empty_dirs_under(from, &base);
+    }
+
+    Ok(entry)
+}
+
+/// Drops deleted-ref entries older than `retention_ms`, returning how many went.
+///
+/// There is no background process and no garbage collector yet, so this is
+/// called opportunistically from `gfs branch -d`. Note that it frees only the
+/// ref files: the commit objects and snapshot trees an expired branch pointed at
+/// stay on disk until a reachability collector exists.
+pub fn prune_expired_deleted_refs(repo_path: &Path, retention_ms: u64) -> Result<usize, RepoError> {
+    let base = deleted_refs_dir(repo_path);
+    if !base.exists() {
+        return Ok(0);
+    }
+    let cutoff = now_ms().saturating_sub(retention_ms);
+    let mut pruned = 0;
+    for entry in fs::read_dir(&base).map_err(RepoError::from)? {
+        let entry = entry.map_err(RepoError::from)?;
+        let path = entry.path();
+        let Some(deleted_at_ms) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if path.is_dir() && deleted_at_ms < cutoff {
+            pruned += collect_branch_refs(&path, "")?.len();
+            fs::remove_dir_all(&path).map_err(RepoError::from)?;
+        }
+    }
+    Ok(pruned)
+}
+
+/// Removes `dir` and its now-empty parents, stopping at `stop_at` exclusive.
+fn prune_empty_dirs_under(dir: &Path, stop_at: &Path) {
+    let mut current = Some(dir);
+    while let Some(d) = current {
+        if d == stop_at || !d.starts_with(stop_at) {
+            break;
+        }
+        if d.read_dir().is_ok_and(|mut it| it.next().is_none()) {
+            let _ = fs::remove_dir(d);
+        } else {
+            break;
+        }
+        current = d.parent();
+    }
+}
+
 /// Resolves a human-readable revision to a commit id.
 ///
 /// Supported formats:
@@ -1035,6 +1337,107 @@ pub fn get_current_commit_id(repo_path: &Path) -> Result<String, RepoError> {
 
 /// Short commit id used for workspace directory path segment (avoids long paths on disk).
 /// If `commit_id` is longer than `SHORT_COMMIT_ID_LEN`, returns the prefix; otherwise returns as-is (e.g. `"0"`).
+/// Where a checkout of `revision` would land: its commit, and the workspace
+/// directory that would be rebuilt.
+///
+/// Extracted so the caller can ask what a checkout is about to overwrite BEFORE
+/// it overwrites it. `GfsRepository::checkout` uses the same function, because
+/// two copies of this rule that disagree is exactly how a guard ends up
+/// protecting a different directory from the one being destroyed.
+pub fn checkout_target(
+    repo: &Path,
+    revision: &str,
+) -> Result<(String, std::path::PathBuf), RepoError> {
+    let commit_hash = rev_parse(repo, revision)?;
+
+    // A branch name only keeps its own workspace while it still points at the
+    // commit being asked for; otherwise the checkout detaches.
+    let branch_segment = if is_branch(repo, revision) {
+        let tip = fs::read_to_string(
+            repo.join(GFS_DIR)
+                .join(REFS_DIR)
+                .join(HEADS_DIR)
+                .join(revision),
+        )
+        .map_err(RepoError::from)?;
+        if tip.trim() == commit_hash {
+            revision.to_string()
+        } else {
+            "detached".to_string()
+        }
+    } else {
+        "detached".to_string()
+    };
+
+    let workspace_segment = if branch_segment == "detached" {
+        short_commit_id_for_workspace(&commit_hash)
+    } else {
+        BRANCH_WORKSPACE_SEGMENT.to_string()
+    };
+
+    let path = repo
+        .join(GFS_DIR)
+        .join(WORKSPACES_DIR)
+        .join(&branch_segment)
+        .join(&workspace_segment)
+        .join(WORKSPACE_DATA_DIR);
+    Ok((commit_hash, path))
+}
+
+/// The directory holding a branch's working copy.
+pub fn branch_workspace_dir(repo_path: &Path, branch: &str) -> std::path::PathBuf {
+    repo_path.join(GFS_DIR).join(WORKSPACES_DIR).join(branch)
+}
+
+/// Paths in `workspace` that differ from `baseline`, i.e. uncommitted work.
+///
+/// Checkout restores the workspace from a snapshot, which overwrites whatever is
+/// there. Callers use this to refuse rather than overwrite silently.
+///
+/// WHAT IS COMPARED, and why it is only this. `FileEntry` records path, size,
+/// owner, group and mode; there is no content hash, so this is git's cheap tier
+/// (stat) without git's second tier (hash on suspicion).
+///
+/// * SIZE, for files present in both. A write to a SQLite database grows the
+///   database or its write-ahead log, so real work shows up here.
+/// * PRESENCE, for files in the workspace that the baseline does not have.
+/// * NOT permissions. A live workspace is 0700 and a snapshot is read-only, so
+///   they always differ and comparing them would report every workspace dirty.
+/// * NOT absences. SQLite deletes its `-wal` and `-shm` sidecars when the last
+///   connection closes, so a file that has gone away is the normal aftermath of
+///   reading the database, not uncommitted work.
+///
+/// The gap this leaves, stated rather than hidden: an edit that changes no
+/// file's size — an in-place UPDATE whose pages are checkpointed back to the
+/// same length — is not detected. The direction of the remaining error is the
+/// safe one for a false positive (a needless refusal, which `--force` clears)
+/// and the unsafe one for a false negative, so it is worth revisiting with a
+/// content hash if the commit object ever grows one.
+pub fn workspace_changes(
+    workspace: &Path,
+    baseline: &[FileEntry],
+) -> Result<Vec<String>, RepoError> {
+    if !workspace.exists() {
+        return Ok(Vec::new());
+    }
+    let current = collect_file_entries(workspace, "")?;
+    let sizes: std::collections::HashMap<&str, u64> = baseline
+        .iter()
+        .map(|e| (e.relative_path.as_str(), e.file_size))
+        .collect();
+
+    let mut changed: Vec<String> = current
+        .iter()
+        .filter(|entry| match sizes.get(entry.relative_path.as_str()) {
+            Some(&size) => size != entry.file_size,
+            None => true,
+        })
+        .map(|entry| entry.relative_path.clone())
+        .collect();
+    changed.sort();
+    Ok(changed)
+}
+
 pub fn short_commit_id_for_workspace(commit_id: &str) -> String {
     if commit_id.len() <= SHORT_COMMIT_ID_LEN {
         commit_id.to_string()
@@ -1105,12 +1508,340 @@ mod tests {
     use std::io;
     use tempfile::TempDir;
 
+    /// The dirty check reports work, and only work.
+    #[test]
+    fn workspace_changes_reports_writes_and_additions() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        fs::write(ws.join("db"), "aaaa").unwrap();
+        fs::write(ws.join("keep"), "same").unwrap();
+        let baseline = collect_file_entries(ws, "").unwrap();
+
+        // Untouched.
+        assert!(workspace_changes(ws, &baseline).unwrap().is_empty());
+
+        // A write that changes the size.
+        fs::write(ws.join("db"), "aaaaaaaa").unwrap();
+        assert_eq!(workspace_changes(ws, &baseline).unwrap(), vec!["db"]);
+
+        // A new file.
+        fs::write(ws.join("db"), "aaaa").unwrap();
+        fs::write(ws.join("new"), "x").unwrap();
+        assert_eq!(workspace_changes(ws, &baseline).unwrap(), vec!["new"]);
+    }
+
+    /// A file that has GONE is not uncommitted work.
+    ///
+    /// SQLite deletes its `-wal` and `-shm` sidecars when the last connection
+    /// closes, so treating an absence as a change would report every workspace
+    /// dirty after a plain read.
+    #[test]
+    fn workspace_changes_ignores_files_that_disappeared() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        fs::write(ws.join("db"), "aaaa").unwrap();
+        fs::write(ws.join("db-wal"), "").unwrap();
+        fs::write(ws.join("db-shm"), "x".repeat(32)).unwrap();
+        let baseline = collect_file_entries(ws, "").unwrap();
+
+        fs::remove_file(ws.join("db-wal")).unwrap();
+        fs::remove_file(ws.join("db-shm")).unwrap();
+        assert!(
+            workspace_changes(ws, &baseline).unwrap().is_empty(),
+            "closing the database is not uncommitted work"
+        );
+    }
+
+    /// Permissions are deliberately not compared.
+    ///
+    /// A live workspace is 0700 and the snapshot it came from is read-only, so
+    /// comparing modes would report every workspace dirty.
+    #[test]
+    fn workspace_changes_ignores_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let file = ws.join("db");
+        fs::write(&file, "aaaa").unwrap();
+        let mut baseline = collect_file_entries(ws, "").unwrap();
+        baseline[0].permissions = Some("0400".to_string());
+        assert!(workspace_changes(ws, &baseline).unwrap().is_empty());
+    }
+
+    /// A workspace that is not there yet has nothing to lose.
+    #[test]
+    fn workspace_changes_on_a_missing_workspace_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            workspace_changes(&dir.path().join("gone"), &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn short_commit_id_for_workspace_keeps_short_and_truncates_long() {
         assert_eq!(short_commit_id_for_workspace("0"), "0");
         assert_eq!(short_commit_id_for_workspace("abc"), "abc");
         let long = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         assert_eq!(short_commit_id_for_workspace(long), "0123456789ab");
+    }
+
+    // -----------------------------------------------------------------------
+    // Soft-deleted branch refs
+    // -----------------------------------------------------------------------
+
+    /// Creates `refs/heads/<name>` holding `tip`, creating parent dirs.
+    fn write_branch(repo: &Path, name: &str, tip: &str) {
+        let p = repo.join(GFS_DIR).join(REFS_DIR).join(HEADS_DIR).join(name);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, tip).unwrap();
+    }
+
+    /// A branch ref is a *file*. `refs/heads/a` can also exist as a directory
+    /// when `a/b` is live, which is not the same thing as branch `a` existing.
+    fn branch_exists(repo: &Path, name: &str) -> bool {
+        repo.join(GFS_DIR)
+            .join(REFS_DIR)
+            .join(HEADS_DIR)
+            .join(name)
+            .is_file()
+    }
+
+    #[test]
+    fn soft_delete_then_restore_round_trips_name_and_tip() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        create_valid_repo_layout(repo).unwrap();
+        write_branch(repo, "feature", "a".repeat(64).as_str());
+
+        let deleted = soft_delete_branch_ref(repo, "feature").unwrap();
+        assert_eq!(deleted.name, "feature");
+        assert_eq!(deleted.commit_hash, "a".repeat(64));
+        assert!(!branch_exists(repo, "feature"), "ref should have moved");
+
+        let listed = list_deleted_branch_refs(repo).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "feature");
+        assert_eq!(listed[0].commit_hash, "a".repeat(64));
+
+        let restored = restore_deleted_branch_ref(repo, "feature", u64::MAX).unwrap();
+        assert_eq!(restored.commit_hash, "a".repeat(64));
+        assert!(branch_exists(repo, "feature"));
+        assert_eq!(
+            fs::read_to_string(
+                repo.join(GFS_DIR)
+                    .join(REFS_DIR)
+                    .join(HEADS_DIR)
+                    .join("feature")
+            )
+            .unwrap()
+            .trim(),
+            "a".repeat(64)
+        );
+        assert!(
+            list_deleted_branch_refs(repo).unwrap().is_empty(),
+            "a restored entry should leave the deleted area"
+        );
+    }
+
+    #[test]
+    fn restore_refuses_when_the_name_is_live_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        create_valid_repo_layout(repo).unwrap();
+        write_branch(repo, "feature", "a".repeat(64).as_str());
+        soft_delete_branch_ref(repo, "feature").unwrap();
+        write_branch(repo, "feature", "b".repeat(64).as_str());
+
+        assert!(restore_deleted_branch_ref(repo, "feature", u64::MAX).is_err());
+        assert_eq!(
+            fs::read_to_string(
+                repo.join(GFS_DIR)
+                    .join(REFS_DIR)
+                    .join(HEADS_DIR)
+                    .join("feature")
+            )
+            .unwrap()
+            .trim(),
+            "b".repeat(64),
+            "the live branch must not be clobbered by a refused restore"
+        );
+    }
+
+    /// The reason the timestamp is the outer path segment.
+    ///
+    /// `a` and `a/b` can never be live at the same time — a ref is a file, so
+    /// `refs/heads/a` being a file blocks `refs/heads/a/b`, the same
+    /// directory/file conflict git has. But *deleted* entries have no such
+    /// mutual exclusion: delete `a`, then later create and delete `a/b`, and
+    /// both are recoverable at once. Keying the deleted area by name first
+    /// would need `a` to be a file and a directory simultaneously; keying it by
+    /// deletion time makes the collision unreachable.
+    #[test]
+    fn a_deleted_branch_and_a_deleted_nested_branch_sharing_its_name_coexist() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        create_valid_repo_layout(repo).unwrap();
+
+        write_branch(repo, "a", "a".repeat(64).as_str());
+        soft_delete_branch_ref(repo, "a").unwrap();
+
+        // Only possible now that `a` is no longer a live ref.
+        write_branch(repo, "a/b", "b".repeat(64).as_str());
+        soft_delete_branch_ref(repo, "a/b").unwrap();
+
+        let listed = list_deleted_branch_refs(repo).unwrap();
+        let mut names: Vec<&str> = listed.iter().map(|d| d.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["a", "a/b"], "both deletions must survive");
+
+        let restored = restore_deleted_branch_ref(repo, "a/b", u64::MAX).unwrap();
+        assert_eq!(restored.commit_hash, "b".repeat(64));
+        assert!(branch_exists(repo, "a/b"));
+        assert!(
+            !branch_exists(repo, "a"),
+            "restoring one must not restore the other"
+        );
+    }
+
+    #[test]
+    fn deleting_the_same_name_twice_keeps_both_and_restores_the_newest() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        create_valid_repo_layout(repo).unwrap();
+
+        write_branch(repo, "feature", "a".repeat(64).as_str());
+        let first = soft_delete_branch_ref(repo, "feature").unwrap();
+        write_branch(repo, "feature", "b".repeat(64).as_str());
+        let second = soft_delete_branch_ref(repo, "feature").unwrap();
+        assert_ne!(
+            first.deleted_at_ms, second.deleted_at_ms,
+            "two deletions must not share a slot"
+        );
+
+        assert_eq!(list_deleted_branch_refs(repo).unwrap().len(), 2);
+        let restored = restore_deleted_branch_ref(repo, "feature", u64::MAX).unwrap();
+        assert_eq!(
+            restored.commit_hash,
+            "b".repeat(64),
+            "restore should take the most recent deletion"
+        );
+        assert_eq!(
+            list_deleted_branch_refs(repo).unwrap().len(),
+            1,
+            "the older deletion should still be recoverable"
+        );
+    }
+
+    #[test]
+    fn prune_drops_expired_entries_and_keeps_in_window_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        create_valid_repo_layout(repo).unwrap();
+        write_branch(repo, "fresh", "a".repeat(64).as_str());
+        soft_delete_branch_ref(repo, "fresh").unwrap();
+
+        // Backdate one entry by relocating it to an older timestamp directory,
+        // which is the same thing the passage of time would do.
+        write_branch(repo, "stale", "b".repeat(64).as_str());
+        let stale = soft_delete_branch_ref(repo, "stale").unwrap();
+        let base = deleted_refs_dir(repo);
+        let old_ms = stale.deleted_at_ms - 10_000;
+        fs::create_dir_all(base.join(old_ms.to_string())).unwrap();
+        fs::rename(
+            base.join(stale.deleted_at_ms.to_string()).join("stale"),
+            base.join(old_ms.to_string()).join("stale"),
+        )
+        .unwrap();
+        fs::remove_dir(base.join(stale.deleted_at_ms.to_string())).unwrap();
+
+        let pruned = prune_expired_deleted_refs(repo, 5_000).unwrap();
+        assert_eq!(pruned, 1);
+        let names: Vec<String> = list_deleted_branch_refs(repo)
+            .unwrap()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(names, vec!["fresh".to_string()]);
+    }
+
+    /// A branch name becomes a path segment, so a traversing name addresses
+    /// files outside `refs/heads`. `branch -d ../heads/main` otherwise deletes
+    /// `main` while the current-branch guard, which compares raw strings, sees a
+    /// name that is not the current branch.
+    #[test]
+    fn validate_branch_name_rejects_names_that_escape_refs_heads() {
+        for good in ["main", "feature", "team/alpha", "a.b", "release-1.2"] {
+            assert!(validate_branch_name(good).is_ok(), "{good} should be valid");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "./main",
+            "../heads/main",
+            "../../../../pwned",
+            "team//alpha",
+            "team/../../escape",
+            "/absolute",
+            "back\\slash",
+        ] {
+            assert!(
+                validate_branch_name(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn soft_delete_refuses_a_traversing_name_instead_of_moving_another_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        create_valid_repo_layout(repo).unwrap();
+        write_branch(repo, "main", "a".repeat(64).as_str());
+
+        assert!(soft_delete_branch_ref(repo, "../heads/main").is_err());
+        assert!(soft_delete_branch_ref(repo, "./main").is_err());
+        assert!(
+            branch_exists(repo, "main"),
+            "a refused delete must not touch the ref it would have resolved to"
+        );
+    }
+
+    /// Expiry has to hold on read. Pruning alone runs only during `branch -d`,
+    /// so a repo where nothing is being deleted would keep entries restorable
+    /// long after the window they were documented to have.
+    #[test]
+    fn recoverable_listing_excludes_entries_past_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        create_valid_repo_layout(repo).unwrap();
+        write_branch(repo, "fresh", "a".repeat(64).as_str());
+        soft_delete_branch_ref(repo, "fresh").unwrap();
+
+        assert_eq!(
+            list_recoverable_branch_refs(repo, 60_000).unwrap().len(),
+            1,
+            "an entry inside the window is recoverable"
+        );
+        assert!(
+            list_recoverable_branch_refs(repo, 0).unwrap().is_empty(),
+            "a zero window makes it immediately unrecoverable"
+        );
+        assert_eq!(
+            list_deleted_branch_refs(repo).unwrap().len(),
+            1,
+            "filtering must not delete anything; the entry is still on disk"
+        );
+    }
+
+    #[test]
+    fn listing_is_empty_and_pruning_is_a_no_op_before_any_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        create_valid_repo_layout(repo).unwrap();
+        assert!(list_deleted_branch_refs(repo).unwrap().is_empty());
+        assert_eq!(prune_expired_deleted_refs(repo, 1).unwrap(), 0);
     }
 
     fn create_valid_repo_layout(path: &Path) -> io::Result<()> {
