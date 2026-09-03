@@ -248,7 +248,7 @@ fn delete_branch(repo_path: &std::path::Path, name: &str, json_output: bool) -> 
     // any branch name — so unlinking makes the name unrecoverable even though
     // every commit survives on disk.
     let deleted = repo_layout::soft_delete_branch_ref(repo_path, name)
-        .with_context(|| format!("failed to delete branch ref '{}'", name))?;
+        .with_context(|| format!("failed to move branch ref '{}' aside", name))?;
 
     // No background process and no collector yet, so expiry is enforced here.
     let retention_ms = retention_ms(repo_path);
@@ -303,7 +303,9 @@ fn delete_branch(repo_path: &std::path::Path, name: &str, json_output: bool) -> 
     println!("{} Deleted branch '{}'", green("✓"), name);
     println!(
         "  {}",
-        dimmed(format!("restore with: gfs branch --restore {}", name))
+        dimmed(format!(
+            "restore with: gfs branch --restore {name}  (restores committed work)"
+        ))
     );
     Ok(())
 }
@@ -316,10 +318,21 @@ fn delete_branch(repo_path: &std::path::Path, name: &str, json_output: bool) -> 
 /// A malformed or missing config is not worth failing a delete over, so this
 /// falls back rather than propagating.
 fn deleted_retention_days(repo_path: &std::path::Path) -> u64 {
-    GfsConfig::load(repo_path)
-        .ok()
-        .and_then(|c| c.deleted_branch_retention_days)
-        .unwrap_or(DEFAULT_DELETED_RETENTION_DAYS)
+    match GfsConfig::load(repo_path) {
+        Ok(config) => config
+            .deleted_branch_retention_days
+            .unwrap_or(DEFAULT_DELETED_RETENTION_DAYS),
+        Err(e) => {
+            // Falling back silently would apply the default to a repo whose
+            // owner configured something shorter, retaining data longer than
+            // they asked. Not fatal, but not silent either.
+            tracing::warn!(
+                "could not read config ({e}); using the default deleted-branch \
+                 retention of {DEFAULT_DELETED_RETENTION_DAYS} days"
+            );
+            DEFAULT_DELETED_RETENTION_DAYS
+        }
+    }
 }
 
 /// The retention window in milliseconds.
@@ -366,7 +379,10 @@ fn list_deleted(repo_path: &std::path::Path, json_output: bool) -> Result<()> {
                 })
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&json!(rows))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "deleted": rows }))?
+        );
         return Ok(());
     }
 
@@ -404,6 +420,47 @@ fn list_deleted(repo_path: &std::path::Path, json_output: bool) -> Result<()> {
 }
 
 fn restore_branch(repo_path: &std::path::Path, name: &str, json_output: bool) -> Result<()> {
+    // Availability is decided first. Asking "is the name taken?" before "is
+    // there anything to restore?" reports a live branch that was never deleted
+    // as an overwrite hazard, naming a deleted branch that does not exist.
+    let available = repo_layout::list_recoverable_branch_refs(repo_path, retention_ms(repo_path))
+        .context("failed to read deleted branch refs")?;
+    if !available.iter().any(|d| d.name == name) {
+        if available.is_empty() {
+            anyhow::bail!(
+                "no deleted branch named '{}' is recoverable, and nothing else is either. \
+                 A branch is recoverable for {} days after deletion",
+                name,
+                deleted_retention_days(repo_path)
+            );
+        }
+        let mut names: Vec<&str> = available.iter().map(|d| d.name.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        anyhow::bail!(
+            "no deleted branch named '{}' is recoverable. Recoverable: {}",
+            name,
+            names.join(", ")
+        );
+    }
+
+    // Checked here as well as in the domain, for the same reason as the checks
+    // below: the domain's message would be wrapped by `with_context` and hidden
+    // by `{}` formatting, leaving only "failed to restore branch 'x'".
+    if let Some(entry) = available.iter().find(|d| d.name == name) {
+        let names_a_commit = entry.commit_hash == "0"
+            || (entry.commit_hash.len() == 64
+                && entry.commit_hash.chars().all(|c| c.is_ascii_hexdigit()));
+        if !names_a_commit {
+            anyhow::bail!(
+                "the stored entry for '{}' does not name a commit, so restoring it would \
+                 create a branch nothing can resolve. Found: {:?}",
+                name,
+                entry.commit_hash
+            );
+        }
+    }
+
     // Checked here rather than relying on the error chain: `main` renders an
     // anyhow error with `{}`, which shows only the outermost context, so a
     // wrapped cause would be invisible to the user.
@@ -455,29 +512,9 @@ fn restore_branch(repo_path: &std::path::Path, name: &str, json_output: bool) ->
         ancestor = ancestor.join(segment);
     }
 
-    let available = repo_layout::list_recoverable_branch_refs(repo_path, retention_ms(repo_path))
-        .context("failed to read deleted branch refs")?;
-    if !available.iter().any(|d| d.name == name) {
-        if available.is_empty() {
-            anyhow::bail!(
-                "no deleted branch named '{}' is recoverable, and nothing else is either. \
-                 A branch is recoverable for {} days after deletion",
-                name,
-                deleted_retention_days(repo_path)
-            );
-        }
-        let mut names: Vec<&str> = available.iter().map(|d| d.name.as_str()).collect();
-        names.sort_unstable();
-        names.dedup();
-        anyhow::bail!(
-            "no deleted branch named '{}' is recoverable. Recoverable: {}",
-            name,
-            names.join(", ")
-        );
-    }
-
-    let restored = repo_layout::restore_deleted_branch_ref(repo_path, name)
-        .with_context(|| format!("failed to restore branch '{}'", name))?;
+    let restored =
+        repo_layout::restore_deleted_branch_ref(repo_path, name, retention_ms(repo_path))
+            .with_context(|| format!("failed to restore branch '{}'", name))?;
 
     if json_output {
         println!(

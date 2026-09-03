@@ -547,7 +547,7 @@ enum TopLevel {
         delete: Option<String>,
 
         /// Switch to the new branch after creating it (like checkout -b)
-        #[arg(short = 'c', long)]
+        #[arg(short = 'c', long, conflicts_with_all = ["deleted", "restore", "delete"])]
         checkout: bool,
 
         /// List deleted branches that can still be restored

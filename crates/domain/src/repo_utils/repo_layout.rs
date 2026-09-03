@@ -948,10 +948,20 @@ pub fn list_recoverable_branch_refs(
     repo_path: &Path,
     retention_ms: u64,
 ) -> Result<Vec<DeletedBranch>, RepoError> {
+    // Zero is special-cased rather than left to fall out of the comparison. With
+    // `cutoff == now`, an entry deleted in the current millisecond compares as
+    // still inside the window, so "no recovery at all" would depend on whether
+    // the clock ticked between the delete and the read.
+    if retention_ms == 0 {
+        return Ok(Vec::new());
+    }
+    // `>=` here and `<` in `prune_expired_deleted_refs` are complementary, so an
+    // entry exactly on the cutoff is listable rather than falling into a gap
+    // where it is neither shown nor collected.
     let cutoff = now_ms().saturating_sub(retention_ms);
     Ok(list_deleted_branch_refs(repo_path)?
         .into_iter()
-        .filter(|d| d.deleted_at_ms > cutoff)
+        .filter(|d| d.deleted_at_ms >= cutoff)
         .collect())
 }
 
@@ -963,6 +973,7 @@ pub fn list_recoverable_branch_refs(
 pub fn restore_deleted_branch_ref(
     repo_path: &Path,
     branch_name: &str,
+    retention_ms: u64,
 ) -> Result<DeletedBranch, RepoError> {
     validate_branch_name(branch_name)?;
     let live = repo_path
@@ -985,10 +996,26 @@ pub fn restore_deleted_branch_ref(
         )));
     }
 
-    let entry = list_deleted_branch_refs(repo_path)?
+    // Filtered here rather than only in the caller: retention is part of the
+    // guarantee, and a library consumer that skipped the check would silently
+    // restore branches the window says are gone.
+    let entry = list_recoverable_branch_refs(repo_path, retention_ms)?
         .into_iter()
         .find(|d| d.name == branch_name)
         .ok_or_else(|| RepoError::RevisionNotFound(branch_name.to_string()))?;
+
+    // A tombstone should name a commit. Restoring an unparseable one would
+    // produce a live ref that no command can resolve, and `checkout` would
+    // report a missing *repository* rather than a missing commit.
+    let looks_like_commit = entry.commit_hash == "0"
+        || (entry.commit_hash.len() == 64
+            && entry.commit_hash.chars().all(|c| c.is_ascii_hexdigit()));
+    if !looks_like_commit {
+        return Err(RepoError::invalid_layout(format!(
+            "the stored entry for '{branch_name}' does not name a commit, so restoring it \
+             would create a branch nothing can resolve"
+        )));
+    }
 
     let base = deleted_refs_dir(repo_path);
     let stored = base.join(entry.deleted_at_ms.to_string()).join(branch_name);
@@ -1597,7 +1624,7 @@ mod tests {
         assert_eq!(listed[0].name, "feature");
         assert_eq!(listed[0].commit_hash, "a".repeat(64));
 
-        let restored = restore_deleted_branch_ref(repo, "feature").unwrap();
+        let restored = restore_deleted_branch_ref(repo, "feature", u64::MAX).unwrap();
         assert_eq!(restored.commit_hash, "a".repeat(64));
         assert!(branch_exists(repo, "feature"));
         assert_eq!(
@@ -1626,7 +1653,7 @@ mod tests {
         soft_delete_branch_ref(repo, "feature").unwrap();
         write_branch(repo, "feature", "b".repeat(64).as_str());
 
-        assert!(restore_deleted_branch_ref(repo, "feature").is_err());
+        assert!(restore_deleted_branch_ref(repo, "feature", u64::MAX).is_err());
         assert_eq!(
             fs::read_to_string(
                 repo.join(GFS_DIR)
@@ -1668,7 +1695,7 @@ mod tests {
         names.sort_unstable();
         assert_eq!(names, vec!["a", "a/b"], "both deletions must survive");
 
-        let restored = restore_deleted_branch_ref(repo, "a/b").unwrap();
+        let restored = restore_deleted_branch_ref(repo, "a/b", u64::MAX).unwrap();
         assert_eq!(restored.commit_hash, "b".repeat(64));
         assert!(branch_exists(repo, "a/b"));
         assert!(
@@ -1693,7 +1720,7 @@ mod tests {
         );
 
         assert_eq!(list_deleted_branch_refs(repo).unwrap().len(), 2);
-        let restored = restore_deleted_branch_ref(repo, "feature").unwrap();
+        let restored = restore_deleted_branch_ref(repo, "feature", u64::MAX).unwrap();
         assert_eq!(
             restored.commit_hash,
             "b".repeat(64),
