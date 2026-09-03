@@ -269,6 +269,15 @@ fn print_table(s: &StatusResponse, repo_path: &Path, moments: Option<&cmd_source
         let row = fmt_box_row("Active workspace", &rel, LABEL_W, BOX_W);
         println!("{}", box_row(&row, BOX_W));
     }
+    // `gfs status --help` promises a connection string. A container-backed
+    // provider prints one in the Compute section below; an embedded one has no
+    // Compute section, so it printed none at all.
+    if s.compute.is_none()
+        && let Some(ref conn) = s.connection_string
+    {
+        let row = fmt_box_row("Connection", conn, LABEL_W, BOX_W);
+        println!("{}", box_row(&row, BOX_W));
+    }
     println!("{}", box_bottom(BOX_W));
 
     println!();

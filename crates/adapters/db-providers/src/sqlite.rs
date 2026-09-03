@@ -97,6 +97,20 @@ const POST_DATA_DDL_QUERY: &str = "SELECT coalesce(group_concat(sql, ';\n'), '')
      WHERE type IN ('view', 'trigger', 'index') AND sql IS NOT NULL \
        AND name NOT LIKE 'sqlite~_%' ESCAPE '~';";
 
+/// Whether this database has any AUTOINCREMENT table.
+///
+/// Asked separately because SQLite resolves table names when a statement is
+/// PREPARED, not when it runs: a query mentioning `sqlite_sequence` fails to
+/// prepare at all when no AUTOINCREMENT table has ever been declared, so
+/// guarding it with `WHERE EXISTS` inside one statement does not work.
+const HAS_SEQUENCE_QUERY: &str = "SELECT CAST(count(*) AS TEXT) FROM sqlite_master \
+     WHERE type = 'table' AND name = 'sqlite_sequence';";
+
+/// The AUTOINCREMENT high-water marks, as replayable INSERTs.
+const SEQUENCE_QUERY: &str = "SELECT coalesce(group_concat(\
+         'INSERT INTO sqlite_sequence(name,seq) VALUES(' || quote(name) || ',' \
+         || quote(seq) || ')', ';\n'), '') FROM sqlite_sequence;";
+
 /// Whether a column can actually hold NULL.
 ///
 /// `pragma_table_info.notnull` alone is not enough, because SQLite reports `0`
@@ -316,9 +330,17 @@ fn collect_sqlite_databases(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     for entry in entries.flatten() {
         let path = entry.path();
         if is_symlink(&path) {
-            // Not followed, but a symlink that IS the database is reported so
-            // the caller can refuse rather than silently skip it.
-            if entry.metadata().is_ok_and(|m| m.is_file()) && is_sqlite_database(&path) {
+            // Not followed for the snapshot — `cp` copies the link, not what it
+            // points at — but a link that LEADS to a database is reported, so
+            // the caller refuses instead of concluding the workspace is empty.
+            //
+            // The previous guard here was `entry.metadata()`, which on Unix is
+            // `symlink_metadata`: `is_file()` is false for every symlink, so
+            // this arm never once fired. A symlinked database was silently
+            // skipped, discovery answered "nothing here", and the commit ran
+            // with no snapshot guard over a directory holding only the link —
+            // reporting success with an empty snapshot and an empty schema.
+            if leads_to_a_database(&path, depth) {
                 out.push(path);
             }
             continue;
@@ -329,6 +351,33 @@ fn collect_sqlite_databases(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
             _ => {}
         }
     }
+}
+
+/// Whether `link` reaches a SQLite database, directly or through a directory.
+///
+/// Both shapes have to be caught, and the second is why this is not simply a
+/// file test. Rails 7.1 keeps its database in `storage/`, and a deployment that
+/// symlinks that directory somewhere persistent is ordinary — the link is then
+/// the only thing in the workspace, `cp` copies the link, and the commit
+/// contains nothing.
+///
+/// `depth` is the caller's, so a link cycle (`a -> .`) terminates on the same
+/// budget as ordinary recursion rather than spinning.
+fn leads_to_a_database(link: &Path, depth: usize) -> bool {
+    let Ok(target) = std::fs::metadata(link) else {
+        // A broken link points at nothing, so it hides nothing.
+        return false;
+    };
+    if target.is_file() {
+        // `is_sqlite_database` goes through `Path::is_file`, which follows.
+        return is_sqlite_database(link);
+    }
+    if target.is_dir() {
+        let mut found = Vec::new();
+        collect_sqlite_databases(link, depth + 1, &mut found);
+        return !found.is_empty();
+    }
+    false
 }
 
 /// Whether `path` is a SQLite database, by its header rather than its name.
@@ -429,9 +478,10 @@ impl SqliteProvider {
                 // unreadable.
                 return Err(ProviderError::InvalidParams(format!(
                     "'{}' is a symbolic link. GFS snapshots the workspace by copying it, \
-                     and a link would be copied instead of the database it points at, so \
-                     the commit would not contain any data. Move the database into the \
-                     workspace",
+                     and a link is copied as a link, not as what it points at — so the \
+                     commit would contain no data, and later checkouts would return \
+                     whatever that file says at the time rather than what was committed. \
+                     Move the database, or the directory holding it, into the workspace",
                     p.display()
                 )));
             }
@@ -482,7 +532,10 @@ impl SqliteProvider {
 
         match found.len() {
             0 => Ok(Located::Absent(conventional)),
-            1 => Ok(Located::Existing(found.remove(0))),
+            // Through `at`, not straight to `Existing`: discovery is the one
+            // way in that used to skip every check `at` performs, so a
+            // discovered symlink was accepted as the database.
+            1 => at(found.remove(0)),
             _ => {
                 let names: Vec<_> = found
                     .iter()
@@ -866,15 +919,33 @@ impl LocalEngine for SqliteProvider {
     /// Write a SQL dump that recreates the database when replayed.
     ///
     /// Values are rendered by SQLite's own `quote()`, which is how the
-    /// `sqlite3` shell builds `.dump`: it emits a correct literal for every
-    /// storage class — `NULL`, integers, reals, `'escaped '' quotes'`, and
-    /// blobs as `X'..'` — so the round trip does not depend on this code
-    /// getting escaping right for each type.
+    /// `sqlite3` shell builds `.dump`: it emits a correct literal for `NULL`,
+    /// integers, reals, `'escaped '' quotes'` and blobs as `X'..'`, so the
+    /// round trip does not depend on this code getting escaping right for each
+    /// type.
+    ///
+    /// With one exception, which this comment used to deny by claiming
+    /// `quote()` was correct for EVERY storage class. TEXT in SQLite is bytes,
+    /// and a NUL is a legal byte in it, but `quote()` is C-string based and
+    /// stops there: `x'610062'` dumped as `'a'` and restored as `'a'`, exit 0.
+    /// Such a value now goes out as a blob cast instead — see
+    /// [`value_literal`].
+    ///
+    /// `-0.0` is NOT in that category, though it looks as though it should be.
+    /// SQLite normalises it to `+0.0` on storage, from a bound parameter as
+    /// well as from a literal (verified against the linked 3.53.2, bits
+    /// `0000000000000000` either way), and no SQL literal can produce one. The
+    /// sign is gone before this code runs.
     ///
     /// Order matters as much as escaping: tables first, then their rows, then
     /// views, triggers and indexes. A trigger installed before the rows are
     /// replayed fires for every one of them, so a restore gained rows the
     /// source never had.
+    ///
+    /// `sqlite_sequence` is replayed after the rows. It is excluded from the
+    /// dumped tables by the `sqlite_%` filter and cannot be created by the dump
+    /// — SQLite makes it itself — so without this a restore reused a deleted
+    /// AUTOINCREMENT id, voiding the one guarantee that column type exists for.
     ///
     /// Generated columns are declared but never inserted; their values are
     /// recomputed on replay. Virtual tables ARE repopulated by insert, which
@@ -908,10 +979,7 @@ impl LocalEngine for SqliteProvider {
             if cols.is_empty() {
                 continue;
             }
-            let quoted: Vec<String> = cols
-                .iter()
-                .map(|c| format!("quote({})", ident(c)))
-                .collect();
+            let quoted: Vec<String> = cols.iter().map(|c| value_literal(&ident(c))).collect();
             // The whole `INSERT INTO "t" VALUES(` prefix is one SQL string
             // literal; embedding the quoted identifier on its own would end the
             // literal early and produce a syntax error.
@@ -944,6 +1012,27 @@ impl LocalEngine for SqliteProvider {
                 out.push('\n');
             }
         }
+        // AUTOINCREMENT counters, before the trailing DDL and after the rows
+        // that determine them. `sqlite_sequence` is excluded from the tables
+        // above by the `sqlite_%` filter and cannot be created by the dump —
+        // SQLite makes it itself the moment an AUTOINCREMENT table is declared
+        // — so its rows are replayed on top, which is what real `.dump` does.
+        //
+        // Without this a restored database REUSES a deleted id: the whole
+        // point of AUTOINCREMENT over a plain rowid is that it never does, so
+        // a restore silently voided the one guarantee the column was chosen
+        // for. A source whose next id was 4 handed out 3.
+        let sequences = if Self::scalar(&conn, HAS_SEQUENCE_QUERY)? == "0" {
+            String::new()
+        } else {
+            Self::scalar(&conn, SEQUENCE_QUERY)?
+        };
+        if !sequences.is_empty() {
+            out.push_str("DELETE FROM sqlite_sequence;\n");
+            out.push_str(&sequences);
+            out.push_str(";\n");
+        }
+
         // Views, triggers and indexes last — see POST_DATA_DDL_QUERY.
         let post_ddl = Self::scalar(&conn, POST_DATA_DDL_QUERY)?;
         if !post_ddl.is_empty() {
@@ -975,8 +1064,39 @@ impl LocalEngine for SqliteProvider {
         let path = Self::resolve(params)?.into_path();
         let conn = Self::open(&path)?;
         conn.execute_batch(&script)
-            .map_err(|e| ProviderError::InvalidParams(format!("import failed: {e}")))
+            .map_err(|e| ProviderError::InvalidParams(format!("import failed: {}", brief(&e))))
     }
+}
+
+/// A rusqlite error message short enough to read.
+///
+/// `execute_batch` reports failures as `<reason> in <the entire un-executed
+/// remainder of the script> at offset N`, and interpolating that verbatim
+/// produced a 4 MB error for a 4 MB dump. Any script large enough to be worth
+/// importing then has an error message too large to read — and in an agent,
+/// one large enough to matter to the context window.
+///
+/// The reason and the offset are the useful parts, so the script body between
+/// them is elided. Anything that does not match that shape is passed through
+/// under a length cap.
+fn brief(error: &rusqlite::Error) -> String {
+    const MAX: usize = 300;
+    let full = error.to_string();
+    if full.len() <= MAX {
+        return full;
+    }
+    if let (Some(start), Some(end)) = (full.find(" in "), full.rfind(" at offset ")) {
+        if start < end {
+            return format!(
+                "{}{}[{} more bytes of script elided]{}",
+                &full[..start + 4],
+                "",
+                end - (start + 4),
+                &full[end..]
+            );
+        }
+    }
+    format!("{}… [{} more bytes elided]", &full[..MAX], full.len() - MAX)
 }
 
 /// How long to wait for the write lock before giving up and letting the caller
@@ -1052,6 +1172,28 @@ fn classify_lock_failure(
 /// Quote a SQLite identifier: wrap in double quotes, doubling any inside.
 fn ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+/// SQL that renders one column's value as a replayable literal.
+///
+/// `quote()` alone is not enough for TEXT. It is C-string based, so a value of
+/// `x'610062'` — legal TEXT in SQLite, which stores bytes and does not require
+/// them to be NUL-free — comes back as `'a'`, and the dump silently truncates
+/// at the first NUL. The doc on this path used to assert that `quote()` "emits
+/// a correct literal for every storage class"; that is true of BLOB, INTEGER,
+/// REAL and NULL, and of TEXT only when it has no NUL.
+///
+/// So TEXT carrying a NUL is emitted as a blob cast instead. `instr` on two
+/// BLOBs compares bytes rather than C strings, which is what makes the NUL
+/// findable at all, and `CAST(X'610062' AS TEXT)` restores the value
+/// byte-exact. Everything else still goes through `quote()`, so an ordinary
+/// dump stays readable.
+fn value_literal(quoted_column: &str) -> String {
+    format!(
+        "CASE WHEN typeof({col}) = 'text' AND instr(CAST({col} AS BLOB), x'00') > 0 \
+         THEN 'CAST(' || quote(CAST({col} AS BLOB)) || ' AS TEXT)' \
+         ELSE quote({col}) END",
+        col = quoted_column
+    )
 }
 
 /// Quote a SQL string literal: wrap in single quotes, doubling any inside.
@@ -2047,6 +2189,160 @@ mod tests {
                 "{sql} / {column}"
             );
         }
+    }
+
+    /// A symlink is refused wherever it is found, not only at the conventional
+    /// name.
+    ///
+    /// The sibling test above puts the link at `DB_FILENAME`, which goes
+    /// through `at()` and was always refused. DISCOVERY was the hole: its
+    /// symlink arm was guarded by `entry.metadata()`, which on Unix does not
+    /// follow links, so `is_file()` was false for every symlink and the arm
+    /// never fired. The link was skipped, the workspace looked empty, and the
+    /// commit ran with no snapshot guard over a directory holding nothing but
+    /// the link — reporting success with an empty snapshot.
+    #[test]
+    fn a_symlinked_database_is_refused_however_it_is_reached() {
+        let outside = tempfile::tempdir().unwrap();
+        let real = outside.path().join("real.db");
+        let conn = rusqlite::Connection::open(&real).unwrap();
+        conn.execute_batch("CREATE TABLE secret(a); INSERT INTO secret VALUES('x')")
+            .unwrap();
+        drop(conn);
+
+        // (a) under a name discovery has to search for, not the conventional one
+        let workspace = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(&real, workspace.path().join("app.db")).unwrap();
+        let err = match SqliteProvider::new().extract_schema(&params_for_dir(workspace.path())) {
+            Ok(out) => panic!("a symlinked database must be refused, got: {out}"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("symbolic link"), "{err}");
+
+        // (b) in a subdirectory, where the Rails layout puts it
+        let nested = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(nested.path().join("storage")).unwrap();
+        std::os::unix::fs::symlink(&real, nested.path().join("storage/development.sqlite3"))
+            .unwrap();
+        let err = match SqliteProvider::new().extract_schema(&params_for_dir(nested.path())) {
+            Ok(out) => panic!("a nested symlinked database must be refused, got: {out}"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("symbolic link"), "{err}");
+
+        // (c) a symlinked DIRECTORY holding the database — the deployment shape
+        // where `storage/` itself is the link. The old arm could not see this
+        // at all: it only ever considered links to files.
+        let linked_dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), linked_dir.path().join("storage")).unwrap();
+        let err = match SqliteProvider::new().extract_schema(&params_for_dir(linked_dir.path())) {
+            Ok(out) => panic!("a symlinked directory must be refused, got: {out}"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("symbolic link"), "{err}");
+    }
+
+    /// A link that points at nothing hides nothing, and must not stop a
+    /// perfectly good database next to it from being found.
+    #[test]
+    fn a_broken_link_is_not_mistaken_for_a_database() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            workspace.path().join("gone.db"),
+            workspace.path().join("dangling.db"),
+        )
+        .unwrap();
+        let conn = rusqlite::Connection::open(workspace.path().join(DB_FILENAME)).unwrap();
+        conn.execute_batch("CREATE TABLE real_one(a)").unwrap();
+        drop(conn);
+
+        let out = SqliteProvider::new()
+            .extract_schema(&params_for_dir(workspace.path()))
+            .expect("a broken link must not block discovery");
+        assert!(out.contains("real_one"), "{out}");
+    }
+
+    /// TEXT is bytes in SQLite, and a NUL is a legal byte in it.
+    ///
+    /// `quote()` is C-string based, so it renders `x'610062'` as `'a'` and the
+    /// dump truncated silently, exit 0. The doc on the export path asserted
+    /// that `quote()` emits a correct literal for every storage class; that is
+    /// true of BLOB, INTEGER, REAL and NULL, and of TEXT only when it holds no
+    /// NUL.
+    #[test]
+    fn text_containing_a_nul_byte_survives_the_dump() {
+        let src = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(src.path().join(DB_FILENAME)).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+             INSERT INTO t(v) VALUES(CAST(x'610062' AS TEXT));
+             INSERT INTO t(v) VALUES(CAST(x'00' AS TEXT));
+             INSERT INTO t(v) VALUES('ordinary');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let dump = src.path().join("d.sql");
+        SqliteProvider::new()
+            .export(&params_for_dir(src.path()), "sql", &dump)
+            .expect("export");
+
+        let dst = tempfile::tempdir().unwrap();
+        SqliteProvider::new()
+            .import(&params_for_dir(dst.path()), "sql", &dump)
+            .expect("import");
+
+        let back = rusqlite::Connection::open(dst.path().join(DB_FILENAME)).unwrap();
+        let hexes: Vec<String> = back
+            .prepare("SELECT hex(v) FROM t ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            hexes,
+            vec!["610062", "00", "6F7264696E617279"],
+            "byte-exact"
+        );
+    }
+
+    /// AUTOINCREMENT promises an id is never reused. A restore used to void it.
+    ///
+    /// `sqlite_sequence` is excluded from the dumped tables by the `sqlite_%`
+    /// filter and cannot be created by the dump, so its rows have to be
+    /// replayed on top — which is what real `.dump` does.
+    #[test]
+    fn autoincrement_does_not_reuse_an_id_after_a_round_trip() {
+        let src = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(src.path().join(DB_FILENAME)).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE s(id INTEGER PRIMARY KEY AUTOINCREMENT, x TEXT);
+             INSERT INTO s(x) VALUES('a'),('b'),('c');
+             DELETE FROM s WHERE id = 3;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let dump = src.path().join("d.sql");
+        SqliteProvider::new()
+            .export(&params_for_dir(src.path()), "sql", &dump)
+            .expect("export");
+
+        let dst = tempfile::tempdir().unwrap();
+        SqliteProvider::new()
+            .import(&params_for_dir(dst.path()), "sql", &dump)
+            .expect("import");
+
+        let back = rusqlite::Connection::open(dst.path().join(DB_FILENAME)).unwrap();
+        back.execute_batch("INSERT INTO s(x) VALUES('d')").unwrap();
+        let issued: i64 = back
+            .query_row("SELECT max(id) FROM s", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            issued, 4,
+            "the deleted id 3 must not come back; the source would have issued 4"
+        );
     }
 
     /// There is no way in that skips the containment check.

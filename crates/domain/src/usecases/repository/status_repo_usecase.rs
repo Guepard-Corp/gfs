@@ -75,9 +75,25 @@ impl<R: DatabaseProviderRegistry> StatusRepoUseCase<R> {
         )
         .await;
 
+        // An embedded provider has no compute section, so its connection string
+        // had nowhere to appear even though the file it names is always there
+        // and `gfs init` prints it. A container-backed one keeps carrying its
+        // own inside `compute`.
+        let connection_string = environment
+            .as_ref()
+            .map(|e| e.database_provider.trim())
+            .filter(|name| !name.is_empty())
+            .and_then(|name| self.registry.get(name))
+            .filter(|provider| provider.local_engine().is_some())
+            .and_then(|provider| {
+                let params = crate::repo_utils::repo_layout::local_connection_params(path).ok()?;
+                provider.connection_string(&params).ok()
+            });
+
         Ok(StatusResponse {
             current_branch,
             compute,
+            connection_string,
             active_workspace_data_dir,
             bind_mismatch_warning,
             // Populated by the CLI: the drift SQL is a psql-level concern that

@@ -14,6 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- fix: a symlinked database — or a symlinked directory containing one — was committed as a success with **zero data** in the snapshot. The refusal existed but only on the conventional-name path; the discovery path's symlink check was guarded by `DirEntry::metadata()`, which does not follow links on Unix, so it never once fired. The snapshot held a dangling link, the schema was empty, and a later checkout returned whatever the outside file said at that moment
+- fix: `gfs export` truncated any TEXT value at an embedded NUL byte. `quote()` is C-string based, so `x'610062'` dumped as `'a'` and restored as `'a'`, exit 0. Such values now go out as a blob cast
+- fix: `gfs export` omitted `sqlite_sequence`, so a restored database reused a deleted AUTOINCREMENT id — voiding the one guarantee that column type exists for. A source whose next id was 4 handed out 3
+- fix: a failed `gfs import` echoed the entire un-executed remainder of the script; a 4 MB dump produced a 4 MB error message
+- fix: `gfs init --database-provider sqlite3` reported "GFS was not able to connect to Docker/Podman" and a list of daemon troubleshooting steps. The provider name was validated only after the container client had been built
+- fix: `gfs init` accepted any `--database-version`, so a repository could permanently record "sqlite 4" while running against the linked 3.53.2
+- fix: `gfs schema extract` and `gfs query` replaced the provider's actionable message ("the workspace holds 2 SQLite databases (a.db, b.db) … set GFS_SQLITE_DB_PATH to choose") with "schema extraction failed" and "failed to build query command"
+- fix: `gfs status` advertises a connection string in its help and showed none for an embedded provider, which has no compute section to carry one. The MCP `status` tool likewise returned two fields where its skill file promised current branch, HEAD commit and connection information
 - fix: a concurrent `gfs commit` and `gfs checkout` could lose a commit. A commit reads HEAD's commit as its parent before the snapshot and reads HEAD's branch after it, so a checkout landing in between made the commit advance the branch it moved *to*, with a parent from the branch it moved *from* — leaving that branch's previous tip unreachable from any ref, with both commands reporting success. Checkout now takes the same repository lock commit takes, waiting for a running commit rather than interleaving with it
 - fix: `gfs export --format sql` produced a dump that corrupted data when replayed. All DDL was written before the rows, so every `AFTER INSERT` trigger fired for every replayed row; and virtual-table content was omitted entirely, because `CREATE VIRTUAL TABLE` builds an empty index. The dump now emits tables, then rows, then views/triggers/indexes, and names its insert columns so generated and hidden columns cannot misalign
 - fix: `gfs import` reported "import failed" and discarded the underlying cause, so a missing file, an unsupported format and an invalid script were indistinguishable
@@ -27,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - chore: `scripts/gfs-reclaim-orphan-snapshots.py` lists and removes snapshot trees no commit refers to. A commit killed between taking its snapshot and writing its commit object leaves one behind, and there is no `gfs gc`
 - chore: `scripts/gfs-commit-checkout-race.py` reproduces the concurrent commit/checkout interleaving, so the fix above can be re-checked rather than believed
+- chore: `scripts/sqlite-snapshot-torture.py` bounds its writer at `GFS_TORTURE_MAX_ROWS` (default 2,000,000, about 90 MB). Unbounded, twelve rounds wrote 59.8M rows and left a 7.5 GB repository, because each round runs for as long as the growing commit takes
 
 ## [0.2.0] - 2026-03-23
 

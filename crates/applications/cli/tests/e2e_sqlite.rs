@@ -95,8 +95,12 @@ fn row_count(repo_path: &Path, table: &str) -> i64 {
 }
 
 fn exec_sql(repo_path: &Path, sql: &str) {
-    let db = workspace_data_dir(repo_path).join("db.sqlite");
-    let conn = rusqlite::Connection::open(db).expect("open workspace database");
+    exec_sql_at(&workspace_data_dir(repo_path).join("db.sqlite"), sql);
+}
+
+/// Same, against a database at a path of the caller's choosing.
+fn exec_sql_at(db: &Path, sql: &str) {
+    let conn = rusqlite::Connection::open(db).expect("open database");
     conn.execute_batch(sql).expect("apply sql");
 }
 
@@ -382,6 +386,101 @@ fn user_and_compute_explain_themselves_instead_of_advising_each_other() {
         assert!(
             !stderr.contains("container_name"),
             "must not invite editing the config: {stderr}"
+        );
+    }
+}
+
+/// A wrong provider name must not send the user to debug Docker.
+///
+/// The name was validated only after the container client had been built, so
+/// `--database-provider sqlite3` — a plausible typo, since the binary is called
+/// `sqlite3` — reported "GFS was not able to connect to Docker/Podman" and a
+/// list of daemon troubleshooting steps for a database that needs no daemon.
+#[test]
+fn a_mistyped_provider_name_names_the_provider_not_the_daemon() {
+    let tmp = tempdir().expect("temp dir");
+    forbid_container_runtime();
+
+    let (ok, _, stderr) = cli_runner::run_gfs([
+        "gfs",
+        "init",
+        tmp.path().to_str().unwrap(),
+        "--database-provider",
+        "sqlite3",
+        "--database-version",
+        "3",
+    ]);
+    assert!(!ok, "'sqlite3' is not a provider name");
+    assert!(
+        stderr.contains("unknown database provider") && stderr.contains("sqlite"),
+        "should name the mistake and list the real names: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Docker") && !stderr.contains("Podman"),
+        "no container runtime is involved: {stderr}"
+    );
+}
+
+/// The recorded version has to be one the provider actually supports.
+///
+/// It is written to `.gfs/config.toml` permanently, and for an embedded
+/// provider it describes an engine that is linked in rather than chosen — so
+/// `--database-version 4` was accepted and then contradicted by every later
+/// report of the real version.
+#[test]
+fn an_unsupported_version_is_refused_rather_than_recorded() {
+    let tmp = tempdir().expect("temp dir");
+    forbid_container_runtime();
+
+    let (ok, _, stderr) = cli_runner::run_gfs([
+        "gfs",
+        "init",
+        tmp.path().to_str().unwrap(),
+        "--database-provider",
+        "sqlite",
+        "--database-version",
+        "4",
+    ]);
+    assert!(!ok, "there is no SQLite 4");
+    assert!(
+        stderr.contains("not a supported") && stderr.contains("Supported: 3"),
+        "should say what is supported: {stderr}"
+    );
+    assert!(
+        !tmp.path().join(".gfs/config.toml").exists(),
+        "nothing should be written for a repo that was refused"
+    );
+}
+
+/// The provider's message names the actual problem; two commands replaced it
+/// with four words.
+///
+/// `gfs commit` and `gfs export` reported "the workspace holds 2 SQLite
+/// databases (a.db, b.db) … set GFS_SQLITE_DB_PATH to choose", which tells the
+/// user exactly what to do. `gfs schema extract` said "schema extraction
+/// failed" and `gfs query` said "failed to build query command" — anyhow's
+/// context Display prints only the context string.
+#[test]
+fn an_ambiguous_workspace_is_explained_by_every_command_that_hits_it() {
+    let tmp = tempdir().expect("temp dir");
+    let repo = tmp.path();
+    init_sqlite(repo);
+
+    let data = workspace_data_dir(repo);
+    for name in ["a.db", "b.db"] {
+        exec_sql_at(&data.join(name), "CREATE TABLE t(x)");
+    }
+
+    for args in [
+        vec!["gfs", "commit", "-m", "x", "--path", repo.to_str().unwrap()],
+        vec!["gfs", "schema", "extract", "--path", repo.to_str().unwrap()],
+        vec!["gfs", "query", "--path", repo.to_str().unwrap(), "SELECT 1"],
+    ] {
+        let (ok, _, stderr) = cli_runner::run_gfs(args.clone());
+        assert!(!ok, "an ambiguous workspace cannot be resolved: {args:?}");
+        assert!(
+            stderr.contains("2 SQLite databases") && stderr.contains("GFS_SQLITE_DB_PATH"),
+            "every command should carry the actionable message, {args:?} gave: {stderr}"
         );
     }
 }

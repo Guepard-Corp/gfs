@@ -335,3 +335,49 @@ fn query_rejects_a_database_argument_for_an_embedded_provider() {
         "should explain that a file has no database to select: {msg}"
     );
 }
+
+/// The status tool must return what the skill file says it returns.
+///
+/// `skills/use-gfs-mcp/SKILL.md` promises "current branch, HEAD commit, and
+/// connection information". It returned `{compute: null, current_branch: ...}`
+/// — two hand-picked fields, less than the CLI's own `--json status`, with
+/// nothing telling the caller the rest were missing.
+#[test]
+fn status_returns_the_fields_its_documentation_promises() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    let mut s = McpSession::start();
+
+    init_sqlite(&mut s, repo);
+    import_seed(&mut s, repo, "CREATE TABLE t(a INTEGER PRIMARY KEY);\n");
+    let commit = s.call("commit", json!({ "path": repo, "message": "one" }));
+    let commit_id = commit
+        .get("commit_id")
+        .and_then(Value::as_str)
+        .expect("commit_id")
+        .to_string();
+
+    let status = s.call("status", json!({ "path": repo }));
+    assert_eq!(
+        status.get("current_branch").and_then(Value::as_str),
+        Some("main")
+    );
+    assert_eq!(
+        status.get("head_commit").and_then(Value::as_str),
+        Some(commit_id.as_str()),
+        "HEAD is the field the skill names most specifically: {status}"
+    );
+    assert!(
+        status
+            .get("connection_string")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .starts_with("sqlite:"),
+        "an embedded provider has no compute section for its connection string, \
+         so it needs one of its own: {status}"
+    );
+    assert!(
+        status.get("active_workspace_data_dir").is_some(),
+        "the CLI reports this and MCP dropped it: {status}"
+    );
+}

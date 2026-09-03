@@ -48,6 +48,39 @@ pub async fn init(
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
     containers::register_all(registry.as_ref())?;
 
+    // Validate the provider and version BEFORE anything reaches for a container
+    // runtime. `--database-provider sqlite3` used to be reported as "GFS was not
+    // able to connect to Docker/Podman", sending the user to debug a daemon they
+    // do not need and were never going to need, because the name was only
+    // checked after the client had been built.
+    if let Some(name) = database_provider.as_deref() {
+        let known = registry.list();
+        let matched = known.iter().find(|n| n.eq_ignore_ascii_case(name)).cloned();
+        let Some(matched) = matched else {
+            return Err(format!(
+                "unknown database provider '{name}'. Available: {}",
+                known.join(", ")
+            )
+            .into());
+        };
+        // The version is recorded in the repo config permanently and, for an
+        // embedded provider, describes an engine that is linked in rather than
+        // chosen — so "sqlite 4" was accepted and then contradicted by every
+        // later report of the real version.
+        if let (Some(provider), Some(version)) =
+            (registry.get(&matched), database_version.as_deref())
+        {
+            let supported = provider.supported_versions();
+            if !supported.is_empty() && !supported.iter().any(|v| v == version) {
+                return Err(format!(
+                    "'{version}' is not a supported {matched} version. Supported: {}",
+                    supported.join(", ")
+                )
+                .into());
+            }
+        }
+    }
+
     // An embedded provider (SQLite) has nothing to provision, so do not open a
     // connection to a container runtime that will never be used — that
     // connection failing is otherwise the first thing a user without Docker

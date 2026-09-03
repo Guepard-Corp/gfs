@@ -704,20 +704,40 @@ async fn do_status(args: &serde_json::Value) -> Result<CallToolResult, McpError>
     containers::register_all(registry.as_ref())
         .map_err(|e| to_error_data(format!("register providers: {e}")))?;
 
-    let use_case = StatusRepoUseCase::new(repository, compute, registry);
+    let use_case = StatusRepoUseCase::new(repository.clone(), compute, registry.clone());
     let status = use_case
         .run(&repo_path)
         .await
         .map_err(|e| to_error_data(e.to_string()))?;
 
-    json_ok(json!({
-        "current_branch": status.current_branch,
-        "compute": status.compute.map(|c| json!({
-            "container_id": c.container_id,
-            "container_status": c.container_status,
-            "connection_string": c.connection_string,
-        })),
-    }))
+    // The whole response, not two hand-picked fields. The skill file promises
+    // "current branch, HEAD commit, and connection information"; this used to
+    // return the branch and a null compute section, which is less than the
+    // CLI's own `--json status`, and an agent following that description got
+    // two of five fields with nothing saying the rest were missing.
+    let mut payload = serde_json::to_value(&status)
+        .map_err(|e| to_error_data(format!("serialize status: {e}")))?;
+
+    // HEAD is not part of StatusResponse, and it is the field the skill names
+    // most specifically.
+    if let Ok(head) = repository.get_current_commit_id(&repo_path).await
+        && head != "0"
+    {
+        payload["head_commit"] = json!(head);
+    }
+
+    // An embedded provider has no compute section to carry its connection
+    // string, so it had nowhere to appear at all.
+    if let Ok(config) = GfsConfig::load(&repo_path)
+        && let Some(name) = embedded_provider_name(&config, registry.as_ref())
+        && let Some(provider) = registry.get(&name)
+        && let Ok(params) = repo_layout::local_connection_params(&repo_path)
+        && let Ok(connection_string) = provider.connection_string(&params)
+    {
+        payload["connection_string"] = json!(connection_string);
+    }
+
+    json_ok(payload)
 }
 
 async fn do_commit(args: &serde_json::Value) -> Result<CallToolResult, McpError> {

@@ -750,7 +750,9 @@ instead of believed.
 ```bash
 # Commit repeatedly while a separate process writes. Every snapshot must pass
 # integrity_check, hold a row count the database genuinely passed through, and
-# contain only whole transactions.
+# contain only whole transactions. The writer stops at GFS_TORTURE_MAX_ROWS
+# (default 2,000,000, about 90 MB) — without a cap it wrote 7.5 GB in twelve
+# rounds, because each round runs for as long as the growing commit takes.
 scripts/sqlite-snapshot-torture.py <repo> ./target/debug/gfs 20
 
 # Try to make a concurrent commit and checkout lose a commit. Needs two

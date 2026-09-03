@@ -2,6 +2,7 @@
 """Commit repeatedly while the database is written continuously.
 
 Usage: sqlite-snapshot-torture.py <repo> <gfs-binary> <rounds> [relative-db-path]
+       GFS_TORTURE_MAX_ROWS=<n>   row budget, default 2,000,000 (about 90 MB)
 
 `<repo>` must already be an initialised GFS repo using the sqlite provider. The
 `ledger` table this writes to is created here if it does not exist, so the
@@ -29,6 +30,14 @@ contains has all GROUP of its rows and the batches run 1..max with no gap. A
 count-only check would have to rely on a partial batch failing to be a multiple
 of GROUP, which is a 1-in-GROUP coincidence away from passing.
 
+DISK. The writer runs flat out for as long as each commit takes, and each
+commit takes longer as the database grows, so rows accumulate superlinearly:
+an unbounded run of twelve rounds wrote 59,837,700 rows and left a 7.5 GB
+repository. It now stops writing at GFS_TORTURE_MAX_ROWS (default 2,000,000,
+roughly 90 MB) and keeps committing, so the remaining rounds still exercise
+commit against a live database. Raise it deliberately, with the space to
+spare; the footprint is printed at the end either way.
+
 The optional fourth argument is the database path relative to the workspace,
 for layouts that do not use the conventional name — Rails 7.1 keeps it at
 `storage/development.sqlite3`, in a subdirectory.
@@ -54,6 +63,7 @@ import time
 repo, gfs, rounds = sys.argv[1], sys.argv[2], int(sys.argv[3])
 REL = sys.argv[4] if len(sys.argv) > 4 else "db.sqlite"
 GROUP = 300
+MAX_ROWS = int(os.environ.get("GFS_TORTURE_MAX_ROWS", 2_000_000))
 db = os.path.join(open(os.path.join(repo, ".gfs", "WORKSPACE")).read().strip(), REL)
 
 os.makedirs(os.path.dirname(db), exist_ok=True)
@@ -84,6 +94,11 @@ def writer():
     w = sqlite3.connect(db, timeout=60)
     w.execute("PRAGMA journal_mode=WAL")
     while not stop.is_set():
+        if wrote[0] >= MAX_ROWS:
+            # Keep the connection open so the commit still contends with a live
+            # writer's lock, just stop growing the file.
+            time.sleep(0.02)
+            continue
         n = batch[0] + 1
         try:
             w.execute("BEGIN IMMEDIATE")
@@ -168,7 +183,14 @@ for i in range(1, rounds + 1):
 
 stop.set()
 th.join(timeout=10)
-print(f"  writer inserted {wrote[0]} rows in {batch[0]} transactions")
+size = sum(
+    os.path.getsize(os.path.join(base, f))
+    for base, _, files in os.walk(os.path.join(repo, ".gfs"))
+    for f in files
+    if os.path.exists(os.path.join(base, f))
+)
+print(f"  writer inserted {wrote[0]} rows in {batch[0]} transactions"
+      f" (cap {MAX_ROWS}); repository is {size / 1e9:.2f} GB")
 print(f"  RESULT: {passed} passed, {failed} failed, {refused} refused")
 if failed:
     sys.exit(1)

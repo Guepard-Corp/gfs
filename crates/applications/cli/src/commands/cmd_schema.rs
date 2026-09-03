@@ -49,7 +49,12 @@ pub async fn run_extract(
     let result = use_case
         .run(&repo_path)
         .await
-        .context("schema extraction failed")?;
+        // No `.context()` here: anyhow's context Display prints only the
+        // context string, so wrapping hid the provider's message. The domain
+        // error already begins "schema extraction failed", and the part that
+        // was being discarded is the actionable half — "the workspace holds 2
+        // SQLite databases (a.db, b.db) … set GFS_SQLITE_DB_PATH to choose".
+        ?;
 
     // Serialize to JSON
     let json = if compact {

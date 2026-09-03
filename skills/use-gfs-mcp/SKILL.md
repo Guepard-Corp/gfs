@@ -124,7 +124,10 @@ Gets repository and database container status including current branch, HEAD com
 Parameters:
 - `path` (optional) - Repository location
 
-Returns: Branch name, commit hash, container state, connection info if running.
+Returns: `current_branch`, `head_commit` (absent before the first commit),
+`active_workspace_data_dir`, and `compute` when a container is configured. For
+SQLite, `connection_string` is a `sqlite:` URL to the file in the active
+workspace and there is no `compute` section.
 
 ### 4. Commit Changes
 

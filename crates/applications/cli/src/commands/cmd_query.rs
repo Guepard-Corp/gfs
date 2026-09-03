@@ -147,7 +147,10 @@ fn run_client(
 ) -> Result<()> {
     let mut cmd = provider
         .query_client_command(params, query)
-        .context("failed to build query command")?;
+        // As in cmd_schema.rs: the provider's message names the actual
+        // problem (an ambiguous workspace, a symlinked database), and wrapping
+        // it replaced that with four words.
+        ?;
 
     // Let the OS report "command not found" so the hint below is accurate.
     let status = cmd.status().or_else(|e| {
