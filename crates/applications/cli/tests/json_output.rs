@@ -208,6 +208,9 @@ fn an_error_is_announced_once() {
 // fsck
 // ---------------------------------------------------------------------------
 
+/// `--grace 0` throughout: the default holds back anything written in the last
+/// 24 hours, which in a test is everything.
+///
 /// A freshly initialised repository has nothing unreachable and nothing broken,
 /// so fsck must exit 0 — the code a script uses to decide there is no work.
 #[test]
@@ -216,7 +219,7 @@ fn fsck_on_a_fresh_repo_is_clean_and_exits_zero() {
     let (code, _, _) = run_gfs(tmp.path(), &["init", "."]);
     assert_eq!(code, 0, "init should succeed");
 
-    let (code, stdout, stderr) = run_gfs(tmp.path(), &["fsck", "--json"]);
+    let (code, stdout, stderr) = run_gfs(tmp.path(), &["fsck", "--grace", "0", "--json"]);
     assert_stderr_empty(&stderr);
     let v = assert_stdout_json(&stdout);
 
@@ -238,7 +241,7 @@ fn fsck_reports_an_unidentifiable_object_and_exits_two() {
     std::fs::create_dir_all(&shard).unwrap();
     std::fs::write(shard.join("c".repeat(62)), b"\xff\xfe not an object").unwrap();
 
-    let (code, stdout, stderr) = run_gfs(tmp.path(), &["fsck", "--json"]);
+    let (code, stdout, stderr) = run_gfs(tmp.path(), &["fsck", "--grace", "0", "--json"]);
     assert_stderr_empty(&stderr);
     let v = assert_stdout_json(&stdout);
 
@@ -258,8 +261,11 @@ fn fsck_refuses_to_write_a_plan_for_an_inconsistent_repo() {
     std::fs::create_dir_all(&shard).unwrap();
     std::fs::write(shard.join("c".repeat(62)), b"\xff\xfe not an object").unwrap();
 
-    let (code, _, _) = run_gfs(tmp.path(), &["fsck", "--plan"]);
-    assert_ne!(code, 0, "refusal must not report success");
+    let (code, _, _) = run_gfs(tmp.path(), &["fsck", "--plan", "--grace", "0"]);
+    assert_eq!(
+        code, 2,
+        "the refusal is caused by corruption, so it must not collide with 1 (garbage found)"
+    );
     assert!(
         !tmp.path().join(".gfs/gc").exists(),
         "no plan directory should have been created"
@@ -273,7 +279,7 @@ fn fsck_plan_writes_exactly_one_artefact() {
     let tmp = TempDir::new().unwrap();
     run_gfs(tmp.path(), &["init", "."]);
 
-    let (code, _, _) = run_gfs(tmp.path(), &["fsck", "--plan"]);
+    let (code, _, _) = run_gfs(tmp.path(), &["fsck", "--plan", "--grace", "0"]);
     assert_eq!(code, 0);
 
     let gc = tmp.path().join(".gfs/gc");

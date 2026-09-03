@@ -569,6 +569,12 @@ enum TopLevel {
         #[arg(long)]
         plan: bool,
 
+        /// Seconds an entry must have existed before it can be called garbage
+        /// (default 86400). A commit writes its snapshot before the object that
+        /// references it, so anything recent may belong to a running operation.
+        #[arg(long, value_name = "SECONDS")]
+        grace: Option<u64>,
+
         /// Path to the GFS repository root (default: current directory)
         #[arg(long)]
         path: Option<PathBuf>,
@@ -1033,7 +1039,9 @@ where
                 .await?;
                 Ok(0)
             }
-            TopLevel::Fsck { plan, path } => commands::cmd_fsck::run(path, plan, json_output).await,
+            TopLevel::Fsck { plan, grace, path } => {
+                commands::cmd_fsck::run(path, plan, grace, json_output).await
+            }
             TopLevel::Status { path, output } => {
                 let output = resolve_output_format(output, json_output);
                 let exit_code = commands::cmd_status::run(path, output).await?;

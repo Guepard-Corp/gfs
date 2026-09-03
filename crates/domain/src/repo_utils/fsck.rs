@@ -8,34 +8,88 @@
 //! `cmd_log::collect_dag` walks the same graph and is deliberately not reused:
 //! it does `Err(_) => continue` on an unreadable commit, silently skipping the
 //! exact condition this module has to report.
+//!
+//! # Why a grace period, and not only a lock
+//!
+//! A commit creates its snapshot directory *before* writing the commit object
+//! that references it. In that window the snapshot is live data nothing points
+//! at, and a mark phase running then would call it garbage.
+//!
+//! A lock cannot be the whole answer. It substitutes for a grace period only
+//! when every writer can be enumerated and forced to a quiescent point, and
+//! GFS's writers are separate short-lived processes, possibly of different
+//! versions, possibly killed mid-commit by a container runtime. So anything
+//! younger than the cutoff is treated as a **root**, not merely skipped, the
+//! way git's `reachable.c` does.
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use crate::model::commit::Commit;
 use crate::model::errors::RepoError;
-use crate::model::fsck::{Dangling, FsckReport, ObjectKind, Unreachable, Unrecognised};
-use crate::model::layout::{GFS_DIR, OBJECTS_DIR, SNAPSHOTS_DIR};
+use crate::model::fsck::{
+    Dangling, FsckReport, ObjectKind, StaleWorkspace, Unreachable, Unrecognised,
+};
+use crate::model::layout::{
+    GFS_DIR, HEAD_FILE, OBJECTS_DIR, SNAPSHOTS_DIR, WORKSPACE_FILE, WORKSPACES_DIR,
+};
 use crate::repo_utils::repo_layout;
 
 /// The sentinel a ref or parent carries when there is no commit yet.
 const NO_COMMIT: &str = "0";
 
-/// True for the 64-char lowercase-or-uppercase hex a hash should be.
+/// How long a newly written entry is protected from being called garbage.
 ///
-/// Checked before any hash reaches a path builder. `repo_layout` resolves a
-/// hash with `split_at(2)`, which panics on a shorter string, and fsck reads
-/// ref files that may well be corrupt — a one-character ref would otherwise
-/// panic the tool you run *because* the repository is broken.
-fn is_hash(s: &str) -> bool {
-    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+/// Larger than the longest legitimate operation, which is a full snapshot of a
+/// multi-gigabyte data directory on a slow volume — hours, not minutes. Not
+/// git's two weeks: git protects loose objects costing 4 KB each, this protects
+/// whole database snapshots that never dedup.
+pub const DEFAULT_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// A value read off disk that should have been a hash, trimmed for display.
+///
+/// Anything can end up in a ref file — a symlink to `/etc/passwd` makes the
+/// "hash" the whole file. An unbounded value read off disk never goes into a
+/// report verbatim.
+fn brief(value: &str) -> String {
+    const MAX: usize = 64;
+    let one_line: String = value.chars().take_while(|c| *c != '\n').collect();
+    if one_line.is_empty() {
+        "(empty)".to_string()
+    } else if one_line.chars().count() > MAX {
+        let head: String = one_line.chars().take(MAX).collect();
+        format!("{head}\u{2026} ({} bytes)", value.len())
+    } else {
+        one_line
+    }
 }
 
-/// Every `<root>/<2>/<62>` entry, as `(hash, path)`.
+/// A hash as it is stored on disk: 64 lowercase hex characters.
 ///
-/// Entries whose shape does not match are skipped rather than reported: a
-/// stray file directly under `objects/`, or a prefix directory that is not two
-/// characters, was not written by us and naming it as a finding would be noise.
+/// Case matters. Accepting an uppercase spelling means that on a
+/// case-insensitive filesystem the read succeeds — so nothing looks dangling —
+/// while the store scan yields the lowercase on-disk name, which does not match
+/// a mark keyed on the literal ref. The live tip would then read as
+/// collectable. Normalising keeps both sides in one spelling.
+fn normalise_hash(s: &str) -> Option<String> {
+    let t = s.trim();
+    if t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(t.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+/// True for a leaf name that could be the back 62 characters of a hash.
+///
+/// Filters out foreign files such as `.DS_Store`, which are not objects and
+/// must not be reported as unidentifiable ones.
+fn is_object_leaf(name: &str) -> bool {
+    name.len() == 62 && name.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Every `<root>/<2>/<62>` entry, as `(hash, path)`. Foreign names are skipped.
 fn two_level(root: &Path) -> Vec<(String, PathBuf)> {
     let mut out = Vec::new();
     let Ok(prefixes) = std::fs::read_dir(root) else {
@@ -46,7 +100,10 @@ fn two_level(root: &Path) -> Vec<(String, PathBuf)> {
         let Some(prefix_name) = prefix_path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if prefix_name.len() != 2 || !prefix_path.is_dir() {
+        if prefix_name.len() != 2
+            || !prefix_name.chars().all(|c| c.is_ascii_hexdigit())
+            || !prefix_path.is_dir()
+        {
             continue;
         }
         let Ok(entries) = std::fs::read_dir(&prefix_path) else {
@@ -56,13 +113,17 @@ fn two_level(root: &Path) -> Vec<(String, PathBuf)> {
             let Some(rest) = entry.file_name().to_str().map(str::to_string) else {
                 continue;
             };
-            out.push((format!("{prefix_name}{rest}"), entry.path()));
+            if !is_object_leaf(&rest) {
+                continue;
+            }
+            let hash = format!("{prefix_name}{rest}").to_ascii_lowercase();
+            out.push((hash, entry.path()));
         }
     }
     out
 }
 
-/// Commit hashes every walk starts from.
+/// Commit hashes every walk starts from, plus any problem found reading a ref.
 ///
 /// Today: every branch tip, plus HEAD. HEAD is included separately because a
 /// detached HEAD points at a commit no branch names, and dropping it would
@@ -70,29 +131,49 @@ fn two_level(root: &Path) -> Vec<(String, PathBuf)> {
 ///
 /// Soft-deleted refs inside their retention window belong here too and are not
 /// yet available — `refs/deleted` arrives with the recoverable-`branch -d`
-/// work. When it lands, add the source to this function and nothing else
-/// changes.
-pub fn roots(repo_path: &Path) -> Result<Vec<String>, RepoError> {
+/// work. When it lands, add the source here and nothing else changes.
+pub fn roots(repo_path: &Path) -> Result<(Vec<String>, Vec<Dangling>), RepoError> {
     let mut out: Vec<String> = Vec::new();
+    let mut problems: Vec<Dangling> = Vec::new();
 
-    for (_, tip) in repo_layout::list_branches(repo_path)? {
-        let tip = tip.trim().to_string();
-        if tip != NO_COMMIT && !tip.is_empty() {
-            out.push(tip);
+    for (name, tip) in repo_layout::list_branches(repo_path)? {
+        let tip = tip.trim();
+        if tip == NO_COMMIT || tip.is_empty() {
+            continue;
+        }
+        match normalise_hash(tip) {
+            Some(h) => out.push(h),
+            // Named against the ref, so the report says which branch is broken
+            // rather than echoing an unusable value back at the reader.
+            None => problems.push(Dangling {
+                from_commit: format!("refs/heads/{name}"),
+                kind: ObjectKind::Commit,
+                missing: brief(tip),
+            }),
         }
     }
 
-    // A repository with no commits has no HEAD commit; that is not an error.
-    if let Ok(head) = repo_layout::get_current_commit_id(repo_path) {
-        let head = head.trim().to_string();
-        if head != NO_COMMIT && !head.is_empty() {
-            out.push(head);
+    // HEAD is read raw rather than resolved. An *attached* HEAD names a branch
+    // whose tip the loop above already covered, so resolving it would report a
+    // broken branch twice — once against the ref and once against HEAD. Only a
+    // detached HEAD contributes a root the branches do not.
+    let head_raw = std::fs::read_to_string(repo_path.join(GFS_DIR).join(HEAD_FILE))
+        .map(|h| h.trim().to_string())
+        .unwrap_or_default();
+    if !head_raw.is_empty() && !head_raw.starts_with("ref:") && head_raw != NO_COMMIT {
+        match normalise_hash(&head_raw) {
+            Some(h) => out.push(h),
+            None => problems.push(Dangling {
+                from_commit: "HEAD".to_string(),
+                kind: ObjectKind::Commit,
+                missing: brief(&head_raw),
+            }),
         }
     }
 
     out.sort();
     out.dedup();
-    Ok(out)
+    Ok((out, problems))
 }
 
 /// Whether snapshot trees for this repository live on the local filesystem.
@@ -101,9 +182,6 @@ pub fn roots(repo_path: &Path) -> Result<Vec<String>, RepoError> {
 /// `.gfs/snapshots/<2>/<62>` is never created, so checking the filesystem would
 /// report every commit as dangling. `GfsRepository::checkout` already treats a
 /// missing snapshot directory as normal there for the same reason.
-///
-/// An unreadable or absent config means a plain local repository, which is the
-/// safe reading: it only ever adds checks.
 fn snapshots_are_local(repo_path: &Path) -> bool {
     !matches!(
         repo_layout::get_runtime_config(repo_path)
@@ -145,22 +223,9 @@ fn mark(
     }
 
     while let Some(hash) = queue.pop_front() {
-        if !is_hash(&hash) {
-            // A ref or parent that is not a hash at all. Reported against
-            // itself, since there is no sensible "from" commit to blame.
-            dangling.push(Dangling {
-                from_commit: hash.clone(),
-                kind: ObjectKind::Commit,
-                missing: hash.clone(),
-            });
-            continue;
-        }
-
         let commit: Commit = match repo_layout::get_commit_from_hash(repo_path, &hash) {
             Ok(c) => c,
             Err(_) => {
-                // Missing or unreadable. Either way a reachable commit is not
-                // there, which is the finding; the walk cannot continue past it.
                 dangling.push(Dangling {
                     from_commit: hash.clone(),
                     kind: ObjectKind::Commit,
@@ -173,44 +238,59 @@ fn mark(
         marks.objects.insert(hash.clone());
         marks.commits += 1;
 
-        // Snapshot: a directory, not a file.
-        let snap = commit.snapshot_hash.trim();
-        if is_hash(snap) && check_snapshots {
-            let (a, b) = snap.split_at(2);
-            if snapshots_dir.join(a).join(b).is_dir() {
-                marks.snapshots.insert(snap.to_string());
-            } else {
-                dangling.push(Dangling {
+        if check_snapshots {
+            match normalise_hash(&commit.snapshot_hash) {
+                Some(snap) => {
+                    let (a, b) = snap.split_at(2);
+                    if snapshots_dir.join(a).join(b).is_dir() {
+                        marks.snapshots.insert(snap);
+                    } else {
+                        dangling.push(Dangling {
+                            from_commit: hash.clone(),
+                            kind: ObjectKind::Snapshot,
+                            missing: snap,
+                        });
+                    }
+                }
+                // Reported, never skipped. Skipping leaves the real snapshot
+                // unmarked, so the store scan then calls live data garbage
+                // while the report claims the repository is consistent.
+                None => dangling.push(Dangling {
                     from_commit: hash.clone(),
                     kind: ObjectKind::Snapshot,
-                    missing: snap.to_string(),
-                });
+                    missing: brief(&commit.snapshot_hash),
+                }),
             }
         }
 
-        // File list and schema both live in the object store.
         for (maybe, kind) in [
             (commit.files_ref.as_deref(), ObjectKind::FileList),
             (commit.schema_hash.as_deref(), ObjectKind::Schema),
         ] {
-            let Some(reference) = maybe.map(str::trim).filter(|r| !r.is_empty()) else {
+            let Some(raw) = maybe.map(str::trim).filter(|r| !r.is_empty()) else {
                 continue;
             };
-            if !is_hash(reference) {
-                continue;
-            }
-            let (a, b) = reference.split_at(2);
-            if objects_dir.join(a).join(b).exists() {
-                marks.objects.insert(reference.to_string());
-                if kind == ObjectKind::FileList {
-                    marks.file_lists += 1;
+            match normalise_hash(raw) {
+                Some(reference) => {
+                    let (a, b) = reference.split_at(2);
+                    if objects_dir.join(a).join(b).exists() {
+                        if kind == ObjectKind::FileList {
+                            marks.file_lists += 1;
+                        }
+                        marks.objects.insert(reference);
+                    } else {
+                        dangling.push(Dangling {
+                            from_commit: hash.clone(),
+                            kind,
+                            missing: reference,
+                        });
+                    }
                 }
-            } else {
-                dangling.push(Dangling {
+                None => dangling.push(Dangling {
                     from_commit: hash.clone(),
                     kind,
-                    missing: reference.to_string(),
-                });
+                    missing: brief(raw),
+                }),
             }
         }
 
@@ -219,8 +299,17 @@ fn mark(
             if parent == NO_COMMIT || parent.is_empty() {
                 continue;
             }
-            if seen.insert(parent.to_string()) {
-                queue.push_back(parent.to_string());
+            match normalise_hash(parent) {
+                Some(p) => {
+                    if seen.insert(p.clone()) {
+                        queue.push_back(p);
+                    }
+                }
+                None => dangling.push(Dangling {
+                    from_commit: hash.clone(),
+                    kind: ObjectKind::Commit,
+                    missing: brief(parent),
+                }),
             }
         }
     }
@@ -229,9 +318,6 @@ fn mark(
 }
 
 /// Identify an unmarked entry in the object store.
-///
-/// Order matters: a schema object is a directory, so that is settled by a
-/// `stat` before anything is parsed.
 fn identify_object(path: &Path) -> Result<ObjectKind, String> {
     if path.is_dir() {
         return if path.join("schema.json").is_file() {
@@ -252,23 +338,51 @@ fn identify_object(path: &Path) -> Result<ObjectKind, String> {
     Err("not a commit, file list or schema object".to_string())
 }
 
+/// Whether `path` was modified after `cutoff`, and so is protected.
+///
+/// An unreadable mtime counts as protected: refusing to collect something that
+/// cannot be dated is the safe direction.
+fn newer_than(path: &Path, cutoff: SystemTime) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map(|t| t > cutoff)
+        .unwrap_or(true)
+}
+
 /// Walk the repository and report what is unreachable, dangling or
 /// unidentifiable. Reads only; creates and removes nothing.
-pub fn check(repo_path: &Path) -> Result<FsckReport, RepoError> {
-    let objects_dir = repo_path.join(GFS_DIR).join(OBJECTS_DIR);
-    let snapshots_dir = repo_path.join(GFS_DIR).join(SNAPSHOTS_DIR);
+///
+/// `grace` protects recently written entries. See the module docs for why that
+/// is a correctness requirement rather than a convenience.
+pub fn check(repo_path: &Path, grace: Duration) -> Result<FsckReport, RepoError> {
+    let gfs_dir = repo_path.join(GFS_DIR);
+    if !gfs_dir.is_dir() {
+        return Err(RepoError::NoRepoFound(repo_path.to_path_buf()));
+    }
+    let objects_dir = gfs_dir.join(OBJECTS_DIR);
+    let snapshots_dir = gfs_dir.join(SNAPSHOTS_DIR);
+
+    // Taken before the walk, so anything written while this runs is newer than
+    // the cutoff by construction and cannot be collected on this pass.
+    let cutoff = SystemTime::now()
+        .checked_sub(grace)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
 
     let check_snapshots = snapshots_are_local(repo_path);
-    let mut dangling: Vec<Dangling> = Vec::new();
-    let roots = roots(repo_path)?;
+    let (roots, mut dangling) = roots(repo_path)?;
     let marks = mark(repo_path, &roots, check_snapshots, &mut dangling);
 
     let mut unreachable: Vec<Unreachable> = Vec::new();
     let mut unrecognised: Vec<Unrecognised> = Vec::new();
     let mut reclaimable_bytes: u64 = 0;
+    let mut protected: usize = 0;
 
     for (hash, path) in two_level(&objects_dir) {
         if marks.objects.contains(&hash) {
+            continue;
+        }
+        if newer_than(&path, cutoff) {
+            protected += 1;
             continue;
         }
         let bytes = object_size(&path);
@@ -278,7 +392,7 @@ pub fn check(repo_path: &Path) -> Result<FsckReport, RepoError> {
                     std::fs::read(&path)
                         .ok()
                         .and_then(|b| serde_json::from_slice::<Commit>(&b).ok())
-                        .map(|c| c.message)
+                        .map(|c| brief(&c.message))
                 } else {
                     None
                 };
@@ -299,23 +413,34 @@ pub fn check(repo_path: &Path) -> Result<FsckReport, RepoError> {
     }
 
     let mut checked_snapshots = 0usize;
-    for (hash, path) in two_level(&snapshots_dir)
-        .into_iter()
-        .filter(|_| check_snapshots)
-    {
-        checked_snapshots += 1;
-        if marks.snapshots.contains(&hash) {
-            continue;
+    if check_snapshots {
+        for (hash, path) in two_level(&snapshots_dir) {
+            checked_snapshots += 1;
+            if marks.snapshots.contains(&hash) {
+                continue;
+            }
+            if newer_than(&path, cutoff) {
+                protected += 1;
+                continue;
+            }
+            let bytes = repo_layout::directory_physical_size_bytes(&path).unwrap_or(0);
+            reclaimable_bytes += bytes;
+            unreachable.push(Unreachable {
+                kind: ObjectKind::Snapshot,
+                hash,
+                summary: None,
+                bytes,
+            });
         }
-        let bytes = repo_layout::directory_physical_size_bytes(&path).unwrap_or(0);
-        reclaimable_bytes += bytes;
-        unreachable.push(Unreachable {
-            kind: ObjectKind::Snapshot,
-            hash,
-            summary: None,
-            bytes,
-        });
     }
+
+    let live_branches: HashSet<String> = repo_layout::list_branches(repo_path)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    let (stale_workspaces, stale_workspace_bytes) =
+        stale_workspaces(repo_path, &live_branches, &marks.objects, cutoff);
 
     unreachable.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.hash.cmp(&b.hash)));
     dangling.sort_by(|a, b| a.from_commit.cmp(&b.from_commit));
@@ -330,7 +455,102 @@ pub fn check(repo_path: &Path) -> Result<FsckReport, RepoError> {
         unrecognised,
         reclaimable_bytes,
         snapshots_checked_on_disk: check_snapshots,
+        protected_by_grace: protected,
+        grace_seconds: grace.as_secs(),
+        stale_workspaces,
+        stale_workspace_bytes,
     })
+}
+
+/// Working copies nothing needs any more.
+///
+/// A workspace is not a graph object; it is a cache that `checkout` rebuilds
+/// from a snapshot. But it is a full copy of the data directory, one per branch
+/// plus one per detached checkout, nothing ever removes one, and on a real
+/// database it dwarfs everything else — so a report that omits them can say
+/// "0 reclaimable" for a repository that is mostly waste.
+///
+/// Three rules, in order:
+/// - the directory named by `.gfs/WORKSPACE` is live, whatever else is true;
+/// - `workspaces/<branch>/` is live while a ref of that name exists;
+/// - `workspaces/detached/<prefix>/` is live while a reachable commit starts
+///   with that prefix.
+fn stale_workspaces(
+    repo_path: &Path,
+    live_branches: &HashSet<String>,
+    reachable: &HashSet<String>,
+    cutoff: SystemTime,
+) -> (Vec<StaleWorkspace>, u64) {
+    let root = repo_path.join(GFS_DIR).join(WORKSPACES_DIR);
+    let active = std::fs::read_to_string(repo_path.join(GFS_DIR).join(WORKSPACE_FILE))
+        .map(|s| PathBuf::from(s.trim().to_string()))
+        .unwrap_or_default();
+
+    let mut out = Vec::new();
+    let mut total = 0u64;
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return (out, total);
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+
+        if name == "detached" {
+            let Ok(kids) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            for kid in kids.flatten() {
+                let kid_path = kid.path();
+                let Some(prefix) = kid_path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if active.starts_with(&kid_path) || newer_than(&kid_path, cutoff) {
+                    continue;
+                }
+                let prefix_lc = prefix.to_ascii_lowercase();
+                if reachable.iter().any(|c| c.starts_with(&prefix_lc)) {
+                    continue;
+                }
+                let bytes = repo_layout::directory_physical_size_bytes(&kid_path).unwrap_or(0);
+                total += bytes;
+                out.push(StaleWorkspace {
+                    path: format!("{WORKSPACES_DIR}/detached/{prefix}"),
+                    reason: "no reachable commit starts with this hash".to_string(),
+                    bytes,
+                });
+            }
+            continue;
+        }
+
+        if active.starts_with(&path) || newer_than(&path, cutoff) {
+            continue;
+        }
+        // Nested branch names are directories too, so a parent that merely holds
+        // other branches must not be reported. `live_branches` carries the full
+        // name, and any live branch under this prefix keeps it.
+        if live_branches
+            .iter()
+            .any(|b| b == name || b.starts_with(&format!("{name}/")))
+        {
+            continue;
+        }
+        let bytes = repo_layout::directory_physical_size_bytes(&path).unwrap_or(0);
+        total += bytes;
+        out.push(StaleWorkspace {
+            path: format!("{WORKSPACES_DIR}/{name}"),
+            reason: "no branch of this name exists".to_string(),
+            bytes,
+        });
+    }
+
+    out.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.path.cmp(&b.path)));
+    (out, total)
 }
 
 /// Size of one object entry, whether it is a file or a schema directory.
@@ -422,7 +642,7 @@ mod tests {
         let h = write_commit(d.path(), "aa", "only commit", None, true);
         set_branch(d.path(), "main", &h);
 
-        let r = check(d.path()).unwrap();
+        let r = check(d.path(), Duration::ZERO).unwrap();
         assert!(r.is_clean(), "expected clean, got {r:?}");
         assert_eq!(r.checked_commits, 1);
         assert_eq!(r.exit_code(), 0);
@@ -435,7 +655,7 @@ mod tests {
         set_branch(d.path(), "main", &live);
         write_commit(d.path(), "bb", "stranded", None, true);
 
-        let r = check(d.path()).unwrap();
+        let r = check(d.path(), Duration::ZERO).unwrap();
         assert_eq!(r.exit_code(), 1, "garbage, not corruption: {r:?}");
         assert!(r.dangling.is_empty());
         // the stranded commit object and the snapshot it names
@@ -457,7 +677,7 @@ mod tests {
         let child = write_commit(d.path(), "bb", "child", Some(&parent), true);
         set_branch(d.path(), "main", &child);
 
-        let r = check(d.path()).unwrap();
+        let r = check(d.path(), Duration::ZERO).unwrap();
         assert!(r.is_clean(), "parent should be reachable: {r:?}");
         assert_eq!(r.checked_commits, 2);
     }
@@ -468,7 +688,7 @@ mod tests {
         let h = write_commit(d.path(), "aa", "no snapshot", None, false);
         set_branch(d.path(), "main", &h);
 
-        let r = check(d.path()).unwrap();
+        let r = check(d.path(), Duration::ZERO).unwrap();
         assert_eq!(r.exit_code(), 2, "corruption: {r:?}");
         assert_eq!(r.dangling.len(), 1);
         assert_eq!(r.dangling[0].kind, ObjectKind::Snapshot);
@@ -487,7 +707,7 @@ mod tests {
         )
         .unwrap();
 
-        let r = check(d.path()).unwrap();
+        let r = check(d.path(), Duration::ZERO).unwrap();
         assert_eq!(r.unrecognised.len(), 1, "{r:?}");
         assert_eq!(r.exit_code(), 2);
     }
@@ -499,7 +719,7 @@ mod tests {
         let d = repo();
         set_branch(d.path(), "main", "x");
 
-        let r = check(d.path()).unwrap();
+        let r = check(d.path(), Duration::ZERO).unwrap();
         assert_eq!(r.dangling.len(), 1, "{r:?}");
         assert_eq!(r.exit_code(), 2);
     }
@@ -518,7 +738,7 @@ mod tests {
         )
         .unwrap();
 
-        let r = check(d.path()).unwrap();
+        let r = check(d.path(), Duration::ZERO).unwrap();
         assert!(!r.snapshots_checked_on_disk);
         assert!(
             r.dangling.is_empty(),
@@ -536,7 +756,7 @@ mod tests {
         let detached = write_commit(d.path(), "bb", "detached", None, true);
         fs::write(d.path().join(GFS_DIR).join("HEAD"), &detached).unwrap();
 
-        let r = check(d.path()).unwrap();
+        let r = check(d.path(), Duration::ZERO).unwrap();
         assert!(
             r.is_clean(),
             "the checked-out commit must not be reported as garbage: {r:?}"
@@ -551,9 +771,189 @@ mod tests {
         write_commit(d.path(), "bb", "garbage", None, true);
 
         let before: Vec<PathBuf> = walkdir(&d.path().join(GFS_DIR));
-        let _ = check(d.path()).unwrap();
+        let _ = check(d.path(), Duration::ZERO).unwrap();
         let after: Vec<PathBuf> = walkdir(&d.path().join(GFS_DIR));
         assert_eq!(before, after, "fsck must not touch the repository");
+    }
+
+    /// The window the grace period exists for: a commit writes its snapshot
+    /// before the object referencing it, so a mark phase running then would
+    /// otherwise call live data garbage.
+    #[test]
+    fn a_recently_written_object_is_protected_rather_than_collected() {
+        let d = repo();
+        let h = write_commit(d.path(), "aa", "live", None, true);
+        set_branch(d.path(), "main", &h);
+        write_commit(d.path(), "bb", "just written", None, true);
+
+        let generous = check(d.path(), Duration::from_secs(3600)).unwrap();
+        assert!(
+            generous.unreachable.is_empty(),
+            "nothing written seconds ago may be collected: {:?}",
+            generous.unreachable
+        );
+        assert!(generous.protected_by_grace > 0);
+        assert!(generous.is_clean());
+
+        let none = check(d.path(), Duration::ZERO).unwrap();
+        assert!(
+            !none.unreachable.is_empty(),
+            "with no grace the same entries are reported"
+        );
+    }
+
+    /// A malformed reference must be reported. Skipping it leaves the real
+    /// object unmarked, so the store scan calls live data garbage while the
+    /// report claims the repository is consistent.
+    #[test]
+    fn a_malformed_snapshot_reference_is_reported_not_skipped() {
+        let d = repo();
+        let h = hash_of("aa");
+        let objects = d.path().join(GFS_DIR).join(OBJECTS_DIR);
+        fs::create_dir_all(objects.join(&h[..2])).unwrap();
+        let commit = serde_json::json!({
+            "hash": h, "message": "bad ref", "timestamp": "2026-01-01T00:00:00Z",
+            "parents": [], "snapshot_hash": "",
+            "author": "t", "author_date": "2026-01-01T00:00:00Z",
+            "committer": "t", "committer_date": "2026-01-01T00:00:00Z",
+        });
+        fs::write(
+            objects.join(&h[..2]).join(&h[2..]),
+            serde_json::to_string_pretty(&commit).unwrap(),
+        )
+        .unwrap();
+        set_branch(d.path(), "main", &h);
+
+        let r = check(d.path(), Duration::ZERO).unwrap();
+        assert_eq!(r.dangling.len(), 1, "{r:?}");
+        assert_eq!(r.exit_code(), 2);
+    }
+
+    /// On a case-insensitive filesystem an uppercase ref reads fine, so nothing
+    /// looks dangling, while the store scan yields the lowercase name. Keyed on
+    /// the literal string, the live tip would read as collectable.
+    #[test]
+    fn an_uppercase_ref_still_marks_the_object_it_names() {
+        let d = repo();
+        let h = write_commit(d.path(), "aa", "live", None, true);
+        set_branch(d.path(), "main", &h.to_ascii_uppercase());
+
+        let r = check(d.path(), Duration::ZERO).unwrap();
+        assert!(
+            r.unreachable.is_empty(),
+            "the live tip must not be collectable: {:?}",
+            r.unreachable
+        );
+        assert!(r.dangling.is_empty(), "{:?}", r.dangling);
+    }
+
+    #[test]
+    fn a_foreign_file_in_a_shard_is_not_mistaken_for_an_object() {
+        let d = repo();
+        let h = write_commit(d.path(), "aa", "live", None, true);
+        set_branch(d.path(), "main", &h);
+        fs::write(
+            d.path()
+                .join(GFS_DIR)
+                .join(OBJECTS_DIR)
+                .join(&h[..2])
+                .join(".DS_Store"),
+            b"junk",
+        )
+        .unwrap();
+
+        let r = check(d.path(), Duration::ZERO).unwrap();
+        assert!(r.is_clean(), "a foreign file is not corruption: {r:?}");
+    }
+
+    #[test]
+    fn a_directory_that_is_not_a_repository_is_an_error() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(
+            check(d.path(), Duration::ZERO).is_err(),
+            "fsck must not report a non-repository as consistent"
+        );
+    }
+
+    /// A ref can be anything, including a symlink to a large file. An unbounded
+    /// value read off disk must never reach the report verbatim.
+    #[test]
+    fn an_enormous_ref_value_is_truncated_in_the_report() {
+        let d = repo();
+        set_branch(d.path(), "main", &"z".repeat(50_000));
+
+        let r = check(d.path(), Duration::ZERO).unwrap();
+        assert_eq!(r.dangling.len(), 1);
+        assert!(
+            r.dangling[0].missing.len() < 200,
+            "value was not trimmed: {} chars",
+            r.dangling[0].missing.len()
+        );
+        assert_eq!(r.dangling[0].from_commit, "refs/heads/main");
+    }
+
+    /// Workspaces are usually the largest thing in a repository and nothing
+    /// removes them, so a report that omits them can say "0 reclaimable" for a
+    /// repository that is mostly waste.
+    #[test]
+    fn a_workspace_whose_branch_is_gone_is_reported_but_the_live_one_is_not() {
+        let d = repo();
+        let h = write_commit(d.path(), "aa", "live", None, true);
+        set_branch(d.path(), "main", &h);
+
+        let ws = d.path().join(GFS_DIR).join("workspaces");
+        for name in ["main", "deleted-branch"] {
+            let dir = ws.join(name).join("0").join("data");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("payload"), vec![0u8; 4096]).unwrap();
+        }
+        fs::write(
+            d.path().join(GFS_DIR).join("WORKSPACE"),
+            ws.join("main")
+                .join("0")
+                .join("data")
+                .to_string_lossy()
+                .as_ref(),
+        )
+        .unwrap();
+
+        let r = check(d.path(), Duration::ZERO).unwrap();
+        let paths: Vec<&str> = r.stale_workspaces.iter().map(|w| w.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["workspaces/deleted-branch"],
+            "only the workspace with no branch is stale: {paths:?}"
+        );
+        assert!(r.stale_workspace_bytes > 0);
+        // Waste, not corruption.
+        assert_eq!(r.exit_code(), 1);
+    }
+
+    /// A branch directory that merely contains nested branches is not stale.
+    #[test]
+    fn a_workspace_directory_holding_a_nested_branch_is_kept() {
+        let d = repo();
+        let h = write_commit(d.path(), "aa", "live", None, true);
+        set_branch(d.path(), "main", &h);
+        fs::create_dir_all(
+            d.path()
+                .join(GFS_DIR)
+                .join(REFS_DIR)
+                .join(HEADS_DIR)
+                .join("team"),
+        )
+        .unwrap();
+        set_branch(d.path(), "team/alpha", &h);
+
+        let dir = d.path().join(GFS_DIR).join("workspaces").join("team");
+        fs::create_dir_all(dir.join("alpha").join("0")).unwrap();
+
+        let r = check(d.path(), Duration::ZERO).unwrap();
+        assert!(
+            r.stale_workspaces.is_empty(),
+            "team/ holds a live branch: {:?}",
+            r.stale_workspaces
+        );
     }
 
     fn walkdir(root: &Path) -> Vec<PathBuf> {

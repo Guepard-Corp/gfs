@@ -8,36 +8,45 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use gfs_domain::model::fsck::FsckReport;
 use gfs_domain::model::layout::{GC_DIR, GFS_DIR};
-use gfs_domain::repo_utils::fsck;
+use gfs_domain::repo_utils::fsck::{self, DEFAULT_GRACE};
 use serde_json::json;
 
 use crate::cli_utils::get_repo_dir;
 use crate::output::{cyan, dimmed, fmt_bytes, gold, green, red, yellow};
 use crate::println_safe;
 
-pub async fn run(path: Option<PathBuf>, plan: bool, json_output: bool) -> Result<i32> {
+pub async fn run(
+    path: Option<PathBuf>,
+    plan: bool,
+    grace_seconds: Option<u64>,
+    json_output: bool,
+) -> Result<i32> {
     let repo_path = path.unwrap_or_else(get_repo_dir);
 
-    let report = fsck::check(&repo_path)
+    let grace = grace_seconds
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(DEFAULT_GRACE);
+
+    let report = fsck::check(&repo_path, grace)
         .context("not a GFS repository (run from a repo root or use --path <dir>)")?;
 
     // A plan is the prelude to a deletion, so refuse to produce one for a
     // repository that is already inconsistent — that is exactly the state in
     // which a collector turns a recoverable incident into an unopenable one.
     // `--json` still reports everything, so nothing is hidden by this.
-    if plan && !report.dangling.is_empty() {
-        anyhow::bail!(
-            "refusing to write a collection plan: {} reference(s) point at something missing. \
-             Run `gfs fsck` to see them; a collector must not run against this repository",
-            report.dangling.len()
-        );
-    }
-    if plan && !report.unrecognised.is_empty() {
-        anyhow::bail!(
-            "refusing to write a collection plan: {} entr(ies) in the object store could not \
-             be identified. Run `gfs fsck` to see them",
+    // Exits 2, not 1: the refusal is caused by corruption, and 1 already means
+    // "unreachable objects found". Returning 1 here would make a script unable
+    // to tell a broken repository from one that merely has garbage.
+    if plan && !report.is_clean() && report.exit_code() == 2 {
+        eprintln!(
+            "{} refusing to write a collection plan: {} reference(s) point at something \
+             missing and {} entr(ies) could not be identified. Run `gfs fsck` to see them; \
+             a collector must not run against this repository",
+            red("error:"),
+            report.dangling.len(),
             report.unrecognised.len()
         );
+        return Ok(2);
     }
 
     let plan_id = if plan {
@@ -110,6 +119,19 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
         }
     )?;
 
+    if report.protected_by_grace > 0 {
+        println_safe!(
+            "{}",
+            dimmed(format!(
+                "{} recent entr(ies) held back by the {}h grace period; \
+                 a commit writes its snapshot before the object that references it, \
+                 so anything recent may still be in flight",
+                report.protected_by_grace,
+                report.grace_seconds / 3600
+            ))
+        )?;
+    }
+
     if !report.snapshots_checked_on_disk {
         println_safe!(
             "{}",
@@ -157,6 +179,31 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
         )?;
     }
 
+    if !report.stale_workspaces.is_empty() {
+        println_safe!("")?;
+        println_safe!(
+            "{}",
+            yellow("stale working copies (no branch or reachable commit needs these):")
+        )?;
+        for w in &report.stale_workspaces {
+            println_safe!(
+                "  {:<34} {:>10}  {}",
+                w.path,
+                fmt_bytes(w.bytes),
+                dimmed(&w.reason)
+            )?;
+        }
+        println_safe!(
+            "  {}",
+            dimmed(format!(
+                "{} working copies, {} \u{2014} rebuilt from the snapshot on the next checkout, \
+                 so removing them costs nothing but time",
+                report.stale_workspaces.len(),
+                fmt_bytes(report.stale_workspace_bytes)
+            ))
+        )?;
+    }
+
     if !report.dangling.is_empty() {
         println_safe!("")?;
         println_safe!(
@@ -188,7 +235,7 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
     if report.is_clean() {
         println_safe!("{} repository is consistent", green("\u{2713}"))?;
     } else if report.dangling.is_empty() && report.unrecognised.is_empty() {
-        println_safe!("repository is consistent; the unreachable objects above are collectable")?;
+        println_safe!("repository is consistent; everything listed above is collectable")?;
     } else {
         println_safe!(
             "{}",

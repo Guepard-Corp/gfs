@@ -75,6 +75,23 @@ pub struct Unrecognised {
     pub bytes: u64,
 }
 
+/// A working copy on disk that nothing needs any more.
+///
+/// Workspaces are not part of the object graph — they are rebuildable caches,
+/// restored from a snapshot on the next checkout — so they are reported apart
+/// from `unreachable` and their bytes are counted separately. They are also
+/// usually the largest thing in a repository: a full copy of the data
+/// directory, one per branch plus one per detached checkout, and nothing
+/// removes them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StaleWorkspace {
+    /// Path relative to `.gfs/`, e.g. `workspaces/feature/0`.
+    pub path: String,
+    /// Why nothing needs it.
+    pub reason: String,
+    pub bytes: u64,
+}
+
 /// The outcome of `gfs fsck`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FsckReport {
@@ -103,6 +120,26 @@ pub struct FsckReport {
     /// this is false the snapshot half of the report is simply absent, and no
     /// conclusion about snapshots should be drawn from it.
     pub snapshots_checked_on_disk: bool,
+
+    /// How many entries were left out of `unreachable` only because they are
+    /// newer than the grace cutoff.
+    ///
+    /// A commit creates its snapshot before writing the object that references
+    /// it, so anything recent may belong to an operation still in flight. These
+    /// are protected rather than reported; a non-zero count here means a later
+    /// run may find more.
+    pub protected_by_grace: usize,
+
+    /// The grace period this run applied, in seconds.
+    pub grace_seconds: u64,
+
+    /// Working copies no branch or reachable commit needs. Reported apart from
+    /// `unreachable` because they are caches rather than graph objects.
+    pub stale_workspaces: Vec<StaleWorkspace>,
+
+    /// Bytes held by [`Self::stale_workspaces`], counted apart from
+    /// `reclaimable_bytes` for the same reason.
+    pub stale_workspace_bytes: u64,
 }
 
 impl FsckReport {
@@ -115,7 +152,7 @@ impl FsckReport {
     pub fn exit_code(&self) -> i32 {
         if !self.dangling.is_empty() || !self.unrecognised.is_empty() {
             2
-        } else if !self.unreachable.is_empty() {
+        } else if !self.unreachable.is_empty() || !self.stale_workspaces.is_empty() {
             1
         } else {
             0
@@ -142,6 +179,10 @@ mod tests {
             unrecognised: Vec::new(),
             reclaimable_bytes: 0,
             snapshots_checked_on_disk: true,
+            protected_by_grace: 0,
+            grace_seconds: 0,
+            stale_workspaces: Vec::new(),
+            stale_workspace_bytes: 0,
         }
     }
 
