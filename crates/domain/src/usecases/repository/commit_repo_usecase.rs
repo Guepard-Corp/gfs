@@ -333,6 +333,13 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
         // that commit contains. On the container path the same ordering is
         // bounded by `pause()`; here the writer is the user's own application
         // and nothing bounds it.
+        //
+        // DECLARED AFTER `_commit_lock`, which matters: Rust drops in reverse
+        // declaration order, so the database write lock is released before the
+        // repository lock. A checkout waiting on the repository lock therefore
+        // finds the database free the moment it gets in, instead of blocking a
+        // second time on a guard this commit still holds. Reordering these two
+        // bindings would reintroduce that wait silently.
         let _local_guard = match (&runtime_config, &environment) {
             (None, Some(env)) => self.acquire_local_snapshot_guard(&path, env).await?,
             _ => None,
