@@ -226,6 +226,11 @@ async fn create_branch(
 // ---------------------------------------------------------------------------
 
 fn delete_branch(repo_path: &std::path::Path, name: &str, json_output: bool) -> Result<()> {
+    // Before the current-branch guard, which compares raw strings: `./main` and
+    // `../heads/main` are not equal to `main` but resolve to it once joined onto
+    // a path, so an unvalidated name walks straight past the guard.
+    repo_layout::validate_branch_name(name)?;
+
     let current = repo_layout::get_current_branch(repo_path).unwrap_or_default();
     if name == current {
         anyhow::bail!("cannot delete the currently checked out branch '{}'", name);
@@ -246,7 +251,7 @@ fn delete_branch(repo_path: &std::path::Path, name: &str, json_output: bool) -> 
         .with_context(|| format!("failed to delete branch ref '{}'", name))?;
 
     // No background process and no collector yet, so expiry is enforced here.
-    let retention_ms = deleted_retention_days(repo_path) * 24 * 60 * 60 * 1000;
+    let retention_ms = retention_ms(repo_path);
     let _ = repo_layout::prune_expired_deleted_refs(repo_path, retention_ms);
 
     // The working copy outlives the ref unless it goes here too. It is keyed by
@@ -317,6 +322,15 @@ fn deleted_retention_days(repo_path: &std::path::Path) -> u64 {
         .unwrap_or(DEFAULT_DELETED_RETENTION_DAYS)
 }
 
+/// The retention window in milliseconds.
+///
+/// Saturating: a config of `u64::MAX / 2` days would otherwise wrap and produce
+/// a window of a few hours, so the largest-looking settings would give some of
+/// the shortest windows.
+fn retention_ms(repo_path: &std::path::Path) -> u64 {
+    deleted_retention_days(repo_path).saturating_mul(24 * 60 * 60 * 1000)
+}
+
 fn format_age(deleted_at_ms: u64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -332,17 +346,23 @@ fn format_age(deleted_at_ms: u64) -> String {
 }
 
 fn list_deleted(repo_path: &std::path::Path, json_output: bool) -> Result<()> {
-    let entries = repo_layout::list_deleted_branch_refs(repo_path)
+    let entries = repo_layout::list_recoverable_branch_refs(repo_path, retention_ms(repo_path))
         .context("failed to read deleted branch refs")?;
 
     if json_output {
+        // `restorable` marks the entry `--restore <name>` would pick, so a JSON
+        // consumer does not have to re-derive it by max-timestamp per name.
+        let mut seen: Vec<&str> = Vec::new();
         let rows: Vec<_> = entries
             .iter()
             .map(|d| {
+                let restorable = !seen.contains(&d.name.as_str());
+                seen.push(d.name.as_str());
                 json!({
                     "branch": d.name,
                     "commit": d.commit_hash,
                     "deleted_at_ms": d.deleted_at_ms,
+                    "restorable": restorable,
                 })
             })
             .collect();
@@ -410,8 +430,32 @@ fn restore_branch(repo_path: &std::path::Path, name: &str, json_output: bool) ->
             name
         );
     }
+    // The mirror case: restoring `a/b` needs `refs/heads/a` to be a directory,
+    // but a live branch `a` is a file there. Neither check above fires — the
+    // target itself does not exist — and the failure would otherwise surface as
+    // a bare ENOTDIR with the cause hidden by `{}` formatting.
+    let heads = repo_path.join(GFS_DIR).join(REFS_DIR).join(HEADS_DIR);
+    let mut ancestor = heads.clone();
+    for segment in name.split('/').filter(|s| !s.is_empty()) {
+        if ancestor.is_file() {
+            let blocking = ancestor
+                .strip_prefix(&heads)
+                .unwrap_or(&ancestor)
+                .to_string_lossy()
+                .to_string();
+            anyhow::bail!(
+                "'{}' cannot be restored while branch '{}' exists: a ref is a file, \
+                 so '{}' cannot also be a directory. Delete or rename '{}' first",
+                name,
+                blocking,
+                blocking,
+                blocking
+            );
+        }
+        ancestor = ancestor.join(segment);
+    }
 
-    let available = repo_layout::list_deleted_branch_refs(repo_path)
+    let available = repo_layout::list_recoverable_branch_refs(repo_path, retention_ms(repo_path))
         .context("failed to read deleted branch refs")?;
     if !available.iter().any(|d| d.name == name) {
         if available.is_empty() {

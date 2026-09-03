@@ -796,6 +796,43 @@ pub struct DeletedBranch {
     pub deleted_at_ms: u64,
 }
 
+/// Rejects branch names that would escape `refs/heads` when joined onto a path.
+///
+/// A branch name is used as a path segment, so `..`, `.` and absolute paths let
+/// it address files outside the directory it is supposed to live in. Without
+/// this, `branch -d ../heads/main` deletes `main` while the current-branch guard
+/// — which compares the raw string — sees a name that is not the current branch.
+pub fn validate_branch_name(name: &str) -> Result<(), RepoError> {
+    if name.is_empty() {
+        return Err(RepoError::invalid_layout(
+            "branch name is empty".to_string(),
+        ));
+    }
+    if Path::new(name).is_absolute() {
+        return Err(RepoError::invalid_layout(format!(
+            "branch name '{name}' must be relative, not an absolute path"
+        )));
+    }
+    for segment in name.split('/') {
+        if segment.is_empty() {
+            return Err(RepoError::invalid_layout(format!(
+                "branch name '{name}' has an empty path segment"
+            )));
+        }
+        if segment == "." || segment == ".." {
+            return Err(RepoError::invalid_layout(format!(
+                "branch name '{name}' must not contain '.' or '..' segments"
+            )));
+        }
+    }
+    if name.contains('\\') {
+        return Err(RepoError::invalid_layout(format!(
+            "branch name '{name}' must not contain a backslash"
+        )));
+    }
+    Ok(())
+}
+
 /// `<repo>/.gfs/refs/deleted`.
 pub fn deleted_refs_dir(repo_path: &Path) -> PathBuf {
     repo_path
@@ -828,6 +865,7 @@ pub fn soft_delete_branch_ref(
     repo_path: &Path,
     branch_name: &str,
 ) -> Result<DeletedBranch, RepoError> {
+    validate_branch_name(branch_name)?;
     let ref_path = repo_path
         .join(GFS_DIR)
         .join(REFS_DIR)
@@ -901,6 +939,22 @@ pub fn list_deleted_branch_refs(repo_path: &Path) -> Result<Vec<DeletedBranch>, 
     Ok(out)
 }
 
+/// Deleted branches still inside `retention_ms`, newest first.
+///
+/// Filtered on read rather than relying on pruning: expiry has to hold even when
+/// nothing has triggered a prune, otherwise the window is advisory and a branch
+/// stays restorable long after it was documented to stop being so.
+pub fn list_recoverable_branch_refs(
+    repo_path: &Path,
+    retention_ms: u64,
+) -> Result<Vec<DeletedBranch>, RepoError> {
+    let cutoff = now_ms().saturating_sub(retention_ms);
+    Ok(list_deleted_branch_refs(repo_path)?
+        .into_iter()
+        .filter(|d| d.deleted_at_ms > cutoff)
+        .collect())
+}
+
 /// Restores the most recent deletion of `branch_name` back to `refs/heads/`.
 ///
 /// Refuses when a live branch of that name already exists: the caller asked to
@@ -910,6 +964,7 @@ pub fn restore_deleted_branch_ref(
     repo_path: &Path,
     branch_name: &str,
 ) -> Result<DeletedBranch, RepoError> {
+    validate_branch_name(branch_name)?;
     let live = repo_path
         .join(GFS_DIR)
         .join(REFS_DIR)
@@ -941,7 +996,12 @@ pub fn restore_deleted_branch_ref(
         fs::create_dir_all(parent).map_err(RepoError::from)?;
     }
     fs::rename(&stored, &live).map_err(RepoError::from)?;
-    prune_empty_dirs_under(&base.join(entry.deleted_at_ms.to_string()), &base);
+    // Start at the directory the ref actually sat in, not the timestamp root:
+    // for `a/b` the newly empty directory is `<ts>/a`, and `<ts>` still contains
+    // it, so starting there would find a non-empty directory and stop.
+    if let Some(from) = stored.parent() {
+        prune_empty_dirs_under(from, &base);
+    }
 
     Ok(entry)
 }
@@ -1676,6 +1736,76 @@ mod tests {
             .map(|d| d.name)
             .collect();
         assert_eq!(names, vec!["fresh".to_string()]);
+    }
+
+    /// A branch name becomes a path segment, so a traversing name addresses
+    /// files outside `refs/heads`. `branch -d ../heads/main` otherwise deletes
+    /// `main` while the current-branch guard, which compares raw strings, sees a
+    /// name that is not the current branch.
+    #[test]
+    fn validate_branch_name_rejects_names_that_escape_refs_heads() {
+        for good in ["main", "feature", "team/alpha", "a.b", "release-1.2"] {
+            assert!(validate_branch_name(good).is_ok(), "{good} should be valid");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "./main",
+            "../heads/main",
+            "../../../../pwned",
+            "team//alpha",
+            "team/../../escape",
+            "/absolute",
+            "back\\slash",
+        ] {
+            assert!(
+                validate_branch_name(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn soft_delete_refuses_a_traversing_name_instead_of_moving_another_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        create_valid_repo_layout(repo).unwrap();
+        write_branch(repo, "main", "a".repeat(64).as_str());
+
+        assert!(soft_delete_branch_ref(repo, "../heads/main").is_err());
+        assert!(soft_delete_branch_ref(repo, "./main").is_err());
+        assert!(
+            branch_exists(repo, "main"),
+            "a refused delete must not touch the ref it would have resolved to"
+        );
+    }
+
+    /// Expiry has to hold on read. Pruning alone runs only during `branch -d`,
+    /// so a repo where nothing is being deleted would keep entries restorable
+    /// long after the window they were documented to have.
+    #[test]
+    fn recoverable_listing_excludes_entries_past_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        create_valid_repo_layout(repo).unwrap();
+        write_branch(repo, "fresh", "a".repeat(64).as_str());
+        soft_delete_branch_ref(repo, "fresh").unwrap();
+
+        assert_eq!(
+            list_recoverable_branch_refs(repo, 60_000).unwrap().len(),
+            1,
+            "an entry inside the window is recoverable"
+        );
+        assert!(
+            list_recoverable_branch_refs(repo, 0).unwrap().is_empty(),
+            "a zero window makes it immediately unrecoverable"
+        );
+        assert_eq!(
+            list_deleted_branch_refs(repo).unwrap().len(),
+            1,
+            "filtering must not delete anything; the entry is still on disk"
+        );
     }
 
     #[test]

@@ -543,7 +543,7 @@ enum TopLevel {
         start_point: Option<String>,
 
         /// Delete the named branch
-        #[arg(short = 'd', long)]
+        #[arg(short = 'd', long, conflicts_with_all = ["deleted", "restore"])]
         delete: Option<String>,
 
         /// Switch to the new branch after creating it (like checkout -b)
@@ -551,11 +551,11 @@ enum TopLevel {
         checkout: bool,
 
         /// List deleted branches that can still be restored
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["name", "start_point", "restore"])]
         deleted: bool,
 
         /// Restore a deleted branch by name
-        #[arg(long, value_name = "NAME")]
+        #[arg(long, value_name = "NAME", conflicts_with_all = ["name", "start_point"])]
         restore: Option<String>,
 
         /// Path to the GFS repository root (default: current directory)
