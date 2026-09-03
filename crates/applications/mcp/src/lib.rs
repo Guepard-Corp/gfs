@@ -7,6 +7,7 @@
 //! `#[tool_router]` + tools and `impl ServerHandler` with `get_info()`, then served
 //! over stdio or streamable HTTP (see [docs/http-service.md](docs/http-service.md)).
 
+pub mod blank_line_filter;
 mod tools;
 
 pub use tools::GfsMcpHandler;
