@@ -32,7 +32,8 @@ use crate::model::fsck::{
     Dangling, FsckReport, ObjectKind, StaleWorkspace, Unreachable, Unrecognised,
 };
 use crate::model::layout::{
-    GFS_DIR, HEAD_FILE, OBJECTS_DIR, SNAPSHOTS_DIR, WORKSPACE_FILE, WORKSPACES_DIR,
+    BRANCH_WORKSPACE_SEGMENT, GFS_DIR, HEAD_FILE, OBJECTS_DIR, SNAPSHOTS_DIR, WORKSPACE_FILE,
+    WORKSPACES_DIR,
 };
 use crate::repo_utils::repo_layout;
 
@@ -342,7 +343,14 @@ fn identify_object(path: &Path) -> Result<ObjectKind, String> {
 ///
 /// An unreadable mtime counts as protected: refusing to collect something that
 /// cannot be dated is the safe direction.
-fn newer_than(path: &Path, cutoff: SystemTime) -> bool {
+/// `None` means no window at all, so nothing is protected — including an entry
+/// whose mtime is in the future, which `--grace 0` must be able to override.
+/// A window so large that the cutoff saturates at the epoch protects
+/// everything, which is the correct reading of "keep for a thousand years".
+fn newer_than(path: &Path, cutoff: Option<SystemTime>) -> bool {
+    let Some(cutoff) = cutoff else {
+        return false;
+    };
     std::fs::metadata(path)
         .and_then(|m| m.modified())
         .map(|t| t > cutoff)
@@ -364,9 +372,15 @@ pub fn check(repo_path: &Path, grace: Duration) -> Result<FsckReport, RepoError>
 
     // Taken before the walk, so anything written while this runs is newer than
     // the cutoff by construction and cannot be collected on this pass.
-    let cutoff = SystemTime::now()
-        .checked_sub(grace)
-        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let cutoff = if grace.is_zero() {
+        None
+    } else {
+        Some(
+            SystemTime::now()
+                .checked_sub(grace)
+                .unwrap_or(SystemTime::UNIX_EPOCH),
+        )
+    };
 
     let check_snapshots = snapshots_are_local(repo_path);
     let (roots, mut dangling) = roots(repo_path)?;
@@ -381,12 +395,20 @@ pub fn check(repo_path: &Path, grace: Duration) -> Result<FsckReport, RepoError>
         if marks.objects.contains(&hash) {
             continue;
         }
-        if newer_than(&path, cutoff) {
-            protected += 1;
-            continue;
-        }
         let bytes = object_size(&path);
         match identify_object(&path) {
+            // The grace check sits *inside* the Ok arm on purpose. It exists to
+            // stop live data being called collectable, not to stop corruption
+            // being reported. An entry that parses as nothing is a finding at
+            // any age — and corruption is most likely to be recent, because the
+            // usual cause is a commit that died partway, so filtering by age
+            // would silence it exactly when it matters. `dangling`, the sibling
+            // corruption class, has never been age-filtered; this makes the two
+            // consistent.
+            Ok(kind) if newer_than(&path, cutoff) => {
+                let _ = kind;
+                protected += 1;
+            }
             Ok(kind) => {
                 let summary = if kind == ObjectKind::Commit {
                     std::fs::read(&path)
@@ -439,8 +461,18 @@ pub fn check(repo_path: &Path, grace: Duration) -> Result<FsckReport, RepoError>
         .into_iter()
         .map(|(name, _)| name)
         .collect();
-    let (stale_workspaces, stale_workspace_bytes) =
+    let (stale_workspaces, stale_workspace_bytes, ws_protected, ws_unreadable) =
         stale_workspaces(repo_path, &live_branches, &marks.objects, cutoff);
+    protected += ws_protected;
+    // An unreadable workspace directory is a finding, not a clean result: every
+    // other directory we cannot read produces one.
+    for path in ws_unreadable {
+        unrecognised.push(Unrecognised {
+            hash: path,
+            reason: "workspace directory could not be read".to_string(),
+            bytes: 0,
+        });
+    }
 
     unreachable.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.hash.cmp(&b.hash)));
     dangling.sort_by(|a, b| a.from_commit.cmp(&b.from_commit));
@@ -470,17 +502,24 @@ pub fn check(repo_path: &Path, grace: Duration) -> Result<FsckReport, RepoError>
 /// database it dwarfs everything else — so a report that omits them can say
 /// "0 reclaimable" for a repository that is mostly waste.
 ///
+/// A branch workspace is identified by shape rather than by depth: any
+/// directory holding a [`BRANCH_WORKSPACE_SEGMENT`] child is one, and the
+/// branch it belongs to is its path relative to `workspaces/`. That is what
+/// makes a nested `team/beta` visible while `team/alpha` is live — keying on
+/// top-level entries alone would hide every workspace under a prefix that any
+/// live branch shares.
+///
 /// Three rules, in order:
 /// - the directory named by `.gfs/WORKSPACE` is live, whatever else is true;
-/// - `workspaces/<branch>/` is live while a ref of that name exists;
+/// - `workspaces/<branch>/` is live while a ref of exactly that name exists;
 /// - `workspaces/detached/<prefix>/` is live while a reachable commit starts
 ///   with that prefix.
 fn stale_workspaces(
     repo_path: &Path,
     live_branches: &HashSet<String>,
     reachable: &HashSet<String>,
-    cutoff: SystemTime,
-) -> (Vec<StaleWorkspace>, u64) {
+    cutoff: Option<SystemTime>,
+) -> (Vec<StaleWorkspace>, u64, usize, Vec<String>) {
     let root = repo_path.join(GFS_DIR).join(WORKSPACES_DIR);
     let active = std::fs::read_to_string(repo_path.join(GFS_DIR).join(WORKSPACE_FILE))
         .map(|s| PathBuf::from(s.trim().to_string()))
@@ -488,69 +527,124 @@ fn stale_workspaces(
 
     let mut out = Vec::new();
     let mut total = 0u64;
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return (out, total);
-    };
+    let mut protected = 0usize;
+    let mut unreadable = Vec::new();
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+    if !root.exists() {
+        return (out, total, protected, unreadable);
+    }
+
+    // Depth-first over real directories only. Symlinks are never followed: a
+    // link into the filesystem would otherwise be measured as reclaimable and,
+    // worse, written into a collection plan naming a path outside the
+    // repository entirely.
+    let mut stack = vec![(root.clone(), String::new())];
+    while let Some((dir, rel)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            unreadable.push(format!("{WORKSPACES_DIR}/{rel}"));
             continue;
         };
-
-        if name == "detached" {
-            let Ok(kids) = std::fs::read_dir(&path) else {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
                 continue;
             };
-            for kid in kids.flatten() {
-                let kid_path = kid.path();
-                let Some(prefix) = kid_path.file_name().and_then(|n| n.to_str()) else {
-                    continue;
-                };
-                if active.starts_with(&kid_path) || newer_than(&kid_path, cutoff) {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let child_rel = if rel.is_empty() {
+                name.to_string()
+            } else {
+                format!("{rel}/{name}")
+            };
+
+            if child_rel == "detached" {
+                collect_detached(
+                    &path,
+                    &active,
+                    reachable,
+                    cutoff,
+                    &mut out,
+                    &mut total,
+                    &mut protected,
+                );
+                continue;
+            }
+
+            // A branch workspace, not a directory that merely holds them.
+            if path.join(BRANCH_WORKSPACE_SEGMENT).is_dir() {
+                if active.starts_with(&path) || live_branches.contains(&child_rel) {
                     continue;
                 }
-                let prefix_lc = prefix.to_ascii_lowercase();
-                if reachable.iter().any(|c| c.starts_with(&prefix_lc)) {
+                if newer_than(&path, cutoff) {
+                    protected += 1;
                     continue;
                 }
-                let bytes = repo_layout::directory_physical_size_bytes(&kid_path).unwrap_or(0);
+                let bytes = repo_layout::directory_physical_size_bytes(&path).unwrap_or(0);
                 total += bytes;
                 out.push(StaleWorkspace {
-                    path: format!("{WORKSPACES_DIR}/detached/{prefix}"),
-                    reason: "no reachable commit starts with this hash".to_string(),
+                    path: format!("{WORKSPACES_DIR}/{child_rel}"),
+                    reason: "no branch of this name exists".to_string(),
                     bytes,
                 });
+                continue;
             }
-            continue;
-        }
 
-        if active.starts_with(&path) || newer_than(&path, cutoff) {
-            continue;
+            stack.push((path, child_rel));
         }
-        // Nested branch names are directories too, so a parent that merely holds
-        // other branches must not be reported. `live_branches` carries the full
-        // name, and any live branch under this prefix keeps it.
-        if live_branches
-            .iter()
-            .any(|b| b == name || b.starts_with(&format!("{name}/")))
-        {
-            continue;
-        }
-        let bytes = repo_layout::directory_physical_size_bytes(&path).unwrap_or(0);
-        total += bytes;
-        out.push(StaleWorkspace {
-            path: format!("{WORKSPACES_DIR}/{name}"),
-            reason: "no branch of this name exists".to_string(),
-            bytes,
-        });
     }
 
     out.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.path.cmp(&b.path)));
-    (out, total)
+    (out, total, protected, unreadable)
+}
+
+/// Detached working copies, keyed by a 12-character commit prefix rather than a
+/// full hash, so liveness is a prefix match against the reachable set.
+fn collect_detached(
+    dir: &Path,
+    active: &Path,
+    reachable: &HashSet<String>,
+    cutoff: Option<SystemTime>,
+    out: &mut Vec<StaleWorkspace>,
+    total: &mut u64,
+    protected: &mut usize,
+) {
+    let Ok(kids) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for kid in kids.flatten() {
+        let path = kid.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            continue;
+        }
+        let Some(prefix) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if active.starts_with(&path) {
+            continue;
+        }
+        let prefix_lc = prefix.to_ascii_lowercase();
+        if reachable.iter().any(|c| c.starts_with(&prefix_lc)) {
+            continue;
+        }
+        if newer_than(&path, cutoff) {
+            *protected += 1;
+            continue;
+        }
+        let bytes = repo_layout::directory_physical_size_bytes(&path).unwrap_or(0);
+        *total += bytes;
+        out.push(StaleWorkspace {
+            path: format!("{WORKSPACES_DIR}/detached/{prefix}"),
+            reason: "no reachable commit starts with this hash".to_string(),
+            bytes,
+        });
+    }
 }
 
 /// Size of one object entry, whether it is a file or a schema directory.
@@ -953,6 +1047,88 @@ mod tests {
             r.stale_workspaces.is_empty(),
             "team/ holds a live branch: {:?}",
             r.stale_workspaces
+        );
+    }
+
+    /// The grace period protects live data from being *collected*. It must not
+    /// stop corruption being *reported* — and corruption is usually recent,
+    /// since the usual cause is a commit that died partway.
+    #[test]
+    fn a_freshly_written_unidentifiable_object_is_still_reported() {
+        let d = repo();
+        let h = write_commit(d.path(), "aa", "live", None, true);
+        set_branch(d.path(), "main", &h);
+        let objects = d.path().join(GFS_DIR).join(OBJECTS_DIR);
+        fs::create_dir_all(objects.join("cd")).unwrap();
+        fs::write(objects.join("cd").join("c".repeat(62)), b"\xff\xfe junk").unwrap();
+
+        // Written a moment ago, so a generous window would hide it if the check
+        // were applied before identification.
+        let r = check(d.path(), Duration::from_secs(3600)).unwrap();
+        assert_eq!(
+            r.unrecognised.len(),
+            1,
+            "corruption must survive grace: {r:?}"
+        );
+        assert_eq!(r.exit_code(), 2);
+    }
+
+    /// Keying on top-level entries alone hides every workspace under a prefix
+    /// that any live branch happens to share.
+    #[test]
+    fn a_nested_workspace_is_visible_even_when_a_sibling_branch_is_live() {
+        let d = repo();
+        let h = write_commit(d.path(), "aa", "live", None, true);
+        set_branch(d.path(), "main", &h);
+        fs::create_dir_all(
+            d.path()
+                .join(GFS_DIR)
+                .join(REFS_DIR)
+                .join(HEADS_DIR)
+                .join("team"),
+        )
+        .unwrap();
+        set_branch(d.path(), "team/alpha", &h);
+
+        let ws = d.path().join(GFS_DIR).join("workspaces");
+        for name in ["team/alpha", "team/beta"] {
+            let dir = ws.join(name).join("0").join("data");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("payload"), vec![0u8; 2048]).unwrap();
+        }
+
+        let r = check(d.path(), Duration::ZERO).unwrap();
+        let paths: Vec<&str> = r.stale_workspaces.iter().map(|w| w.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["workspaces/team/beta"],
+            "the live sibling must be kept and the dead one found: {paths:?}"
+        );
+    }
+
+    /// A window of zero must protect nothing, and a window so large the cutoff
+    /// saturates must protect everything. Both land on the epoch, so they have
+    /// to be distinguished explicitly.
+    #[test]
+    fn the_two_extreme_grace_windows_mean_opposite_things() {
+        let d = repo();
+        let h = write_commit(d.path(), "aa", "live", None, true);
+        set_branch(d.path(), "main", &h);
+        write_commit(d.path(), "bb", "garbage", None, true);
+
+        assert!(
+            !check(d.path(), Duration::ZERO)
+                .unwrap()
+                .unreachable
+                .is_empty(),
+            "a zero window protects nothing"
+        );
+        assert!(
+            check(d.path(), Duration::from_secs(u64::MAX / 2))
+                .unwrap()
+                .unreachable
+                .is_empty(),
+            "an enormous window protects everything"
         );
     }
 
