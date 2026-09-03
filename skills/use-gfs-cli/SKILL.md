@@ -79,6 +79,9 @@ gfs --color always log     # Force colors even when piped
 | `gfs schema diff` | 0 | No schema changes |
 | `gfs schema diff` | 1 | Schema changes detected |
 | `gfs schema diff` | 2 | Breaking changes detected |
+| `gfs fsck` | 0 | Repository consistent, nothing unreachable |
+| `gfs fsck` | 1 | Unreachable objects found (collectable) |
+| `gfs fsck` | 2 | Corruption found: something referenced is missing, or an object could not be identified |
 
 Use exit codes for conditional logic:
 ```shell

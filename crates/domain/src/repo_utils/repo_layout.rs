@@ -684,6 +684,26 @@ pub fn write_files_object(repo_path: &Path, entries: &[FileEntry]) -> Result<Str
 }
 
 /// Read the file entries list from the object store by its content hash.
+/// Decode a file-list object from raw bytes.
+///
+/// Asserts the whole buffer was consumed. `decode_from_slice` stops at the end
+/// of the value and reports how far it got; ignoring that lets a blob which
+/// merely *begins* with something bincode-shaped decode successfully, which
+/// matters when the caller is trying to identify an unknown file rather than
+/// read one it already trusts.
+pub fn decode_file_entries(bytes: &[u8]) -> Result<Vec<FileEntry>, RepoError> {
+    let (entries, read): (Vec<FileEntry>, usize) =
+        bincode::serde::decode_from_slice(bytes, files_bincode_config())
+            .map_err(|e| RepoError::InvalidConfig(e.to_string()))?;
+    if read != bytes.len() {
+        return Err(RepoError::InvalidConfig(format!(
+            "trailing bytes after the file list ({read} of {} consumed)",
+            bytes.len()
+        )));
+    }
+    Ok(entries)
+}
+
 pub fn get_file_entries_by_ref(
     repo_path: &Path,
     files_ref: &str,

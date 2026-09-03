@@ -203,3 +203,85 @@ fn an_error_is_announced_once() {
         "and main's own prefix is still applied exactly once: {first}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// fsck
+// ---------------------------------------------------------------------------
+
+/// A freshly initialised repository has nothing unreachable and nothing broken,
+/// so fsck must exit 0 — the code a script uses to decide there is no work.
+#[test]
+fn fsck_on_a_fresh_repo_is_clean_and_exits_zero() {
+    let tmp = TempDir::new().unwrap();
+    let (code, _, _) = run_gfs(tmp.path(), &["init", "."]);
+    assert_eq!(code, 0, "init should succeed");
+
+    let (code, stdout, stderr) = run_gfs(tmp.path(), &["fsck", "--json"]);
+    assert_stderr_empty(&stderr);
+    let v = assert_stdout_json(&stdout);
+
+    assert_eq!(code, 0, "a clean repository must exit 0, got {code}");
+    assert_eq!(v["exit_code"], 0);
+    assert_eq!(v["fsck"]["unreachable"].as_array().unwrap().len(), 0);
+    assert_eq!(v["fsck"]["dangling"].as_array().unwrap().len(), 0);
+    assert_eq!(v["fsck"]["unrecognised"].as_array().unwrap().len(), 0);
+}
+
+/// An entry the object store cannot identify is corruption, and corruption
+/// exits 2 so it is distinguishable from "there is garbage to collect" (1).
+#[test]
+fn fsck_reports_an_unidentifiable_object_and_exits_two() {
+    let tmp = TempDir::new().unwrap();
+    run_gfs(tmp.path(), &["init", "."]);
+
+    let shard = tmp.path().join(".gfs/objects/ab");
+    std::fs::create_dir_all(&shard).unwrap();
+    std::fs::write(shard.join("c".repeat(62)), b"\xff\xfe not an object").unwrap();
+
+    let (code, stdout, stderr) = run_gfs(tmp.path(), &["fsck", "--json"]);
+    assert_stderr_empty(&stderr);
+    let v = assert_stdout_json(&stdout);
+
+    assert_eq!(code, 2, "corruption must exit 2, got {code}");
+    assert_eq!(v["exit_code"], 2);
+    assert_eq!(v["fsck"]["unrecognised"].as_array().unwrap().len(), 1);
+}
+
+/// A plan is the prelude to a deletion, so it must not be produced for a
+/// repository that is already inconsistent.
+#[test]
+fn fsck_refuses_to_write_a_plan_for_an_inconsistent_repo() {
+    let tmp = TempDir::new().unwrap();
+    run_gfs(tmp.path(), &["init", "."]);
+
+    let shard = tmp.path().join(".gfs/objects/ab");
+    std::fs::create_dir_all(&shard).unwrap();
+    std::fs::write(shard.join("c".repeat(62)), b"\xff\xfe not an object").unwrap();
+
+    let (code, _, _) = run_gfs(tmp.path(), &["fsck", "--plan"]);
+    assert_ne!(code, 0, "refusal must not report success");
+    assert!(
+        !tmp.path().join(".gfs/gc").exists(),
+        "no plan directory should have been created"
+    );
+}
+
+/// On a clean repository the plan is written, and it is the only thing fsck
+/// ever creates.
+#[test]
+fn fsck_plan_writes_exactly_one_artefact() {
+    let tmp = TempDir::new().unwrap();
+    run_gfs(tmp.path(), &["init", "."]);
+
+    let (code, _, _) = run_gfs(tmp.path(), &["fsck", "--plan"]);
+    assert_eq!(code, 0);
+
+    let gc = tmp.path().join(".gfs/gc");
+    let runs: Vec<_> = std::fs::read_dir(&gc).unwrap().flatten().collect();
+    assert_eq!(runs.len(), 1, "expected one mark directory");
+    let plan = runs[0].path().join("plan.json");
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+    assert!(v.get("mark_id").is_some(), "plan must carry its mark id");
+    assert!(v.get("cutoff").is_some(), "plan must carry its cutoff");
+    assert!(v.get("report").is_some(), "plan must carry the marked set");
+}

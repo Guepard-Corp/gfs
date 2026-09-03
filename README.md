@@ -530,6 +530,26 @@ gfs status
 gfs status --output json
 ```
 
+### `gfs fsck`
+
+Check repository integrity. Walks from every branch and HEAD and reports what
+is not reachable, what is referenced but missing, and any entry in the object
+store it cannot identify. It removes nothing.
+
+```bash
+gfs fsck
+gfs fsck --json
+gfs fsck --plan          # also record the marked set under .gfs/gc/<id>/
+```
+
+Exit status is meaningful: `0` consistent, `1` unreachable objects found (a
+collector would have work to do), `2` corruption found. Reported sizes are what
+`du` would show for those trees, not space already free — on a copy-on-write
+filesystem a snapshot shares blocks with the tree it was cloned from.
+
+`--plan` is refused on an inconsistent repository, since a plan is the prelude
+to a deletion.
+
 ### `gfs commit`
 
 Commit the current database state.

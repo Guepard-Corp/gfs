@@ -563,6 +563,17 @@ enum TopLevel {
         path: Option<PathBuf>,
     },
 
+    /// Check repository integrity: report unreachable and dangling objects
+    Fsck {
+        /// Record the marked set under .gfs/gc/<id>/ for a later `gfs gc`
+        #[arg(long)]
+        plan: bool,
+
+        /// Path to the GFS repository root (default: current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+
     /// Export data from the running database instance to a file
     Export {
         /// Path to the GFS repository root (default: current directory)
@@ -783,6 +794,7 @@ fn command_name(cmd: &TopLevel) -> &'static str {
         TopLevel::Checkout { .. } => "checkout",
         TopLevel::Destroy { .. } => "destroy",
         TopLevel::Branch { .. } => "branch",
+        TopLevel::Fsck { .. } => "fsck",
         TopLevel::Export { .. } => "export",
         TopLevel::Import { .. } => "import",
         TopLevel::Providers { .. } => "providers",
@@ -1021,6 +1033,7 @@ where
                 .await?;
                 Ok(0)
             }
+            TopLevel::Fsck { plan, path } => commands::cmd_fsck::run(path, plan, json_output).await,
             TopLevel::Status { path, output } => {
                 let output = resolve_output_format(output, json_output);
                 let exit_code = commands::cmd_status::run(path, output).await?;

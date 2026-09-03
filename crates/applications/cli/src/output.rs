@@ -222,6 +222,22 @@ pub fn fmt_box_row_colored(
     )
 }
 
+/// Bytes for humans, binary units (matches `docker` / `pg_size_pretty` habits).
+pub fn fmt_bytes(b: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = b as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{b} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

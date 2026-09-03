@@ -8,8 +8,9 @@ This RFC specifies `gfs fsck` (read-only, ships first) and `gfs gc`
 (reclaims, ships behind it), and records why the safety design is what it is.
 
 Background research, with primary sources and eleven post-mortems from git,
-Dolt, lakeFS, Nessie, Iceberg and Delta Lake:
-`gfs-gc-design-research.md`.
+Dolt, lakeFS, Nessie, Iceberg and Delta Lake, is held outside this repository
+and is not required to follow the decisions below; every claim it supports is
+restated here with its source.
 
 ## The problem, measured
 
@@ -39,10 +40,12 @@ content, so two commits of byte-identical data produce two independent trees.
 GFS never dedups, which makes its garbage problem larger than that of the
 systems it is compared to below, not smaller.
 
-The only existing tool, `scripts/gfs-reclaim-orphan-snapshots.py`, is explicitly
-not reachability-based — its own docstring says *"Every commit is scanned, not
-just the ones reachable from a ref, so a snapshot belonging to a commit on a
-deleted branch is NOT reclaimed."* It covers the crash window and nothing else.
+There is no tool in this repository that reclaims any of it. A standalone
+reclaim script exists on an unmerged branch and is deliberately *not*
+reachability-based — its own docstring says *"Every commit is scanned, not just
+the ones reachable from a ref, so a snapshot belonging to a commit on a deleted
+branch is NOT reclaimed."* It covers only the crash window between taking a
+snapshot and writing its commit object.
 
 ## The hazard
 
