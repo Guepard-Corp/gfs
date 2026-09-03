@@ -755,10 +755,6 @@ instead of believed.
 # rounds, because each round runs for as long as the growing commit takes.
 scripts/sqlite-snapshot-torture.py <repo> ./target/debug/gfs 20
 
-# Try to make a concurrent commit and checkout lose a commit. Needs two
-# branches and a workspace big enough that the snapshot copy takes real time.
-scripts/gfs-commit-checkout-race.py <repo> ./target/debug/gfs 10
-
 # List snapshot trees no commit refers to, and optionally delete them.
 scripts/gfs-reclaim-orphan-snapshots.py <repo> [--delete]
 ```
