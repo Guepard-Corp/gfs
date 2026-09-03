@@ -550,6 +550,14 @@ enum TopLevel {
         #[arg(short = 'c', long)]
         checkout: bool,
 
+        /// List deleted branches that can still be restored
+        #[arg(long)]
+        deleted: bool,
+
+        /// Restore a deleted branch by name
+        #[arg(long, value_name = "NAME")]
+        restore: Option<String>,
+
         /// Path to the GFS repository root (default: current directory)
         #[arg(long)]
         path: Option<PathBuf>,
@@ -951,10 +959,21 @@ where
                 start_point,
                 delete,
                 checkout,
+                deleted,
+                restore,
                 path,
             } => {
-                commands::cmd_branch::run(path, name, start_point, delete, checkout, json_output)
-                    .await?;
+                commands::cmd_branch::run(
+                    path,
+                    name,
+                    start_point,
+                    delete,
+                    checkout,
+                    deleted,
+                    restore,
+                    json_output,
+                )
+                .await?;
                 Ok(0)
             }
             TopLevel::Export {

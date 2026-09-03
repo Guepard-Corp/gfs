@@ -9,6 +9,11 @@ pub const HEAD_FILE: &str = "HEAD";
 pub const WORKSPACE_FILE: &str = "WORKSPACE";
 pub const REFS_DIR: &str = "refs";
 pub const HEADS_DIR: &str = "heads";
+/// Holds branch refs that `gfs branch -d` moved aside instead of unlinking, so a
+/// deleted branch can be restored by name. Entries live at
+/// `refs/deleted/<unix_millis>/<branch path>`; see `repo_layout::soft_delete_branch_ref`
+/// for why the timestamp is the outer segment.
+pub const DELETED_REFS_DIR: &str = "deleted";
 pub const MAIN_BRANCH: &str = "main";
 pub const CONFIG_FILE: &str = "config.toml";
 pub const OBJECTS_DIR: &str = "objects";

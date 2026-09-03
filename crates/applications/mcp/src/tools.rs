@@ -1935,6 +1935,7 @@ mod tests {
             }),
             storage: None,
             compute: None,
+            deleted_branch_retention_days: None,
         }
         .save(&repo)
         .expect("save .gfs config");
