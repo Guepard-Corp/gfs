@@ -1,5 +1,5 @@
 /*
- * gfs — PoC Table Access Method for the GFS lazy clone (RFC 008).
+ * gfs — PoC Table Access Method for the GFS lazy clone.
  *
  * A custom routine over heap storage: a real relkind='r' table, full CRUD, plus
  * transparent COPY-ON-READ. The table behaves like an ordinary table, but rows

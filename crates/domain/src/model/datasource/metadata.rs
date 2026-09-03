@@ -1,4 +1,4 @@
-//! Top-level datasource metadata. Mirrors `@domain/entities/datasource-meta` DatasourceMetadata (Zod).
+//! Top-level datasource metadata. Mirrors the datasource metadata schema.
 
 use serde::{Deserialize, Serialize};
 

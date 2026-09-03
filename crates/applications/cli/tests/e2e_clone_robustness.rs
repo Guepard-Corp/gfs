@@ -1,4 +1,4 @@
-//! End-to-end regression tests for `gfs clone` (RFC 008) on the current
+//! End-to-end regression tests for `gfs clone` on the current
 //! **planner-hook** model (the former overlay/TAM is gone). Each test starts a
 //! throwaway remote Postgres, runs the real `gfs clone` binary onto the
 //! `gfs-postgres:16` image (which ships the `gfs` extension), and asserts the

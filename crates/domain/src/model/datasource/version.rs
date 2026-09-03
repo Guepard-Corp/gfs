@@ -1,5 +1,5 @@
 //! Datasource version info.
-//! Mirrors `@domain/entities/datasource-meta` DatasourceVersion (Zod).
+//! Mirrors the datasource metadata schema.
 
 use serde::{Deserialize, Serialize};
 

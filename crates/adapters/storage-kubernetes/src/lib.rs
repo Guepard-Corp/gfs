@@ -58,7 +58,7 @@ fn now_suffix() -> String {
 ///
 /// OpenEBS ZFS LocalPV provisions each PV as a dataset named `<pool>/<pv-name>`
 /// on the **local** node, so usage is read by shelling `zfs` on the host this
-/// adapter runs on. This assumes the single-node topology where the data-plane
+/// adapter runs on. This assumes the single-node topology where the engine
 /// daemon is co-located with the ZFS pool (it is); on any other layout the
 /// dataset won't resolve and the caller falls back to `0` rather than erroring.
 /// `size_bytes` is `used + available` (the effective per-volume capacity under

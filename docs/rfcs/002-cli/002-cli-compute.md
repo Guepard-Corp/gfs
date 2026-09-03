@@ -1,8 +1,8 @@
-# RFC 006 — Data-plane compute (CLI)
+# RFC 002: Compute (CLI)
 
 ## Overview
 
-The data-plane **compute** subcommands manage the lifecycle and inspection of a GFS database compute instance (e.g. a Docker container running PostgreSQL). They are invoked via `gfs compute [--path <dir>] <action> [--id <instance>]` and delegate to the **Compute** port; the CLI adapter uses the Docker compute implementation. The instance is identified by `--id` when given; otherwise it is resolved from the repository at `--path` (or the current directory) as `runtime.container_name` in `.gfs/config.toml`.
+The **compute** subcommands manage the lifecycle and inspection of a GFS database compute instance (e.g. a Docker container running PostgreSQL). They are invoked via `gfs compute [--path <dir>] <action> [--id <instance>]` and delegate to the **Compute** port; the CLI adapter uses the Docker compute implementation. The instance is identified by `--id` when given; otherwise it is resolved from the repository at `--path` (or the current directory) as `runtime.container_name` in `.gfs/config.toml`.
 
 This RFC defines the **command interface**, **behaviour**, and **output** of `gfs compute`.
 
@@ -188,5 +188,5 @@ Exit code on error: non-zero (e.g. `1`).
 
 - **`start --wait`** — Waiting until the instance reaches `Running` is supported by the Compute port's `StartOptions` but not yet exposed in the CLI.
 - **Provision** — Creating a new instance from a `ComputeDefinition` remains part of init (or a dedicated flow); not a `gfs compute` subcommand here.
-- **Connection string** — For a human-readable connection string and repo-level status, use `gfs status` (see RFC 006 status).
+- **Connection string** — For a human-readable connection string and repo-level status, use `gfs status` (see RFC 002 status).
 - **Prepare for snapshot** — Used internally by `gfs commit`; not exposed as a standalone compute command.

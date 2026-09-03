@@ -1,5 +1,5 @@
 //! Table metadata for datasources.
-//! Mirrors `@domain/entities/datasource-meta` Table, TablePrimaryKey, TableRelationship (Zod).
+//! Mirrors the datasource metadata schema.
 
 use serde::{Deserialize, Serialize};
 

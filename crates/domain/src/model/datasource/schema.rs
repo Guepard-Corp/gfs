@@ -1,5 +1,5 @@
 //! Schema (namespace) metadata for datasources.
-//! Mirrors `@domain/entities/datasource-meta` Schema (Zod).
+//! Mirrors the datasource metadata schema.
 
 use serde::{Deserialize, Serialize};
 

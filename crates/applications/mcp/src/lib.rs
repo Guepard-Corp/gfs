@@ -1,4 +1,4 @@
-//! MCP server for GFS / data-plane (RFC 008).
+//! MCP server for GFS.
 //!
 //! Exposes tools: list_providers, status, commit, log, checkout, init, compute.
 //! Each tool delegates to domain use cases; the MCP layer is a thin adapter.

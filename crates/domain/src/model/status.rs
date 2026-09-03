@@ -1,4 +1,4 @@
-//! Status response DTO for the data-plane status use case (RFC 006).
+//! Status response DTO for the status use case.
 //!
 //! Read-only aggregate of repository, config, and compute runtime data.
 

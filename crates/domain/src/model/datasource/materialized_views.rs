@@ -1,4 +1,4 @@
-//! Materialized view metadata. Mirrors `@domain/entities/datasource-meta` MaterializedView (Zod).
+//! Materialized view metadata. Mirrors the datasource metadata schema.
 
 use serde::{Deserialize, Serialize};
 

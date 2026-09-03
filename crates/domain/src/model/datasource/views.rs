@@ -1,4 +1,4 @@
-//! View metadata. Mirrors `@domain/entities/datasource-meta` View (Zod).
+//! View metadata. Mirrors the datasource metadata schema.
 
 use serde::{Deserialize, Serialize};
 

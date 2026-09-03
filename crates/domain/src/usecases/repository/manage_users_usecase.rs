@@ -12,8 +12,8 @@ use thiserror::Error;
 
 use crate::model::config::GfsConfig;
 use crate::model::db_user::{
-    DeployEnvSpec, GrantSpec, GrantableObject, ObjectPrivilege, Privilege, RevokeSpec, RoleInfo,
-    RolePreset, RoleSpec,
+    DeployEnvSpec, GrantSpec, GrantableObject, ObjectPrivilege, PRESET_GROUP_ROLES, Privilege,
+    RevokeSpec, RoleInfo, RolePreset, RoleSpec,
 };
 use crate::ports::compute::{Compute, ExecOutput, InstanceId};
 use crate::ports::database_provider::{DatabaseProvider, DatabaseProviderRegistry};
@@ -126,15 +126,110 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
         let command = provider
             .alter_password_command(username, password)
             .map_err(map_provider_err)?;
+        expect_success(self.run(&container, &command).await?)?;
+        // Immediate revocation: kill any session still authenticated with the OLD
+        // password so a rotation takes effect at once, not only when that session
+        // disconnects. Best-effort — a terminate failure must not fail the rotation,
+        // which has already changed the credential. (On the checkout re-key path the
+        // pod is fresh, so this is a no-op.)
+        if let Err(e) = self.terminate_user_sessions(path, username).await {
+            tracing::warn!(
+                user = %username,
+                error = %e,
+                "set-password: could not terminate live sessions after rotation"
+            );
+        }
+        Ok(())
+    }
+
+    /// Reset the deploy `owner`'s password as a **platform** operation (clone
+    /// fresh-reset): a clone inherits the parent's `owner` from the seeded
+    /// snapshot, so the platform rotates it to a fresh, child-owned credential.
+    /// Unlike [`Self::set_password`], this permits the reserved `owner` role (the
+    /// caller is the platform, not a customer) but still refuses the management
+    /// superuser. Not exposed on any customer-facing route.
+    pub async fn reset_deploy_owner_password(
+        &self,
+        path: &Path,
+        owner: &str,
+        password: &str,
+    ) -> Result<(), ManageUsersError> {
+        require_password(password)?;
+        reject_superuser_role(owner)?;
+        let (provider, container) = self.resolve(path)?;
+        let command = provider
+            .alter_password_command(owner, password)
+            .map_err(map_provider_err)?;
         expect_success(self.run(&container, &command).await?)
     }
 
     /// Drop a role.
-    pub async fn drop_role(&self, path: &Path, username: &str) -> Result<(), ManageUsersError> {
+    /// Disable `username`'s ability to open NEW sessions (`ALTER ROLE … NOLOGIN`),
+    /// committed immediately. Used before a drop to close the reconnect window while
+    /// the role's live backends are terminated. Refuses reserved roles.
+    ///
+    /// # Errors
+    /// Propagates a provider or exec failure.
+    pub async fn disable_login(&self, path: &Path, username: &str) -> Result<(), ManageUsersError> {
         reject_reserved_role(username)?;
         let (provider, container) = self.resolve(path)?;
         let command = provider
-            .drop_role_command(username)
+            .disable_login_command(username)
+            .map_err(map_provider_err)?;
+        expect_success(self.run(&container, &command).await?)
+    }
+
+    pub async fn drop_role(&self, path: &Path, username: &str) -> Result<(), ManageUsersError> {
+        reject_reserved_role(username)?;
+        // Immediate revocation with no reconnect window: first disable login
+        // (committed, so no NEW session can authenticate), then terminate the live
+        // backends, then drop. Without the disable-login step a client with the
+        // still-valid credential could reconnect during the terminate→drop gap and
+        // survive the drop as an orphan. Both pre-steps are best-effort — a failure
+        // must not block the removal, which is the actual guarantee.
+        if let Err(e) = self.disable_login(path, username).await {
+            tracing::warn!(
+                user = %username,
+                error = %e,
+                "drop: could not disable login before terminate; a brief reconnect window remains"
+            );
+        }
+        if let Err(e) = self.terminate_user_sessions(path, username).await {
+            tracing::warn!(
+                user = %username,
+                error = %e,
+                "drop: could not terminate live sessions before drop; proceeding with the drop"
+            );
+        }
+        let (provider, container) = self.resolve(path)?;
+        // Reassign the role's objects to the deploy `owner` (the customer's own
+        // role) rather than the management superuser running this exec, so a
+        // dropped user's tables don't silently move to an unusable platform role.
+        // Falls back to CURRENT_USER when the owner can't be resolved.
+        let reassign_owner = self.detect_deploy_owner(path).await;
+        let command = provider
+            .drop_role_command(username, reassign_owner.as_deref())
+            .map_err(map_provider_err)?;
+        expect_success(self.run(&container, &command).await?)
+    }
+
+    /// Neutralize a role we intend to remove but cannot [`Self::drop_role`] (it
+    /// owns objects in the restored older data version): disable login and
+    /// overwrite its password with a fresh unknowable one. Degrades access to
+    /// *disabled* without mutating customer data — the fail-closed guarantee that
+    /// does not depend on DROP. The caller supplies `new_password`; it is meant to
+    /// be thrown away (never surfaced, never vaulted — its unknowability is the
+    /// point), so callers pass a fresh random value.
+    pub async fn quarantine_role(
+        &self,
+        path: &Path,
+        username: &str,
+        new_password: &str,
+    ) -> Result<(), ManageUsersError> {
+        reject_reserved_role(username)?;
+        let (provider, container) = self.resolve(path)?;
+        let command = provider
+            .quarantine_role_command(username, new_password)
             .map_err(map_provider_err)?;
         expect_success(self.run(&container, &command).await?)
     }
@@ -159,7 +254,7 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
         expect_success(self.run(&container, &command).await?)
     }
 
-    /// Bootstrap a database's deploy environment (RFC 009): create the `NOLOGIN`
+    /// Bootstrap a database's deploy environment: create the `NOLOGIN`
     /// group + the least-privileged `owner` login + grants + role-scoped default
     /// privileges, in one transaction, as the management superuser via the exec
     /// seam. Idempotency is the caller's concern (run on fresh deploy only).
@@ -188,18 +283,87 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
             .map_err(|e| ManageUsersError::Parse(e.to_string()))
     }
 
-    /// Detect the deploy's object-creating `owner` role (RFC 009 §5.1) so a
+    /// Read `username`'s stored password verifier (`pg_authid.rolpassword`), or
+    /// `None` when the role is absent or carries no password. The verifier is a
+    /// one-way value: it is what the durability store keeps at rest instead of the
+    /// plaintext, and re-key compares it by value to detect credential drift.
+    ///
+    /// # Errors
+    /// Propagates a provider or exec failure.
+    pub async fn user_verifier(
+        &self,
+        path: &Path,
+        username: &str,
+    ) -> Result<Option<String>, ManageUsersError> {
+        let (provider, container) = self.resolve(path)?;
+        let command = provider
+            .user_verifier_command(username)
+            .map_err(map_provider_err)?;
+        let output = self.run(&container, &command).await?;
+        if output.exit_code != 0 {
+            return Err(fail(output));
+        }
+        let verifier = output.stdout.trim();
+        Ok((!verifier.is_empty()).then(|| verifier.to_string()))
+    }
+
+    /// Terminate every live backend for `username` except the management session,
+    /// returning the number terminated. Makes a drop or password rotation take
+    /// effect on open connections immediately. Refuses reserved roles — the
+    /// platform never kills its own management / bootstrap sessions.
+    ///
+    /// # Errors
+    /// Propagates a provider or exec failure; a parse error on a non-numeric count.
+    pub async fn terminate_user_sessions(
+        &self,
+        path: &Path,
+        username: &str,
+    ) -> Result<u64, ManageUsersError> {
+        reject_reserved_role(username)?;
+        let (provider, container) = self.resolve(path)?;
+        let command = provider
+            .terminate_user_sessions_command(username)
+            .map_err(map_provider_err)?;
+        let output = self.run(&container, &command).await?;
+        if output.exit_code != 0 {
+            return Err(fail(output));
+        }
+        output
+            .stdout
+            .trim()
+            .parse::<u64>()
+            .map_err(|e| ManageUsersError::Parse(e.to_string()))
+    }
+
+    /// Detect the deploy's object-creating `owner` role so a
     /// preset's `ALTER DEFAULT PRIVILEGES` covers the customer's future tables,
     /// not the connecting admin's. The CLI/MCP don't know the deploy owner: if the
     /// conventional `owner` role exists, scope preset defaults to it; otherwise
     /// `None` (single-node — defaults stay connecting-role-scoped).
     pub async fn detect_deploy_owner(&self, path: &Path) -> Option<String> {
+        self.detect_deploy_owner_checked(path).await.ok().flatten()
+    }
+
+    /// Like [`Self::detect_deploy_owner`] but distinguishes a detection *failure*
+    /// (listing roles errored) from a database that genuinely has no `owner` role.
+    /// The clone fresh-reset needs this: a detection error must fail **closed** —
+    /// never silently skip rotating the inherited `owner` password,
+    /// which would leave the parent's credential live on the child. A legitimate
+    /// absence (`Ok(None)`, a legacy parent) safely takes the
+    /// parent-credential path.
+    ///
+    /// # Errors
+    /// Propagates a `list_roles` failure (exec/parse/non-zero exit).
+    pub async fn detect_deploy_owner_checked(
+        &self,
+        path: &Path,
+    ) -> Result<Option<String>, ManageUsersError> {
         const DEPLOY_OWNER_ROLE: &str = "owner";
-        let roles = self.list_roles(path).await.ok()?;
-        roles
+        let roles = self.list_roles(path).await?;
+        Ok(roles
             .iter()
             .any(|r| r.username == DEPLOY_OWNER_ROLE)
-            .then(|| DEPLOY_OWNER_ROLE.to_string())
+            .then(|| DEPLOY_OWNER_ROLE.to_string()))
     }
 
     /// Grant object-level privileges on `spec.object` to `spec.role`.
@@ -294,21 +458,49 @@ fn require_password(password: &str) -> Result<(), ManageUsersError> {
     }
 }
 
-/// The platform's load-bearing roles (RFC 009), never client roles: the engine
-/// connection superuser `postgres`, the bootstrap super `guepard-admin`, the
+/// The platform's load-bearing roles, never client roles: the engine
+/// connection superuser `postgres`, the bootstrap super `gfs_super`, the
 /// customer's least-privileged login `owner`, and the `developers` group. Client
 /// user management (`gfs user`) refuses to mutate any of them — dropping the
 /// connection superuser makes `DROP OWNED BY` wedge the session; dropping `owner`
 /// destroys the customer's primary login; rotating a password or privileges
 /// out-of-band desyncs the deploy's stored credential/connection string. Fail
 /// fast with a clear message instead.
-const RESERVED_ROLES: [&str; 4] = ["guepard-admin", "postgres", "owner", "developers"];
+const RESERVED_ROLES: [&str; 4] = ["gfs_super", "postgres", "owner", "developers"];
+
+/// The management superusers, whose passwords the platform never rotates through
+/// any user-facing or fresh-reset path — they live in `credentials.toml`, not the
+/// revealable vault.
+const SUPERUSER_ROLES: [&str; 2] = ["gfs_super", "postgres"];
+
+/// Refuse the management superuser (a subset of [`reject_reserved_role`]) while
+/// permitting the platform-provisioned `owner`/`developers`. Used by the
+/// platform-only owner-password reset (clone fresh-reset).
+fn reject_superuser_role(username: &str) -> Result<(), ManageUsersError> {
+    if SUPERUSER_ROLES.contains(&username.to_ascii_lowercase().as_str()) {
+        Err(ManageUsersError::InvalidInput(format!(
+            "'{username}' is a management superuser and cannot be rotated"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether `username` is a reserved platform role (`owner`/`developers` + the
+/// management superusers + the preset group roles). Public so the reconcile
+/// re-key can skip them — a reserved role must not be re-keyed as a normal
+/// managed user. The preset group roles (`gfs_readonly`/`gfs_readwrite`/
+/// `gfs_admin`) carry the platform-managed privilege level; a client must never
+/// create, drop, or rotate one. Case-insensitive: a look-alike like `POSTGRES`
+/// is a *distinct* Postgres role, but treating every case variant as reserved
+/// avoids confusion with the real one.
+pub fn is_reserved_role(username: &str) -> bool {
+    let lower = username.to_ascii_lowercase();
+    RESERVED_ROLES.contains(&lower.as_str()) || PRESET_GROUP_ROLES.contains(&lower.as_str())
+}
 
 fn reject_reserved_role(username: &str) -> Result<(), ManageUsersError> {
-    // Case-insensitive: a look-alike like `POSTGRES` is a *distinct* Postgres role
-    // (quoted identifiers are case-sensitive), but creating one invites confusion
-    // with the real reserved role, so refuse every case variant too.
-    if RESERVED_ROLES.contains(&username.to_ascii_lowercase().as_str()) {
+    if is_reserved_role(username) {
         Err(ManageUsersError::InvalidInput(format!(
             "'{username}' is a reserved platform role and cannot be modified via user management"
         )))
@@ -338,14 +530,32 @@ mod tests {
     fn reserved_roles_cannot_be_dropped() {
         use super::reject_reserved_role;
         assert!(reject_reserved_role("postgres").is_err());
-        assert!(reject_reserved_role("guepard-admin").is_err());
+        assert!(reject_reserved_role("gfs_super").is_err());
         // The customer's load-bearing deploy roles are protected too (F-04).
         assert!(reject_reserved_role("owner").is_err());
         assert!(reject_reserved_role("developers").is_err());
         // Case variants of a reserved name are refused (no confusing look-alikes).
         assert!(reject_reserved_role("POSTGRES").is_err());
         assert!(reject_reserved_role("Owner").is_err());
+        // The preset group roles carry the platform-managed level — a client must
+        // never create, drop, or rotate one (any case variant).
+        assert!(reject_reserved_role("gfs_readonly").is_err());
+        assert!(reject_reserved_role("gfs_readwrite").is_err());
+        assert!(reject_reserved_role("gfs_admin").is_err());
+        assert!(reject_reserved_role("GFS_Admin").is_err());
         assert!(reject_reserved_role("app_rw").is_ok());
+    }
+
+    #[test]
+    fn superuser_guard_permits_owner_but_refuses_the_management_super() {
+        use super::reject_superuser_role;
+        // The platform owner-reset (clone fresh-reset) rotates `owner` — allowed.
+        assert!(reject_superuser_role("owner").is_ok());
+        assert!(reject_superuser_role("developers").is_ok());
+        // ...but never the management superuser, in any case.
+        assert!(reject_superuser_role("gfs_super").is_err());
+        assert!(reject_superuser_role("postgres").is_err());
+        assert!(reject_superuser_role("POSTGRES").is_err());
     }
     use tempfile::TempDir;
 
@@ -563,9 +773,16 @@ mod tests {
             self.guard()?;
             Ok(format!("MOCK-ALTER:{username}"))
         }
-        fn drop_role_command(&self, username: &str) -> std::result::Result<String, ProviderError> {
+        fn drop_role_command(
+            &self,
+            username: &str,
+            reassign_owned_to: Option<&str>,
+        ) -> std::result::Result<String, ProviderError> {
             self.guard()?;
-            Ok(format!("MOCK-DROP:{username}"))
+            Ok(format!(
+                "MOCK-DROP:{username}:reassign={}",
+                reassign_owned_to.unwrap_or("CURRENT_USER")
+            ))
         }
         fn list_roles_command(&self) -> std::result::Result<String, ProviderError> {
             self.guard()?;
@@ -719,6 +936,56 @@ mod tests {
         assert_eq!(roles.len(), 1);
         assert_eq!(roles[0].username, "alice");
         assert!(roles[0].can_login && !roles[0].is_superuser);
+    }
+
+    #[tokio::test]
+    async fn detect_deploy_owner_checked_distinguishes_absence_from_failure() {
+        // Present -> Ok(Some("owner")).
+        let (_t1, repo1) = repo_with_config("pg-c1");
+        let uc1 = use_case(
+            MockCompute {
+                stdout: r#"[{"username":"owner","can_login":true,"is_superuser":false}]"#.into(),
+                ..Default::default()
+            },
+            true,
+        )
+        .0;
+        assert_eq!(
+            uc1.detect_deploy_owner_checked(&repo1).await.unwrap(),
+            Some("owner".to_string())
+        );
+
+        // Genuinely absent -> Ok(None): a legacy parent, safe to skip the reset.
+        let (_t2, repo2) = repo_with_config("pg-c1");
+        let uc2 = use_case(
+            MockCompute {
+                stdout: r#"[{"username":"alice","can_login":true,"is_superuser":false}]"#.into(),
+                ..Default::default()
+            },
+            true,
+        )
+        .0;
+        assert_eq!(uc2.detect_deploy_owner_checked(&repo2).await.unwrap(), None);
+
+        // Detection FAILURE -> Err (F1): a listing error must propagate, never be
+        // swallowed to Ok(None) — that would make the clone fresh-reset silently
+        // skip and leave the parent's owner password live on the child.
+        let (_t3, repo3) = repo_with_config("pg-c1");
+        let uc3 = use_case(
+            MockCompute {
+                exit_code: 1,
+                stderr: "list roles boom".into(),
+                ..Default::default()
+            },
+            true,
+        )
+        .0;
+        assert!(
+            uc3.detect_deploy_owner_checked(&repo3).await.is_err(),
+            "a listing error must propagate, not become Ok(None)"
+        );
+        // The lenient variant still degrades to None for its preset-scoping callers.
+        assert_eq!(uc3.detect_deploy_owner(&repo3).await, None);
     }
 
     #[tokio::test]

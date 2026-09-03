@@ -1,8 +1,8 @@
-# RFC 006 — Data-plane commit (CLI)
+# RFC 002: Commit (CLI)
 
 ## Overview
 
-The data-plane **commit** records a point-in-time snapshot of a GFS repository and its associated database container. It is invoked via `gfs commit -m <message>` and follows the same hexagonal architecture as the rest of the data-plane: a use case in the domain orchestrates the Repository, Compute, and Storage ports; adapters (GFS repository, Docker compute, APFS storage) satisfy those ports.
+The **commit** records a point-in-time snapshot of a GFS repository and its associated database container. It is invoked via `gfs commit -m <message>` and follows the same hexagonal architecture as the rest of GFS: a use case in the domain orchestrates the Repository, Compute, and Storage ports; adapters (GFS repository, Docker compute, APFS storage) satisfy those ports.
 
 This RFC defines the **command interface**, **behaviour**, and **output** of `gfs commit`.
 

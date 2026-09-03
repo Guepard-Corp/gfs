@@ -1,4 +1,4 @@
-//! `gfs status` — show repository and compute status (RFC 006).
+//! `gfs status` — show repository and compute status.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

@@ -1,4 +1,4 @@
-//! `gfs` – Guepard data-plane CLI binary.
+//! `gfs` – GFS command-line interface binary.
 //!
 //! Thin wrapper around the library. See `gfs_cli::run()` for programmatic use.
 

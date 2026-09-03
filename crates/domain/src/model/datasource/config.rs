@@ -1,4 +1,4 @@
-//! Config/settings metadata (e.g. Postgres pg_settings). Mirrors `@domain/entities/datasource-meta` Config (Zod).
+//! Config/settings metadata (e.g. Postgres pg_settings). Mirrors the datasource metadata schema.
 
 use serde::{Deserialize, Serialize};
 

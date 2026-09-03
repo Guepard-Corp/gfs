@@ -1,4 +1,4 @@
-//! End-to-end test for `gfs clone` (RFC 008 lazy clone) against a real remote Postgres.
+//! End-to-end test for `gfs clone` (lazy clone) against a real remote Postgres.
 //!
 //! Flow:
 //!   1. Start a throwaway "remote" Postgres (published port) and seed it read-only.

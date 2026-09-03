@@ -1,4 +1,4 @@
-//! gfs-mcp — MCP server for GFS / data-plane (RFC 008).
+//! gfs-mcp — MCP server for GFS.
 //!
 //! **Transport:** stdio (default) or SSE over HTTP.
 //!

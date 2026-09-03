@@ -1,8 +1,8 @@
-# RFC 006 — Data-plane import (CLI)
+# RFC 002: Import (CLI)
 
 ## Overview
 
-The data-plane **import** imports data from a file into the running database instance associated with a GFS repository. It is invoked via `gfs import --file <path> [--format <fmt>]` and follows the same hexagonal architecture as the rest of the data-plane: a use case in the domain orchestrates the Compute and DatabaseProvider ports; adapters (Docker compute, GFS repository) satisfy those ports. The import runs an ephemeral sidecar container linked to the database instance, which executes the provider-specific import command (e.g. `psql -f` for SQL, `pg_restore` for custom, or `\copy` for CSV in PostgreSQL).
+The **import** imports data from a file into the running database instance associated with a GFS repository. It is invoked via `gfs import --file <path> [--format <fmt>]` and follows the same hexagonal architecture as the rest of GFS: a use case in the domain orchestrates the Compute and DatabaseProvider ports; adapters (Docker compute, GFS repository) satisfy those ports. The import runs an ephemeral sidecar container linked to the database instance, which executes the provider-specific import command (e.g. `psql -f` for SQL, `pg_restore` for custom, or `\copy` for CSV in PostgreSQL).
 
 This RFC defines the **command interface**, **behaviour**, and **output** of `gfs import`.
 

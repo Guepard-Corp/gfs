@@ -1,4 +1,4 @@
-//! Trigger metadata. Mirrors `@domain/entities/datasource-meta` Trigger (Zod).
+//! Trigger metadata. Mirrors the datasource metadata schema.
 
 use serde::{Deserialize, Serialize};
 

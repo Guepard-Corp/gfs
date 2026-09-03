@@ -6,7 +6,7 @@ authors.workspace   = true
 license.workspace   = true
 repository.workspace = true
 rust-version.workspace = true
-description        = "MCP server exposing GFS/data-plane tools (list_providers, status, commit, log, checkout, init, compute)"
+description        = "MCP server exposing GFS tools (list_providers, status, commit, log, checkout, init, compute)"
 
 [[bin]]
 name = "gfs-mcp"

@@ -1,4 +1,4 @@
-//! Foreign table metadata. Mirrors `@domain/entities/datasource-meta` ForeignTable (Zod).
+//! Foreign table metadata. Mirrors the datasource metadata schema.
 
 use serde::{Deserialize, Serialize};
 
