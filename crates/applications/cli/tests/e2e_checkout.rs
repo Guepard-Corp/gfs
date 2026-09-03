@@ -173,3 +173,164 @@ fn checkout_zero_fails() {
         "stderr should mention no commits or 0; got: {stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Workspace identity: a checkout must give you what you asked for, and must
+// not silently destroy work to do it.
+// ---------------------------------------------------------------------------
+
+/// Sorted `name=content` for every file in the active workspace.
+fn workspace_contents(repo_path: &Path) -> String {
+    let dir = read_workspace_path(repo_path);
+    let mut out: Vec<String> = fs::read_dir(&dir)
+        .expect("read workspace")
+        .flatten()
+        .filter(|e| e.path().is_file())
+        .map(|e| {
+            format!(
+                "{}={}",
+                e.file_name().to_string_lossy(),
+                fs::read_to_string(e.path()).unwrap_or_default().trim()
+            )
+        })
+        .collect();
+    out.sort();
+    out.join(" ")
+}
+
+/// Uncommitted work is neither carried across a checkout nor thrown away.
+///
+/// Carrying it made `checkout <branch>` non-deterministic and left state no GFS
+/// command displays. Discarding it is unrecoverable. So checkout refuses,
+/// naming what is in the way, and `--force` is the way to say you meant it.
+#[test]
+fn checkout_refuses_to_overwrite_uncommitted_work_unless_forced() {
+    let tmp = tempdir().expect("create temp dir");
+    let repo_path = tmp.path();
+    assert!(cli_runner::gfs_init(repo_path), "gfs init should succeed");
+
+    let data_dir = workspace_data_dir_main_0(repo_path);
+    fs::write(data_dir.join("seed.txt"), "committed").unwrap();
+    let (ok, _, stderr) = cli_runner::gfs_commit(repo_path, "c1", None, None);
+    assert!(ok, "commit should succeed; stderr: {stderr}");
+
+    // A clean workspace is not in the way.
+    let (ok, _, stderr) = cli_runner::run_gfs([
+        "gfs",
+        "checkout",
+        "--path",
+        repo_path.to_str().unwrap(),
+        "main",
+    ]);
+    assert!(ok, "a clean checkout must not be refused; stderr: {stderr}");
+
+    fs::write(read_workspace_path(repo_path).join("scratch.txt"), "wip").unwrap();
+
+    let (ok, _, stderr) = cli_runner::run_gfs([
+        "gfs",
+        "checkout",
+        "--path",
+        repo_path.to_str().unwrap(),
+        "main",
+    ]);
+    assert!(!ok, "uncommitted work must stop the checkout");
+    assert!(
+        stderr.contains("uncommitted changes") && stderr.contains("scratch.txt"),
+        "the refusal should name what is in the way: {stderr}"
+    );
+    assert!(
+        read_workspace_path(repo_path).join("scratch.txt").exists(),
+        "a refused checkout must change nothing"
+    );
+
+    let (ok, _, stderr) = cli_runner::run_gfs([
+        "gfs",
+        "checkout",
+        "--path",
+        repo_path.to_str().unwrap(),
+        "main",
+        "--force",
+    ]);
+    assert!(ok, "--force should go through; stderr: {stderr}");
+    assert_eq!(
+        workspace_contents(repo_path),
+        "seed.txt=committed",
+        "forced checkout restores the commit exactly"
+    );
+}
+
+/// A branch's working copy must not outlive the branch.
+///
+/// The workspace is keyed by branch NAME, so a later branch reusing the name
+/// inherited the dead branch's working copy and `checkout` reported success
+/// while handing over content that branch never contained.
+#[test]
+fn a_recreated_branch_does_not_inherit_the_deleted_one() {
+    let tmp = tempdir().expect("create temp dir");
+    let repo_path = tmp.path();
+    assert!(cli_runner::gfs_init(repo_path), "gfs init should succeed");
+
+    let data_dir = workspace_data_dir_main_0(repo_path);
+    fs::write(data_dir.join("seed.txt"), "v1").unwrap();
+    assert!(cli_runner::gfs_commit(repo_path, "c1", None, None).0);
+    fs::write(data_dir.join("seed.txt"), "v2").unwrap();
+    assert!(cli_runner::gfs_commit(repo_path, "c2", None, None).0);
+    let tip = read_ref(repo_path, "main");
+
+    let repo = repo_path.to_str().unwrap();
+    assert!(cli_runner::run_gfs(["gfs", "checkout", "--path", repo, "-b", "b1"]).0);
+    fs::write(read_workspace_path(repo_path).join("only-on-b1.txt"), "x").unwrap();
+    assert!(cli_runner::gfs_commit(repo_path, "b1 work", None, None).0);
+    fs::write(
+        read_workspace_path(repo_path).join("never-committed.txt"),
+        "y",
+    )
+    .unwrap();
+
+    assert!(cli_runner::run_gfs(["gfs", "checkout", "--path", repo, "main", "--force"]).0);
+    assert!(cli_runner::run_gfs(["gfs", "branch", "--path", repo, "-d", "b1"]).0);
+    assert!(
+        !repo_path.join(".gfs/workspaces/b1").exists(),
+        "the workspace must go with the branch"
+    );
+
+    assert!(cli_runner::run_gfs(["gfs", "branch", "--path", repo, "b1", &tip]).0);
+    assert!(cli_runner::run_gfs(["gfs", "checkout", "--path", repo, "b1"]).0);
+    assert_eq!(
+        workspace_contents(repo_path),
+        "seed.txt=v2",
+        "the new b1 holds its own commit, not the deleted branch's working copy"
+    );
+}
+
+/// A commit hash names exactly one content state.
+///
+/// The detached workspace is named by the hash, and was reused as-is, so
+/// mutating one and returning to it gave you something other than what
+/// `Switched to <hash>` says you got.
+#[test]
+fn returning_to_a_detached_commit_gives_that_commit() {
+    let tmp = tempdir().expect("create temp dir");
+    let repo_path = tmp.path();
+    assert!(cli_runner::gfs_init(repo_path), "gfs init should succeed");
+
+    let data_dir = workspace_data_dir_main_0(repo_path);
+    fs::write(data_dir.join("seed.txt"), "v1").unwrap();
+    assert!(cli_runner::gfs_commit(repo_path, "c1", None, None).0);
+    let first = read_ref(repo_path, "main");
+    fs::write(data_dir.join("seed.txt"), "v2").unwrap();
+    assert!(cli_runner::gfs_commit(repo_path, "c2", None, None).0);
+
+    let repo = repo_path.to_str().unwrap();
+    assert!(cli_runner::run_gfs(["gfs", "checkout", "--path", repo, &first]).0);
+    assert_eq!(workspace_contents(repo_path), "seed.txt=v1");
+
+    fs::write(read_workspace_path(repo_path).join("poison.txt"), "z").unwrap();
+    assert!(cli_runner::run_gfs(["gfs", "checkout", "--path", repo, "main", "--force"]).0);
+    assert!(cli_runner::run_gfs(["gfs", "checkout", "--path", repo, &first]).0);
+    assert_eq!(
+        workspace_contents(repo_path),
+        "seed.txt=v1",
+        "the commit's content, not what was left in its directory"
+    );
+}

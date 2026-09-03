@@ -593,14 +593,29 @@ impl Repository for GfsRepository {
             .join(&workspace_segment)
             .join(WORKSPACE_DATA_DIR);
 
-        // Only populate from snapshot when the workspace does not exist (preserve live DB state in branch workspace).
-        let workspace_exists = workspace_path.exists();
+        // Always restore from the snapshot. Reusing a workspace that happens to
+        // still be on disk made checkout non-deterministic in three ways: a
+        // deleted branch's working copy was inherited by a new branch that
+        // reused the name; returning to a detached commit gave you whatever you
+        // last left in its directory rather than that commit; and uncommitted
+        // changes leaked across a branch switch. `Switched to X` now means the
+        // workspace holds X.
+        //
+        // Nothing is discarded silently: `CheckoutRepoUseCase` refuses when the
+        // workspace has uncommitted work, and only passes through once the
+        // caller has committed it or asked for `--force`.
         tracing::info!(
             "Checkout: workspace_path={:?}, exists={}",
             workspace_path,
-            workspace_exists
+            workspace_path.exists()
         );
-        if !workspace_exists {
+        if workspace_path.exists() {
+            // Files restored from a snapshot carry its read-only bits, which
+            // `remove_dir_all` will not override.
+            let _ = set_workspace_dir_permissions(&workspace_path);
+            fs::remove_dir_all(&workspace_path).map_err(RepositoryError::Io)?;
+        }
+        {
             let commit = repo_layout::get_commit_from_hash(&repo, &commit_hash).map_err(map_err)?;
             let snapshot_hash = commit.snapshot_hash;
             let snapshot_dir = repo

@@ -32,6 +32,12 @@ pub enum CheckoutRepoError {
 
     #[error("compute: {0}")]
     Compute(#[from] ComputeError),
+
+    #[error(
+        "the workspace has uncommitted changes that checkout would overwrite ({0}). \
+         Commit them first, or pass --force to discard them"
+    )]
+    WorkspaceDirty(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -47,6 +53,8 @@ pub struct CheckoutRepoUseCase<R: DatabaseProviderRegistry> {
     repository: Arc<dyn Repository>,
     compute: Arc<dyn Compute>,
     registry: Arc<R>,
+    /// Discard uncommitted work instead of refusing. Off by default.
+    force: bool,
 }
 
 impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
@@ -59,7 +67,60 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
             repository,
             compute,
             registry,
+            force: false,
         }
+    }
+
+    /// Overwrite a workspace that has uncommitted changes rather than refusing.
+    ///
+    /// A builder rather than a `run` parameter on purpose: `run`'s signature is
+    /// part of this crate's public surface and the data-plane calls it directly,
+    /// so adding an argument would break a caller that has no opinion about
+    /// forcing.
+    pub fn with_force(mut self, force: bool) -> Self {
+        self.force = force;
+        self
+    }
+
+    /// The uncommitted changes checkout would overwrite, as a short description.
+    ///
+    /// Compared against the file list recorded on the CURRENT commit, which is
+    /// the right baseline because a commit snapshots the workspace: immediately
+    /// after one, the two agree, and everything written since is uncommitted.
+    /// `None` when there is nothing recorded to compare against — a repository
+    /// with no commits yet, or one whose commit predates file lists — in which
+    /// case checkout proceeds as before rather than refusing on a fact it does
+    /// not have.
+    async fn uncommitted_changes(
+        &self,
+        path: &Path,
+    ) -> std::result::Result<Option<String>, CheckoutRepoError> {
+        let current = self.repository.get_current_commit_id(path).await?;
+        if current == "0" {
+            return Ok(None);
+        }
+        let Ok(commit) = repo_layout::get_commit_from_hash(path, &current) else {
+            return Ok(None);
+        };
+        let Ok(Some(baseline)) = repo_layout::get_file_entries_for_commit(path, &commit) else {
+            return Ok(None);
+        };
+        let workspace = self.repository.get_active_workspace_data_dir(path).await?;
+        let changed = repo_layout::workspace_changes(&workspace, &baseline)
+            .map_err(|e| CheckoutRepoError::Repository(RepositoryError::Internal(e.to_string())))?;
+        if changed.is_empty() {
+            return Ok(None);
+        }
+        let shown: Vec<&str> = changed.iter().take(3).map(String::as_str).collect();
+        Ok(Some(if changed.len() > shown.len() {
+            format!(
+                "{} and {} more",
+                shown.join(", "),
+                changed.len() - shown.len()
+            )
+        } else {
+            shown.join(", ")
+        }))
     }
 
     /// Check out `revision` (branch name or full 64-char commit hash) at `path`.
@@ -72,6 +133,17 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
         revision: String,
         create_branch: Option<String>,
     ) -> std::result::Result<String, CheckoutRepoError> {
+        // Refuse before anything is touched. Checkout restores the workspace
+        // from a snapshot, so work that was never committed is overwritten and
+        // unrecoverable. Neither silent option is acceptable: discarding loses
+        // data the user cannot get back, and preserving it across a switch
+        // leaves state that no command in GFS displays.
+        if !self.force
+            && let Some(changed) = self.uncommitted_changes(&path).await?
+        {
+            return Err(CheckoutRepoError::WorkspaceDirty(changed));
+        }
+
         let revision = revision.trim().to_string();
 
         // Validate the target ref BEFORE stopping compute — a bad revision must

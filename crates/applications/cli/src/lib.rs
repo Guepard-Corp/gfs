@@ -517,6 +517,10 @@ enum TopLevel {
 
         /// Branch name or full 64-char commit hash; or start revision when using -b
         revision: Option<String>,
+
+        /// Discard uncommitted changes in the workspace instead of refusing
+        #[arg(long)]
+        force: bool,
     },
 
     /// Tear down the compute instance and remove the repository's .gfs store
@@ -932,8 +936,9 @@ where
                 path,
                 create_branch,
                 revision,
+                force,
             } => {
-                commands::cmd_checkout::checkout(path, revision, create_branch, json_output)
+                commands::cmd_checkout::checkout(path, revision, create_branch, force, json_output)
                     .await?;
                 Ok(0)
             }

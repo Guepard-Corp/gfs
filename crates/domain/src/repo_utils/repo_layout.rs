@@ -1035,6 +1035,60 @@ pub fn get_current_commit_id(repo_path: &Path) -> Result<String, RepoError> {
 
 /// Short commit id used for workspace directory path segment (avoids long paths on disk).
 /// If `commit_id` is longer than `SHORT_COMMIT_ID_LEN`, returns the prefix; otherwise returns as-is (e.g. `"0"`).
+/// The directory holding a branch's working copy.
+pub fn branch_workspace_dir(repo_path: &Path, branch: &str) -> std::path::PathBuf {
+    repo_path.join(GFS_DIR).join(WORKSPACES_DIR).join(branch)
+}
+
+/// Paths in `workspace` that differ from `baseline`, i.e. uncommitted work.
+///
+/// Checkout restores the workspace from a snapshot, which overwrites whatever is
+/// there. Callers use this to refuse rather than overwrite silently.
+///
+/// WHAT IS COMPARED, and why it is only this. `FileEntry` records path, size,
+/// owner, group and mode; there is no content hash, so this is git's cheap tier
+/// (stat) without git's second tier (hash on suspicion).
+///
+/// * SIZE, for files present in both. A write to a SQLite database grows the
+///   database or its write-ahead log, so real work shows up here.
+/// * PRESENCE, for files in the workspace that the baseline does not have.
+/// * NOT permissions. A live workspace is 0700 and a snapshot is read-only, so
+///   they always differ and comparing them would report every workspace dirty.
+/// * NOT absences. SQLite deletes its `-wal` and `-shm` sidecars when the last
+///   connection closes, so a file that has gone away is the normal aftermath of
+///   reading the database, not uncommitted work.
+///
+/// The gap this leaves, stated rather than hidden: an edit that changes no
+/// file's size — an in-place UPDATE whose pages are checkpointed back to the
+/// same length — is not detected. The direction of the remaining error is the
+/// safe one for a false positive (a needless refusal, which `--force` clears)
+/// and the unsafe one for a false negative, so it is worth revisiting with a
+/// content hash if the commit object ever grows one.
+pub fn workspace_changes(
+    workspace: &Path,
+    baseline: &[FileEntry],
+) -> Result<Vec<String>, RepoError> {
+    if !workspace.exists() {
+        return Ok(Vec::new());
+    }
+    let current = collect_file_entries(workspace, "")?;
+    let sizes: std::collections::HashMap<&str, u64> = baseline
+        .iter()
+        .map(|e| (e.relative_path.as_str(), e.file_size))
+        .collect();
+
+    let mut changed: Vec<String> = current
+        .iter()
+        .filter(|entry| match sizes.get(entry.relative_path.as_str()) {
+            Some(&size) => size != entry.file_size,
+            None => true,
+        })
+        .map(|entry| entry.relative_path.clone())
+        .collect();
+    changed.sort();
+    Ok(changed)
+}
+
 pub fn short_commit_id_for_workspace(commit_id: &str) -> String {
     if commit_id.len() <= SHORT_COMMIT_ID_LEN {
         commit_id.to_string()
@@ -1104,6 +1158,76 @@ mod tests {
     use std::fs;
     use std::io;
     use tempfile::TempDir;
+
+    /// The dirty check reports work, and only work.
+    #[test]
+    fn workspace_changes_reports_writes_and_additions() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        fs::write(ws.join("db"), "aaaa").unwrap();
+        fs::write(ws.join("keep"), "same").unwrap();
+        let baseline = collect_file_entries(ws, "").unwrap();
+
+        // Untouched.
+        assert!(workspace_changes(ws, &baseline).unwrap().is_empty());
+
+        // A write that changes the size.
+        fs::write(ws.join("db"), "aaaaaaaa").unwrap();
+        assert_eq!(workspace_changes(ws, &baseline).unwrap(), vec!["db"]);
+
+        // A new file.
+        fs::write(ws.join("db"), "aaaa").unwrap();
+        fs::write(ws.join("new"), "x").unwrap();
+        assert_eq!(workspace_changes(ws, &baseline).unwrap(), vec!["new"]);
+    }
+
+    /// A file that has GONE is not uncommitted work.
+    ///
+    /// SQLite deletes its `-wal` and `-shm` sidecars when the last connection
+    /// closes, so treating an absence as a change would report every workspace
+    /// dirty after a plain read.
+    #[test]
+    fn workspace_changes_ignores_files_that_disappeared() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        fs::write(ws.join("db"), "aaaa").unwrap();
+        fs::write(ws.join("db-wal"), "").unwrap();
+        fs::write(ws.join("db-shm"), "x".repeat(32)).unwrap();
+        let baseline = collect_file_entries(ws, "").unwrap();
+
+        fs::remove_file(ws.join("db-wal")).unwrap();
+        fs::remove_file(ws.join("db-shm")).unwrap();
+        assert!(
+            workspace_changes(ws, &baseline).unwrap().is_empty(),
+            "closing the database is not uncommitted work"
+        );
+    }
+
+    /// Permissions are deliberately not compared.
+    ///
+    /// A live workspace is 0700 and the snapshot it came from is read-only, so
+    /// comparing modes would report every workspace dirty.
+    #[test]
+    fn workspace_changes_ignores_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let file = ws.join("db");
+        fs::write(&file, "aaaa").unwrap();
+        let mut baseline = collect_file_entries(ws, "").unwrap();
+        baseline[0].permissions = Some("0400".to_string());
+        assert!(workspace_changes(ws, &baseline).unwrap().is_empty());
+    }
+
+    /// A workspace that is not there yet has nothing to lose.
+    #[test]
+    fn workspace_changes_on_a_missing_workspace_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            workspace_changes(&dir.path().join("gone"), &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[test]
     fn short_commit_id_for_workspace_keeps_short_and_truncates_long() {
