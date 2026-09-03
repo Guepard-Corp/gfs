@@ -741,6 +741,37 @@ scripts/e2e-clone-remote-source.sh drift "postgresql://user:pw@host:5432/db?sslm
 This is the only way to exercise the cost model at real scale, since the copy-vs-ask
 decision depends on measured link speed and real table sizes.
 
+### Concurrency and reclaim scripts
+
+Three things about commit are only observable under load or after a crash, and
+each has a script rather than a paragraph, so the claim can be re-checked
+instead of believed.
+
+```bash
+# Commit repeatedly while a separate process writes. Every snapshot must pass
+# integrity_check, hold a row count the database genuinely passed through, and
+# contain only whole transactions.
+scripts/sqlite-snapshot-torture.py <repo> ./target/debug/gfs 20
+
+# Try to make a concurrent commit and checkout lose a commit. Needs two
+# branches and a workspace big enough that the snapshot copy takes real time.
+scripts/gfs-commit-checkout-race.py <repo> ./target/debug/gfs 10
+
+# List snapshot trees no commit refers to, and optionally delete them.
+scripts/gfs-reclaim-orphan-snapshots.py <repo> [--delete]
+```
+
+**Orphan snapshots.** A commit takes its snapshot before it writes the commit
+object, and the destination comes from the workspace path and a timestamp
+rather than from the content, so it is created up front. Killing `gfs commit`
+between those two points — `SIGKILL`, a lost session, a machine losing power —
+leaves a complete-looking snapshot tree that nothing references. Nothing is
+corrupt and the next commit works; the tree is simply never read again and
+never freed. Reproduced with a 640 MB orphan from one killed commit. There is
+no `gfs gc`, so the reclaim script above is the way to get the space back; it
+lists before it deletes, and only considers a snapshot orphaned when no object
+under `.gfs/objects` names it.
+
 ### Building for release
 
 ```bash

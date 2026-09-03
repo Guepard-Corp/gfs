@@ -125,16 +125,102 @@ const IS_NULLABLE: &str = "CASE \
 ///
 /// A column of a composite primary key is not: `PRIMARY KEY(a, b)` constrains
 /// the pair, and `a` may repeat. So a primary key column qualifies only when it
-/// is the whole key. A single-column `UNIQUE` index qualifies too — but only a
-/// total one: `CREATE UNIQUE INDEX ... WHERE deleted = 0` constrains just the
-/// matching rows, and duplicates are genuinely storable outside them.
+/// is the whole key. A single-column `UNIQUE` index qualifies too — but only
+/// one that constrains every row. `CREATE UNIQUE INDEX ... WHERE deleted = 0`
+/// leaves duplicates genuinely storable outside the matching rows.
+///
+/// `WHERE <col> IS NOT NULL` is the exception, and the reason
+/// [`predicate_is_only_not_null`] exists: SQLite already permits any number of
+/// NULLs in a unique index, so excluding the null rows removes exactly the rows
+/// the index was ignoring anyway. Verified by inserting into both forms — a
+/// partial `IS NOT NULL` index and a plain one accept and reject exactly the
+/// same rows.
+///
+/// NOT covered, deliberately: a unique index on an EXPRESSION,
+/// `CREATE UNIQUE INDEX ix ON t(lower(a))`, does make `a` unique — uniqueness
+/// of a function of `a` is a stronger constraint than uniqueness of `a` — and
+/// is reported as non-unique here. It is indistinguishable through the pragmas
+/// from `CREATE UNIQUE INDEX ix ON t(a || b)`, which makes NEITHER column
+/// unique: both report one key column with `cid = -2` and no name. Telling them
+/// apart means tokenising the index DDL to find which of the table's columns
+/// the expression mentions, and a tokeniser that misses a reference would claim
+/// a column is unique when it is not. Under-claiming loses a fact; over-claiming
+/// invents one, so this stays under-claimed until it is worth doing exactly.
 const IS_UNIQUE: &str = "CASE \
      WHEN p.pk = 1 AND (SELECT max(pk) FROM pragma_table_info(t.name)) = 1 THEN 'true' \
      WHEN EXISTS (SELECT 1 FROM pragma_index_list(t.name) il \
-                  WHERE il.\"unique\" = 1 AND il.partial = 0 \
+                  WHERE il.\"unique\" = 1 \
+                    AND (il.partial = 0 \
+                         OR gfs_predicate_is_only_not_null(\
+                              (SELECT m.sql FROM sqlite_master m \
+                                WHERE m.type = 'index' AND m.name = il.name), \
+                              p.name)) \
                     AND (SELECT count(*) FROM pragma_index_info(il.name)) = 1 \
                     AND (SELECT ii.name FROM pragma_index_info(il.name) ii) = p.name) THEN 'true' \
      ELSE 'false' END";
+
+/// Whether `index_sql` is a partial index whose predicate is exactly
+/// `<column> IS NOT NULL`.
+///
+/// Such a predicate cannot exclude a row the index would otherwise constrain,
+/// because a unique index already tolerates any number of NULLs. So the column
+/// is unique, and reporting otherwise loses a true fact.
+///
+/// Only that one shape is recognised, in SQLite's four identifier quotings.
+/// Anything else — a real filter, or a spelling this does not match — returns
+/// false and the column is reported non-unique. That is the safe direction, and
+/// it is why this compares against a closed list of forms rather than parsing.
+fn predicate_is_only_not_null(index_sql: &str, column: &str) -> bool {
+    // Collapse runs of whitespace and lower-case, so the comparison does not
+    // depend on how the DDL was typed. SQLite stores it verbatim.
+    let mut normalised = String::with_capacity(index_sql.len());
+    let mut pending_space = false;
+    for ch in index_sql.chars() {
+        if ch.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if pending_space && !normalised.is_empty() {
+            normalised.push(' ');
+        }
+        pending_space = false;
+        normalised.extend(ch.to_lowercase());
+    }
+
+    let column = column.to_lowercase();
+    ["{}", "\"{}\"", "[{}]", "`{}`"].iter().any(|quoting| {
+        let quoted = quoting.replace("{}", &column);
+        normalised.ends_with(&format!(" where {quoted} is not null"))
+            || normalised.ends_with(&format!(" where ({quoted} is not null)"))
+    })
+}
+
+/// Make [`predicate_is_only_not_null`] callable from the schema queries.
+///
+/// The question needs the index DDL, which no pragma exposes, and answering it
+/// in SQL string functions would be a worse tokeniser than a Rust one. The
+/// function is registered on the connection that runs those queries, which is
+/// also the only place they run: `schema_extraction_queries` for this provider
+/// has exactly one consumer, `extract_schema`, a few lines below.
+fn register_helpers(conn: &rusqlite::Connection) -> std::result::Result<(), ProviderError> {
+    use rusqlite::functions::FunctionFlags;
+    conn.create_scalar_function(
+        "gfs_predicate_is_only_not_null",
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            // An auto-index created for a UNIQUE constraint has no DDL of its
+            // own, so NULL here is normal and simply means "not that shape".
+            let (Some(sql), Some(column)) =
+                (ctx.get_raw(0).as_str().ok(), ctx.get_raw(1).as_str().ok())
+            else {
+                return Ok(false);
+            };
+            Ok(predicate_is_only_not_null(sql, column))
+        },
+    )
+    .map_err(|e| ProviderError::InvalidParams(format!("cannot register schema helper: {e}")))
+}
 
 /// Whether the workspace already holds a database, and where.
 ///
@@ -160,14 +246,56 @@ fn is_symlink(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
 }
 
+/// Resolve `p` as far as the filesystem allows, and lexically for the rest.
+///
+/// `canonicalize` fails outright on a path that does not exist — which is the
+/// normal case for a database GFS has not seen written yet. Falling back to the
+/// raw path then compares an unresolved candidate against a resolved root, and
+/// on macOS, where `/tmp` and `/var` are symlinks into `/private`, a file
+/// genuinely inside the workspace reads as outside it.
+///
+/// So the longest existing ANCESTOR is canonicalised and the remaining names
+/// are appended. `.` and `..` are removed first, because a path that cannot be
+/// canonicalised keeps them, and `<workspace>/../etc/passwd` starts with
+/// `<workspace>` as a string while naming somewhere else entirely.
+fn resolved(p: &Path) -> PathBuf {
+    if let Ok(real) = p.canonicalize() {
+        return real;
+    }
+
+    let mut lexical = PathBuf::new();
+    for component in p.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                // At the root this is a no-op, which is what POSIX does too.
+                lexical.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => lexical.push(other.as_os_str()),
+        }
+    }
+
+    let mut trailing: Vec<std::ffi::OsString> = Vec::new();
+    let mut current: &Path = &lexical;
+    while let (Some(parent), Some(name)) = (current.parent(), current.file_name()) {
+        trailing.push(name.to_os_string());
+        if let Ok(real) = parent.canonicalize() {
+            let mut out = real;
+            out.extend(trailing.iter().rev());
+            return out;
+        }
+        current = parent;
+    }
+    lexical
+}
+
 /// Whether `candidate` lies inside `root`.
 ///
-/// Both sides are canonicalised where possible so `..`, a symlinked workspace
-/// and differing but equivalent spellings all compare correctly; when a path
-/// cannot be canonicalised (it may not exist yet) the lexical form is used.
+/// Both sides go through [`resolved`], so `..`, a symlinked workspace, a
+/// database that does not exist yet and differing but equivalent spellings all
+/// compare correctly.
 fn is_within(root: &Path, candidate: &Path) -> bool {
-    let real = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    real(candidate).starts_with(real(root))
+    resolved(candidate).starts_with(resolved(root))
 }
 
 /// Collect every SQLite database under `dir`, recursively.
@@ -276,11 +404,19 @@ impl SqliteProvider {
     /// Everything this returns must lie inside the directory the storage layer
     /// is about to copy. A path outside it would be locked and inspected but
     /// never snapshotted, so the commit would describe a file it does not
-    /// contain.
+    /// contain. That holds for every way in, the explicit override included:
+    /// the workspace directory is required precisely so there is always
+    /// something to check containment against.
     fn resolve(params: &ConnectionParams) -> std::result::Result<Located, ProviderError> {
-        // Optional here: an explicit override may be supplied on its own, in
-        // which case there is no volume to check it against.
-        let dir = params.get_env(LOCAL_DATA_DIR_ENV).map(Path::new);
+        // Required, including when an explicit override is supplied. Making it
+        // optional there left one entry shape with no containment check at all:
+        // a caller passing only the override got a database locked, read and
+        // schema-captured from outside whatever directory was being
+        // snapshotted. The guard was not wrong in that shape, it was absent.
+        let dir = params
+            .get_env(LOCAL_DATA_DIR_ENV)
+            .map(Path::new)
+            .ok_or_else(|| ProviderError::MissingEnvVar(LOCAL_DATA_DIR_ENV.to_string()))?;
 
         // A path that exists but is not a regular file is a mistake worth
         // reporting. Treating it as "nothing here yet" would reintroduce the
@@ -322,9 +458,7 @@ impl SqliteProvider {
             .filter(|v| !v.trim().is_empty())
         {
             let chosen = PathBuf::from(explicit);
-            if let Some(dir) = dir
-                && !is_within(dir, &chosen)
-            {
+            if !is_within(dir, &chosen) {
                 return Err(ProviderError::InvalidParams(format!(
                     "{ENV_DB_PATH} points at '{}', which is outside the workspace '{}'. \
                      Only files inside the workspace are snapshotted, so that database \
@@ -337,8 +471,6 @@ impl SqliteProvider {
             return at(chosen);
         }
 
-        let dir =
-            dir.ok_or_else(|| ProviderError::MissingEnvVar(LOCAL_DATA_DIR_ENV.to_string()))?;
         let conventional = dir.join(DB_FILENAME);
         if conventional.exists() || is_symlink(&conventional) {
             return at(conventional);
@@ -437,11 +569,13 @@ impl SqliteProvider {
     /// since it promises nothing else is writing, which during a commit is
     /// exactly what we cannot promise.
     fn open_read_only(path: &Path) -> std::result::Result<rusqlite::Connection, ProviderError> {
-        rusqlite::Connection::open_with_flags(
+        let conn = rusqlite::Connection::open_with_flags(
             path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
         )
-        .map_err(|e| ProviderError::InvalidParams(format!("cannot read '{path:?}': {e}")))
+        .map_err(|e| ProviderError::InvalidParams(format!("cannot read '{path:?}': {e}")))?;
+        register_helpers(&conn)?;
+        Ok(conn)
     }
 
     /// Run a query returning a single text value.
@@ -945,11 +1079,26 @@ pub fn register(registry: &impl DatabaseProviderRegistry) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// An explicit database path, plus the workspace it lives in.
+    ///
+    /// Both, always — the pair is the only shape `local_connection_params`
+    /// produces, and the only shape the resolver accepts. Passing the override
+    /// alone used to be legal and skipped the containment check entirely.
     fn params_with_path(path: &str) -> ConnectionParams {
+        let parent = Path::new(path)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("/"));
         ConnectionParams {
             host: String::new(),
             port: 0,
-            env: vec![(ENV_DB_PATH.to_string(), path.to_string())],
+            env: vec![
+                (
+                    LOCAL_DATA_DIR_ENV.to_string(),
+                    parent.to_string_lossy().into_owned(),
+                ),
+                (ENV_DB_PATH.to_string(), path.to_string()),
+            ],
         }
     }
 
@@ -1776,6 +1925,213 @@ mod tests {
         ));
         let out = SqliteProvider::new().extract_schema(&ok_params).unwrap();
         assert!(out.contains("picked"), "{out}");
+    }
+
+    /// A predicate that cannot exclude a row does not make the index partial in
+    /// any way that matters.
+    ///
+    /// Established by insertion, not by reading the manual: a partial
+    /// `IS NOT NULL` unique index and a plain one accept and reject exactly the
+    /// same rows, because SQLite already tolerates any number of NULLs in a
+    /// unique index. A predicate that CAN exclude rows must still report
+    /// non-unique.
+    #[test]
+    fn a_partial_index_that_excludes_nothing_still_makes_the_column_unique() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(DB_FILENAME);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t(total TEXT, filtered TEXT, expr TEXT, pair_a TEXT, pair_b TEXT);
+             CREATE UNIQUE INDEX ix_total    ON t(total)    WHERE total IS NOT NULL;
+             CREATE UNIQUE INDEX ix_filtered ON t(filtered) WHERE filtered <> 'skip';
+             CREATE UNIQUE INDEX ix_expr     ON t(lower(expr));
+             CREATE UNIQUE INDEX ix_pair     ON t(pair_a || pair_b);",
+        )
+        .unwrap();
+
+        // What SQLite actually enforces, for the two predicate forms.
+        conn.execute("INSERT INTO t(total) VALUES('x')", [])
+            .unwrap();
+        assert!(
+            conn.execute("INSERT INTO t(total) VALUES('x')", [])
+                .is_err(),
+            "a duplicate must be rejected despite the predicate"
+        );
+        conn.execute("INSERT INTO t(total) VALUES(NULL)", [])
+            .unwrap();
+        conn.execute("INSERT INTO t(total) VALUES(NULL)", [])
+            .expect("nulls were already unconstrained, with or without the predicate");
+
+        conn.execute("INSERT INTO t(filtered) VALUES('y')", [])
+            .unwrap();
+        conn.execute("INSERT INTO t(filtered) VALUES('skip')", [])
+            .unwrap();
+        conn.execute("INSERT INTO t(filtered) VALUES('skip')", [])
+            .expect("this predicate genuinely excludes rows, so duplicates are storable");
+        drop(conn);
+
+        let out = SqliteProvider::new()
+            .extract_schema(&params_for_dir(dir.path()))
+            .unwrap();
+        let unique_of = |column: &str| -> bool {
+            let key = format!("\"name\":\"{column}\"");
+            let at = out
+                .find(&key)
+                .unwrap_or_else(|| panic!("no {column} in {out}"));
+            let tail = &out[at..];
+            let end = tail.find('}').unwrap_or(tail.len());
+            tail[..end].contains("\"is_unique\":true")
+        };
+
+        assert!(unique_of("total"), "IS NOT NULL excludes nothing: {out}");
+        assert!(!unique_of("filtered"), "this one really is partial: {out}");
+    }
+
+    /// The recognised predicate is a closed list, and everything else is
+    /// reported non-unique.
+    #[test]
+    fn only_an_is_not_null_predicate_counts_as_total() {
+        for (sql, column, expected) in [
+            (
+                "CREATE UNIQUE INDEX ix ON t(a) WHERE a IS NOT NULL",
+                "a",
+                true,
+            ),
+            (
+                "CREATE UNIQUE INDEX ix ON t(a) WHERE \"a\" IS NOT NULL",
+                "a",
+                true,
+            ),
+            (
+                "CREATE UNIQUE INDEX ix ON t(a) WHERE [a] IS NOT NULL",
+                "a",
+                true,
+            ),
+            (
+                "CREATE UNIQUE INDEX ix ON t(a) WHERE (a IS NOT NULL)",
+                "a",
+                true,
+            ),
+            (
+                "create unique index ix on t(a)\n  where\n a\tis   not null",
+                "a",
+                true,
+            ),
+            (
+                "CREATE UNIQUE INDEX ix ON t(a) WHERE A IS NOT NULL",
+                "a",
+                true,
+            ),
+            // A different column's predicate says nothing about this one.
+            (
+                "CREATE UNIQUE INDEX ix ON t(a) WHERE b IS NOT NULL",
+                "a",
+                false,
+            ),
+            ("CREATE UNIQUE INDEX ix ON t(a) WHERE a IS NULL", "a", false),
+            (
+                "CREATE UNIQUE INDEX ix ON t(a) WHERE deleted = 0",
+                "a",
+                false,
+            ),
+            (
+                "CREATE UNIQUE INDEX ix ON t(a) WHERE a IS NOT NULL AND b > 0",
+                "a",
+                false,
+            ),
+            ("CREATE UNIQUE INDEX ix ON t(a)", "a", false),
+        ] {
+            assert_eq!(
+                predicate_is_only_not_null(sql, column),
+                expected,
+                "{sql} / {column}"
+            );
+        }
+    }
+
+    /// There is no way in that skips the containment check.
+    ///
+    /// The override used to be accepted on its own, and the workspace directory
+    /// was optional for exactly that shape — so a caller supplying only the
+    /// override got no check at all, which is the stale-override bug with the
+    /// guard absent rather than wrong. `local_connection_params` always
+    /// supplies both, so this was a trap for an embedder of the public API
+    /// rather than a live defect; it is now impossible either way.
+    #[test]
+    fn an_override_without_a_workspace_is_refused_rather_than_unchecked() {
+        let elsewhere = tempfile::tempdir().unwrap();
+        let stale = elsewhere.path().join("stale.db");
+        let conn = rusqlite::Connection::open(&stale).unwrap();
+        conn.execute_batch("CREATE TABLE decoy(a)").unwrap();
+        drop(conn);
+
+        let params = ConnectionParams {
+            host: String::new(),
+            port: 0,
+            env: vec![(
+                ENV_DB_PATH.to_string(),
+                stale.to_string_lossy().into_owned(),
+            )],
+        };
+
+        let err = match SqliteProvider::new().extract_schema(&params) {
+            Ok(_) => panic!("an override with nothing to check it against must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains(LOCAL_DATA_DIR_ENV), "{err}");
+    }
+
+    /// Containment must hold for a database that does not exist yet.
+    ///
+    /// `canonicalize` fails on a path with no file behind it, and the old
+    /// fallback compared the raw candidate against a resolved root. On macOS
+    /// every temp directory is under `/var`, a symlink into `/private/var`, so
+    /// `<workspace>/db.sqlite` — the conventional path, in the workspace, for a
+    /// repository that has simply not been written to yet — resolved as
+    /// OUTSIDE its own workspace and the first commit was refused.
+    #[test]
+    fn a_database_that_does_not_exist_yet_is_inside_its_own_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let not_yet = workspace.path().join(DB_FILENAME);
+        assert!(!not_yet.exists());
+        assert!(
+            is_within(workspace.path(), &not_yet),
+            "{} should be inside {}",
+            not_yet.display(),
+            workspace.path().display()
+        );
+
+        // And the provider agrees: an empty repository reports an empty schema
+        // rather than an error.
+        let mut params = params_for_dir(workspace.path());
+        params.env.push((
+            ENV_DB_PATH.to_string(),
+            not_yet.to_string_lossy().into_owned(),
+        ));
+        let out = SqliteProvider::new().extract_schema(&params).unwrap();
+        assert!(out.contains("GFS_SCHEMA_TABLES\n[]"), "{out}");
+    }
+
+    /// A traversal that no filesystem can resolve is still not contained.
+    ///
+    /// Neither side of this path exists, so both fall to the lexical form —
+    /// which is precisely where a plain `starts_with` says yes, because
+    /// `<workspace>/../elsewhere/db.sqlite` begins with `<workspace>`.
+    #[test]
+    fn a_parent_traversal_out_of_the_workspace_is_not_contained() {
+        let workspace = tempfile::tempdir().unwrap();
+        let escape = workspace
+            .path()
+            .join("..")
+            .join("elsewhere")
+            .join("db.sqlite");
+        assert!(!escape.exists());
+        assert!(
+            !is_within(workspace.path(), &escape),
+            "{} must not count as inside {}",
+            escape.display(),
+            workspace.path().display()
+        );
     }
 
     /// Ambiguity must survive recursion: two databases at different depths are

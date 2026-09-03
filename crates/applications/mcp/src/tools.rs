@@ -15,6 +15,7 @@ use gfs_domain::ports::compute::{
 };
 use gfs_domain::ports::database_provider::{
     ConnectionParams, DatabaseProviderRegistry, InMemoryDatabaseProviderRegistry,
+    embedded_provider_name,
 };
 use gfs_domain::ports::repository::{LogOptions, Repository};
 use gfs_domain::repo_utils::repo_layout;
@@ -1005,6 +1006,17 @@ async fn do_compute(args: &serde_json::Value) -> Result<CallToolResult, McpError
         None => {
             let config = GfsConfig::load(&repo_path)
                 .map_err(|e| to_error_data(format!("not a GFS repository: {e}")))?;
+            let registry = InMemoryDatabaseProviderRegistry::new();
+            containers::register_all(&registry)
+                .map_err(|e| to_error_data(format!("register providers: {e}")))?;
+            if let Some(provider) = embedded_provider_name(&config, &registry) {
+                return Err(to_error_data(format!(
+                    "'{provider}' is an embedded database — a file this process opens, not a \
+                     server. There is no container to start, stop or inspect, and nothing to \
+                     connect to: the commit, checkout and query tools work directly on the file"
+                )));
+            }
+
             let name = config
                 .runtime
                 .as_ref()

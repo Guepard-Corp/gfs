@@ -334,3 +334,54 @@ fn a_container_backed_provider_still_reports_the_runtime_failure() {
         "the failure should still point at the container runtime, not something obscure: {stderr}"
     );
 }
+
+/// Neither command may point at the other.
+///
+/// `gfs user` on a SQLite repo used to answer "no container configured (run
+/// gfs compute start)", and `gfs compute start` then answered "no
+/// container_name in repo config" — a closed loop of two commands, neither
+/// able to succeed, and the second an invitation to hand-edit the config into
+/// a state the repo cannot support.
+#[test]
+fn user_and_compute_explain_themselves_instead_of_advising_each_other() {
+    let tmp = tempdir().expect("temp dir");
+    let repo = tmp.path();
+    init_sqlite(repo);
+
+    for args in [
+        vec!["gfs", "user", "list", "--path", repo.to_str().unwrap()],
+        vec![
+            "gfs",
+            "user",
+            "create",
+            "bob",
+            "--path",
+            repo.to_str().unwrap(),
+        ],
+    ] {
+        let (ok, _, stderr) = cli_runner::run_gfs(args.clone());
+        assert!(!ok, "user management cannot work here: {args:?}");
+        assert!(
+            stderr.contains("embedded database") && stderr.contains("no roles"),
+            "should explain why there are no users: {stderr}"
+        );
+        assert!(
+            !stderr.contains("gfs compute start"),
+            "must not advise a command that cannot succeed: {stderr}"
+        );
+    }
+
+    for action in ["start", "status", "stop"] {
+        let (ok, _, stderr) =
+            cli_runner::run_gfs(["gfs", "compute", "--path", repo.to_str().unwrap(), action]);
+        assert!(!ok, "there is no container to {action}");
+        assert!(
+            stderr.contains("embedded database") && stderr.contains("no container"),
+            "should say there is nothing to run: {stderr}"
+        );
+        assert!(
+            !stderr.contains("container_name"),
+            "must not invite editing the config: {stderr}"
+        );
+    }
+}

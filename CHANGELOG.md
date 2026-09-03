@@ -14,8 +14,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- fix: a concurrent `gfs commit` and `gfs checkout` could lose a commit. A commit reads HEAD's commit as its parent before the snapshot and reads HEAD's branch after it, so a checkout landing in between made the commit advance the branch it moved *to*, with a parent from the branch it moved *from* — leaving that branch's previous tip unreachable from any ref, with both commands reporting success. Checkout now takes the same repository lock commit takes, waiting for a running commit rather than interleaving with it
+- fix: `gfs export --format sql` produced a dump that corrupted data when replayed. All DDL was written before the rows, so every `AFTER INSERT` trigger fired for every replayed row; and virtual-table content was omitted entirely, because `CREATE VIRTUAL TABLE` builds an empty index. The dump now emits tables, then rows, then views/triggers/indexes, and names its insert columns so generated and hidden columns cannot misalign
+- fix: `gfs import` reported "import failed" and discarded the underlying cause, so a missing file, an unsupported format and an invalid script were indistinguishable
+- fix: MCP tools all built a container client before deciding whether they needed one, so with no reachable Docker daemon every tool failed — including `init --database-provider sqlite`, which starts no container. The MCP `query` tool also required a runtime section that an embedded repository never writes
+- fix: `gfs user` on an embedded provider advised `gfs compute start`, which then reported no `container_name` in the repo config. Neither command could succeed; both now explain that an embedded database is a file with no server, no roles and nothing to start
+- fix: a column made unique by a partial index whose predicate is `<column> IS NOT NULL` is now reported unique. Such a predicate cannot exclude a row the index would otherwise constrain, since a unique index already permits any number of NULLs
 - fix: Windows snapshot/clone use `robocopy /E /COPY:DAT` instead of `/COPYALL` so commits do not require copying audit (SACL) information, which failed on Windows 11 ([issue #34](https://github.com/Guepard-Corp/gfs/issues/34))
 - fix: Correct opencode.json MCP configuration format to use command array with type: local for proper OpenCode integration
+
+### Chores
+
+- chore: `scripts/gfs-reclaim-orphan-snapshots.py` lists and removes snapshot trees no commit refers to. A commit killed between taking its snapshot and writing its commit object leaves one behind, and there is no `gfs gc`
+- chore: `scripts/gfs-commit-checkout-race.py` reproduces the concurrent commit/checkout interleaving, so the fix above can be re-checked rather than believed
 
 ## [0.2.0] - 2026-03-23
 

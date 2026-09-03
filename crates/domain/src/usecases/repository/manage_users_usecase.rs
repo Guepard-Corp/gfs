@@ -74,6 +74,25 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
             })?
             .to_string();
 
+        let provider = self
+            .registry
+            .get(&provider_name)
+            .ok_or_else(|| ManageUsersError::ProviderNotFound(provider_name.clone()))?;
+
+        // Resolved before the container, so an embedded provider gets an answer
+        // rather than a closed loop: it has no runtime section, so requiring one
+        // first advised `gfs compute start`, which then reported that there is
+        // no container_name in the repo config. Neither command could succeed
+        // and neither said why.
+        if provider.local_engine().is_some() {
+            return Err(ManageUsersError::Unsupported(format!(
+                "'{provider_name}' is an embedded database — a file opened by this process, \
+                 not a server. There is no connection to authenticate, so there are no roles, \
+                 passwords or privileges to manage; access is whatever the filesystem grants \
+                 to whoever can open the file"
+            )));
+        }
+
         let container_name = config
             .runtime
             .as_ref()
@@ -85,11 +104,6 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
                 )
             })?
             .to_string();
-
-        let provider = self
-            .registry
-            .get(&provider_name)
-            .ok_or_else(|| ManageUsersError::ProviderNotFound(provider_name.clone()))?;
 
         Ok((provider, container_name))
     }

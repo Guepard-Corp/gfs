@@ -902,6 +902,31 @@ impl DatabaseProviderRegistry for InMemoryDatabaseProviderRegistry {
     }
 }
 
+/// The name of the repository's provider, when that provider is embedded.
+///
+/// A repository backed by an embedded provider has no `runtime` section,
+/// because there is no container to record. Every caller that requires one is
+/// therefore about to report that no container is configured — and, before this
+/// existed, to advise `gfs compute start`, which then answered that there is no
+/// `container_name` in the repo config. Two commands, neither able to succeed,
+/// each pointing at the other.
+///
+/// Consulting the registry first turns that into a statement of fact.
+pub fn embedded_provider_name(
+    config: &crate::model::config::GfsConfig,
+    registry: &dyn DatabaseProviderRegistry,
+) -> Option<String> {
+    let name = config
+        .environment
+        .as_ref()
+        .map(|e| e.database_provider.trim())
+        .filter(|name| !name.is_empty())?;
+    registry
+        .get(name)
+        .filter(|provider| provider.local_engine().is_some())
+        .map(|_| name.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
