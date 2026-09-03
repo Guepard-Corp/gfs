@@ -1,4 +1,3 @@
-use std::fs::{File, OpenOptions, TryLockError};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -8,12 +7,12 @@ use thiserror::Error;
 
 use crate::model::commit::NewCommit;
 use crate::model::config::{EnvironmentConfig, GlobalSettings, RuntimeConfig};
-use crate::model::layout::GFS_DIR;
 use crate::ports::compute::{Compute, ComputeError, InstanceId, InstanceState};
 use crate::ports::database_provider::{ConnectionParams, DatabaseProviderRegistry};
 use crate::ports::repository::{Repository, RepositoryError};
 use crate::ports::storage::{SnapshotOptions, StorageError, StoragePort, VolumeId};
 use crate::repo_utils::repo_layout;
+use crate::repo_utils::repo_lock::{LockError, RepoLock};
 use crate::usecases::repository::extract_schema_usecase::ExtractSchemaUseCase;
 use crate::utils::hash::hash_snapshot;
 
@@ -93,61 +92,6 @@ impl Drop for UnpauseGuard {
                 }
             });
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Per-repo commit lock
-// ---------------------------------------------------------------------------
-
-/// Exclusive advisory lock on `<repo>/.gfs/commit.lock`, held for the duration
-/// of a single `CommitRepoUseCase::run` invocation.
-///
-/// Prevents two concurrent `gfs commit` processes on the same repository from
-/// racing pause/unpause, writing overlapping snapshot directories, or
-/// advancing the branch ref with the same parent — any of which can produce
-/// orphan snapshots or lost commits.
-///
-/// Uses `std::fs::File::try_lock` (stable since Rust 1.89) for a non-blocking
-/// POSIX `flock`. Lock is released on Drop via explicit `unlock`; if the
-/// process is killed, the kernel releases the flock on FD close so a crashed
-/// commit never wedges future commits.
-struct CommitLock {
-    file: File,
-}
-
-impl CommitLock {
-    fn acquire(repo_path: &Path) -> std::result::Result<Self, CommitRepoError> {
-        let gfs_dir = repo_path.join(GFS_DIR);
-        std::fs::create_dir_all(&gfs_dir)
-            .map_err(|e| CommitRepoError::Repository(RepositoryError::Io(e)))?;
-        let lock_path = gfs_dir.join("commit.lock");
-
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|e| CommitRepoError::Repository(RepositoryError::Io(e)))?;
-
-        match file.try_lock() {
-            Ok(()) => Ok(Self { file }),
-            Err(TryLockError::WouldBlock) => Err(CommitRepoError::Repository(
-                RepositoryError::Internal(format!(
-                    "another `gfs commit` is already running on this repository \
-                     (lock held at {}); retry once it finishes",
-                    lock_path.display()
-                )),
-            )),
-            Err(TryLockError::Error(e)) => Err(CommitRepoError::Repository(RepositoryError::Io(e))),
-        }
-    }
-}
-
-impl Drop for CommitLock {
-    fn drop(&mut self) {
-        // Best-effort: kernel will release on FD close regardless.
-        let _ = self.file.unlock();
     }
 }
 
@@ -236,39 +180,6 @@ mod unfrozen_snapshot_flag_tests {
     }
 }
 
-#[cfg(test)]
-mod commit_lock_tests {
-    use super::{CommitLock, CommitRepoError};
-    use crate::ports::repository::RepositoryError;
-
-    #[test]
-    fn second_acquire_reports_contention() {
-        let dir = tempfile::tempdir().unwrap();
-        let _first = CommitLock::acquire(dir.path()).expect("first acquire should succeed");
-
-        let second = CommitLock::acquire(dir.path());
-        match second {
-            Err(CommitRepoError::Repository(RepositoryError::Internal(msg))) => {
-                assert!(
-                    msg.contains("another `gfs commit` is already running"),
-                    "unexpected message: {msg}"
-                );
-            }
-            Err(e) => panic!("expected Internal contention error, got {e:?}"),
-            Ok(_) => panic!("expected contention error, but second acquire succeeded"),
-        }
-    }
-
-    #[test]
-    fn acquire_succeeds_after_drop() {
-        let dir = tempfile::tempdir().unwrap();
-        {
-            let _first = CommitLock::acquire(dir.path()).unwrap();
-        }
-        let _second = CommitLock::acquire(dir.path()).expect("lock should be released after drop");
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Use case
 // ---------------------------------------------------------------------------
@@ -330,7 +241,19 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
 
         // Serialize commits per repository. Held until this function returns,
         // covering pause, snapshot, finalize, and ref advance.
-        let _commit_lock = CommitLock::acquire(&path)?;
+        // Fail fast rather than wait: a second commit would snapshot a state the
+        // first has already captured, so queueing it produces a redundant commit
+        // rather than a useful one. Checkout waits instead — see repo_lock.
+        let _repo_lock = RepoLock::try_acquire(&path).map_err(|e| match e {
+            LockError::Busy(busy) => {
+                CommitRepoError::Repository(RepositoryError::Internal(format!(
+                    "another `gfs commit` is already running on this repository \
+                     (lock held at {}); retry once it finishes",
+                    busy.lock_path.display()
+                )))
+            }
+            LockError::Io(e) => CommitRepoError::Repository(RepositoryError::Io(e)),
+        })?;
 
         // 1. Resolve commit context from the repository.
         let parent_commit_id = self.repository.get_current_commit_id(&path).await?;
