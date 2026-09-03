@@ -8,19 +8,17 @@
 //!
 //! Runs the CLI in-process via `gfs_cli::run()` so coverage is captured.
 //!
-//! macOS-only, like the sibling commit/checkout suites, because commit goes
-//! through the platform storage backend and these tests have only been
-//! exercised against APFS.
+//! Unix-only, not macOS-only, and the difference is the point. The snapshot
+//! guard matters MOST where the copy is NOT atomic: on Linux `storage-file`
+//! uses `cp --reflink=auto`, which silently degrades to a deep copy on ext4,
+//! and a deep copy of a database being written to is exactly where an
+//! unquiesced snapshot tears. GitHub's ubuntu runner is ext4, so running here
+//! is the non-copy-on-write variant — no flag or special filesystem needed.
 //!
-//! That gating has a real cost worth naming: the snapshot guard matters MOST on
-//! Linux, where `storage-file` uses `cp --reflink=auto` and silently degrades
-//! to a deep copy on ext4 — the one case where an unquiesced snapshot tears.
-//! Nothing here runs there. The assertions are about logical behaviour rather
-//! than APFS semantics, so they are expected to pass on Linux; enabling them,
-//! together with a non-copy-on-write variant of the concurrency test, belongs
-//! to the CI task rather than being flipped on unverified.
+//! Windows is excluded because one test shells out to `chmod`; nothing else
+//! here is platform-specific.
 
-#![cfg(target_os = "macos")]
+#![cfg(unix)]
 
 mod common;
 
@@ -561,5 +559,243 @@ fn a_checkout_whose_snapshot_is_missing_fails_instead_of_emptying_the_database()
         users(repo),
         "alice,bob",
         "the workspace it refused to leave must be untouched"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The snapshot guard, under a writer that does not stop
+// ---------------------------------------------------------------------------
+
+/// Every commit must capture a state the database genuinely passed through.
+///
+/// This is the assertion the whole embedded design rests on, and the one that
+/// could not be made anywhere but here: a container provider quiesces by
+/// pausing its instance, but the process writing a SQLite file is the user's
+/// own application, which nothing GFS controls can freeze. What replaces it is
+/// SQLite's own write lock, taken before the snapshot and held across it.
+///
+/// Three properties are checked per commit, and the third is the one that
+/// matters:
+///
+/// 1. `PRAGMA integrity_check` passes — the file is structurally sound;
+/// 2. the row count lies between the counts observed immediately before and
+///    after the commit — a state the database really was in;
+/// 3. every transaction in the snapshot is WHOLE.
+///
+/// (3) is not implied by (1) or (2). A torn transaction leaves a database that
+/// is structurally valid, so `integrity_check` calls it ok, and whose row count
+/// can still land inside the window. Each transaction here writes `GROUP` rows
+/// stamped with one increasing batch number, so a snapshot is whole only when
+/// every batch it holds is complete and the batches run without a gap.
+///
+/// Commits run as a SUBPROCESS so the contention is genuinely between
+/// processes — SQLite's file locking is what is under test, not a mutex.
+///
+/// A commit that REFUSES is not a failure: declining to snapshot a database it
+/// could not quiesce is the correct outcome, and the branch's whole thesis. But
+/// a run that is entirely refusals proves nothing, so at least one must succeed.
+///
+/// WHAT THIS DOES NOT ESTABLISH, measured rather than assumed. At this size —
+/// 60k rows of 256 bytes, about 15 MB — it PASSES with the snapshot guard
+/// removed, on APFS and on a non-copy-on-write HFS+ volume alike. The copy
+/// finishes in milliseconds either way, so there is no window to tear in. It is
+/// a regression test for the invariants, not a demonstration that the guard is
+/// necessary.
+///
+/// The demonstration lives in `scripts/sqlite-snapshot-torture.py`, which runs
+/// unbounded against a database large enough for the copy to take real time;
+/// there, removing the guard produces `database disk image is malformed` and
+/// snapshots of states the database was never in. Growing this test until it
+/// could show the same thing would cost minutes and gigabytes on every CI run,
+/// which is the wrong trade for a suite that runs on every push.
+///
+/// So read a pass here as "the invariants still hold", and the script as "and
+/// here is why the guard has to be there".
+#[test]
+fn commits_under_a_concurrent_writer_capture_only_whole_transactions() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    /// Rows per transaction. Small enough to keep the run quick, large enough
+    /// that a torn write lands mid-batch rather than exactly on a boundary.
+    const GROUP: i64 = 50;
+    const PAYLOAD: usize = 256;
+    /// Row budget, so this stays a test rather than a disk-space hazard.
+    const MAX_ROWS: i64 = 60_000;
+    const ROUNDS: usize = 6;
+
+    let tmp = tempdir().expect("temp dir");
+    let repo = tmp.path();
+    init_sqlite(repo);
+    exec_sql(
+        repo,
+        "PRAGMA journal_mode=WAL;
+         CREATE TABLE ledger(id INTEGER PRIMARY KEY, batch INTEGER NOT NULL, payload TEXT NOT NULL);
+         CREATE INDEX ledger_batch ON ledger(batch);",
+    );
+
+    let db = workspace_data_dir(repo).join("db.sqlite");
+    let stop = Arc::new(AtomicBool::new(false));
+    let written = Arc::new(AtomicU64::new(0));
+
+    let writer = {
+        let (db, stop, written) = (db.clone(), stop.clone(), written.clone());
+        std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(&db).expect("writer connection");
+            conn.busy_timeout(std::time::Duration::from_secs(30))
+                .expect("busy timeout");
+            let pad = "y".repeat(PAYLOAD);
+            let mut batch = 0i64;
+            while !stop.load(Ordering::Relaxed) && (batch * GROUP) < MAX_ROWS {
+                let next = batch + 1;
+                // One explicit transaction per batch, built as a single script:
+                // the whole point is that either all GROUP rows are in the
+                // snapshot or none of them are.
+                let mut script = String::from("BEGIN IMMEDIATE;");
+                for _ in 0..GROUP {
+                    script.push_str(&format!(
+                        "INSERT INTO ledger(batch, payload) VALUES({next},'{pad}');"
+                    ));
+                }
+                script.push_str("COMMIT;");
+                match conn.execute_batch(&script) {
+                    Ok(()) => {
+                        batch = next;
+                        written.fetch_add(GROUP as u64, Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        // The committer holds the write lock. Roll back the
+                        // half-open transaction before retrying, or the next
+                        // BEGIN fails for a different reason and the writer
+                        // silently stops writing anything at all.
+                        let _ = conn.execute_batch("ROLLBACK");
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
+            }
+        })
+    };
+
+    // Let the writer get ahead so every commit lands mid-stream.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let count_rows = |path: &Path| -> i64 {
+        let conn = rusqlite::Connection::open(path).expect("open");
+        conn.busy_timeout(std::time::Duration::from_secs(30))
+            .expect("busy timeout");
+        conn.query_row("SELECT count(*) FROM ledger", [], |r| r.get(0))
+            .expect("count")
+    };
+
+    let mut passed = 0usize;
+    let mut refused = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+
+    for round in 0..ROUNDS {
+        let before = count_rows(&db);
+        let (ok, _, stderr) = cli_runner::run_gfs_subprocess([
+            "gfs",
+            "commit",
+            "-m",
+            &format!("round {round}"),
+            "--path",
+            repo.to_str().unwrap(),
+        ]);
+        let after = count_rows(&db);
+
+        if !ok || stderr.contains("Refusing to commit") {
+            refused += 1;
+            continue;
+        }
+
+        // Resolve the snapshot through the commit object, not by listing
+        // directories: snapshot trees are made read-only at creation and share
+        // an mtime, so sorting them by time picks an arbitrary one.
+        let head = fs::read_to_string(repo.join(".gfs/refs/heads/main"))
+            .expect("read main ref")
+            .trim()
+            .to_string();
+        let commit = gfs_domain::repo_utils::repo_layout::get_commit_from_hash(repo, &head)
+            .expect("commit object");
+        let snapshot = repo
+            .join(".gfs/snapshots")
+            .join(&commit.snapshot_hash[..2])
+            .join(&commit.snapshot_hash[2..]);
+
+        // Copy it out: the tree is read-only, and reading a WAL database needs
+        // to create shared memory beside it.
+        let scratch = tempdir().expect("scratch");
+        let copied = scratch.path().join("snap");
+        assert!(
+            std::process::Command::new("cp")
+                .args(["-R"])
+                .arg(&snapshot)
+                .arg(&copied)
+                .status()
+                .expect("cp")
+                .success(),
+            "copy the snapshot out"
+        );
+        let _ = std::process::Command::new("chmod")
+            .args(["-R", "u+w"])
+            .arg(&copied)
+            .output();
+
+        let conn = rusqlite::Connection::open(copied.join("db.sqlite")).expect("open snapshot");
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .expect("integrity_check");
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM ledger", [], |r| r.get(0))
+            .expect("count");
+        let short_batch: Option<(i64, i64)> = conn
+            .query_row(
+                "SELECT batch, count(*) FROM ledger GROUP BY batch HAVING count(*) <> ?1 LIMIT 1",
+                [GROUP],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+        let (distinct, highest): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT count(DISTINCT batch), max(batch) FROM ledger",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("batch summary");
+
+        if integrity != "ok" {
+            failures.push(format!("round {round}: integrity_check said {integrity}"));
+        } else if let Some((batch, n)) = short_batch {
+            failures.push(format!(
+                "round {round}: torn transaction — batch {batch} has {n} of {GROUP} rows"
+            ));
+        } else if highest.is_some_and(|h| distinct != h) {
+            failures.push(format!(
+                "round {round}: batch gap — {distinct} batches present but highest is {}",
+                highest.unwrap()
+            ));
+        } else if !(before..=after).contains(&rows) {
+            failures.push(format!(
+                "round {round}: snapshot holds {rows} rows, outside [{before}, {after}] — \
+                 a state the database was never in"
+            ));
+        } else {
+            passed += 1;
+        }
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    writer.join().expect("writer thread");
+
+    assert!(
+        failures.is_empty(),
+        "the snapshot guard did not hold ({} written): {}",
+        written.load(Ordering::Relaxed),
+        failures.join("; ")
+    );
+    assert!(
+        passed > 0,
+        "every one of {ROUNDS} commits refused, so nothing was actually verified \
+         ({refused} refused)"
     );
 }

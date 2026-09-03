@@ -763,6 +763,15 @@ scripts/gfs-commit-checkout-race.py <repo> ./target/debug/gfs 10
 scripts/gfs-reclaim-orphan-snapshots.py <repo> [--delete]
 ```
 
+**Coverage note.** The SQLite e2e suites (`e2e_sqlite`, `mcp_sqlite_no_runtime`)
+are `cfg(unix)`, so they run on Linux as well as macOS. That matters more than
+it looks: on Linux `storage-file` uses `cp --reflink=auto`, which silently
+degrades to a deep copy on ext4, and a deep copy of a database being written to
+is where an unquiesced snapshot would tear. The concurrency test there asserts
+the invariants, but at a size sensible for CI it passes with the snapshot guard
+removed — the copy is too quick to tear. The torture script above is the one
+that shows why the guard has to exist.
+
 **Orphan snapshots.** A commit takes its snapshot before it writes the commit
 object, and the destination comes from the workspace path and a timestamp
 rather than from the content, so it is created up front. Killing `gfs commit`

@@ -36,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - chore: `scripts/gfs-reclaim-orphan-snapshots.py` lists and removes snapshot trees no commit refers to. A commit killed between taking its snapshot and writing its commit object leaves one behind, and there is no `gfs gc`
 - chore: `scripts/gfs-commit-checkout-race.py` reproduces the concurrent commit/checkout interleaving, so the fix above can be re-checked rather than believed
+- chore: the SQLite end-to-end suites now run on Linux as well as macOS (`cfg(unix)` rather than `cfg(target_os = "macos")`), which is where the snapshot guard matters most — `cp --reflink=auto` degrades to a deep copy on ext4. Adds a concurrency test that commits repeatedly against a live writer and asserts every snapshot is structurally sound, holds a row count the database passed through, and contains only whole transactions
 - chore: `scripts/sqlite-snapshot-torture.py` bounds its writer at `GFS_TORTURE_MAX_ROWS` (default 2,000,000, about 90 MB). Unbounded, twelve rounds wrote 59.8M rows and left a 7.5 GB repository, because each round runs for as long as the growing commit takes
 
 ## [0.2.0] - 2026-03-23

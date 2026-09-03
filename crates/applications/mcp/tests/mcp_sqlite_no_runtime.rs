@@ -13,11 +13,12 @@
 //! exist, which is what makes a pass mean the tool genuinely reached the
 //! database rather than quietly finding a daemon on the developer's machine.
 //!
-//! macOS-only for the same reason as the CLI's `e2e_sqlite` suite: commit goes
-//! through the platform storage backend, and these have only been exercised
-//! against APFS. See that file's header for the cost of the gating.
+//! Unix, not macOS-only: nothing here is APFS-specific, and running on Linux
+//! is what makes the claim mean anything on the platform most users deploy to.
+//! Windows is out because the CLI suite beside it shells out to `chmod`, and
+//! keeping the two gated alike avoids one passing where the other cannot.
 
-#![cfg(target_os = "macos")]
+#![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -255,6 +256,13 @@ fn the_repository_lifecycle_needs_no_container_runtime() {
 #[test]
 fn query_reaches_the_embedded_engine_and_time_travel_works() {
     if !have_sqlite3() {
+        // Skipping is fine on a developer machine without the client, but in CI
+        // a silent skip is a hole in exactly the coverage this suite exists to
+        // provide — so there it is a failure. Both GitHub runners ship sqlite3.
+        assert!(
+            std::env::var("CI").is_err(),
+            "CI must exercise the query path: host 'sqlite3' not found on PATH"
+        );
         eprintln!("SKIP query_reaches_the_embedded_engine: host 'sqlite3' not found");
         return;
     }
