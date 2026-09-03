@@ -732,7 +732,7 @@ impl Compute for DockerCompute {
             .unwrap_or_default();
 
         Ok(InstanceConnectionInfo {
-            host: "localhost".to_string(),
+            host: "127.0.0.1".to_string(),
             port: host_port,
             env,
         })
