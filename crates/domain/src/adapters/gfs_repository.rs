@@ -359,22 +359,6 @@ fn create_empty_workspace(path: &Path) -> std::io::Result<()> {
 /// repository files can be owned by subordinate UIDs that are not chmod-able
 /// from the host user. In that case, we continue checkout and let the runtime
 /// handle access through its own namespace mapping.
-/// Make a tree writable so it can be removed.
-///
-/// A workspace restored from a snapshot carries the snapshot's read-only bits,
-/// and `remove_dir_all` will not override them. Best effort: the removal that
-/// follows reports the real failure if this was not enough.
-fn make_tree_writable(path: &Path) {
-    #[cfg(unix)]
-    {
-        let _ = Command::new("chmod").args(["-R", "u+w"]).arg(path).output();
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-}
-
 /// Whether this repository's restores come from something other than a
 /// filesystem snapshot.
 ///
@@ -640,37 +624,19 @@ impl Repository for GfsRepository {
             .join(&workspace_segment)
             .join(WORKSPACE_DATA_DIR);
 
-        // Reusing an existing workspace is deliberate for a BRANCH: it keeps
-        // uncommitted work across a round trip through another branch, which is
-        // what a working copy is for.
+        // Only populate from snapshot when the workspace does not exist (preserve
+        // live DB state in branch workspace).
         //
-        // It is not deliberate for a DETACHED commit. That directory is named
-        // by the commit hash — an immutable name for exactly one content state
-        // — so leaving a mutation in it and coming back gave you something
-        // other than what `Switched to <hash>` says you got. Rebuild it, unless
-        // it is already the active workspace, in which case re-checking-out
-        // where you already are must not throw away what you are doing.
-        let detached = branch_segment == "detached";
-        let already_active = repo_layout::get_active_workspace_data_dir(&repo)
-            .map(|active| active == workspace_path)
-            .unwrap_or(false);
-        let reuse_workspace = workspace_path.exists() && (!detached || already_active);
-
+        // NOTE: whether to reuse an existing workspace at all is upstream PR #76's
+        // subject, not this branch's. Deliberately left as-is here so the two do
+        // not collide; only the MISSING-SNAPSHOT case below is changed.
+        let workspace_exists = workspace_path.exists();
         tracing::info!(
-            "Checkout: workspace_path={:?}, exists={}, reuse={}",
+            "Checkout: workspace_path={:?}, exists={}",
             workspace_path,
-            workspace_path.exists(),
-            reuse_workspace
+            workspace_exists
         );
-
-        if !reuse_workspace {
-            // A detached workspace left over from an earlier visit is stale by
-            // definition; clear it so the restore below is what the caller gets.
-            if workspace_path.exists() {
-                make_tree_writable(&workspace_path);
-                fs::remove_dir_all(&workspace_path).map_err(RepositoryError::Io)?;
-            }
-
+        if !workspace_exists {
             let commit = repo_layout::get_commit_from_hash(&repo, &commit_hash).map_err(map_err)?;
             let snapshot_hash = commit.snapshot_hash;
             let snapshot_dir = repo

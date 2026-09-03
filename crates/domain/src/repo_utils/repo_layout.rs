@@ -1054,16 +1054,6 @@ pub fn get_current_commit_id(repo_path: &Path) -> Result<String, RepoError> {
 
 /// Short commit id used for workspace directory path segment (avoids long paths on disk).
 /// If `commit_id` is longer than `SHORT_COMMIT_ID_LEN`, returns the prefix; otherwise returns as-is (e.g. `"0"`).
-/// The directory holding a branch's working copy.
-///
-/// Keyed by branch NAME, which is why it has to be removed when the branch is:
-/// a later branch that reuses the name would otherwise inherit this one's
-/// working copy, uncommitted rows included, and `checkout` would report success
-/// while handing over content that branch never contained.
-pub fn branch_workspace_dir(repo_path: &Path, branch: &str) -> std::path::PathBuf {
-    repo_path.join(GFS_DIR).join(WORKSPACES_DIR).join(branch)
-}
-
 pub fn short_commit_id_for_workspace(commit_id: &str) -> String {
     if commit_id.len() <= SHORT_COMMIT_ID_LEN {
         commit_id.to_string()
