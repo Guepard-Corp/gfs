@@ -32,6 +32,12 @@ pub enum CheckoutRepoError {
 
     #[error("compute: {0}")]
     Compute(#[from] ComputeError),
+
+    #[error(
+        "the workspace has uncommitted changes that checkout would overwrite ({0}). \
+         Commit them first, or pass --force to discard them"
+    )]
+    WorkspaceDirty(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -47,6 +53,8 @@ pub struct CheckoutRepoUseCase<R: DatabaseProviderRegistry> {
     repository: Arc<dyn Repository>,
     compute: Arc<dyn Compute>,
     registry: Arc<R>,
+    /// Discard uncommitted work instead of refusing. Off by default.
+    force: bool,
 }
 
 impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
@@ -59,7 +67,73 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
             repository,
             compute,
             registry,
+            force: false,
         }
+    }
+
+    /// Overwrite a workspace that has uncommitted changes rather than refusing.
+    ///
+    /// A builder rather than a `run` parameter on purpose: `run`'s signature is
+    /// part of this crate's public surface and the data-plane calls it directly,
+    /// so adding an argument would break a caller that has no opinion about
+    /// forcing.
+    pub fn with_force(mut self, force: bool) -> Self {
+        self.force = force;
+        self
+    }
+
+    /// The uncommitted changes this checkout would overwrite, as a short
+    /// description.
+    ///
+    /// Asks about the TARGET workspace, not the one being left, because that is
+    /// the directory the restore rebuilds. Getting this backwards is a live
+    /// hazard rather than a nicety: checking the workspace you leave both
+    /// refuses switches that would overwrite nothing — each branch has its own
+    /// directory, so leaving a dirty branch destroys nothing — and, worse, lets
+    /// you walk away from dirty work on one branch and come back to it from a
+    /// clean one, at which point the restore deletes it with no refusal at all.
+    ///
+    /// The baseline is the file list recorded on the commit being checked out,
+    /// which is the right one for that directory: committing on a branch
+    /// snapshots its workspace, so the two agree immediately afterwards and
+    /// everything written since is uncommitted.
+    ///
+    /// `None` whenever the question cannot be answered — an unresolvable
+    /// revision (a branch about to be created), no commits yet, or a commit
+    /// that predates file lists. Checkout then proceeds and reports its own
+    /// error, rather than refusing on a fact this does not have.
+    async fn uncommitted_changes(
+        &self,
+        path: &Path,
+        revision: &str,
+    ) -> std::result::Result<Option<String>, CheckoutRepoError> {
+        let Ok((commit_hash, workspace)) = repo_layout::checkout_target(path, revision) else {
+            return Ok(None);
+        };
+        if commit_hash == "0" {
+            return Ok(None);
+        }
+        let Ok(commit) = repo_layout::get_commit_from_hash(path, &commit_hash) else {
+            return Ok(None);
+        };
+        let Ok(Some(baseline)) = repo_layout::get_file_entries_for_commit(path, &commit) else {
+            return Ok(None);
+        };
+        let changed = repo_layout::workspace_changes(&workspace, &baseline)
+            .map_err(|e| CheckoutRepoError::Repository(RepositoryError::Internal(e.to_string())))?;
+        if changed.is_empty() {
+            return Ok(None);
+        }
+        let shown: Vec<&str> = changed.iter().take(3).map(String::as_str).collect();
+        Ok(Some(if changed.len() > shown.len() {
+            format!(
+                "{} and {} more",
+                shown.join(", "),
+                changed.len() - shown.len()
+            )
+        } else {
+            shown.join(", ")
+        }))
     }
 
     /// Check out `revision` (branch name or full 64-char commit hash) at `path`.
@@ -72,7 +146,27 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
         revision: String,
         create_branch: Option<String>,
     ) -> std::result::Result<String, CheckoutRepoError> {
+        // Refuse before anything is touched. Checkout restores the workspace
+        // from a snapshot, so work that was never committed is overwritten and
+        // unrecoverable. Neither silent option is acceptable: discarding loses
+        // data the user cannot get back, and preserving it across a switch
+        // leaves state that no command in GFS displays.
         let revision = revision.trim().to_string();
+
+        // Refuse before anything is touched. The restore rebuilds the target
+        // workspace, so work that was never committed THERE is overwritten and
+        // unrecoverable. Neither silent option is acceptable: discarding loses
+        // data the user cannot get back, and keeping a stale directory means
+        // `Switched to X` does not give you X.
+        //
+        // Skipped when a branch is being created, since its workspace does not
+        // exist yet and there is nothing to lose.
+        if !self.force
+            && create_branch.is_none()
+            && let Some(changed) = self.uncommitted_changes(&path, &revision).await?
+        {
+            return Err(CheckoutRepoError::WorkspaceDirty(changed));
+        }
 
         // Validate the target ref BEFORE stopping compute — a bad revision must
         // not leave the database offline (mirrors the k8s checkout path).
