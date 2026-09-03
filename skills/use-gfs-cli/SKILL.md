@@ -239,6 +239,11 @@ gfs checkout <commit_id>
 
 #### Start/Stop Database Container
 
+Container-backed providers only. On a SQLite repository every `gfs compute`
+action reports that an embedded database is a file this process opens, with no
+container to start, stop or inspect — and `gfs user` likewise reports that there
+is no server, so no roles, passwords or privileges to manage.
+
 ```shell
 # Check container status
 gfs compute status
