@@ -522,11 +522,35 @@ pub fn snapshot_diff(
     })
 }
 
+/// Split a 64-hex object hash into its `<2>/<62>` storage path parts.
+///
+/// Guarded, because `str::split_at` panics on a boundary past the end and the
+/// value that reaches here is not always a hash. A repository with no commits
+/// records the sentinel `"0"` as its current commit, so `gfs schema show HEAD`
+/// on a fresh repo — step two of the documented workflow — reached
+/// `"0".split_at(2)` and took the whole process down with
+/// `end byte index 2 is out of bounds for string of length 1`. Over MCP that
+/// was worse than a crash: the panic unwound the request while the server
+/// stayed up, so the call was never answered and the client waited forever.
+///
+/// Returning `RevisionNotFound` instead turns it into the same error every
+/// other bad revision produces.
+pub fn split_object_hash(hash: &str) -> Result<(&str, &str), RepoError> {
+    if hash.len() < 3 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(if hash == "0" {
+            RepoError::NoCommitsYet
+        } else {
+            RepoError::RevisionNotFound(hash.to_string())
+        });
+    }
+    Ok(hash.split_at(2))
+}
+
 pub fn get_commit_from_hash(repo_path: &Path, commit_hash: &str) -> Result<Commit, RepoError> {
     tracing::trace!("Getting commit from hash {}", commit_hash);
 
     let objects_dir = repo_path.join(GFS_DIR).join(OBJECTS_DIR);
-    let (dir_part, file_part) = commit_hash.split_at(2);
+    let (dir_part, file_part) = split_object_hash(commit_hash)?;
     let object_path = objects_dir.join(dir_part).join(file_part);
     let commit_json = fs::read_to_string(object_path).map_err(RepoError::from)?;
 
@@ -659,9 +683,25 @@ pub fn write_schema_object(
     let schema_json = serde_json::to_string_pretty(schema_metadata)
         .map_err(|e| RepoError::InvalidConfig(format!("failed to serialize schema: {}", e)))?;
 
-    // 2. Compute SHA-256 hash of schema.json content
+    // 2. Name the object after EVERYTHING it stores, not just half of it.
+    //
+    //    The hash covered `schema.json` alone while the directory it names also
+    //    holds `schema.sql`. Two commits whose structured metadata matches but
+    //    whose DDL differs — a dropped CHECK constraint, a changed foreign-key
+    //    action, a rewritten trigger body, a different collation — therefore
+    //    landed in the SAME directory, and the second write REPLACED the first
+    //    commit's `schema.sql`. `gfs schema show <old-commit>` then returned
+    //    the newer schema: a stored artefact changing retroactively, with
+    //    nothing to indicate it.
+    //
+    //    Including the DDL makes the name identify the content, which is what a
+    //    content-addressed store is for. A separator keeps the two fields from
+    //    running together, so a byte moved from the end of one to the start of
+    //    the other cannot produce the same digest.
     let mut hasher = Sha256::new();
     hasher.update(schema_json.as_bytes());
+    hasher.update(b"\0schema.sql\0");
+    hasher.update(schema_sql.as_bytes());
     let hash = format!("{:x}", hasher.finalize());
 
     // 3. Create directory: objects/<2>/<62>/
@@ -1104,6 +1144,89 @@ mod tests {
     use std::fs;
     use std::io;
     use tempfile::TempDir;
+
+    /// A schema object must be named by everything it stores.
+    ///
+    /// The hash covered `schema.json` alone while the directory it names also
+    /// holds `schema.sql`, so two commits with identical structured metadata
+    /// and different DDL — a dropped CHECK, a changed FK action, a rewritten
+    /// trigger — collided, and the second write REPLACED the first commit's
+    /// stored DDL. `gfs schema show <old>` then returned the newer schema.
+    #[test]
+    fn two_schemas_differing_only_in_ddl_do_not_collide() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata = crate::model::datasource::DatasourceMetadata {
+            version: "3".into(),
+            driver: "sqlite".into(),
+            schemas: vec![],
+            tables: vec![],
+            columns: vec![],
+            views: None,
+            functions: None,
+            indexes: None,
+            triggers: None,
+            materialized_views: None,
+            types: None,
+            foreign_tables: None,
+            policies: None,
+            table_privileges: None,
+            column_privileges: None,
+            config: None,
+            publications: None,
+            roles: None,
+            extensions: None,
+        };
+
+        let first =
+            write_schema_object(dir.path(), &metadata, "CREATE TABLE t(a INT CHECK(a > 0));")
+                .expect("first");
+        let second =
+            write_schema_object(dir.path(), &metadata, "CREATE TABLE t(a INT);").expect("second");
+
+        assert_ne!(
+            first, second,
+            "same metadata, different DDL — the objects must not share a name"
+        );
+
+        // And the first commit's DDL is still what it was.
+        let stored = |hash: &str| {
+            let (a, b) = hash.split_at(2);
+            fs::read_to_string(
+                dir.path()
+                    .join(GFS_DIR)
+                    .join(OBJECTS_DIR)
+                    .join(a)
+                    .join(b)
+                    .join("schema.sql"),
+            )
+            .expect("schema.sql")
+        };
+        assert!(stored(&first).contains("CHECK"), "the older DDL survived");
+        assert!(!stored(&second).contains("CHECK"));
+    }
+
+    /// A repository with no commits must not take the process down.
+    ///
+    /// `get_current_commit_id` returns the sentinel `"0"` before the first
+    /// commit, and `"0".split_at(2)` panics. `gfs schema show HEAD` on a fresh
+    /// repository is step two of the documented workflow, so this was reachable
+    /// immediately — and over MCP the panic unwound the request while the
+    /// server stayed up, leaving the client waiting forever.
+    #[test]
+    fn a_hash_that_is_not_a_hash_is_an_error_not_a_panic() {
+        assert!(matches!(
+            split_object_hash("0"),
+            Err(RepoError::NoCommitsYet)
+        ));
+        for bad in ["", "a", "ab", "zz1234", "not-hex-at-all"] {
+            assert!(
+                split_object_hash(bad).is_err(),
+                "{bad:?} is not an object hash"
+            );
+        }
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(split_object_hash(hash).unwrap(), ("01", &hash[2..]));
+    }
 
     #[test]
     fn short_commit_id_for_workspace_keeps_short_and_truncates_long() {

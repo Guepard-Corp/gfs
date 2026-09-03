@@ -84,7 +84,10 @@ pub async fn run_show(
 
     // Load commit
     let commit_obj = repo_layout::get_commit_from_hash(&repo_path, &commit_hash)
-        .with_context(|| format!("failed to load commit {}", commit_hash))?;
+        // No `.with_context()`: anyhow renders the context string ALONE, so
+        // wrapping replaced "the repository has no commits yet" with "failed to
+        // load commit 0" — the half that says nothing.
+        ?;
 
     // Get schema hash
     let schema_hash = commit_obj.schema_hash.ok_or_else(|| {
@@ -152,10 +155,8 @@ pub async fn run_diff(
         .with_context(|| format!("failed to resolve commit '{}'", commit2))?;
 
     // Load commits
-    let commit1_obj = repo_layout::get_commit_from_hash(&repo_path, &hash1)
-        .with_context(|| format!("failed to load commit {}", hash1))?;
-    let commit2_obj = repo_layout::get_commit_from_hash(&repo_path, &hash2)
-        .with_context(|| format!("failed to load commit {}", hash2))?;
+    let commit1_obj = repo_layout::get_commit_from_hash(&repo_path, &hash1)?;
+    let commit2_obj = repo_layout::get_commit_from_hash(&repo_path, &hash2)?;
 
     // Get schema hashes
     let schema_hash1 = commit1_obj
