@@ -565,37 +565,26 @@ impl Repository for GfsRepository {
             .map_err(|e| RepositoryError::Internal(e.to_string()))?;
         fs::write(&object_path, json).map_err(RepositoryError::Io)?;
 
-        // 7. Advance the current branch ref to the new commit — or, on a
-        //    detached HEAD, advance HEAD itself.
-        //
-        //    Skipping both, which is what this used to do, wrote the object and
-        //    updated nothing: the commit was unreachable from every ref and
-        //    from HEAD the moment it was created, reported as a success whose
-        //    branch field was the full 64-character hash. There is no reflog to
-        //    find it again with. Moving HEAD is what git does, and it keeps the
-        //    commit reachable; the CLI says plainly that it is on no branch.
+        // 7. Advance the current branch ref to the new commit.
         let branch = repo_layout::get_current_branch(&repo).map_err(map_err)?;
-        let detached = branch.len() == 64 && branch.chars().all(|c| c.is_ascii_hexdigit());
-        if detached {
-            repo_layout::update_head_with_commit(&repo, &commit_hash).map_err(map_err)?;
-        } else {
+        // Only update a named branch ref; skip when HEAD is detached (64-char hex).
+        //
+        // NOTE: this leaves a detached-HEAD commit unreachable, which upstream
+        // PR #146 fixes properly — by refusing the commit at the top of this
+        // method, before anything is written, with a typed
+        // `RepositoryError::DetachedHead`. Deliberately not touched here so the
+        // two do not collide.
+        if !(branch.len() == 64 && branch.chars().all(|c| c.is_ascii_hexdigit())) {
             repo_layout::update_branch_ref(&repo, &branch, &commit_hash).map_err(map_err)?;
         }
 
-        if detached {
-            tracing::info!(
-                "Committed '{}' on a detached HEAD → {} (no branch points at it)",
-                new_commit.message,
-                commit_hash
-            );
-        } else {
-            tracing::info!(
-                "Committed '{}' on branch '{}' → {}",
-                new_commit.message,
-                branch,
-                commit_hash
-            );
-        }
+        tracing::info!(
+            "Committed '{}' on branch '{}' → {}",
+            new_commit.message,
+            branch,
+            commit_hash
+        );
+
         Ok(commit_hash)
     }
 

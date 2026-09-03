@@ -119,46 +119,19 @@ async fn run(
             "{}",
             json!({
                 "hash": commit_hash,
-                "branch": if is_detached(&branch) { None } else { Some(branch.clone()) },
-                "detached": is_detached(&branch),
+                "branch": branch,
                 "message": message,
             })
         );
     } else {
         let short = &commit_hash[..7.min(commit_hash.len())];
-        // On a detached HEAD `branch` is the full 64-character hash of the
-        // commit we were sitting on, which made the success line read
-        // "✓ [<64 hex>] abc1234". Name the situation instead, and say what to
-        // do about it: HEAD now points at this commit, but nothing else does,
-        // and the next checkout leaves it with no way back.
-        if is_detached(&branch) {
-            println!(
-                "{} [detached HEAD] {}  {}",
-                green("✓"),
-                dimmed(short),
-                message
-            );
-            eprintln!(
-                "  note: this commit is on no branch. Keep it with `gfs branch <name> {short}` \
-                 before checking anything else out"
-            );
-        } else {
-            println!(
-                "{} [{}] {}  {}",
-                green("✓"),
-                cyan(&branch),
-                dimmed(short),
-                message
-            );
-        }
+        println!(
+            "{} [{}] {}  {}",
+            green("✓"),
+            cyan(&branch),
+            dimmed(short),
+            message
+        );
     }
     Ok(())
-}
-
-/// Whether `branch` is really a detached HEAD.
-///
-/// `get_current_branch` returns the commit hash itself when HEAD is detached,
-/// so a 64-character hex string is not a branch name.
-fn is_detached(branch: &str) -> bool {
-    branch.len() == 64 && branch.chars().all(|c| c.is_ascii_hexdigit())
 }

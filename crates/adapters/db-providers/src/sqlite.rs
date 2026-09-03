@@ -1085,16 +1085,15 @@ fn brief(error: &rusqlite::Error) -> String {
     if full.len() <= MAX {
         return full;
     }
-    if let (Some(start), Some(end)) = (full.find(" in "), full.rfind(" at offset ")) {
-        if start < end {
-            return format!(
-                "{}{}[{} more bytes of script elided]{}",
-                &full[..start + 4],
-                "",
-                end - (start + 4),
-                &full[end..]
-            );
-        }
+    if let (Some(start), Some(end)) = (full.find(" in "), full.rfind(" at offset "))
+        && start < end
+    {
+        return format!(
+            "{}[{} more bytes of script elided]{}",
+            &full[..start + 4],
+            end - (start + 4),
+            &full[end..]
+        );
     }
     format!("{}… [{} more bytes elided]", &full[..MAX], full.len() - MAX)
 }
