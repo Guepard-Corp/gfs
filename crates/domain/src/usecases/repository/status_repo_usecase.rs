@@ -90,9 +90,19 @@ impl<R: DatabaseProviderRegistry> StatusRepoUseCase<R> {
                 provider.connection_string(&params).ok()
             });
 
+        // "0" is the sentinel for a repository with no commits; reporting it
+        // as a commit id would be worse than reporting nothing.
+        let head_commit = self
+            .repository
+            .get_current_commit_id(path)
+            .await
+            .ok()
+            .filter(|id| id != "0");
+
         Ok(StatusResponse {
             current_branch,
             compute,
+            head_commit,
             connection_string,
             active_workspace_data_dir,
             bind_mismatch_warning,

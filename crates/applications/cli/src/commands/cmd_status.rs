@@ -264,6 +264,14 @@ fn print_table(s: &StatusResponse, repo_path: &Path, moments: Option<&cmd_source
     );
     println!("{}", box_row(&branch_row, BOX_W));
 
+    // The same field the MCP `status` tool reports, from the same place. When
+    // only MCP had it the two surfaces answered the same question differently.
+    if let Some(ref head) = s.head_commit {
+        let short = &head[..7.min(head.len())];
+        let row = fmt_box_row_colored("HEAD", &dimmed(short), short, LABEL_W, BOX_W);
+        println!("{}", box_row(&row, BOX_W));
+    }
+
     if let Some(ref active) = s.active_workspace_data_dir {
         let rel = relativize_to_repo(repo_path, active);
         let row = fmt_box_row("Active workspace", &rel, LABEL_W, BOX_W);

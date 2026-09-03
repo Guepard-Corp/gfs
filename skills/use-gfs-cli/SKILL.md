@@ -126,10 +126,13 @@ gfs init --database-provider sqlite --database-version 3
 gfs status
 ```
 
-Shows the current branch, the active workspace, and database container status
-(including the connection string when there is one). It does NOT report the HEAD
-commit — use `gfs log` for that. For an embedded provider there is no container
-section, and the connection string is a `sqlite:` URL to the file.
+Shows the current branch, the HEAD commit, the active workspace, and database
+container status (including the connection string when there is one). For an
+embedded provider there is no container section, and the connection string is a
+`sqlite:` URL to the file.
+
+The MCP `status` tool reports the same fields from the same source, so the two
+surfaces cannot disagree.
 
 ## Revision References
 

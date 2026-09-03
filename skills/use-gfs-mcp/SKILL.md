@@ -129,6 +129,9 @@ Returns: `current_branch`, `head_commit` (absent before the first commit),
 SQLite, `connection_string` is a `sqlite:` URL to the file in the active
 workspace and there is no `compute` section.
 
+`gfs status` reports the same fields from the same source, so the CLI and this
+tool cannot disagree.
+
 ### 4. Commit Changes
 
 Tool: `commit`

@@ -441,3 +441,41 @@ fn init_refuses_what_the_cli_refuses() {
     );
     assert!(repo.join(".gfs/config.toml").exists());
 }
+
+/// `status` reports the fields the CLI reports, from the shared response.
+///
+/// `head_commit` existed only as a field the MCP tool injected into its own
+/// payload, so the CLI reported none in any output mode and the two skill files
+/// documented the same command two different ways. It now lives on
+/// `StatusResponse`, which both surfaces serialise. The CLI half of this parity
+/// is asserted in `gfs-cli`'s `e2e_sqlite`, where that binary is available.
+#[test]
+fn status_reports_the_shared_response_fields() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    let mut s = McpSession::start();
+
+    init_sqlite(&mut s, repo);
+    import_seed(&mut s, repo, "CREATE TABLE t(a INTEGER PRIMARY KEY);\n");
+    let commit = s.call("commit", json!({ "path": repo, "message": "one" }));
+    let expected = commit
+        .get("commit_id")
+        .and_then(Value::as_str)
+        .expect("commit_id");
+
+    let from_mcp = s.call("status", json!({ "path": repo }));
+
+    assert_eq!(
+        from_mcp.get("head_commit").and_then(Value::as_str),
+        Some(expected),
+        "status must report the commit HEAD points at: {from_mcp}"
+    );
+    assert_eq!(
+        from_mcp.get("current_branch").and_then(Value::as_str),
+        Some("main")
+    );
+    assert!(
+        from_mcp.get("active_workspace_data_dir").is_some(),
+        "the field the CLI also reports must be here: {from_mcp}"
+    );
+}

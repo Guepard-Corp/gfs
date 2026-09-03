@@ -718,14 +718,6 @@ async fn do_status(args: &serde_json::Value) -> Result<CallToolResult, McpError>
     let mut payload = serde_json::to_value(&status)
         .map_err(|e| to_error_data(format!("serialize status: {e}")))?;
 
-    // HEAD is not part of StatusResponse, and it is the field the skill names
-    // most specifically.
-    if let Ok(head) = repository.get_current_commit_id(&repo_path).await
-        && head != "0"
-    {
-        payload["head_commit"] = json!(head);
-    }
-
     // An embedded provider has no compute section to carry its connection
     // string, so it had nowhere to appear at all.
     if let Ok(config) = GfsConfig::load(&repo_path)

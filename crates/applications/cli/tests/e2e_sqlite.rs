@@ -799,3 +799,63 @@ fn commits_under_a_concurrent_writer_capture_only_whole_transactions() {
          ({refused} refused)"
     );
 }
+
+/// `gfs status` reports the commit HEAD points at.
+///
+/// It did not, in any output mode, while the MCP `status` tool did — because
+/// that tool injected a `head_commit` into its own payload rather than reading
+/// a shared field. The two surfaces answered the same question differently and
+/// the skill files documented both answers. The field now lives on
+/// `StatusResponse`, so neither can drift.
+#[test]
+fn status_reports_the_head_commit_like_the_mcp_tool_does() {
+    let tmp = tempdir().expect("temp dir");
+    let repo = tmp.path();
+    init_sqlite(repo);
+
+    // Before the first commit there is no HEAD to report, and the sentinel "0"
+    // must not be dressed up as one.
+    let (ok, stdout, stderr) = cli_runner::run_gfs_subprocess([
+        "gfs",
+        "status",
+        "--path",
+        repo.to_str().unwrap(),
+        "--output",
+        "json",
+    ]);
+    assert!(ok, "status before any commit: {stderr}");
+    let before: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert!(
+        before.get("head_commit").is_none(),
+        "no commits yet, so no HEAD: {before}"
+    );
+
+    exec_sql(repo, "CREATE TABLE t(a INTEGER PRIMARY KEY);");
+    assert!(commit(repo, "one").0, "commit");
+    let expected = head_commit(repo);
+
+    let (ok, stdout, stderr) = cli_runner::run_gfs_subprocess([
+        "gfs",
+        "status",
+        "--path",
+        repo.to_str().unwrap(),
+        "--output",
+        "json",
+    ]);
+    assert!(ok, "status after a commit: {stderr}");
+    let after: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(
+        after.get("head_commit").and_then(|v| v.as_str()),
+        Some(expected.as_str()),
+        "status must report the commit HEAD points at: {after}"
+    );
+
+    // And the styled output shows it too, not just the machine-readable form.
+    let (ok, stdout, _) =
+        cli_runner::run_gfs_subprocess(["gfs", "status", "--path", repo.to_str().unwrap()]);
+    assert!(ok);
+    assert!(
+        stdout.contains(&expected[..7]),
+        "the styled output should show the short HEAD: {stdout}"
+    );
+}
