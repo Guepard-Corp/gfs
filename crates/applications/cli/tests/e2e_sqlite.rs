@@ -484,3 +484,307 @@ fn an_ambiguous_workspace_is_explained_by_every_command_that_hits_it() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Core checkout/commit behaviour (TASK-8.17)
+//
+// These are not SQLite-specific — they live in the shared checkout and commit
+// path and hold for every provider. They are asserted here because SQLite is
+// the only provider that runs without a container, so this is the only suite
+// that can exercise them without a daemon.
+// ---------------------------------------------------------------------------
+
+/// Rows in `users`, sorted, as one string.
+fn users(repo_path: &Path) -> String {
+    let db = workspace_data_dir(repo_path).join("db.sqlite");
+    let conn = rusqlite::Connection::open(db).expect("open workspace database");
+    let mut names: Vec<String> = conn
+        .prepare("SELECT name FROM users")
+        .expect("prepare")
+        .query_map([], |r| r.get(0))
+        .expect("query")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect");
+    names.sort();
+    names.join(",")
+}
+
+/// A repo on `main` with one commit holding `alice`.
+fn repo_with_alice(repo: &Path) {
+    init_sqlite(repo);
+    exec_sql(
+        repo,
+        "CREATE TABLE users(name TEXT); INSERT INTO users VALUES('alice');",
+    );
+    assert!(commit(repo, "alice").0, "first commit");
+}
+
+/// A branch's working copy must not outlive the branch.
+///
+/// The workspace is keyed by branch NAME, and `branch -d` removed only the ref.
+/// A later branch reusing the name inherited the dead branch's working copy —
+/// uncommitted rows included — and checkout reported success while handing over
+/// content that branch never contained. A commit taken from there records a
+/// diff that never happened, and nothing in the tool can tell afterwards.
+#[test]
+fn a_deleted_branch_does_not_leave_its_working_copy_behind() {
+    let tmp = tempdir().expect("temp dir");
+    let repo = tmp.path();
+    repo_with_alice(repo);
+
+    let first = head_commit(repo);
+    exec_sql(repo, "INSERT INTO users VALUES('carol');");
+    assert!(commit(repo, "carol").0, "second commit");
+    let second = head_commit(repo);
+
+    // A branch at the first commit, with a commit of its own and some
+    // uncommitted work on top.
+    assert!(
+        cli_runner::run_gfs([
+            "gfs",
+            "checkout",
+            "--path",
+            repo.to_str().unwrap(),
+            "-b",
+            "b1",
+            &first,
+        ])
+        .0,
+        "branch b1 at the first commit"
+    );
+    exec_sql(repo, "INSERT INTO users VALUES('dave');");
+    assert!(commit(repo, "dave on b1").0, "commit on b1");
+    exec_sql(repo, "INSERT INTO users VALUES('UNCOMMITTED');");
+
+    assert!(
+        cli_runner::run_gfs(["gfs", "checkout", "--path", repo.to_str().unwrap(), "main"]).0,
+        "back to main"
+    );
+    assert!(
+        cli_runner::run_gfs([
+            "gfs",
+            "branch",
+            "--path",
+            repo.to_str().unwrap(),
+            "-d",
+            "b1"
+        ])
+        .0,
+        "delete b1"
+    );
+    assert!(
+        !repo.join(".gfs/workspaces/b1").exists(),
+        "the workspace must go with the branch"
+    );
+
+    // A new branch that happens to reuse the name, at a different commit.
+    assert!(
+        cli_runner::run_gfs([
+            "gfs",
+            "branch",
+            "--path",
+            repo.to_str().unwrap(),
+            "b1",
+            &second,
+        ])
+        .0,
+        "recreate b1 at the second commit"
+    );
+    assert!(
+        cli_runner::run_gfs(["gfs", "checkout", "--path", repo.to_str().unwrap(), "b1"]).0,
+        "checkout the new b1"
+    );
+    assert_eq!(
+        users(repo),
+        "alice,carol",
+        "the new b1 must hold its own commit's content, not the deleted branch's working copy"
+    );
+}
+
+/// A branch workspace still keeps uncommitted work across a round trip.
+///
+/// This is what the reuse is FOR, and the fix above must not cost it.
+#[test]
+fn a_branch_keeps_uncommitted_work_across_a_round_trip() {
+    let tmp = tempdir().expect("temp dir");
+    let repo = tmp.path();
+    repo_with_alice(repo);
+
+    assert!(
+        cli_runner::run_gfs([
+            "gfs",
+            "checkout",
+            "--path",
+            repo.to_str().unwrap(),
+            "-b",
+            "feature",
+        ])
+        .0,
+        "create feature"
+    );
+    exec_sql(repo, "INSERT INTO users VALUES('wip');");
+
+    assert!(
+        cli_runner::run_gfs(["gfs", "checkout", "--path", repo.to_str().unwrap(), "main"]).0,
+        "to main"
+    );
+    assert_eq!(users(repo), "alice", "main is unaffected by feature's work");
+
+    assert!(
+        cli_runner::run_gfs([
+            "gfs",
+            "checkout",
+            "--path",
+            repo.to_str().unwrap(),
+            "feature"
+        ])
+        .0,
+        "back to feature"
+    );
+    assert_eq!(users(repo), "alice,wip", "uncommitted work must survive");
+}
+
+/// A commit hash names exactly one content state.
+///
+/// A detached workspace is named by the commit hash, and it was reused as-is,
+/// so mutating one and returning to it gave you something other than what
+/// `Switched to <hash>` says you got.
+#[test]
+fn returning_to_a_detached_commit_gives_that_commit_not_what_was_left_there() {
+    let tmp = tempdir().expect("temp dir");
+    let repo = tmp.path();
+    repo_with_alice(repo);
+
+    let first = head_commit(repo);
+    exec_sql(repo, "INSERT INTO users VALUES('bob');");
+    assert!(commit(repo, "bob").0, "second commit");
+
+    assert!(
+        cli_runner::run_gfs(["gfs", "checkout", "--path", repo.to_str().unwrap(), &first]).0,
+        "detach at the first commit"
+    );
+    assert_eq!(users(repo), "alice");
+    exec_sql(repo, "INSERT INTO users VALUES('POISON');");
+
+    // Re-checking-out where you already are must NOT throw away what you are
+    // doing — the directory is only stale once you have left it.
+    assert!(
+        cli_runner::run_gfs(["gfs", "checkout", "--path", repo.to_str().unwrap(), &first]).0,
+        "re-checkout the same commit"
+    );
+    assert_eq!(users(repo), "POISON,alice", "still where you were");
+
+    assert!(
+        cli_runner::run_gfs(["gfs", "checkout", "--path", repo.to_str().unwrap(), "main"]).0,
+        "leave"
+    );
+    assert!(
+        cli_runner::run_gfs(["gfs", "checkout", "--path", repo.to_str().unwrap(), &first]).0,
+        "and come back"
+    );
+    assert_eq!(
+        users(repo),
+        "alice",
+        "the commit's content, not what was left in its directory"
+    );
+}
+
+/// A missing snapshot must fail, not seed an empty database.
+///
+/// The restore treated "this commit records no snapshot" and "this commit's
+/// snapshot is gone" as the same thing. `schema show` still printed the real
+/// DDL, so only a query noticed, and a commit taken from that state recorded
+/// the emptiness as a legitimate breaking change.
+#[test]
+fn a_checkout_whose_snapshot_is_missing_fails_instead_of_emptying_the_database() {
+    let tmp = tempdir().expect("temp dir");
+    let repo = tmp.path();
+    repo_with_alice(repo);
+
+    let first = head_commit(repo);
+    exec_sql(repo, "INSERT INTO users VALUES('bob');");
+    assert!(commit(repo, "bob").0, "second commit");
+
+    // Snapshots are the bulky part of a repo and the first thing a partial copy
+    // leaves out.
+    let snapshots = repo.join(".gfs/snapshots");
+    for entry in fs::read_dir(&snapshots).expect("read snapshots") {
+        let path = entry.expect("entry").path();
+        let _ = std::process::Command::new("chmod")
+            .args(["-R", "u+w"])
+            .arg(&path)
+            .output();
+        fs::remove_dir_all(&path).expect("remove snapshot tree");
+    }
+
+    let (ok, _, stderr) =
+        cli_runner::run_gfs(["gfs", "checkout", "--path", repo.to_str().unwrap(), &first]);
+    assert!(
+        !ok,
+        "a checkout that cannot restore must not report success"
+    );
+    assert!(
+        stderr.contains("does not exist") && stderr.contains("empty database"),
+        "should name the missing snapshot and say what it would have caused: {stderr}"
+    );
+    assert_eq!(
+        users(repo),
+        "alice,bob",
+        "the workspace it refused to leave must be untouched"
+    );
+}
+
+/// A commit on a detached HEAD must stay reachable.
+///
+/// It used to write the object and update nothing — no ref, not even HEAD — so
+/// the commit was unreachable the moment it was created, reported as a success
+/// whose branch field was the full 64-character hash. There is no reflog.
+#[test]
+fn a_commit_on_a_detached_head_is_reachable_afterwards() {
+    let tmp = tempdir().expect("temp dir");
+    let repo = tmp.path();
+    repo_with_alice(repo);
+
+    let first = head_commit(repo);
+    exec_sql(repo, "INSERT INTO users VALUES('bob');");
+    assert!(commit(repo, "bob").0, "second commit");
+
+    assert!(
+        cli_runner::run_gfs(["gfs", "checkout", "--path", repo.to_str().unwrap(), &first]).0,
+        "detach"
+    );
+    exec_sql(repo, "INSERT INTO users VALUES('detached');");
+    // A subprocess, because `gag` does not reliably capture stdout under the
+    // test harness and the success LINE is part of what is being asserted here.
+    let (ok, stdout, stderr) = cli_runner::run_gfs_subprocess([
+        "gfs",
+        "commit",
+        "-m",
+        "on a detached head",
+        "--path",
+        repo.to_str().unwrap(),
+    ]);
+    assert!(ok, "the commit itself succeeds: {stderr}");
+    assert!(
+        stdout.contains("detached HEAD"),
+        "the success line must name the situation, not print a 64-hex 'branch': {stdout}"
+    );
+    assert!(
+        stderr.contains("on no branch"),
+        "and say the commit is not on a branch: {stderr}"
+    );
+
+    let head = fs::read_to_string(repo.join(".gfs/HEAD")).expect("read HEAD");
+    let head = head.trim();
+    assert!(
+        !head.starts_with("ref:") && head != first,
+        "HEAD must have advanced to the new commit, not stayed at {first}: {head}"
+    );
+    assert!(
+        repo.join(".gfs/objects")
+            .join(&head[..2])
+            .join(&head[2..])
+            .exists(),
+        "and HEAD must name a commit object that exists"
+    );
+}

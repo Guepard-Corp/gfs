@@ -227,6 +227,29 @@ fn delete_branch(repo_path: &std::path::Path, name: &str, json_output: bool) -> 
     std::fs::remove_file(&ref_path)
         .with_context(|| format!("failed to delete branch ref '{}'", name))?;
 
+    // The working copy outlives the ref unless it goes here too. It is keyed by
+    // branch NAME, so a later branch reusing the name inherited this one's
+    // workspace — uncommitted rows and all — and `gfs checkout` then reported
+    // success while handing over content that branch never contained. A commit
+    // taken from that state records a diff that never happened.
+    let workspace = repo_layout::branch_workspace_dir(repo_path, name);
+    if workspace.exists() {
+        // A workspace restored from a snapshot can carry the snapshot's
+        // read-only bits, which `remove_dir_all` will not override.
+        #[cfg(unix)]
+        let _ = std::process::Command::new("chmod")
+            .args(["-R", "u+w"])
+            .arg(&workspace)
+            .output();
+        std::fs::remove_dir_all(&workspace).with_context(|| {
+            format!(
+                "branch ref '{}' was deleted but its workspace at '{}' could not be removed;                  remove it before creating a branch of the same name",
+                name,
+                workspace.display()
+            )
+        })?;
+    }
+
     // Clean up empty parent directories (for nested branches like feature/foo).
     let mut parent = ref_path.parent();
     while let Some(dir) = parent {
