@@ -111,7 +111,14 @@ gfs init --database-provider postgres --database-version 17
 gfs init --database-provider mysql --database-version 8.0
 ```
 
-This creates a `.gfs` directory in your project and starts a Docker container with the database.
+This creates a `.gfs` directory in your project and, for a container-backed
+provider, starts a container with the database.
+
+SQLite starts nothing — it is a file this process opens:
+
+```shell
+gfs init --database-provider sqlite --database-version 3
+```
 
 ### 3. Check status
 
@@ -119,7 +126,10 @@ This creates a `.gfs` directory in your project and starts a Docker container wi
 gfs status
 ```
 
-Shows current branch, HEAD commit, and database container status (including connection string if running).
+Shows the current branch, the active workspace, and database container status
+(including the connection string when there is one). It does NOT report the HEAD
+commit — use `gfs log` for that. For an embedded provider there is no container
+section, and the connection string is a `sqlite:` URL to the file.
 
 ## Revision References
 
@@ -368,7 +378,8 @@ gfs schema diff abc123~2 def456
 gfs export --format sql
 
 # Export to specific directory
-gfs export --format sql --output-dir /path/to/exports
+# --output-dir must be inside the repository; omit it to use the default
+gfs export --format sql --output-dir ./exports
 
 # Export using custom format (PostgreSQL's pg_dump custom format)
 gfs export --format custom
@@ -378,15 +389,15 @@ gfs export --format custom
 
 ```shell
 # Import data file (format auto-detected from extension)
-gfs import /path/to/data.sql
+gfs import --file /path/to/data.sql
 
 # Specify format explicitly
-gfs import --format sql /path/to/dump.sql
-gfs import --format csv /path/to/data.csv
-gfs import --format json /path/to/data.json
+gfs import --format sql --file /path/to/dump.sql
+gfs import --format csv --file /path/to/data.csv
+gfs import --format json --file /path/to/data.json
 
 # Import custom database-specific format (e.g., PostgreSQL's pg_dump custom format)
-gfs import --format custom /path/to/dump.dump
+gfs import --format custom --file /path/to/dump.dump
 ```
 
 Supported formats: SQL, CSV, JSON, custom (database-specific formats)
@@ -396,8 +407,10 @@ Supported formats: SQL, CSV, JSON, custom (database-specific formats)
 GFS stores configuration in `.gfs/config.toml`:
 
 ```shell
-# View configuration
-gfs config
+# Read one configuration value. A key is required — bare `gfs config` exits 1.
+# Supported keys: user.name, user.email, storage.compression, storage.reflink,
+# telemetry.enabled
+gfs config user.name
 
 # Configuration includes:
 # - Database provider and version
@@ -496,7 +509,7 @@ diff -u schema-then.sql schema-now.sql
 gfs commit -m "before import test"
 
 # 2. Import test data
-gfs import /path/to/test-data.sql
+gfs import --file /path/to/test-data.sql
 
 # 3. Run tests
 gfs query "SELECT COUNT(*) FROM users;"

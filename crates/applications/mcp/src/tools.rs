@@ -177,7 +177,7 @@ pub struct CheckoutRequest {
 pub struct InitRequest {
     #[schemars(description = "repo root path")]
     pub path: Option<String>,
-    #[schemars(description = "database provider e.g. postgres, mysql, clickhouse")]
+    #[schemars(description = "database provider e.g. postgres, mysql, clickhouse, sqlite")]
     pub database_provider: Option<String>,
     #[schemars(
         description = "database version e.g. 17 for postgres, 8.0 for mysql, 24.8.14.39 for clickhouse; required when database_provider is set"
@@ -327,7 +327,7 @@ impl GfsMcpHandler {
     }
 
     #[tool(
-        description = "List supported database providers (e.g. postgres, mysql, clickhouse) and their versions and features. Use when choosing or checking which databases this GFS server can run. Equivalent to gfs providers."
+        description = "List supported database providers (e.g. postgres, mysql, clickhouse, sqlite) and their versions and features. Use when choosing or checking which databases this GFS server can run. Equivalent to gfs providers."
     )]
     async fn list_providers(
         &self,
@@ -446,7 +446,7 @@ impl GfsMcpHandler {
     }
 
     #[tool(
-        description = "Initialize a new GFS repository backed by a database. Optional: path. If database_provider is set (e.g. postgres, mysql, clickhouse), database_version is required (e.g. 17 for postgres, 24.8.14.39 for clickhouse). Creates repo metadata and can start the database container. Equivalent to gfs init."
+        description = "Initialize a new GFS repository backed by a database. Optional: path. If database_provider is set (e.g. postgres, mysql, clickhouse, sqlite), database_version is required (e.g. 17 for postgres, 3 for sqlite, 24.8.14.39 for clickhouse). Creates repo metadata and, for a container-backed provider, can start the database container; sqlite is a file and starts nothing. Equivalent to gfs init."
     )]
     async fn init(
         &self,
