@@ -150,16 +150,14 @@ const IS_NULLABLE: &str = "CASE \
 /// partial `IS NOT NULL` index and a plain one accept and reject exactly the
 /// same rows.
 ///
-/// NOT covered, deliberately: a unique index on an EXPRESSION,
-/// `CREATE UNIQUE INDEX ix ON t(lower(a))`, does make `a` unique — uniqueness
-/// of a function of `a` is a stronger constraint than uniqueness of `a` — and
-/// is reported as non-unique here. It is indistinguishable through the pragmas
-/// from `CREATE UNIQUE INDEX ix ON t(a || b)`, which makes NEITHER column
-/// unique: both report one key column with `cid = -2` and no name. Telling them
-/// apart means tokenising the index DDL to find which of the table's columns
-/// the expression mentions, and a tokeniser that misses a reference would claim
-/// a column is unique when it is not. Under-claiming loses a fact; over-claiming
-/// invents one, so this stays under-claimed until it is worth doing exactly.
+/// A unique index on an EXPRESSION counts too, and needs the DDL to decide.
+/// `CREATE UNIQUE INDEX ix ON t(lower(a))` does make `a` unique — uniqueness of
+/// a function of `a` is a stronger constraint than uniqueness of `a` — while
+/// `CREATE UNIQUE INDEX ix ON t(a || b)` makes NEITHER column unique, and the
+/// two are indistinguishable through the pragmas: both report one key column
+/// with `cid = -2` and no name. [`expression_mentions_only`] separates them by
+/// reading the key list, and is written so that its every failure mode
+/// under-claims rather than over-claims.
 const IS_UNIQUE: &str = "CASE \
      WHEN p.pk = 1 AND (SELECT max(pk) FROM pragma_table_info(t.name)) = 1 THEN 'true' \
      WHEN EXISTS (SELECT 1 FROM pragma_index_list(t.name) il \
@@ -170,7 +168,14 @@ const IS_UNIQUE: &str = "CASE \
                                 WHERE m.type = 'index' AND m.name = il.name), \
                               p.name)) \
                     AND (SELECT count(*) FROM pragma_index_info(il.name)) = 1 \
-                    AND (SELECT ii.name FROM pragma_index_info(il.name) ii) = p.name) THEN 'true' \
+                    AND ((SELECT ii.name FROM pragma_index_info(il.name) ii) = p.name \
+                         OR ((SELECT ii.name FROM pragma_index_info(il.name) ii) IS NULL \
+                             AND gfs_expression_mentions_only(\
+                                   (SELECT m.sql FROM sqlite_master m \
+                                     WHERE m.type = 'index' AND m.name = il.name), \
+                                   p.name, \
+                                   (SELECT group_concat(name, char(10)) \
+                                      FROM pragma_table_info(t.name)))))) THEN 'true' \
      ELSE 'false' END";
 
 /// Whether `index_sql` is a partial index whose predicate is exactly
@@ -209,6 +214,159 @@ fn predicate_is_only_not_null(index_sql: &str, column: &str) -> bool {
     })
 }
 
+/// The identifiers inside an index's key list, or `None` when the DDL contains
+/// anything this does not understand.
+///
+/// Only the FIRST top-level parenthesised group is read — the key list. The
+/// index name and the table name sit outside it, and a partial index's `WHERE`
+/// clause comes after it; neither says anything about which columns the key
+/// depends on.
+///
+/// Every failure direction here is deliberate, because the two are not
+/// symmetric. Reporting a column unique when it is not invents a fact a
+/// consumer may act on; failing to report one that is loses a fact. So:
+///
+/// * an unrecognised character returns `None`, and the caller reports
+///   non-unique;
+/// * comments are not parsed, they are refused outright — a `--` inside a key
+///   list is rare enough that under-claiming costs nothing, and mis-parsing one
+///   would silently drop the rest of the expression;
+/// * identifiers this collects too EAGERLY are harmless. `t.a` yields both `t`
+///   and `a`, and `x'00'` yields `x`; a spurious name can only enlarge the set,
+///   and the caller requires the set to intersect the table's columns in
+///   exactly one name. Enlarging it can only turn a yes into a no.
+///
+/// The one way to be wrong in the unsafe direction is to MISS a column
+/// reference, which is why all four of SQLite's identifier quotings are handled
+/// and anything else aborts.
+fn index_key_identifiers(index_sql: &str) -> Option<Vec<String>> {
+    if index_sql.contains("--") || index_sql.contains("/*") {
+        return None;
+    }
+
+    let mut chars = index_sql.chars().peekable();
+    let mut idents = Vec::new();
+    let mut depth = 0usize;
+    let mut entered = false;
+
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() => {}
+            '(' => {
+                depth += 1;
+                entered = true;
+            }
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if entered && depth == 0 {
+                    return Some(idents);
+                }
+            }
+            // A string literal is a value, never a column reference.
+            '\'' => loop {
+                match chars.next()? {
+                    '\'' if chars.peek() == Some(&'\'') => {
+                        chars.next();
+                    }
+                    '\'' => break,
+                    _ => {}
+                }
+            },
+            '"' | '`' => {
+                let close = c;
+                let mut name = String::new();
+                loop {
+                    match chars.next()? {
+                        ch if ch == close && chars.peek() == Some(&close) => {
+                            chars.next();
+                            name.push(close);
+                        }
+                        ch if ch == close => break,
+                        ch => name.push(ch),
+                    }
+                }
+                if depth > 0 {
+                    idents.push(name);
+                }
+            }
+            '[' => {
+                let mut name = String::new();
+                loop {
+                    match chars.next()? {
+                        ']' => break,
+                        ch => name.push(ch),
+                    }
+                }
+                if depth > 0 {
+                    idents.push(name);
+                }
+            }
+            c if c.is_alphabetic() || c == '_' => {
+                let mut name = String::from(c);
+                while let Some(&next) = chars.peek() {
+                    if next.is_alphanumeric() || next == '_' || next == '$' {
+                        name.push(next);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                if depth > 0 {
+                    idents.push(name);
+                }
+            }
+            c if c.is_ascii_digit() => {
+                while let Some(&next) = chars.peek() {
+                    if next.is_alphanumeric() || next == '.' {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            ',' | '.' | '+' | '-' | '*' | '/' | '%' | '|' | '<' | '>' | '=' | '!' | '~' | '&' => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Whether an index key expression depends on `column` and on no other column
+/// of the table.
+///
+/// `CREATE UNIQUE INDEX ix ON t(lower(a))` really does make `a` unique:
+/// uniqueness of a function of `a` is a strictly stronger constraint than
+/// uniqueness of `a`, because two equal values of `a` would give two equal
+/// values of the function. `CREATE UNIQUE INDEX ix ON t(a || b)` makes neither
+/// column unique, and the two are INDISTINGUISHABLE through the pragmas — both
+/// report one key column with `cid = -2` and no name. Only the DDL separates
+/// them.
+///
+/// `columns` is the table's column list, newline-separated, so the comparison
+/// is against real columns rather than against every word in the expression:
+/// `lower` is an identifier too, and is not a column unless someone named one
+/// that, in which case the intersection grows and this correctly says no.
+fn expression_mentions_only(index_sql: &str, column: &str, columns: &str) -> bool {
+    let Some(idents) = index_key_identifiers(index_sql) else {
+        return false;
+    };
+    let table_columns: Vec<&str> = columns.lines().filter(|c| !c.is_empty()).collect();
+    let mentioned: std::collections::BTreeSet<&str> = idents
+        .iter()
+        .filter_map(|ident| {
+            table_columns
+                .iter()
+                .find(|c| c.eq_ignore_ascii_case(ident))
+                .copied()
+        })
+        .collect();
+    mentioned.len() == 1
+        && mentioned
+            .iter()
+            .next()
+            .is_some_and(|c| c.eq_ignore_ascii_case(column))
+}
+
 /// Make [`predicate_is_only_not_null`] callable from the schema queries.
 ///
 /// The question needs the index DDL, which no pragma exposes, and answering it
@@ -231,6 +389,23 @@ fn register_helpers(conn: &rusqlite::Connection) -> std::result::Result<(), Prov
                 return Ok(false);
             };
             Ok(predicate_is_only_not_null(sql, column))
+        },
+    )
+    .map_err(|e| ProviderError::InvalidParams(format!("cannot register schema helper: {e}")))?;
+
+    conn.create_scalar_function(
+        "gfs_expression_mentions_only",
+        3,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let (Some(sql), Some(column), Some(columns)) = (
+                ctx.get_raw(0).as_str().ok(),
+                ctx.get_raw(1).as_str().ok(),
+                ctx.get_raw(2).as_str().ok(),
+            ) else {
+                return Ok(false);
+            };
+            Ok(expression_mentions_only(sql, column, columns))
         },
     )
     .map_err(|e| ProviderError::InvalidParams(format!("cannot register schema helper: {e}")))
@@ -2126,6 +2301,124 @@ mod tests {
 
         assert!(unique_of("total"), "IS NOT NULL excludes nothing: {out}");
         assert!(!unique_of("filtered"), "this one really is partial: {out}");
+    }
+
+    /// A unique index on an expression makes its column unique — but only when
+    /// the expression depends on that column ALONE.
+    ///
+    /// Verified against what SQLite actually enforces, not against the manual:
+    /// a duplicate `expr` is rejected because `lower(expr)` collides, while
+    /// duplicates of `pair_a` are storable because only the concatenation is
+    /// constrained.
+    #[test]
+    fn a_unique_expression_index_makes_its_one_column_unique() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(DB_FILENAME);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t(expr TEXT, pair_a TEXT, pair_b TEXT);
+             CREATE UNIQUE INDEX ix_expr ON t(lower(expr));
+             CREATE UNIQUE INDEX ix_pair ON t(pair_a || pair_b);",
+        )
+        .unwrap();
+
+        // What SQLite enforces.
+        conn.execute("INSERT INTO t(expr) VALUES('x')", []).unwrap();
+        assert!(
+            conn.execute("INSERT INTO t(expr) VALUES('X')", []).is_err(),
+            "lower() collides, so expr is genuinely unique"
+        );
+        conn.execute("INSERT INTO t(pair_a, pair_b) VALUES('a','1')", [])
+            .unwrap();
+        conn.execute("INSERT INTO t(pair_a, pair_b) VALUES('a','2')", [])
+            .expect("only the concatenation is constrained, so pair_a repeats");
+        drop(conn);
+
+        let out = SqliteProvider::new()
+            .extract_schema(&params_for_dir(dir.path()))
+            .unwrap();
+        let unique_of = |column: &str| -> bool {
+            let key = format!("\"name\":\"{column}\"");
+            let at = out
+                .find(&key)
+                .unwrap_or_else(|| panic!("no {column} in {out}"));
+            let tail = &out[at..];
+            tail[..tail.find('}').unwrap_or(tail.len())].contains("\"is_unique\":true")
+        };
+        assert!(unique_of("expr"), "single-column expression key: {out}");
+        assert!(!unique_of("pair_a"), "two-column expression key: {out}");
+        assert!(!unique_of("pair_b"), "two-column expression key: {out}");
+    }
+
+    /// The tokeniser may only ever be wrong by under-claiming.
+    ///
+    /// Over-claiming needs it to MISS a column reference, so every identifier
+    /// quoting SQLite allows has to be seen; anything it cannot parse must
+    /// abort rather than guess. Collecting too eagerly is harmless, because a
+    /// spurious name only enlarges the set the caller requires to be exactly
+    /// one column.
+    #[test]
+    fn the_index_key_tokeniser_never_over_claims() {
+        let cols = "a\nb";
+        // The column is reached through each of SQLite's four quotings.
+        for key in [
+            "lower(a)",
+            "lower(\"a\")",
+            "lower([a])",
+            "lower(`a`)",
+            "abs(a) + 1",
+        ] {
+            let sql = format!("CREATE UNIQUE INDEX ix ON t({key})");
+            assert!(
+                expression_mentions_only(&sql, "a", cols),
+                "should see the column in {key}"
+            );
+        }
+        // A second column anywhere in the key list disqualifies it.
+        for key in [
+            "a || b",
+            "lower(a) || upper(b)",
+            "iif(b > 0, a, a)",
+            "\"b\" + a",
+        ] {
+            let sql = format!("CREATE UNIQUE INDEX ix ON t({key})");
+            assert!(
+                !expression_mentions_only(&sql, "a", cols),
+                "{key} depends on b as well"
+            );
+        }
+        // The index name and the table name are outside the key list, so a
+        // table or index called `b` must not be mistaken for a reference to it.
+        assert!(expression_mentions_only(
+            "CREATE UNIQUE INDEX b ON b(lower(a))",
+            "a",
+            cols
+        ));
+        // A string literal is a value, not a reference — even when it spells a
+        // column name, and even when it contains a doubled quote or a paren.
+        assert!(expression_mentions_only(
+            "CREATE UNIQUE INDEX ix ON t(replace(a, 'b', 'it''s (b)'))",
+            "a",
+            cols
+        ));
+        // Anything unparsed aborts instead of guessing.
+        for sql in [
+            "CREATE UNIQUE INDEX ix ON t(a) -- b",
+            "CREATE UNIQUE INDEX ix ON t(/* b */ a)",
+            "CREATE UNIQUE INDEX ix ON t(a",
+            "CREATE UNIQUE INDEX ix ON t(lower(a) ? 1)",
+        ] {
+            assert!(
+                !expression_mentions_only(sql, "a", cols),
+                "must refuse to answer for: {sql}"
+            );
+        }
+        // A key naming no column of the table is not a claim about one.
+        assert!(!expression_mentions_only(
+            "CREATE UNIQUE INDEX ix ON t(1)",
+            "a",
+            cols
+        ));
     }
 
     /// The recognised predicate is a closed list, and everything else is
