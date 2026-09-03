@@ -15,6 +15,7 @@ use std::sync::Arc;
 use crate::model::config::GfsConfig;
 use crate::ports::compute::{Compute, ComputeError, InstanceId};
 use crate::ports::database_provider::{ConnectionParams, DatabaseProviderRegistry};
+use crate::repo_utils::repo_layout;
 
 // ---------------------------------------------------------------------------
 // Error
@@ -145,6 +146,41 @@ impl<R: DatabaseProviderRegistry> ExportRepoUseCase<R> {
             })?
             .to_string();
 
+        // 2. Resolve provider before looking for a container: an embedded
+        //    provider legitimately has none, and writes the file itself.
+        let provider = self
+            .registry
+            .get(&provider_name)
+            .ok_or_else(|| ExportRepoError::ProviderNotFound(provider_name.clone()))?;
+
+        if let Some(engine) = provider.local_engine() {
+            let params = repo_layout::local_connection_params(path)
+                .map_err(|e| ExportRepoError::NotConfigured(e.to_string()))?;
+            let filename = provider
+                .supported_export_formats()
+                .into_iter()
+                .find(|f| f.id == format)
+                .map(|f| format!("export{}", f.file_extension))
+                .ok_or_else(|| ExportRepoError::UnsupportedFormat(format.to_string()))?;
+
+            std::fs::create_dir_all(&output_dir)
+                .map_err(|e| ExportRepoError::Config(format!("cannot create output dir: {e}")))?;
+            let file_path = output_dir.join(filename);
+            engine.export(&params, format, &file_path).map_err(|e| {
+                ExportRepoError::TaskFailed {
+                    exit_code: 1,
+                    stderr: e.to_string(),
+                }
+            })?;
+
+            return Ok(ExportOutput {
+                file_path,
+                format: format.to_string(),
+                stdout: String::new(),
+                stderr: String::new(),
+            });
+        }
+
         let container_name = config
             .runtime
             .as_ref()
@@ -157,18 +193,16 @@ impl<R: DatabaseProviderRegistry> ExportRepoUseCase<R> {
             })?
             .to_string();
 
-        // 2. Resolve provider.
-        let provider = self
-            .registry
-            .get(&provider_name)
-            .ok_or_else(|| ExportRepoError::ProviderNotFound(provider_name.clone()))?;
+        let container = provider
+            .require_container()
+            .map_err(|e| ExportRepoError::NotConfigured(e.to_string()))?;
 
         let instance_id = InstanceId(container_name);
 
         // 3. Get internal connection info for the sidecar.
         let conn_info = self
             .compute
-            .get_task_connection_info(&instance_id, provider.default_port())
+            .get_task_connection_info(&instance_id, container.default_port())
             .await?;
 
         let params = ConnectionParams {
@@ -178,7 +212,7 @@ impl<R: DatabaseProviderRegistry> ExportRepoUseCase<R> {
         };
 
         // 4. Build the export spec.
-        let mut spec = provider
+        let mut spec = container
             .export_spec(&params, format)
             .map_err(|e| ExportRepoError::UnsupportedFormat(e.to_string()))?;
 
@@ -235,8 +269,9 @@ mod tests {
         Compute, ComputeDefinition, InstanceId, InstanceState, InstanceStatus, StartOptions,
     };
     use crate::ports::database_provider::{
-        ConnectionParams, DatabaseProvider, DatabaseProviderArg, DatabaseProviderRegistry,
-        ExportSpec, ProviderError, Result as RegistryResult, SIGTERM, SupportedFeature,
+        ConnectionParams, ContainerProvider, DatabaseProvider, DatabaseProviderArg,
+        DatabaseProviderRegistry, ExportSpec, ProviderError, Result as RegistryResult, SIGTERM,
+        SupportedFeature,
     };
 
     struct MockCompute {
@@ -375,6 +410,32 @@ mod tests {
         fn name(&self) -> &str {
             "postgres"
         }
+        fn connection_string(
+            &self,
+            _: &ConnectionParams,
+        ) -> std::result::Result<String, ProviderError> {
+            Ok("postgres://localhost:5432".into())
+        }
+        fn supported_versions(&self) -> Vec<String> {
+            vec!["17".into()]
+        }
+        fn supported_features(&self) -> Vec<SupportedFeature> {
+            vec![]
+        }
+        fn query_client_command(
+            &self,
+            _: &ConnectionParams,
+            _: Option<&str>,
+        ) -> std::result::Result<std::process::Command, ProviderError> {
+            Ok(std::process::Command::new("true"))
+        }
+
+        fn container(&self) -> Option<&dyn ContainerProvider> {
+            Some(self)
+        }
+    }
+
+    impl ContainerProvider for MockProvider {
         fn definition(&self) -> ComputeDefinition {
             ComputeDefinition {
                 labels: Default::default(),
@@ -398,27 +459,8 @@ mod tests {
         fn default_signal(&self) -> u32 {
             SIGTERM
         }
-        fn connection_string(
-            &self,
-            _: &ConnectionParams,
-        ) -> std::result::Result<String, ProviderError> {
-            Ok("postgres://localhost:5432".into())
-        }
-        fn supported_versions(&self) -> Vec<String> {
-            vec!["17".into()]
-        }
-        fn supported_features(&self) -> Vec<SupportedFeature> {
-            vec![]
-        }
         fn prepare_for_snapshot(&self, _: &ConnectionParams) -> RegistryResult<Vec<String>> {
             Ok(vec![])
-        }
-        fn query_client_command(
-            &self,
-            _: &ConnectionParams,
-            _: Option<&str>,
-        ) -> std::result::Result<std::process::Command, ProviderError> {
-            Ok(std::process::Command::new("true"))
         }
         fn export_spec(
             &self,

@@ -29,7 +29,7 @@ pub async fn run(path: Option<PathBuf>, output: String) -> Result<i32> {
     let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
     let compute = compute_for_repo(&repository, &repo_path).await?;
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
-    gfs_compute_docker::containers::register_all(registry.as_ref())
+    gfs_db_providers::register_all(registry.as_ref())
         .context("failed to register database providers")?;
 
     let use_case = StatusRepoUseCase::new(repository, compute, registry);
@@ -264,9 +264,26 @@ fn print_table(s: &StatusResponse, repo_path: &Path, moments: Option<&cmd_source
     );
     println!("{}", box_row(&branch_row, BOX_W));
 
+    // The same field the MCP `status` tool reports, from the same place. When
+    // only MCP had it the two surfaces answered the same question differently.
+    if let Some(ref head) = s.head_commit {
+        let short = &head[..7.min(head.len())];
+        let row = fmt_box_row_colored("HEAD", &dimmed(short), short, LABEL_W, BOX_W);
+        println!("{}", box_row(&row, BOX_W));
+    }
+
     if let Some(ref active) = s.active_workspace_data_dir {
         let rel = relativize_to_repo(repo_path, active);
         let row = fmt_box_row("Active workspace", &rel, LABEL_W, BOX_W);
+        println!("{}", box_row(&row, BOX_W));
+    }
+    // `gfs status --help` promises a connection string. A container-backed
+    // provider prints one in the Compute section below; an embedded one has no
+    // Compute section, so it printed none at all.
+    if s.compute.is_none()
+        && let Some(ref conn) = s.connection_string
+    {
+        let row = fmt_box_row("Connection", conn, LABEL_W, BOX_W);
         println!("{}", box_row(&row, BOX_W));
     }
     println!("{}", box_bottom(BOX_W));

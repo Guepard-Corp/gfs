@@ -14,7 +14,7 @@ use crate::model::config::RuntimeConfig;
 use crate::ports::compute::{
     Compute, ComputeCapabilities, ComputeDefinition, ComputeError, InstanceId, RuntimeDescriptor,
 };
-use crate::ports::database_provider::DatabaseProviderRegistry;
+use crate::ports::database_provider::{DatabaseProviderRegistry, ProviderError, SnapshotGuard};
 use crate::ports::repository::{Repository, RepositoryError};
 use crate::repo_utils::repo_layout;
 #[cfg(unix)]
@@ -126,6 +126,16 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
             }
         }
 
+        // A container-backed database is stopped just above, before the
+        // workspace changes underneath it. GFS cannot stop an embedded one —
+        // the writer is the user's own application — so the most it can do is
+        // refuse to move the workspace out from under a live writer, and hold
+        // the database still while the restore happens. Without this, checkout
+        // silently redirected GFS to a new directory while the application kept
+        // writing the abandoned one, and the next commit recorded an empty
+        // database as a success.
+        let _local_guard = self.quiesce_embedded(&path).await?;
+
         let commit_hash = self.do_checkout(&path, &revision, create_branch).await?;
 
         if let Some(ref id) = container_id {
@@ -134,6 +144,44 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
         }
 
         Ok(commit_hash)
+    }
+
+    /// Hold an embedded database still across a checkout, or refuse.
+    ///
+    /// Only genuine contention is refused. A database that cannot be opened at
+    /// all is not a reason to block a checkout — restoring a snapshot over it is
+    /// a reasonable way to recover from exactly that.
+    async fn quiesce_embedded(
+        &self,
+        path: &Path,
+    ) -> Result<Option<Box<dyn SnapshotGuard>>, CheckoutRepoError> {
+        let Ok(Some(environment)) = self.repository.get_environment_config(path).await else {
+            return Ok(None);
+        };
+        let Some(provider) = self.registry.get(&environment.database_provider) else {
+            return Ok(None);
+        };
+        let Some(engine) = provider.local_engine() else {
+            return Ok(None);
+        };
+        let Ok(params) = repo_layout::local_connection_params(path) else {
+            return Ok(None);
+        };
+
+        match engine.prepare_for_snapshot(&params) {
+            Ok(guard) => Ok(guard),
+            Err(ProviderError::Busy(e)) => Err(CheckoutRepoError::Repository(
+                RepositoryError::Internal(format!(
+                    "{e}. Refusing to switch: the workspace directory changes on checkout, \
+                     and an application still writing the current database would keep \
+                     writing a directory GFS no longer tracks — its work would not be \
+                     committed. Stop the process using the database and retry"
+                )),
+            )),
+            // Unopenable for some other reason: checkout replaces the workspace
+            // anyway, so let it proceed rather than trapping the user.
+            Err(_) => Ok(None),
+        }
     }
 
     async fn do_checkout(
@@ -203,7 +251,10 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
         };
 
         let params = crate::model::config::GfsConfig::load_compute_params(path);
-        let mut definition = provider.definition_with_overrides(&params);
+        let container = provider
+            .require_container()
+            .map_err(|e| CheckoutRepoError::Compute(ComputeError::Internal(e.to_string())))?;
+        let mut definition = container.definition_with_overrides(&params);
         if !environment.database_version.is_empty() {
             let base = definition
                 .image
@@ -258,8 +309,8 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
         let repair_target = definition
             .user
             .clone()
-            .or_else(|| provider.data_dir_owner().map(str::to_string));
-        let startup_probes = provider.container_startup_probes();
+            .or_else(|| container.data_dir_owner().map(str::to_string));
+        let startup_probes = container.container_startup_probes();
 
         let current_bind = self
             .compute
@@ -552,8 +603,9 @@ mod tests {
         Compute, ComputeDefinition, InstanceId, InstanceState, InstanceStatus, StartOptions,
     };
     use crate::ports::database_provider::{
-        ConnectionParams, DatabaseProvider, DatabaseProviderArg, DatabaseProviderRegistry,
-        ProviderError, Result as RegistryResult, SIGTERM, SupportedFeature,
+        ConnectionParams, ContainerProvider, DatabaseProvider, DatabaseProviderArg,
+        DatabaseProviderRegistry, ProviderError, Result as RegistryResult, SIGTERM,
+        SupportedFeature,
     };
     use crate::ports::repository::Repository;
 
@@ -845,6 +897,32 @@ mod tests {
         fn name(&self) -> &str {
             "postgres"
         }
+        fn connection_string(
+            &self,
+            _: &ConnectionParams,
+        ) -> std::result::Result<String, ProviderError> {
+            Ok("postgres://localhost:5432".into())
+        }
+        fn supported_versions(&self) -> Vec<String> {
+            vec!["17".into()]
+        }
+        fn supported_features(&self) -> Vec<SupportedFeature> {
+            vec![]
+        }
+        fn query_client_command(
+            &self,
+            _: &ConnectionParams,
+            _: Option<&str>,
+        ) -> std::result::Result<std::process::Command, ProviderError> {
+            Ok(std::process::Command::new("true"))
+        }
+
+        fn container(&self) -> Option<&dyn ContainerProvider> {
+            Some(self)
+        }
+    }
+
+    impl ContainerProvider for MockProvider {
         fn definition(&self) -> ComputeDefinition {
             ComputeDefinition {
                 labels: Default::default(),
@@ -868,27 +946,8 @@ mod tests {
         fn default_signal(&self) -> u32 {
             SIGTERM
         }
-        fn connection_string(
-            &self,
-            _: &ConnectionParams,
-        ) -> std::result::Result<String, ProviderError> {
-            Ok("postgres://localhost:5432".into())
-        }
-        fn supported_versions(&self) -> Vec<String> {
-            vec!["17".into()]
-        }
-        fn supported_features(&self) -> Vec<SupportedFeature> {
-            vec![]
-        }
         fn prepare_for_snapshot(&self, _: &ConnectionParams) -> RegistryResult<Vec<String>> {
             Ok(vec![])
-        }
-        fn query_client_command(
-            &self,
-            _: &ConnectionParams,
-            _: Option<&str>,
-        ) -> std::result::Result<std::process::Command, ProviderError> {
-            Ok(std::process::Command::new("true"))
         }
     }
 
@@ -1494,6 +1553,32 @@ mod tests {
         fn name(&self) -> &str {
             "postgres"
         }
+        fn connection_string(
+            &self,
+            _: &ConnectionParams,
+        ) -> std::result::Result<String, ProviderError> {
+            Ok("postgres://localhost:5432".into())
+        }
+        fn supported_versions(&self) -> Vec<String> {
+            vec!["17".into()]
+        }
+        fn supported_features(&self) -> Vec<SupportedFeature> {
+            vec![]
+        }
+        fn query_client_command(
+            &self,
+            _: &ConnectionParams,
+            _: Option<&str>,
+        ) -> std::result::Result<std::process::Command, ProviderError> {
+            Ok(std::process::Command::new("true"))
+        }
+
+        fn container(&self) -> Option<&dyn ContainerProvider> {
+            Some(self)
+        }
+    }
+
+    impl ContainerProvider for MockProviderWithProbe {
         fn definition(&self) -> ComputeDefinition {
             ComputeDefinition {
                 labels: Default::default(),
@@ -1517,27 +1602,8 @@ mod tests {
         fn default_signal(&self) -> u32 {
             SIGTERM
         }
-        fn connection_string(
-            &self,
-            _: &ConnectionParams,
-        ) -> std::result::Result<String, ProviderError> {
-            Ok("postgres://localhost:5432".into())
-        }
-        fn supported_versions(&self) -> Vec<String> {
-            vec!["17".into()]
-        }
-        fn supported_features(&self) -> Vec<SupportedFeature> {
-            vec![]
-        }
         fn prepare_for_snapshot(&self, _: &ConnectionParams) -> RegistryResult<Vec<String>> {
             Ok(vec![])
-        }
-        fn query_client_command(
-            &self,
-            _: &ConnectionParams,
-            _: Option<&str>,
-        ) -> std::result::Result<std::process::Command, ProviderError> {
-            Ok(std::process::Command::new("true"))
         }
         fn container_startup_probes(&self) -> &'static [&'static str] {
             &["pg_isready -U postgres"]

@@ -11,6 +11,7 @@ GFS brings Git-like version control to your databases. Commit database states, c
 
 - PostgreSQL (versions 13-18)
 - MySQL (versions 8.0-8.1)
+- SQLite (version 3) — file-based; needs no container runtime
 
 ## Installation
 
@@ -110,7 +111,14 @@ gfs init --database-provider postgres --database-version 17
 gfs init --database-provider mysql --database-version 8.0
 ```
 
-This creates a `.gfs` directory in your project and starts a Docker container with the database.
+This creates a `.gfs` directory in your project and, for a container-backed
+provider, starts a container with the database.
+
+SQLite starts nothing — it is a file this process opens:
+
+```shell
+gfs init --database-provider sqlite --database-version 3
+```
 
 ### 3. Check status
 
@@ -118,7 +126,13 @@ This creates a `.gfs` directory in your project and starts a Docker container wi
 gfs status
 ```
 
-Shows current branch, HEAD commit, and database container status (including connection string if running).
+Shows the current branch, the HEAD commit, the active workspace, and database
+container status (including the connection string when there is one). For an
+embedded provider there is no container section, and the connection string is a
+`sqlite:` URL to the file.
+
+The MCP `status` tool reports the same fields from the same source, so the two
+surfaces cannot disagree.
 
 ## Revision References
 
@@ -237,6 +251,11 @@ gfs checkout <commit_id>
 ### 5. Database Management
 
 #### Start/Stop Database Container
+
+Container-backed providers only. On a SQLite repository every `gfs compute`
+action reports that an embedded database is a file this process opens, with no
+container to start, stop or inspect — and `gfs user` likewise reports that there
+is no server, so no roles, passwords or privileges to manage.
 
 ```shell
 # Check container status
@@ -362,7 +381,8 @@ gfs schema diff abc123~2 def456
 gfs export --format sql
 
 # Export to specific directory
-gfs export --format sql --output-dir /path/to/exports
+# --output-dir must be inside the repository; omit it to use the default
+gfs export --format sql --output-dir ./exports
 
 # Export using custom format (PostgreSQL's pg_dump custom format)
 gfs export --format custom
@@ -372,15 +392,15 @@ gfs export --format custom
 
 ```shell
 # Import data file (format auto-detected from extension)
-gfs import /path/to/data.sql
+gfs import --file /path/to/data.sql
 
 # Specify format explicitly
-gfs import --format sql /path/to/dump.sql
-gfs import --format csv /path/to/data.csv
-gfs import --format json /path/to/data.json
+gfs import --format sql --file /path/to/dump.sql
+gfs import --format csv --file /path/to/data.csv
+gfs import --format json --file /path/to/data.json
 
 # Import custom database-specific format (e.g., PostgreSQL's pg_dump custom format)
-gfs import --format custom /path/to/dump.dump
+gfs import --format custom --file /path/to/dump.dump
 ```
 
 Supported formats: SQL, CSV, JSON, custom (database-specific formats)
@@ -390,8 +410,10 @@ Supported formats: SQL, CSV, JSON, custom (database-specific formats)
 GFS stores configuration in `.gfs/config.toml`:
 
 ```shell
-# View configuration
-gfs config
+# Read one configuration value. A key is required — bare `gfs config` exits 1.
+# Supported keys: user.name, user.email, storage.compression, storage.reflink,
+# telemetry.enabled
+gfs config user.name
 
 # Configuration includes:
 # - Database provider and version
@@ -490,7 +512,7 @@ diff -u schema-then.sql schema-now.sql
 gfs commit -m "before import test"
 
 # 2. Import test data
-gfs import /path/to/test-data.sql
+gfs import --file /path/to/test-data.sql
 
 # 3. Run tests
 gfs query "SELECT COUNT(*) FROM users;"
@@ -551,7 +573,7 @@ If schema is not captured during commit:
 4. **Check status regularly** - Understand current state and container status
 6. **Export before risky operations** - Create backups with `gfs export`
 7. **Use descriptive commit messages** - Makes history navigation easier
-8. **Container must be running** - Most operations require active database container
+8. **Container must be running** - Most operations require active database container. Not for SQLite, which is embedded: `init`, `query`, `commit`, `schema`, `checkout`, `export` and `import` all work with no container runtime at all
 9. **Schema as documentation** - Use `gfs schema show` to document database structure
 
 ## Environment Variables

@@ -19,5 +19,7 @@ tokio                     = { workspace = true }
 tracing                   = { workspace = true }
 
 [dev-dependencies]
+gfs-db-providers = { workspace = true }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio    = { workspace = true }

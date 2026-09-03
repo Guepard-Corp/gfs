@@ -359,6 +359,30 @@ fn create_empty_workspace(path: &Path) -> std::io::Result<()> {
 /// repository files can be owned by subordinate UIDs that are not chmod-able
 /// from the host user. In that case, we continue checkout and let the runtime
 /// handle access through its own namespace mapping.
+/// Whether this repository's restores come from something other than a
+/// filesystem snapshot.
+///
+/// On the Kubernetes runtime the real restore is a PVC VolumeSnapshot, so
+/// `.gfs/snapshots` is legitimately empty and a missing directory says nothing
+/// about whether the data survives. Everywhere else, a commit naming a snapshot
+/// that is not there means the data is gone.
+fn restore_is_not_filesystem_based(repo: &Path) -> bool {
+    GfsConfig::load(repo)
+        .ok()
+        .and_then(|config| config.runtime)
+        .map(|runtime| {
+            matches!(
+                runtime
+                    .runtime_provider
+                    .trim()
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "kubernetes" | "k8s" | "k3s"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn set_workspace_dir_permissions(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -528,6 +552,12 @@ impl Repository for GfsRepository {
         // 7. Advance the current branch ref to the new commit.
         let branch = repo_layout::get_current_branch(&repo).map_err(map_err)?;
         // Only update a named branch ref; skip when HEAD is detached (64-char hex).
+        //
+        // NOTE: this leaves a detached-HEAD commit unreachable, which upstream
+        // PR #146 fixes properly — by refusing the commit at the top of this
+        // method, before anything is written, with a typed
+        // `RepositoryError::DetachedHead`. Deliberately not touched here so the
+        // two do not collide.
         if !(branch.len() == 64 && branch.chars().all(|c| c.is_ascii_hexdigit())) {
             repo_layout::update_branch_ref(&repo, &branch, &commit_hash).map_err(map_err)?;
         }
@@ -538,6 +568,7 @@ impl Repository for GfsRepository {
             branch,
             commit_hash
         );
+
         Ok(commit_hash)
     }
 
@@ -593,7 +624,12 @@ impl Repository for GfsRepository {
             .join(&workspace_segment)
             .join(WORKSPACE_DATA_DIR);
 
-        // Only populate from snapshot when the workspace does not exist (preserve live DB state in branch workspace).
+        // Only populate from snapshot when the workspace does not exist (preserve
+        // live DB state in branch workspace).
+        //
+        // NOTE: whether to reuse an existing workspace at all is upstream PR #76's
+        // subject, not this branch's. Deliberately left as-is here so the two do
+        // not collide; only the MISSING-SNAPSHOT case below is changed.
         let workspace_exists = workspace_path.exists();
         tracing::info!(
             "Checkout: workspace_path={:?}, exists={}",
@@ -626,14 +662,32 @@ impl Repository for GfsRepository {
                 if let Some(marker) = repo_layout::repair_marker_path(&workspace_path) {
                     let _ = fs::write(marker, b"");
                 }
-            } else {
-                // Expected on a fresh branch (no snapshot yet) and always on the k8s
-                // runtime, where the real restore is a PVC VolumeSnapshot rather than a
-                // filesystem snapshot. Not an error — seed an empty workspace.
+            } else if snapshot_hash.is_empty() || restore_is_not_filesystem_based(&repo) {
+                // Two legitimate cases: a commit that records no snapshot at
+                // all, and the k8s runtime, where the real restore is a PVC
+                // VolumeSnapshot rather than a filesystem one. Seed an empty
+                // workspace.
                 tracing::debug!(
                     "Checkout: no filesystem snapshot for this workspace; seeding empty workspace"
                 );
                 create_empty_workspace(&workspace_path).map_err(RepositoryError::Io)?;
+            } else {
+                // The commit NAMES a snapshot and it is not there. Seeding an
+                // empty workspace here reported success and handed over an
+                // empty database: `schema show` still printed the real DDL, so
+                // only a query noticed, and a commit taken from that state
+                // recorded the emptiness as a legitimate breaking change —
+                // `schema diff` called it a table drop. Snapshots are the bulky
+                // part of a repository and the first thing a partial copy or a
+                // careless backup leaves out.
+                return Err(RepositoryError::Internal(format!(
+                    "commit {} refers to snapshot {} but '{}' does not exist. Its data cannot \
+                     be restored, so this checkout would silently hand you an empty database. \
+                     If the repository was copied, copy .gfs/snapshots as well",
+                    &commit_hash[..7.min(commit_hash.len())],
+                    &snapshot_hash[..7.min(snapshot_hash.len())],
+                    snapshot_dir.display()
+                )));
             }
         }
         set_workspace_dir_permissions(&workspace_path).map_err(RepositoryError::Io)?;

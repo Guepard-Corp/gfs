@@ -10,7 +10,9 @@ use crate::model::commit::NewCommit;
 use crate::model::config::{EnvironmentConfig, GlobalSettings, RuntimeConfig};
 use crate::model::layout::GFS_DIR;
 use crate::ports::compute::{Compute, ComputeError, InstanceId, InstanceState};
-use crate::ports::database_provider::{ConnectionParams, DatabaseProviderRegistry};
+use crate::ports::database_provider::{
+    ConnectionParams, DatabaseProviderRegistry, ProviderError, SnapshotGuard,
+};
 use crate::ports::repository::{Repository, RepositoryError};
 use crate::ports::storage::{SnapshotOptions, StorageError, StoragePort, VolumeId};
 use crate::repo_utils::repo_layout;
@@ -401,6 +403,26 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
         // produces (`schema_hash` is attached at commit-build, after the
         // snapshot). The CHECKPOINT -> snapshot ordering stays inside the
         // snapshot arm regardless of which path runs.
+        // Hold an embedded database still for BOTH phases. Acquiring inside the
+        // snapshot alone left schema extraction outside the lock, so anything a
+        // writer did between the two ended up in the snapshot but not in the
+        // recorded schema — `gfs schema show <commit>` then misdescribed what
+        // that commit contains. On the container path the same ordering is
+        // bounded by `pause()`; here the writer is the user's own application
+        // and nothing bounds it.
+        //
+        // DECLARED AFTER `_commit_lock`, which matters: Rust drops in reverse
+        // declaration order, so the database write lock is released before the
+        // commit lock. The next commit therefore finds the database free the
+        // moment it gets in, instead of blocking a second time on a guard the
+        // previous commit still holds. Reordering these two bindings would
+        // reintroduce that wait silently. The same ordering will matter more
+        // once checkout takes a repository lock too.
+        let _local_guard = match (&runtime_config, &environment) {
+            (None, Some(env)) => self.acquire_local_snapshot_guard(&path, env).await?,
+            _ => None,
+        };
+
         let (schema_hash, snapshot_hash) = if db_live_during_snapshot {
             // Overlap: run both arms to completion, then apply the asymmetry.
             // `join!` (not `try_join!`) is required because schema extraction is
@@ -476,7 +498,19 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
         runtime_config: &Option<RuntimeConfig>,
         environment: &Option<EnvironmentConfig>,
     ) -> Option<String> {
-        if runtime_config.is_some() && environment.is_some() {
+        let environment = environment.as_ref()?;
+
+        // A container-backed provider needs its instance running to be queried.
+        // An embedded provider has no instance and no `RuntimeConfig`, so
+        // requiring one here would silently drop schema capture for every one of
+        // its commits.
+        let extractable = runtime_config.is_some()
+            || self
+                .registry
+                .get(&environment.database_provider)
+                .is_some_and(|p| !p.requires_compute());
+
+        if extractable {
             self.extract_and_store_schema(path).await.ok()
         } else {
             None
@@ -500,6 +534,90 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
     /// `stream_snapshot` fallback), or — under the default safe policy — the
     /// runtime cannot freeze the database and `GFS_ALLOW_UNFROZEN_SNAPSHOT` is
     /// not set.
+    /// Quiesce an embedded provider's database for the duration of the snapshot.
+    ///
+    /// Mirrors what `prepare_for_snapshot` + `pause()` do for a container: fold
+    /// in any write-ahead log and stop writers landing mid-copy. The difference
+    /// is that the engine does it, because the writer is not in a container.
+    ///
+    /// When the engine cannot quiesce — typically another process is holding the
+    /// database — this refuses the commit unless `GFS_ALLOW_UNFROZEN_SNAPSHOT`
+    /// is set, matching the policy the container path applies to a runtime that
+    /// cannot freeze.
+    async fn acquire_local_snapshot_guard(
+        &self,
+        path: &Path,
+        environment: &EnvironmentConfig,
+    ) -> Result<Option<Box<dyn SnapshotGuard>>, CommitRepoError> {
+        let Some(provider) = self.registry.get(&environment.database_provider) else {
+            return Ok(None);
+        };
+        if provider.local_engine().is_none() {
+            return Ok(None);
+        }
+
+        let params = repo_layout::local_connection_params(path)
+            .map_err(|e| CommitRepoError::Repository(RepositoryError::Internal(e.to_string())))?;
+
+        // Acquiring the guard is synchronous and waits on SQLite's own locking,
+        // for up to the engine's full lock budget. In the CLI that would merely
+        // block the one task, but this library is also linked into a long-lived
+        // daemon, where holding an executor thread for seconds would stall
+        // unrelated work. Hand it to a blocking thread instead.
+        let provider_for_task = Arc::clone(&provider);
+        let params_for_task = params.clone();
+        let prepared = tokio::task::spawn_blocking(move || {
+            let engine = provider_for_task
+                .local_engine()
+                .expect("provider had a local engine a moment ago");
+            engine.prepare_for_snapshot(&params_for_task)
+        })
+        .await
+        .map_err(|e| {
+            CommitRepoError::Repository(RepositoryError::Internal(format!(
+                "snapshot preparation task failed: {e}"
+            )))
+        })?;
+
+        match prepared {
+            Ok(Some(guard)) => {
+                tracing::debug!(held = %guard.describe(), "database quiesced for snapshot");
+                Ok(Some(guard))
+            }
+            // Nothing to quiesce: no database has been written yet.
+            Ok(None) => Ok(None),
+            // Only a *busy* database may be snapshotted unquiesced. The override
+            // deliberately does not apply to any other failure: if the engine could
+            // not open or read the database at all, proceeding would record
+            // something unusable as a commit — and our own error message would have
+            // invited the operator to do it.
+            Err(ProviderError::Busy(e)) if unfrozen_snapshot_allowed() => {
+                tracing::warn!(
+                    error = %e,
+                    "database is busy; proceeding with an UNFROZEN snapshot per \
+                     GFS_ALLOW_UNFROZEN_SNAPSHOT — it may capture a torn copy if the \
+                     other process writes during the snapshot"
+                );
+                Ok(None)
+            }
+            Err(ProviderError::Busy(e)) => Err(CommitRepoError::Repository(
+                RepositoryError::Internal(format!(
+                    "{e}. Refusing to snapshot a database that is being written: a copy \
+                     taken mid-write can capture a torn file. Options: (1) stop the process \
+                     writing the database and retry; or (2) set GFS_ALLOW_UNFROZEN_SNAPSHOT=1 \
+                     to proceed with a best-effort snapshot that may not be restorable"
+                )),
+            )),
+            Err(e) => Err(CommitRepoError::Repository(RepositoryError::Internal(
+                format!(
+                    "{e}. Refusing to commit: the database could not be prepared for a \
+                     snapshot, so its contents cannot be trusted. This is not lock \
+                     contention, and GFS_ALLOW_UNFROZEN_SNAPSHOT does not apply"
+                ),
+            ))),
+        }
+    }
+
     async fn take_snapshot(
         &self,
         path: &Path,
@@ -517,16 +635,19 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
             let provider = self.registry.get(&env.database_provider).ok_or_else(|| {
                 CommitRepoError::UnknownDatabaseProvider(env.database_provider.clone())
             })?;
+            let container = provider.require_container().map_err(|e| {
+                CommitRepoError::Repository(RepositoryError::Internal(e.to_string()))
+            })?;
             let conn_info = self
                 .compute
-                .get_connection_info(&instance_id, provider.default_port())
+                .get_connection_info(&instance_id, container.default_port())
                 .await?;
             let params = ConnectionParams {
                 host: conn_info.host,
                 port: conn_info.port,
                 env: conn_info.env,
             };
-            let commands = provider.prepare_for_snapshot(&params).map_err(|e| {
+            let commands = container.prepare_for_snapshot(&params).map_err(|e| {
                 CommitRepoError::Repository(RepositoryError::Internal(e.to_string()))
             })?;
             self.compute
@@ -600,6 +721,10 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
             }
         }
 
+        // An embedded provider's guard is acquired by the caller before schema
+        // extraction and held across this snapshot, so nothing is taken here —
+        // a second `BEGIN IMMEDIATE` would block against our own lock.
+
         // 4. Take a storage snapshot.
         //    The VolumeId is the mount point of the workspace volume.  When no
         //    explicit mount_point is configured we read .gfs/WORKSPACE which
@@ -657,6 +782,10 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                         CommitRepoError::UnknownDatabaseProvider(env.database_provider.clone())
                     })?;
                     let container_data_path = provider
+                        .require_container()
+                        .map_err(|e| {
+                            CommitRepoError::Repository(RepositoryError::Internal(e.to_string()))
+                        })?
                         .definition()
                         .data_dir
                         .to_string_lossy()
@@ -859,8 +988,9 @@ mod tests {
         StartOptions,
     };
     use crate::ports::database_provider::{
-        ConnectionParams, DatabaseProvider, DatabaseProviderArg, DatabaseProviderRegistry,
-        ProviderError, Result as RegistryResult, SIGTERM, SupportedFeature,
+        ConnectionParams, ContainerProvider, DatabaseProvider, DatabaseProviderArg,
+        DatabaseProviderRegistry, ProviderError, Result as RegistryResult, SIGTERM,
+        SupportedFeature,
     };
     use crate::ports::repository::{LogOptions, RemoteOptions, Repository};
     use crate::ports::storage::{
@@ -1352,6 +1482,35 @@ mod tests {
         fn name(&self) -> &str {
             "mock-db"
         }
+        fn connection_string(
+            &self,
+            _: &ConnectionParams,
+        ) -> std::result::Result<String, ProviderError> {
+            Ok("mock://localhost:5432".into())
+        }
+        fn supported_versions(&self) -> Vec<String> {
+            vec!["latest".to_string()]
+        }
+        fn supported_features(&self) -> Vec<SupportedFeature> {
+            vec![SupportedFeature {
+                id: "schema".into(),
+                description: "Schema support.".into(),
+            }]
+        }
+        fn query_client_command(
+            &self,
+            _: &ConnectionParams,
+            _: Option<&str>,
+        ) -> std::result::Result<std::process::Command, ProviderError> {
+            Ok(std::process::Command::new("true"))
+        }
+
+        fn container(&self) -> Option<&dyn crate::ports::database_provider::ContainerProvider> {
+            Some(self)
+        }
+    }
+
+    impl ContainerProvider for MockProvider {
         fn definition(&self) -> ComputeDefinition {
             ComputeDefinition {
                 labels: Default::default(),
@@ -1375,30 +1534,8 @@ mod tests {
         fn default_signal(&self) -> u32 {
             SIGTERM
         }
-        fn connection_string(
-            &self,
-            _: &ConnectionParams,
-        ) -> std::result::Result<String, ProviderError> {
-            Ok("mock://localhost:5432".into())
-        }
-        fn supported_versions(&self) -> Vec<String> {
-            vec!["latest".to_string()]
-        }
-        fn supported_features(&self) -> Vec<SupportedFeature> {
-            vec![SupportedFeature {
-                id: "schema".into(),
-                description: "Schema support.".into(),
-            }]
-        }
         fn prepare_for_snapshot(&self, _: &ConnectionParams) -> RegistryResult<Vec<String>> {
             Ok(vec![])
-        }
-        fn query_client_command(
-            &self,
-            _: &ConnectionParams,
-            _: Option<&str>,
-        ) -> std::result::Result<std::process::Command, ProviderError> {
-            Ok(std::process::Command::new("true"))
         }
     }
 
@@ -2511,6 +2648,32 @@ mod tests {
             fn name(&self) -> &str {
                 PROVIDER_NAME
             }
+            fn connection_string(
+                &self,
+                _: &ConnectionParams,
+            ) -> std::result::Result<String, ProviderError> {
+                Ok("mock://localhost:5432".into())
+            }
+            fn supported_versions(&self) -> Vec<String> {
+                vec!["latest".into()]
+            }
+            fn supported_features(&self) -> Vec<SupportedFeature> {
+                vec![]
+            }
+            fn query_client_command(
+                &self,
+                _: &ConnectionParams,
+                _: Option<&str>,
+            ) -> std::result::Result<std::process::Command, ProviderError> {
+                Ok(std::process::Command::new("true"))
+            }
+
+            fn container(&self) -> Option<&dyn crate::ports::database_provider::ContainerProvider> {
+                Some(self)
+            }
+        }
+
+        impl crate::ports::database_provider::ContainerProvider for OverlapProvider {
             fn definition(&self) -> ComputeDefinition {
                 ComputeDefinition {
                     labels: Default::default(),
@@ -2534,27 +2697,8 @@ mod tests {
             fn default_signal(&self) -> u32 {
                 SIGTERM
             }
-            fn connection_string(
-                &self,
-                _: &ConnectionParams,
-            ) -> std::result::Result<String, ProviderError> {
-                Ok("mock://localhost:5432".into())
-            }
-            fn supported_versions(&self) -> Vec<String> {
-                vec!["latest".into()]
-            }
-            fn supported_features(&self) -> Vec<SupportedFeature> {
-                vec![]
-            }
             fn prepare_for_snapshot(&self, _: &ConnectionParams) -> RegistryResult<Vec<String>> {
                 Ok(vec!["CHECKPOINT".into()])
-            }
-            fn query_client_command(
-                &self,
-                _: &ConnectionParams,
-                _: Option<&str>,
-            ) -> std::result::Result<std::process::Command, ProviderError> {
-                Ok(std::process::Command::new("true"))
             }
             fn schema_extraction_spec(
                 &self,

@@ -51,6 +51,34 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo fmt -- --check
 
+      # The SQLite suites are cfg(unix), so this job is where the byte-copy
+      # snapshot backend gets exercised — and it is the only place the snapshot
+      # guard is load-bearing. On APFS, `cp -cRp` clones per file, so a snapshot
+      # is largely crash-consistent by construction; `gfs_storage_file` copies
+      # bytes, which is where an unquiesced snapshot tears.
+      #
+      # That coverage is a property of the runner image, not of the code, so it
+      # can vanish silently. Assert it rather than assume it: on a
+      # copy-on-write runner every test would still pass while covering
+      # strictly less.
+      - name: Assert the runner filesystem is not copy-on-write
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          # Ask whether a reflink WORKS, rather than matching filesystem names.
+          # A name list gets this wrong: `stat` reports plain "xfs" whether or
+          # not reflink=1 is set, and modern mkfs.xfs enables it by default — so
+          # an XFS runner would pass a name check while quietly providing
+          # copy-on-write and removing the coverage this step exists to protect.
+          fs=$(stat -f --format=%T . || echo unknown)
+          head -c 1M /dev/urandom > .cow-probe-src
+          if cp --reflink=always .cow-probe-src .cow-probe-dst 2>/dev/null; then
+            rm -f .cow-probe-src .cow-probe-dst
+            echo "::error::runner filesystem ($fs) supports reflink, so 'cp --reflink=auto' clones instead of copying bytes. The byte-copy snapshot path — the only place the snapshot guard is load-bearing — is no longer exercised, and the tests cover strictly less than they appear to."
+            exit 1
+          fi
+          rm -f .cow-probe-src .cow-probe-dst
+          echo "runner filesystem: $fs — no reflink, byte-copy path exercised" 
+
       - name: Run tests
         if: matrix.os == 'ubuntu-latest'
         run: cargo test --verbose

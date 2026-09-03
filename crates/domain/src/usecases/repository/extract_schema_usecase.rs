@@ -14,7 +14,10 @@ use std::sync::Arc;
 use crate::model::config::GfsConfig;
 use crate::model::datasource::{Column, DatasourceMetadata, Schema, Table};
 use crate::ports::compute::{Compute, ComputeError, InstanceId};
-use crate::ports::database_provider::{ConnectionParams, DatabaseProviderRegistry};
+use crate::ports::database_provider::{
+    ConnectionParams, DatabaseProvider, DatabaseProviderRegistry,
+};
+use crate::repo_utils::repo_layout;
 
 // ---------------------------------------------------------------------------
 // Error
@@ -88,7 +91,9 @@ impl<R: DatabaseProviderRegistry> ExtractSchemaUseCase<R> {
 
     /// Extract schema metadata from the database instance associated with the repo at `path`.
     ///
-    /// Runs schema extraction inside a container (no psql or other client tools required on host).
+    /// Embedded providers (those exposing a `LocalEngine`) are queried in this
+    /// process. Every other provider is queried inside its running container, so
+    /// no client tools are required on the host either way.
     ///
     /// - `path`: GFS repository root.
     pub async fn run(&self, path: &Path) -> Result<SchemaOutput, ExtractSchemaError> {
@@ -109,76 +114,40 @@ impl<R: DatabaseProviderRegistry> ExtractSchemaUseCase<R> {
             })?
             .to_string();
 
-        let container_name = config
-            .runtime
-            .as_ref()
-            .map(|r| r.container_name.as_str())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                ExtractSchemaError::NotConfigured(
-                    "no container configured (run gfs compute start)".into(),
-                )
-            })?
-            .to_string();
-
-        // 2. Resolve provider.
+        // 2. Resolve provider. This happens before any container lookup because
+        //    an embedded provider legitimately has no container configured.
         let provider = self
             .registry
             .get(&provider_name)
             .ok_or_else(|| ExtractSchemaError::ProviderNotFound(provider_name.clone()))?;
 
-        let instance_id = InstanceId(container_name);
-
-        // 3. Connection env (credentials, db name) from the running container. The
-        //    command runs *inside* that container via `exec`, so it reaches the
-        //    database on 127.0.0.1 rather than the container's network IP.
-        let conn_info = self
-            .compute
-            .get_task_connection_info(&instance_id, provider.default_port())
-            .await?;
-
-        let params = ConnectionParams {
-            host: "127.0.0.1".to_string(),
-            port: conn_info.port,
-            env: conn_info.env,
+        // 3. Produce the delimited extraction output, either in this process or
+        //    inside the database container. Both arms yield the same format, so
+        //    everything below the branch is shared.
+        let stdout = match provider.local_engine() {
+            Some(engine) => {
+                let params = repo_layout::local_connection_params(path)
+                    .map_err(|e| ExtractSchemaError::NotConfigured(e.to_string()))?;
+                engine
+                    .extract_schema(&params)
+                    .map_err(|e| ExtractSchemaError::ExtractionFailed(e.to_string()))?
+            }
+            None => {
+                self.extract_via_container(&config, &*provider, &provider_name)
+                    .await?
+            }
         };
 
-        // 4. Get schema extraction spec (a shell command emitting delimited output).
-        let spec = provider
-            .schema_extraction_spec(&params)
-            .map_err(|e| ExtractSchemaError::ExtractionFailed(e.to_string()))?
-            .ok_or_else(|| {
-                ExtractSchemaError::ExtractionFailed(format!(
-                    "provider '{}' does not support schema extraction",
-                    provider_name
-                ))
-            })?;
-
-        // 5. Run the command via `exec` inside the running database container
-        //    instead of spawning a throwaway sidecar. The DB image already ships
-        //    the client tools the command needs (psql, pg_dump), so no separate
-        //    container, image pull, or network linking is required. The
-        //    task-image-versioning retag from `main` applied only to the sidecar
-        //    image, which `exec` no longer creates, so it is intentionally dropped.
-        let output = self.compute.exec(&instance_id, &spec.command, None).await?;
-
-        if output.exit_code != 0 {
-            return Err(ExtractSchemaError::QueryFailed(format!(
-                "schema extraction task failed (exit {}): {}",
-                output.exit_code, output.stderr
-            )));
-        }
-
-        // 6. Parse stdout into version, schemas, tables, columns, and DDL.
+        // 4. Parse stdout into version, schemas, tables, columns, and DDL.
         let ParsedSchema {
             version,
             schemas,
             tables,
             columns,
             ddl,
-        } = parse_schema_output(&output.stdout).map_err(ExtractSchemaError::ExtractionFailed)?;
+        } = parse_schema_output(&stdout).map_err(ExtractSchemaError::ExtractionFailed)?;
 
-        // 7. Build metadata.
+        // 5. Build metadata.
         let metadata = DatasourceMetadata {
             version,
             driver: provider_name,
@@ -205,6 +174,69 @@ impl<R: DatabaseProviderRegistry> ExtractSchemaUseCase<R> {
             metadata,
             schema_sql: ddl,
         })
+    }
+
+    /// Run the provider's extraction command inside its running database
+    /// container, returning the command's stdout.
+    async fn extract_via_container(
+        &self,
+        config: &GfsConfig,
+        provider: &dyn DatabaseProvider,
+        provider_name: &str,
+    ) -> Result<String, ExtractSchemaError> {
+        let container = provider
+            .require_container()
+            .map_err(|e| ExtractSchemaError::NotConfigured(e.to_string()))?;
+        let container_name = config
+            .runtime
+            .as_ref()
+            .map(|r| r.container_name.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                ExtractSchemaError::NotConfigured(
+                    "no container configured (run gfs compute start)".into(),
+                )
+            })?
+            .to_string();
+        let instance_id = InstanceId(container_name);
+
+        // Connection env (credentials, db name) from the running container. The
+        // command runs *inside* that container via `exec`, so it reaches the
+        // database on 127.0.0.1 rather than the container's network IP.
+        let conn_info = self
+            .compute
+            .get_task_connection_info(&instance_id, container.default_port())
+            .await?;
+
+        let params = ConnectionParams {
+            host: "127.0.0.1".to_string(),
+            port: conn_info.port,
+            env: conn_info.env,
+        };
+
+        let spec = container
+            .schema_extraction_spec(&params)
+            .map_err(|e| ExtractSchemaError::ExtractionFailed(e.to_string()))?
+            .ok_or_else(|| {
+                ExtractSchemaError::ExtractionFailed(format!(
+                    "provider '{provider_name}' does not support schema extraction"
+                ))
+            })?;
+
+        // `exec` into the running database container rather than spawning a
+        // throwaway sidecar: the DB image already ships the client tools the
+        // command needs, so no separate container, image pull, or network
+        // linking is required.
+        let output = self.compute.exec(&instance_id, &spec.command, None).await?;
+
+        if output.exit_code != 0 {
+            return Err(ExtractSchemaError::QueryFailed(format!(
+                "schema extraction task failed (exit {}): {}",
+                output.exit_code, output.stderr
+            )));
+        }
+
+        Ok(output.stdout)
     }
 }
 
@@ -342,8 +374,9 @@ mod tests {
         PortMapping, StartOptions,
     };
     use crate::ports::database_provider::{
-        ConnectionParams, DatabaseProvider, DatabaseProviderArg, DatabaseProviderRegistry,
-        ProviderError, Result as RegistryResult, SIGTERM, SchemaExtractionSpec, SupportedFeature,
+        ConnectionParams, ContainerProvider, DatabaseProvider, DatabaseProviderArg,
+        DatabaseProviderRegistry, ProviderError, Result as RegistryResult, SIGTERM,
+        SchemaExtractionSpec, SupportedFeature,
     };
 
     fn existing_repo_path() -> (TempDir, std::path::PathBuf) {
@@ -631,6 +664,35 @@ GFS_SCHEMA_COLUMNS
         fn name(&self) -> &str {
             "mock-schema"
         }
+        fn connection_string(
+            &self,
+            _: &ConnectionParams,
+        ) -> std::result::Result<String, ProviderError> {
+            Ok("mock://localhost:5432".into())
+        }
+        fn supported_versions(&self) -> Vec<String> {
+            vec!["latest".to_string()]
+        }
+        fn supported_features(&self) -> Vec<SupportedFeature> {
+            vec![SupportedFeature {
+                id: "schema".into(),
+                description: "Schema support.".into(),
+            }]
+        }
+        fn query_client_command(
+            &self,
+            _: &ConnectionParams,
+            _: Option<&str>,
+        ) -> std::result::Result<std::process::Command, ProviderError> {
+            Ok(std::process::Command::new("true"))
+        }
+
+        fn container(&self) -> Option<&dyn ContainerProvider> {
+            Some(self)
+        }
+    }
+
+    impl ContainerProvider for MockSchemaProvider {
         fn definition(&self) -> ComputeDefinition {
             ComputeDefinition {
                 labels: Default::default(),
@@ -657,30 +719,8 @@ GFS_SCHEMA_COLUMNS
         fn default_signal(&self) -> u32 {
             SIGTERM
         }
-        fn connection_string(
-            &self,
-            _: &ConnectionParams,
-        ) -> std::result::Result<String, ProviderError> {
-            Ok("mock://localhost:5432".into())
-        }
-        fn supported_versions(&self) -> Vec<String> {
-            vec!["latest".to_string()]
-        }
-        fn supported_features(&self) -> Vec<SupportedFeature> {
-            vec![SupportedFeature {
-                id: "schema".into(),
-                description: "Schema support.".into(),
-            }]
-        }
         fn prepare_for_snapshot(&self, _: &ConnectionParams) -> RegistryResult<Vec<String>> {
             Ok(vec![])
-        }
-        fn query_client_command(
-            &self,
-            _: &ConnectionParams,
-            _: Option<&str>,
-        ) -> std::result::Result<std::process::Command, ProviderError> {
-            Ok(std::process::Command::new("true"))
         }
         fn schema_extraction_spec(
             &self,

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use gfs_compute_docker::containers;
+use gfs_db_providers as containers;
 use gfs_domain::adapters::gfs_repository::GfsRepository;
 #[cfg(target_os = "linux")]
 use gfs_domain::model::layout::GFS_DIR;

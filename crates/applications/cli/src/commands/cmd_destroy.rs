@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use gfs_compute_docker::containers;
+use gfs_db_providers as containers;
 use gfs_domain::adapters::gfs_repository::GfsRepository;
 use gfs_domain::model::config::GfsConfig;
 use gfs_domain::ports::compute::{Compute, InstanceId};
@@ -135,7 +135,7 @@ async fn remove_gfs_as_root(
 
     // Reuse the repo's own engine image (guaranteed present locally): re-tag the
     // provider default with the configured major version.
-    let mut definition = provider.definition();
+    let mut definition = provider.require_container()?.definition();
     if let Some(env) = config.environment.as_ref()
         && !env.database_version.is_empty()
         && let Some((base, _)) = definition.image.clone().rsplit_once(':')

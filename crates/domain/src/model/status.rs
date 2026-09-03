@@ -18,6 +18,27 @@ pub struct StatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_workspace_data_dir: Option<String>,
 
+    /// The commit HEAD points at, or `None` before the first commit.
+    ///
+    /// Lives here rather than in either caller because both surfaces need it
+    /// and, when only one had it, they disagreed: the MCP tool injected a
+    /// `head_commit` into its own payload while the CLI reported none in any
+    /// output mode, and the skill files documented the same command twice, two
+    /// different ways.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_commit: Option<String>,
+
+    /// How to connect to this repository's database, when that can be stated
+    /// without a running container.
+    ///
+    /// `gfs status --help` advertises a connection string, and for a
+    /// container-backed provider it lives in [`ComputeStatus`]. An embedded
+    /// provider has no compute section, so there was nowhere for it to appear
+    /// and the advertised field was simply absent — even though `gfs init`
+    /// prints it and the file it names is always there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection_string: Option<String>,
+
     /// Set when the container is bound to a different path than the active workspace (e.g. after checkout).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bind_mismatch_warning: Option<String>,
@@ -106,12 +127,24 @@ mod tests {
         let s = StatusResponse {
             current_branch: "main".into(),
             compute: None,
+            head_commit: None,
+            connection_string: None,
             active_workspace_data_dir: None,
             bind_mismatch_warning: None,
             source: None,
         };
         let json = serde_json::to_string(&s).expect("serialize");
         assert!(!json.contains("source"), "unexpected source key in {json}");
+        // Same contract for the connection string: absent, not null, so a
+        // container-backed payload is byte-identical to what it was.
+        assert!(
+            !json.contains("connection_string"),
+            "unexpected connection_string key in {json}"
+        );
+        assert!(
+            !json.contains("head_commit"),
+            "unexpected head_commit key in {json}"
+        );
         // and a pre-#133 payload (no source field) still deserializes
         let back: StatusResponse = serde_json::from_str(&json).expect("deserialize");
         assert!(back.source.is_none());
@@ -122,6 +155,8 @@ mod tests {
         let s = StatusResponse {
             current_branch: "main".into(),
             compute: None,
+            head_commit: None,
+            connection_string: None,
             active_workspace_data_dir: None,
             bind_mismatch_warning: None,
             source: Some(SourceStatus {

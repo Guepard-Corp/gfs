@@ -15,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::model::config::GfsConfig;
 use crate::ports::compute::{Compute, ComputeError, InstanceId};
 use crate::ports::database_provider::{ConnectionParams, DatabaseProviderRegistry};
+use crate::repo_utils::repo_layout;
 
 // ---------------------------------------------------------------------------
 // Error
@@ -179,6 +180,30 @@ impl<R: DatabaseProviderRegistry> ImportRepoUseCase<R> {
             format.to_string()
         };
 
+        // 2. Resolve provider before looking for a container: an embedded
+        //    provider legitimately has none, and replays the script itself.
+        let provider = self
+            .registry
+            .get(&provider_name)
+            .ok_or_else(|| ImportRepoError::ProviderNotFound(provider_name.clone()))?;
+
+        if let Some(engine) = provider.local_engine() {
+            let params = repo_layout::local_connection_params(path)
+                .map_err(|e| ImportRepoError::NotConfigured(e.to_string()))?;
+            engine
+                .import(&params, &resolved_format, &input_file)
+                .map_err(|e| ImportRepoError::TaskFailed {
+                    exit_code: 1,
+                    stderr: e.to_string(),
+                })?;
+            return Ok(ImportOutput {
+                format: resolved_format,
+                imported_from: input_file,
+                stdout: String::new(),
+                stderr: String::new(),
+            });
+        }
+
         let container_name = config
             .runtime
             .as_ref()
@@ -191,18 +216,16 @@ impl<R: DatabaseProviderRegistry> ImportRepoUseCase<R> {
             })?
             .to_string();
 
-        // 2. Resolve provider.
-        let provider = self
-            .registry
-            .get(&provider_name)
-            .ok_or_else(|| ImportRepoError::ProviderNotFound(provider_name.clone()))?;
+        let container = provider
+            .require_container()
+            .map_err(|e| ImportRepoError::NotConfigured(e.to_string()))?;
 
         let instance_id = InstanceId(container_name);
 
         // 3. Get internal connection info for the sidecar.
         let conn_info = self
             .compute
-            .get_task_connection_info(&instance_id, provider.default_port())
+            .get_task_connection_info(&instance_id, container.default_port())
             .await?;
 
         let params = ConnectionParams {
@@ -217,7 +240,7 @@ impl<R: DatabaseProviderRegistry> ImportRepoUseCase<R> {
             .unwrap_or("import.sql");
 
         // 4. Build the import spec.
-        let mut spec = provider
+        let mut spec = container
             .import_spec(&params, &resolved_format, input_filename)
             .map_err(|e| ImportRepoError::UnsupportedFormat(e.to_string()))?;
 
@@ -291,8 +314,9 @@ mod tests {
         Compute, ComputeDefinition, InstanceId, InstanceState, InstanceStatus, StartOptions,
     };
     use crate::ports::database_provider::{
-        ConnectionParams, DatabaseProvider, DatabaseProviderArg, DatabaseProviderRegistry,
-        ImportSpec, ProviderError, Result as RegistryResult, SIGTERM, SupportedFeature,
+        ConnectionParams, ContainerProvider, DatabaseProvider, DatabaseProviderArg,
+        DatabaseProviderRegistry, ImportSpec, ProviderError, Result as RegistryResult, SIGTERM,
+        SupportedFeature,
     };
 
     #[test]
@@ -476,6 +500,32 @@ mod tests {
         fn name(&self) -> &str {
             "postgres"
         }
+        fn connection_string(
+            &self,
+            _: &ConnectionParams,
+        ) -> std::result::Result<String, ProviderError> {
+            Ok("postgres://localhost:5432".into())
+        }
+        fn supported_versions(&self) -> Vec<String> {
+            vec!["17".into()]
+        }
+        fn supported_features(&self) -> Vec<SupportedFeature> {
+            vec![]
+        }
+        fn query_client_command(
+            &self,
+            _: &ConnectionParams,
+            _: Option<&str>,
+        ) -> std::result::Result<std::process::Command, ProviderError> {
+            Ok(std::process::Command::new("true"))
+        }
+
+        fn container(&self) -> Option<&dyn ContainerProvider> {
+            Some(self)
+        }
+    }
+
+    impl ContainerProvider for MockProvider {
         fn definition(&self) -> ComputeDefinition {
             ComputeDefinition {
                 labels: Default::default(),
@@ -499,27 +549,8 @@ mod tests {
         fn default_signal(&self) -> u32 {
             SIGTERM
         }
-        fn connection_string(
-            &self,
-            _: &ConnectionParams,
-        ) -> std::result::Result<String, ProviderError> {
-            Ok("postgres://localhost:5432".into())
-        }
-        fn supported_versions(&self) -> Vec<String> {
-            vec!["17".into()]
-        }
-        fn supported_features(&self) -> Vec<SupportedFeature> {
-            vec![]
-        }
         fn prepare_for_snapshot(&self, _: &ConnectionParams) -> RegistryResult<Vec<String>> {
             Ok(vec![])
-        }
-        fn query_client_command(
-            &self,
-            _: &ConnectionParams,
-            _: Option<&str>,
-        ) -> std::result::Result<std::process::Command, ProviderError> {
-            Ok(std::process::Command::new("true"))
         }
         fn import_spec(
             &self,

@@ -2,13 +2,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gfs_compute_docker::DockerCompute;
-use gfs_compute_docker::containers;
 use gfs_compute_kubernetes::KubernetesCompute;
+use gfs_db_providers as containers;
 use gfs_domain::adapters::gfs_repository::GfsRepository;
 use gfs_domain::model::config::GfsConfig;
 use gfs_domain::ports::compute::Compute;
-use gfs_domain::ports::database_provider::InMemoryDatabaseProviderRegistry;
+use gfs_domain::ports::database_provider::{
+    DatabaseProviderRegistry, InMemoryDatabaseProviderRegistry,
+};
 use gfs_domain::ports::repository::Repository;
+use gfs_domain::repo_utils::repo_layout;
 use gfs_domain::usecases::repository::init_repo_usecase::{
     DatabaseCredentials, InitRepositoryUseCase,
 };
@@ -42,7 +45,58 @@ pub async fn init(
         .trim()
         .to_ascii_lowercase();
 
-    let compute: Option<Arc<dyn Compute>> = if database_provider.is_some() {
+    let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
+    containers::register_all(registry.as_ref())?;
+
+    // Validate the provider and version BEFORE anything reaches for a container
+    // runtime. `--database-provider sqlite3` used to be reported as "GFS was not
+    // able to connect to Docker/Podman", sending the user to debug a daemon they
+    // do not need and were never going to need, because the name was only
+    // checked after the client had been built.
+    if let Some(name) = database_provider.as_deref() {
+        let known = registry.list();
+        let matched = known.iter().find(|n| n.eq_ignore_ascii_case(name)).cloned();
+        let Some(matched) = matched else {
+            return Err(format!(
+                "unknown database provider '{name}'. Available: {}",
+                known.join(", ")
+            )
+            .into());
+        };
+        // The version is recorded in the repo config permanently and, for an
+        // embedded provider, describes an engine that is linked in rather than
+        // chosen — so "sqlite 4" was accepted and then contradicted by every
+        // later report of the real version.
+        if let (Some(provider), Some(version)) =
+            (registry.get(&matched), database_version.as_deref())
+        {
+            let supported = provider.supported_versions();
+            if !supported.is_empty() && !supported.iter().any(|v| v == version) {
+                return Err(format!(
+                    "'{version}' is not a supported {matched} version. Supported: {}",
+                    supported.join(", ")
+                )
+                .into());
+            }
+        }
+    }
+
+    // An embedded provider (SQLite) has nothing to provision, so do not open a
+    // connection to a container runtime that will never be used — that
+    // connection failing is otherwise the first thing a user without Docker
+    // sees, even though no container is involved.
+    let embedded = database_provider
+        .as_deref()
+        .and_then(|name| {
+            let list = registry.list();
+            list.iter()
+                .find(|n| n.eq_ignore_ascii_case(name))
+                .cloned()
+                .and_then(|n| registry.get(&n))
+        })
+        .is_some_and(|p| !p.requires_compute());
+
+    let compute: Option<Arc<dyn Compute>> = if database_provider.is_some() && !embedded {
         match runtime_provider.as_str() {
             "kubernetes" | "k8s" | "k3s" => Some(Arc::new(
                 KubernetesCompute::new(None)
@@ -58,9 +112,6 @@ pub async fn init(
     } else {
         None
     };
-
-    let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
-    containers::register_all(registry.as_ref())?;
 
     let use_case =
         InitRepositoryUseCase::new(repository.clone(), compute.clone(), registry.clone());
@@ -92,12 +143,21 @@ pub async fn init(
 
     let mut connection_string: Option<String> = None;
     if has_provider && let Some(compute) = compute.clone() {
-        let status_uc = StatusRepoUseCase::new(repository, compute, registry);
+        let status_uc = StatusRepoUseCase::new(repository, compute, registry.clone());
         if let Ok(status) = status_uc.run(&target_path).await {
             connection_string = status
                 .compute
                 .and_then(|c| (!c.connection_string.is_empty()).then_some(c.connection_string));
         }
+    } else if has_provider {
+        // An embedded provider has no compute instance to ask, but the user
+        // still needs to know where the database is in order to point an
+        // application at it — and nothing else in the CLI tells them.
+        connection_string = provider_display
+            .as_deref()
+            .and_then(|name| registry.get(name))
+            .zip(repo_layout::local_connection_params(&target_path).ok())
+            .and_then(|(provider, params)| provider.connection_string(&params).ok());
     }
 
     if json_output {
