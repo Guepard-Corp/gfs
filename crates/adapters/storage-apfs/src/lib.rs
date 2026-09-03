@@ -35,22 +35,8 @@ use gfs_domain::ports::storage::{
     CloneOptions, MountStatus, Quota, Result, Snapshot, SnapshotId, SnapshotOptions, StorageError,
     StoragePort, VolumeId, VolumeStatus,
 };
+use gfs_domain::utils::system_bin;
 use tokio::process::Command;
-
-/// Absolute path to the system `cp`, deliberately not resolved through `PATH`.
-///
-/// `-c` is a BSD flag — it asks for a clonefile(2) copy — and GNU `cp` rejects
-/// it outright with "cp: invalid option -- 'c'". Homebrew's coreutils installs
-/// a GNU `cp` at `/opt/homebrew/opt/coreutils/libexec/gnubin`, which many
-/// developers put ahead of `/usr/bin` on `PATH`, and every `gfs commit` on such
-/// a machine then failed with an error naming a `cp` invocation and nothing
-/// about `PATH`, so there was no way to connect the two.
-///
-/// This is not a macOS-only concern in principle either: resolving a helper
-/// binary through `PATH` means the behaviour of a commit depends on the user's
-/// shell configuration. `/bin/cp` is on the read-only system volume and is the
-/// binary these flags are written for.
-const SYSTEM_CP: &str = "/bin/cp";
 
 use tracing::instrument;
 
@@ -173,7 +159,7 @@ impl StoragePort for ApfsStorage {
             }
         };
 
-        let output = Command::new(SYSTEM_CP)
+        let output = Command::new(system_bin::resolve("cp"))
             .args(["-cRp", &id.0, dest.to_string_lossy().as_ref()])
             .env("LANG", "C")
             .output()
@@ -183,7 +169,7 @@ impl StoragePort for ApfsStorage {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let msg = format!(
-                "{SYSTEM_CP} -cRp '{}' '{}' failed: {}",
+                "cp -cRp '{}' '{}' failed: {}",
                 id,
                 dest.display(),
                 stderr.trim()
@@ -231,7 +217,7 @@ impl StoragePort for ApfsStorage {
             .map(|s| s.0.as_str())
             .unwrap_or(&source.0);
 
-        let output = Command::new(SYSTEM_CP)
+        let output = Command::new(system_bin::resolve("cp"))
             .args(["-cRp", src, &target_id.0])
             .env("LANG", "C")
             .output()
@@ -241,7 +227,7 @@ impl StoragePort for ApfsStorage {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let msg = format!(
-                "{SYSTEM_CP} -cRp '{}' '{}' failed: {}",
+                "cp -cRp '{}' '{}' failed: {}",
                 src,
                 target_id,
                 stderr.trim()
@@ -404,6 +390,10 @@ mod tests {
     /// many developers' `PATH` — rejects it and every snapshot fails. Shadowing
     /// `cp` with a script that always fails proves the adapter is not reaching
     /// for whatever `cp` the shell happens to find.
+    ///
+    /// The sibling assertion for `storage-file`, which has its own `cp` spawn
+    /// and is the backend used when the filesystem is neither APFS nor btrfs,
+    /// lives in that crate.
     #[tokio::test]
     async fn a_shadowed_cp_on_path_cannot_break_a_snapshot() {
         let dir = tempfile::tempdir().expect("temp dir");
