@@ -226,6 +226,8 @@ fn checkout_refuses_to_overwrite_uncommitted_work_unless_forced() {
 
     fs::write(read_workspace_path(repo_path).join("scratch.txt"), "wip").unwrap();
 
+    // Checking out the branch you are already on rebuilds this very directory,
+    // so the work in it is exactly what would be lost.
     let (ok, _, stderr) = cli_runner::run_gfs([
         "gfs",
         "checkout",
@@ -326,11 +328,66 @@ fn returning_to_a_detached_commit_gives_that_commit() {
     assert_eq!(workspace_contents(repo_path), "seed.txt=v1");
 
     fs::write(read_workspace_path(repo_path).join("poison.txt"), "z").unwrap();
-    assert!(cli_runner::run_gfs(["gfs", "checkout", "--path", repo, "main", "--force"]).0);
-    assert!(cli_runner::run_gfs(["gfs", "checkout", "--path", repo, &first]).0);
+
+    // Leaving is fine: the detached directory is not the one being rebuilt.
+    assert!(
+        cli_runner::run_gfs(["gfs", "checkout", "--path", repo, "main"]).0,
+        "leaving a dirty workspace overwrites nothing, so it must not be refused"
+    );
+
+    // Returning is where it would be destroyed, so that is where the refusal is.
+    let (ok, _, stderr) = cli_runner::run_gfs(["gfs", "checkout", "--path", repo, &first]);
+    assert!(!ok, "returning would overwrite poison.txt");
+    assert!(stderr.contains("poison.txt"), "{stderr}");
+
+    assert!(cli_runner::run_gfs(["gfs", "checkout", "--path", repo, &first, "--force"]).0);
     assert_eq!(
         workspace_contents(repo_path),
         "seed.txt=v1",
         "the commit's content, not what was left in its directory"
+    );
+}
+
+/// The refusal has to guard the workspace the restore REBUILDS, not the one
+/// being left behind.
+///
+/// Each branch has its own directory, so leaving a dirty branch overwrites
+/// nothing and must not be refused. The destructive moment is coming BACK: the
+/// target directory is rebuilt from its snapshot, and work left there is gone.
+/// Guarding the wrong side is both too strict and, more seriously, silent —
+/// walk away from dirty work on one branch and return to it from a clean one,
+/// and it is deleted with no refusal at all.
+#[test]
+fn the_refusal_guards_the_workspace_being_rebuilt_not_the_one_being_left() {
+    let tmp = tempdir().expect("create temp dir");
+    let repo_path = tmp.path();
+    assert!(cli_runner::gfs_init(repo_path), "gfs init should succeed");
+    let repo = repo_path.to_str().unwrap();
+
+    fs::write(workspace_data_dir_main_0(repo_path).join("seed.txt"), "v1").unwrap();
+    assert!(cli_runner::gfs_commit(repo_path, "c1", None, None).0);
+
+    assert!(cli_runner::run_gfs(["gfs", "checkout", "--path", repo, "-b", "feature"]).0);
+    let feature_ws = read_workspace_path(repo_path);
+    fs::write(feature_ws.join("scratch.txt"), "wip").unwrap();
+
+    // Leaving: allowed, and the directory is left alone.
+    let (ok, _, stderr) = cli_runner::run_gfs(["gfs", "checkout", "--path", repo, "main"]);
+    assert!(ok, "leaving must not be refused; stderr: {stderr}");
+    assert!(
+        feature_ws.join("scratch.txt").exists(),
+        "leaving must not touch the branch's directory"
+    );
+
+    // Returning: refused, from a workspace that is itself clean.
+    let (ok, _, stderr) = cli_runner::run_gfs(["gfs", "checkout", "--path", repo, "feature"]);
+    assert!(
+        !ok,
+        "returning would rebuild feature's directory and destroy scratch.txt"
+    );
+    assert!(stderr.contains("scratch.txt"), "{stderr}");
+    assert!(
+        feature_ws.join("scratch.txt").exists(),
+        "a refused checkout must change nothing"
     );
 }

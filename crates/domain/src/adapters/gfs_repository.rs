@@ -15,10 +15,7 @@ use async_trait::async_trait;
 use crate::model::commit::{Commit, CommitWithRefs, FileEntry, NewCommit, file_entry_diff_stats};
 use crate::model::config::{EnvironmentConfig, GfsConfig, RuntimeConfig, UserConfig};
 use crate::model::errors::RepoError;
-use crate::model::layout::{
-    BRANCH_WORKSPACE_SEGMENT, GFS_DIR, HEADS_DIR, OBJECTS_DIR, REFS_DIR, SNAPSHOTS_DIR,
-    WORKSPACE_DATA_DIR, WORKSPACES_DIR,
-};
+use crate::model::layout::{GFS_DIR, HEADS_DIR, OBJECTS_DIR, REFS_DIR, SNAPSHOTS_DIR};
 use crate::ports::repository::{LogOptions, RemoteOptions, Repository, RepositoryError, Result};
 use crate::repo_utils::repo_layout;
 use crate::utils::hash::hash_commit;
@@ -551,7 +548,10 @@ impl Repository for GfsRepository {
         }
 
         // Resolve revision to full commit hash.
-        let commit_hash = repo_layout::rev_parse(&repo, revision).map_err(map_err)?;
+        // Where this lands, decided in one place — `CheckoutRepoUseCase` asks the
+        // same function what is about to be overwritten before allowing it.
+        let (commit_hash, workspace_path) =
+            repo_layout::checkout_target(&repo, revision).map_err(map_err)?;
 
         // Reject initial state: cannot checkout "0".
         if commit_hash == "0" {
@@ -563,35 +563,12 @@ impl Repository for GfsRepository {
             return Err(RepositoryError::Internal(msg));
         }
 
-        // Determine HEAD update: branch name iff refs/heads/<revision> exists and tip matches.
-        let branch_segment = if repo_layout::is_branch(&repo, revision) {
-            let ref_path = repo
-                .join(GFS_DIR)
-                .join(REFS_DIR)
-                .join(HEADS_DIR)
-                .join(revision);
-            let tip = fs::read_to_string(&ref_path).map_err(RepositoryError::Io)?;
-            if tip.trim() == commit_hash {
-                revision.to_string()
-            } else {
-                "detached".to_string()
-            }
-        } else {
-            "detached".to_string()
-        };
-
-        // Workspace path: one persistent dir per branch (workspaces/<branch>/0/data), or per-commit when detached.
-        let workspace_segment = if branch_segment == "detached" {
-            repo_layout::short_commit_id_for_workspace(&commit_hash)
-        } else {
-            BRANCH_WORKSPACE_SEGMENT.to_string()
-        };
-        let workspace_path = repo
-            .join(GFS_DIR)
-            .join(WORKSPACES_DIR)
-            .join(&branch_segment)
-            .join(&workspace_segment)
-            .join(WORKSPACE_DATA_DIR);
+        let branch_segment = workspace_path
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "detached".to_string());
 
         // Always restore from the snapshot. Reusing a workspace that happens to
         // still be on disk made checkout non-deterministic in three ways: a
@@ -800,7 +777,9 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    use crate::model::layout::{CONFIG_FILE, HEAD_FILE, MAIN_BRANCH, WORKSPACE_FILE};
+    use crate::model::layout::{
+        CONFIG_FILE, HEAD_FILE, MAIN_BRANCH, WORKSPACE_DATA_DIR, WORKSPACE_FILE, WORKSPACES_DIR,
+    };
     use crate::ports::repository::{LogOptions, Repository};
     use crate::utils::hash::hash_commit;
 

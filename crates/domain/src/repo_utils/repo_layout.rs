@@ -1035,6 +1035,53 @@ pub fn get_current_commit_id(repo_path: &Path) -> Result<String, RepoError> {
 
 /// Short commit id used for workspace directory path segment (avoids long paths on disk).
 /// If `commit_id` is longer than `SHORT_COMMIT_ID_LEN`, returns the prefix; otherwise returns as-is (e.g. `"0"`).
+/// Where a checkout of `revision` would land: its commit, and the workspace
+/// directory that would be rebuilt.
+///
+/// Extracted so the caller can ask what a checkout is about to overwrite BEFORE
+/// it overwrites it. `GfsRepository::checkout` uses the same function, because
+/// two copies of this rule that disagree is exactly how a guard ends up
+/// protecting a different directory from the one being destroyed.
+pub fn checkout_target(
+    repo: &Path,
+    revision: &str,
+) -> Result<(String, std::path::PathBuf), RepoError> {
+    let commit_hash = rev_parse(repo, revision)?;
+
+    // A branch name only keeps its own workspace while it still points at the
+    // commit being asked for; otherwise the checkout detaches.
+    let branch_segment = if is_branch(repo, revision) {
+        let tip = fs::read_to_string(
+            repo.join(GFS_DIR)
+                .join(REFS_DIR)
+                .join(HEADS_DIR)
+                .join(revision),
+        )
+        .map_err(RepoError::from)?;
+        if tip.trim() == commit_hash {
+            revision.to_string()
+        } else {
+            "detached".to_string()
+        }
+    } else {
+        "detached".to_string()
+    };
+
+    let workspace_segment = if branch_segment == "detached" {
+        short_commit_id_for_workspace(&commit_hash)
+    } else {
+        BRANCH_WORKSPACE_SEGMENT.to_string()
+    };
+
+    let path = repo
+        .join(GFS_DIR)
+        .join(WORKSPACES_DIR)
+        .join(&branch_segment)
+        .join(&workspace_segment)
+        .join(WORKSPACE_DATA_DIR);
+    Ok((commit_hash, path))
+}
+
 /// The directory holding a branch's working copy.
 pub fn branch_workspace_dir(repo_path: &Path, branch: &str) -> std::path::PathBuf {
     repo_path.join(GFS_DIR).join(WORKSPACES_DIR).join(branch)

@@ -82,30 +82,43 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
         self
     }
 
-    /// The uncommitted changes checkout would overwrite, as a short description.
+    /// The uncommitted changes this checkout would overwrite, as a short
+    /// description.
     ///
-    /// Compared against the file list recorded on the CURRENT commit, which is
-    /// the right baseline because a commit snapshots the workspace: immediately
-    /// after one, the two agree, and everything written since is uncommitted.
-    /// `None` when there is nothing recorded to compare against — a repository
-    /// with no commits yet, or one whose commit predates file lists — in which
-    /// case checkout proceeds as before rather than refusing on a fact it does
-    /// not have.
+    /// Asks about the TARGET workspace, not the one being left, because that is
+    /// the directory the restore rebuilds. Getting this backwards is a live
+    /// hazard rather than a nicety: checking the workspace you leave both
+    /// refuses switches that would overwrite nothing — each branch has its own
+    /// directory, so leaving a dirty branch destroys nothing — and, worse, lets
+    /// you walk away from dirty work on one branch and come back to it from a
+    /// clean one, at which point the restore deletes it with no refusal at all.
+    ///
+    /// The baseline is the file list recorded on the commit being checked out,
+    /// which is the right one for that directory: committing on a branch
+    /// snapshots its workspace, so the two agree immediately afterwards and
+    /// everything written since is uncommitted.
+    ///
+    /// `None` whenever the question cannot be answered — an unresolvable
+    /// revision (a branch about to be created), no commits yet, or a commit
+    /// that predates file lists. Checkout then proceeds and reports its own
+    /// error, rather than refusing on a fact this does not have.
     async fn uncommitted_changes(
         &self,
         path: &Path,
+        revision: &str,
     ) -> std::result::Result<Option<String>, CheckoutRepoError> {
-        let current = self.repository.get_current_commit_id(path).await?;
-        if current == "0" {
+        let Ok((commit_hash, workspace)) = repo_layout::checkout_target(path, revision) else {
+            return Ok(None);
+        };
+        if commit_hash == "0" {
             return Ok(None);
         }
-        let Ok(commit) = repo_layout::get_commit_from_hash(path, &current) else {
+        let Ok(commit) = repo_layout::get_commit_from_hash(path, &commit_hash) else {
             return Ok(None);
         };
         let Ok(Some(baseline)) = repo_layout::get_file_entries_for_commit(path, &commit) else {
             return Ok(None);
         };
-        let workspace = self.repository.get_active_workspace_data_dir(path).await?;
         let changed = repo_layout::workspace_changes(&workspace, &baseline)
             .map_err(|e| CheckoutRepoError::Repository(RepositoryError::Internal(e.to_string())))?;
         if changed.is_empty() {
@@ -138,13 +151,22 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
         // unrecoverable. Neither silent option is acceptable: discarding loses
         // data the user cannot get back, and preserving it across a switch
         // leaves state that no command in GFS displays.
+        let revision = revision.trim().to_string();
+
+        // Refuse before anything is touched. The restore rebuilds the target
+        // workspace, so work that was never committed THERE is overwritten and
+        // unrecoverable. Neither silent option is acceptable: discarding loses
+        // data the user cannot get back, and keeping a stale directory means
+        // `Switched to X` does not give you X.
+        //
+        // Skipped when a branch is being created, since its workspace does not
+        // exist yet and there is nothing to lose.
         if !self.force
-            && let Some(changed) = self.uncommitted_changes(&path).await?
+            && create_branch.is_none()
+            && let Some(changed) = self.uncommitted_changes(&path, &revision).await?
         {
             return Err(CheckoutRepoError::WorkspaceDirty(changed));
         }
-
-        let revision = revision.trim().to_string();
 
         // Validate the target ref BEFORE stopping compute — a bad revision must
         // not leave the database offline (mirrors the k8s checkout path).
