@@ -29,11 +29,12 @@ use std::time::{Duration, SystemTime};
 use crate::model::commit::Commit;
 use crate::model::errors::RepoError;
 use crate::model::fsck::{
-    Dangling, FsckReport, ObjectKind, ReclaimableWorkspace, Unreachable, Unrecognised,
+    Dangling, FsckReport, ObjectKind, ReclaimableWorkspace, SnapshotFacts, Unreachable,
+    Unrecognised,
 };
 use crate::model::layout::{
-    BRANCH_WORKSPACE_SEGMENT, DELETED_REFS_DIR, GFS_DIR, HEAD_FILE, OBJECTS_DIR, REFS_DIR,
-    SNAPSHOTS_DIR, WORKSPACE_FILE, WORKSPACES_DIR,
+    BRANCH_WORKSPACE_SEGMENT, DELETED_REFS_DIR, GFS_DIR, HEAD_FILE, HEADS_DIR, OBJECTS_DIR,
+    REFS_DIR, SNAPSHOTS_DIR, WORKSPACE_FILE, WORKSPACES_DIR,
 };
 use crate::repo_utils::repo_layout;
 
@@ -91,20 +92,34 @@ fn is_object_leaf(name: &str) -> bool {
 }
 
 /// Every `<root>/<2>/<62>` entry, as `(hash, path)`. Foreign names are skipped.
-fn two_level(root: &Path) -> Vec<(String, PathBuf)> {
+/// Every object leaf under a two-level shard, and separately everything else
+/// that is in there.
+///
+/// The second list is not a curiosity. `Unrecognised` exists because
+/// `git count-objects -v` reports `garbage` — "files in the ODB that are
+/// neither valid loose objects nor valid packs" — rather than ignoring it, and
+/// this walker was quietly doing the opposite: every non-conforming name hit a
+/// `continue` and vanished. A stray file in the object store was reported as
+/// nothing at all, which is the one outcome worse than a false alarm.
+fn two_level(root: &Path) -> (Vec<(String, PathBuf)>, Vec<PathBuf>) {
     let mut out = Vec::new();
+    let mut junk = Vec::new();
     let Ok(prefixes) = std::fs::read_dir(root) else {
-        return out;
+        return (out, junk);
     };
     for prefix in prefixes.flatten() {
         let prefix_path = prefix.path();
         let Some(prefix_name) = prefix_path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
+        if is_incidental(prefix_name) {
+            continue;
+        }
         if prefix_name.len() != 2
             || !prefix_name.chars().all(|c| c.is_ascii_hexdigit())
             || !prefix_path.is_dir()
         {
+            junk.push(prefix_path);
             continue;
         }
         let Ok(entries) = std::fs::read_dir(&prefix_path) else {
@@ -114,14 +129,32 @@ fn two_level(root: &Path) -> Vec<(String, PathBuf)> {
             let Some(rest) = entry.file_name().to_str().map(str::to_string) else {
                 continue;
             };
+            if is_incidental(&rest) {
+                continue;
+            }
             if !is_object_leaf(&rest) {
+                junk.push(entry.path());
                 continue;
             }
             let hash = format!("{prefix_name}{rest}").to_ascii_lowercase();
             out.push((hash, entry.path()));
         }
     }
-    out
+    (out, junk)
+}
+
+/// Files an operating system leaves lying about, which are not findings.
+///
+/// Narrow and explicit on purpose. `.DS_Store` appears in any directory a macOS
+/// Finder window has been opened on, and treating it as an unidentifiable object
+/// would make a routine check report corruption — and refuse to write a plan —
+/// on a repository where nothing is wrong. Every name here is a known artefact
+/// of a file browser or archiver, never anything a partial write produces.
+fn is_incidental(name: &str) -> bool {
+    matches!(
+        name,
+        ".DS_Store" | "._.DS_Store" | "Thumbs.db" | "desktop.ini" | ".gitkeep" | ".keep"
+    )
 }
 
 /// Commit hashes every walk starts from, plus any problem found reading a ref.
@@ -137,7 +170,23 @@ pub fn roots(repo_path: &Path) -> Result<(Vec<String>, Vec<Dangling>), RepoError
     let mut out: Vec<String> = Vec::new();
     let mut problems: Vec<Dangling> = Vec::new();
 
+    let heads = repo_path.join(GFS_DIR).join(REFS_DIR).join(HEADS_DIR);
     for (name, tip) in repo_layout::list_branches(repo_path)? {
+        // A ref is a file. A symlink where one should be sends the walk outside
+        // the repository to decide what is live inside it, and the sibling
+        // walkers in this codebase already refuse to follow one. Reported here
+        // rather than followed, and not resolved for a tip.
+        if std::fs::symlink_metadata(heads.join(&name))
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            problems.push(Dangling {
+                from_commit: format!("refs/heads/{name}"),
+                kind: ObjectKind::Commit,
+                missing: "(symbolic link, not a ref)".to_string(),
+            });
+            continue;
+        }
         let tip = tip.trim();
         // `"0"` is the sentinel `init` writes before the first commit, and is
         // the only legitimate non-hash value. An *empty* ref is not a sentinel:
@@ -283,33 +332,65 @@ fn soft_deleted_roots(repo_path: &Path, problems: &mut Vec<Dangling>) -> Vec<Str
 pub enum SnapshotSource<'a> {
     /// Walk `.gfs/snapshots/`. Correct for the file, APFS and btrfs backends.
     Filesystem,
-    /// Exactly these snapshot hashes exist, as reported by the backend, mapped
-    /// to the bytes deleting each would actually free. Used for Kubernetes,
-    /// where the adapter lists ready `VolumeSnapshot`s and joins them to ZFS.
+    /// Exactly these snapshots exist and belong to this repository, as the
+    /// backend reports them. Used for Kubernetes, where the adapter lists the
+    /// `VolumeSnapshot`s carrying this repo's owner annotation and joins them
+    /// to ZFS.
     ///
-    /// The value is the backend's *exclusive* figure — ZFS's `used` — not the
-    /// `referenced` number a filesystem walk produces. It is the only honest
-    /// answer to "how much would I get back", and it is available only because
-    /// the backend computes it; nothing GFS can do from a directory tree
-    /// reproduces it.
-    ///
-    /// A hash present with no size is not free, only unmeasured.
-    Known(&'a HashMap<String, Option<u64>>),
+    /// Each carries whether it is finished, when it was made, and what it holds
+    /// exclusively. All three matter: an unfinished snapshot is present but
+    /// uncollectable, the creation time is the only clock this backend has, and
+    /// an unmeasured size is not a zero one.
+    Known(&'a HashMap<String, SnapshotFacts>),
     /// The backend could not be asked. Snapshots are neither verified nor
     /// reported, and the report says so rather than implying they are fine.
     Unavailable,
 }
 
+/// Whether a thing is there, absent, or beyond our reach.
+///
+/// The third case used to collapse into the second, because `Path::exists`
+/// answers `false` for both. An intact object inside a directory the caller
+/// cannot open was therefore reported as *missing* — corruption — and on a host
+/// where repositories are root-owned that is what a non-root operator is told
+/// about a perfectly healthy repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Presence {
+    Present,
+    Absent,
+    Unreadable,
+}
+
+fn presence(path: &Path) -> Presence {
+    match std::fs::metadata(path) {
+        Ok(_) => Presence::Present,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Presence::Absent,
+        // Permission denied, a broken mount, an I/O error: all mean we did not
+        // get to look, which is not the same as having looked and found nothing.
+        Err(_) => Presence::Unreadable,
+    }
+}
+
 impl SnapshotSource<'_> {
-    fn contains(&self, hash: &str, snapshots_dir: &Path) -> bool {
+    fn contains(&self, hash: &str, snapshots_dir: &Path) -> Presence {
         match self {
             SnapshotSource::Filesystem => {
                 let (a, b) = hash.split_at(2);
-                snapshots_dir.join(a).join(b).is_dir()
+                presence(&snapshots_dir.join(a).join(b))
             }
-            SnapshotSource::Known(map) => map.contains_key(hash),
+            // Present is present: a snapshot the backend is still writing is
+            // not a missing one, so a commit naming it is not dangling. The map
+            // deliberately carries unfinished snapshots for this reason; the
+            // sweep below is where readiness matters.
+            SnapshotSource::Known(map) => {
+                if map.contains_key(hash) {
+                    Presence::Present
+                } else {
+                    Presence::Absent
+                }
+            }
             // Nothing is provably missing when nothing can be asked.
-            SnapshotSource::Unavailable => true,
+            SnapshotSource::Unavailable => Presence::Present,
         }
     }
 
@@ -353,6 +434,7 @@ fn mark(
     roots: &[String],
     snapshots: &SnapshotSource<'_>,
     dangling: &mut Vec<Dangling>,
+    unreadable: &mut Vec<Unrecognised>,
 ) -> Marks {
     let mut marks = Marks::default();
     let mut queue: VecDeque<String> = VecDeque::new();
@@ -370,6 +452,18 @@ fn mark(
     while let Some(hash) = queue.pop_front() {
         let commit: Commit = match repo_layout::get_commit_from_hash(repo_path, &hash) {
             Ok(c) => c,
+            // Absent is corruption; unreachable-by-permissions is not.
+            Err(_)
+                if presence(&objects_dir.join(&hash[..2]).join(&hash[2..]))
+                    == Presence::Unreadable =>
+            {
+                unreadable.push(Unrecognised {
+                    hash: hash.clone(),
+                    reason: "commit object could not be read".to_string(),
+                    bytes: 0,
+                });
+                continue;
+            }
             Err(_) => {
                 dangling.push(Dangling {
                     from_commit: hash.clone(),
@@ -386,14 +480,25 @@ fn mark(
         if snapshots.is_checked() {
             match normalise_hash(&commit.snapshot_hash) {
                 Some(snap) => {
-                    if snapshots.contains(&snap, &snapshots_dir) {
-                        marks.snapshots.insert(snap);
-                    } else {
-                        dangling.push(Dangling {
+                    match snapshots.contains(&snap, &snapshots_dir) {
+                        // Marked in both cases: it is there, we simply could not
+                        // open it, and marking keeps the sweep from proposing it
+                        // for collection.
+                        found @ (Presence::Present | Presence::Unreadable) => {
+                            if found == Presence::Unreadable {
+                                unreadable.push(Unrecognised {
+                                    hash: snap.clone(),
+                                    reason: "snapshot could not be read".to_string(),
+                                    bytes: 0,
+                                });
+                            }
+                            marks.snapshots.insert(snap);
+                        }
+                        Presence::Absent => dangling.push(Dangling {
                             from_commit: hash.clone(),
                             kind: ObjectKind::Snapshot,
                             missing: snap,
-                        });
+                        }),
                     }
                 }
                 // Reported, never skipped. Skipping leaves the real snapshot
@@ -417,17 +522,23 @@ fn mark(
             match normalise_hash(raw) {
                 Some(reference) => {
                     let (a, b) = reference.split_at(2);
-                    if objects_dir.join(a).join(b).exists() {
-                        if kind == ObjectKind::FileList {
-                            marks.file_lists += 1;
+                    match presence(&objects_dir.join(a).join(b)) {
+                        Presence::Present => {
+                            if kind == ObjectKind::FileList {
+                                marks.file_lists += 1;
+                            }
+                            marks.objects.insert(reference);
                         }
-                        marks.objects.insert(reference);
-                    } else {
-                        dangling.push(Dangling {
+                        Presence::Absent => dangling.push(Dangling {
                             from_commit: hash.clone(),
                             kind,
                             missing: reference,
-                        });
+                        }),
+                        Presence::Unreadable => unreadable.push(Unrecognised {
+                            hash: reference,
+                            reason: format!("{} could not be read", kind.as_str()),
+                            bytes: 0,
+                        }),
                     }
                 }
                 None => dangling.push(Dangling {
@@ -490,6 +601,18 @@ fn identify_object(path: &Path) -> Result<ObjectKind, String> {
 /// whose mtime is in the future, which `--grace 0` must be able to override.
 /// A window so large that the cutoff saturates at the epoch protects
 /// everything, which is the correct reading of "keep for a thousand years".
+/// Whether a backend-supplied creation time falls inside the grace window.
+///
+/// An absent time counts as recent. Same direction as the filesystem walk: what
+/// cannot be dated cannot be shown to be old, and the cost of being wrong is
+/// asymmetric — protecting garbage wastes space, collecting live data does not.
+fn within_grace(created: Option<SystemTime>, cutoff: Option<SystemTime>) -> bool {
+    let Some(cutoff) = cutoff else {
+        return false;
+    };
+    created.map(|t| t > cutoff).unwrap_or(true)
+}
+
 fn newer_than(path: &Path, cutoff: Option<SystemTime>) -> bool {
     let Some(cutoff) = cutoff else {
         return false;
@@ -576,6 +699,7 @@ pub fn check_with(
     };
 
     let check_snapshots = snapshots.is_checked();
+    let mut unreadable: Vec<Unrecognised> = Vec::new();
     let (roots, mut dangling) = roots(repo_path)?;
     // A root that does not resolve is not one missing answer among many: the
     // walk never started from where it should have, so *every* object that root
@@ -584,7 +708,7 @@ pub fn check_with(
     // a wrong answer presented confidently is the failure mode a check exists
     // to prevent. Same reasoning as `snapshots_checked`.
     let reachability_complete = dangling.is_empty();
-    let marks = mark(repo_path, &roots, snapshots, &mut dangling);
+    let marks = mark(repo_path, &roots, snapshots, &mut dangling, &mut unreadable);
 
     let mut unreachable: Vec<Unreachable> = Vec::new();
     let mut unrecognised: Vec<Unrecognised> = Vec::new();
@@ -592,7 +716,19 @@ pub fn check_with(
     let mut exclusive_bytes: u64 = 0;
     let mut protected: usize = 0;
 
-    for (hash, path) in two_level(&objects_dir) {
+    let (object_leaves, object_junk) = two_level(&objects_dir);
+    for path in object_junk {
+        unrecognised.push(Unrecognised {
+            hash: path
+                .strip_prefix(repo_path)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string(),
+            reason: "unexpected entry in the object store".to_string(),
+            bytes: object_size(&path),
+        });
+    }
+    for (hash, path) in object_leaves {
         if marks.objects.contains(&hash) {
             continue;
         }
@@ -636,26 +772,59 @@ pub fn check_with(
     }
 
     let mut checked_snapshots = 0usize;
+    // Set when the backend held a snapshot it could not size. The total is then
+    // a floor over an unknown remainder rather than a complete figure, and
+    // saying so is the difference between "nothing to reclaim" and "we could
+    // not measure".
+    let mut exclusive_incomplete = false;
     if let SnapshotSource::Known(map) = snapshots {
         // The backend is the inventory, and it also knows what each snapshot
         // exclusively holds — which a directory walk cannot. These bytes are
         // the real thing: what deleting it would free, not what `du` shows.
-        for (hash, size) in map.iter() {
+        for (hash, facts) in map.iter() {
             checked_snapshots += 1;
             if marks.snapshots.contains(hash) {
                 continue;
             }
-            let bytes = size.unwrap_or(0);
-            exclusive_bytes += bytes;
+            // Unfinished, so an operation is still writing it. Not garbage,
+            // whatever its age — the backend is telling us it is in flight.
+            if !facts.ready {
+                protected += 1;
+                continue;
+            }
+            // The grace window applies here exactly as it does to a directory,
+            // and used not to apply at all: this branch read no clock, so on the
+            // Kubernetes backend `--grace` did nothing whatsoever and a snapshot
+            // seconds old was offered for collection every single time.
+            if within_grace(facts.created, cutoff) {
+                protected += 1;
+                continue;
+            }
+            match facts.bytes {
+                Some(b) => exclusive_bytes += b,
+                None => exclusive_incomplete = true,
+            }
             unreachable.push(Unreachable {
                 kind: ObjectKind::Snapshot,
                 hash: hash.clone(),
                 summary: None,
-                bytes,
+                bytes: facts.bytes.unwrap_or(0),
             });
         }
     } else if check_snapshots {
-        for (hash, path) in two_level(&snapshots_dir) {
+        let (snapshot_trees, snapshot_junk) = two_level(&snapshots_dir);
+        for path in snapshot_junk {
+            unrecognised.push(Unrecognised {
+                hash: path
+                    .strip_prefix(repo_path)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .to_string(),
+                reason: "unexpected entry in the snapshot store".to_string(),
+                bytes: 0,
+            });
+        }
+        for (hash, path) in snapshot_trees {
             checked_snapshots += 1;
             if marks.snapshots.contains(&hash) {
                 continue;
@@ -700,6 +869,10 @@ pub fn check_with(
         (unreachable, referenced_bytes, exclusive_bytes);
     let (mut reclaimable_workspaces, mut reclaimable_workspace_bytes) =
         (reclaimable_workspaces, reclaimable_workspace_bytes);
+    // An object we could not open is a hole in the walk just as much as a root
+    // we could not resolve: whatever it referenced is now unmarked and looks
+    // collectable.
+    let reachability_complete = reachability_complete && unreadable.is_empty();
     if !reachability_complete {
         unreachable.clear();
         reclaimable_workspaces.clear();
@@ -727,8 +900,10 @@ pub fn check_with(
         } else {
             None
         },
+        exclusive_is_partial: exclusive_incomplete,
         snapshots_checked: check_snapshots,
         reachability_complete,
+        unreadable,
         protected_by_grace: protected,
         grace_seconds: grace.as_secs(),
         reclaimable_workspaces,
@@ -918,7 +1093,6 @@ fn object_size(path: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::layout::{HEADS_DIR, REFS_DIR};
     use std::fs;
 
     /// A minimal `.gfs` with one branch and no commits.
@@ -1098,7 +1272,19 @@ mod tests {
             "a missing snapshot directory is normal on k8s: {:?}",
             r.dangling
         );
-        assert!(r.is_clean(), "{r:?}");
+        // But emphatically not clean, and this assertion is the inverse of what
+        // it used to be. A run that could not see the snapshots has checked half
+        // the graph; calling that consistent is how the same repository reported
+        // "inconsistent" with the cluster up and a green tick with it down.
+        assert!(
+            !r.is_clean(),
+            "an unverified half is not a clean bill: {r:?}"
+        );
+        assert_eq!(
+            r.exit_code(),
+            3,
+            "did-not-run is not the same as found-garbage"
+        );
     }
 
     #[test]
@@ -1661,5 +1847,255 @@ mod tests {
         );
         let json = serde_json::to_string(&r.reclaimable_workspaces[0]).unwrap();
         assert!(json.contains("\"safe_to_remove\":false"), "got {json}");
+    }
+
+    /// The cluster namespace is shared. Handing fsck a snapshot belonging to
+    /// another deployment makes it garbage by definition — no local commit
+    /// names it — so the scoping that keeps it out of the map is the only thing
+    /// standing between a routine check and a plan to delete a live branch tip.
+    #[test]
+    fn a_pending_snapshot_is_present_but_never_collectable() {
+        let d = repo();
+        let h = write_commit(d.path(), "aa", "live", None, false);
+        set_branch(d.path(), "main", &h);
+        let snap = hash_of(&format!("5{}", "aa"));
+
+        // Mid-commit: the VolumeSnapshot exists, the backend is still writing it.
+        let mut map = HashMap::new();
+        map.insert(
+            snap.clone(),
+            SnapshotFacts {
+                ready: false,
+                created: Some(SystemTime::now()),
+                bytes: None,
+            },
+        );
+        let r = check_with(d.path(), Duration::ZERO, &SnapshotSource::Known(&map)).unwrap();
+        assert!(
+            r.dangling.is_empty(),
+            "a snapshot being written is present, not missing: {:?}",
+            r.dangling
+        );
+        assert!(
+            !r.unreachable.iter().any(|u| u.hash == snap),
+            "and it is in flight, so it is not garbage at any age: {:?}",
+            r.unreachable
+        );
+
+        // Unreferenced *and* unfinished stays protected even with no grace.
+        let orphan = hash_of("9f");
+        let mut map2 = HashMap::new();
+        map2.insert(
+            orphan.clone(),
+            SnapshotFacts {
+                ready: false,
+                created: None,
+                bytes: None,
+            },
+        );
+        let r2 = check_with(d.path(), Duration::ZERO, &SnapshotSource::Known(&map2)).unwrap();
+        assert!(
+            !r2.unreachable.iter().any(|u| u.hash == orphan),
+            "{:?}",
+            r2.unreachable
+        );
+        assert!(r2.protected_by_grace > 0);
+    }
+
+    /// `--grace` read no clock at all on this backend, so it did nothing: a
+    /// snapshot created seconds ago was offered for collection on every run.
+    #[test]
+    fn grace_protects_a_freshly_created_backend_snapshot() {
+        let d = repo();
+        let h = write_commit(d.path(), "aa", "live", None, false);
+        set_branch(d.path(), "main", &h);
+
+        let fresh = hash_of("7a");
+        let ancient = hash_of("7b");
+        let mut map = HashMap::new();
+        map.insert(
+            fresh.clone(),
+            SnapshotFacts {
+                ready: true,
+                created: Some(SystemTime::now()),
+                bytes: Some(1024),
+            },
+        );
+        map.insert(
+            ancient.clone(),
+            SnapshotFacts {
+                ready: true,
+                created: Some(SystemTime::UNIX_EPOCH),
+                bytes: Some(2048),
+            },
+        );
+
+        let held = check_with(
+            d.path(),
+            Duration::from_secs(3600),
+            &SnapshotSource::Known(&map),
+        )
+        .unwrap();
+        let names: Vec<&str> = held.unreachable.iter().map(|u| u.hash.as_str()).collect();
+        assert!(
+            !names.contains(&fresh.as_str()),
+            "seconds old, inside the window: {names:?}"
+        );
+        assert!(
+            names.contains(&ancient.as_str()),
+            "and the window is not simply protecting everything: {names:?}"
+        );
+
+        // Zero grace still means zero.
+        let none = check_with(d.path(), Duration::ZERO, &SnapshotSource::Known(&map)).unwrap();
+        assert_eq!(none.unreachable.len(), 2, "{:?}", none.unreachable);
+    }
+
+    /// An unmeasured size is not a zero one. Where the CLI can reach the cluster
+    /// but no ZFS pool answers, every size comes back absent — and the report
+    /// used to print "0 B would be freed", which reads as a measurement.
+    #[test]
+    fn an_unmeasured_snapshot_is_not_reported_as_costing_nothing() {
+        let d = repo();
+        let h = write_commit(d.path(), "aa", "live", None, false);
+        set_branch(d.path(), "main", &h);
+
+        let orphan = hash_of("7c");
+        let mut map = HashMap::new();
+        map.insert(
+            orphan,
+            SnapshotFacts {
+                ready: true,
+                created: Some(SystemTime::UNIX_EPOCH),
+                bytes: None,
+            },
+        );
+        let r = check_with(d.path(), Duration::ZERO, &SnapshotSource::Known(&map)).unwrap();
+        assert_eq!(r.unreachable.len(), 1);
+        assert_eq!(r.exclusive_bytes, Some(0));
+        assert!(
+            r.exclusive_is_partial,
+            "the zero has to be marked as incomplete, or it reads as a measurement: {r:?}"
+        );
+    }
+
+    /// Dropped rather than reported: a stray file in the object store hit a
+    /// `continue` and was never mentioned, while the model's own docs cite
+    /// `git count-objects -v` reporting exactly this as `garbage`.
+    #[test]
+    fn a_stray_file_in_the_object_store_is_reported_not_swallowed() {
+        let d = repo();
+        let h = write_commit(d.path(), "aa", "live", None, true);
+        set_branch(d.path(), "main", &h);
+        assert!(check(d.path(), Duration::ZERO).unwrap().is_clean());
+
+        let objects = d.path().join(GFS_DIR).join(OBJECTS_DIR);
+        fs::write(objects.join("README.txt"), "how did this get here").unwrap();
+        fs::create_dir_all(objects.join("not-a-shard")).unwrap();
+
+        let r = check(d.path(), Duration::ZERO).unwrap();
+        assert_eq!(r.exit_code(), 2, "{r:?}");
+        let named: Vec<&str> = r.unrecognised.iter().map(|u| u.hash.as_str()).collect();
+        assert!(
+            named.iter().any(|n| n.contains("README.txt")),
+            "must name the file: {named:?}"
+        );
+        assert!(
+            named.iter().any(|n| n.contains("not-a-shard")),
+            "and the directory: {named:?}"
+        );
+    }
+
+    /// ...but a Finder artefact is not corruption. Reporting it would make a
+    /// routine check refuse to write a plan on a repository where nothing is
+    /// wrong, on any machine someone has opened the folder on.
+    #[test]
+    fn os_droppings_are_not_mistaken_for_corruption() {
+        let d = repo();
+        let h = write_commit(d.path(), "aa", "live", None, true);
+        set_branch(d.path(), "main", &h);
+        let objects = d.path().join(GFS_DIR).join(OBJECTS_DIR);
+        fs::write(objects.join(".DS_Store"), "\x00\x01").unwrap();
+        fs::write(objects.join(&h[..2]).join(".DS_Store"), "\x00\x01").unwrap();
+
+        let r = check(d.path(), Duration::ZERO).unwrap();
+        assert!(r.is_clean(), "{r:?}");
+    }
+
+    /// A ref is a file. A symlink in its place sends the walk outside the
+    /// repository to decide what is live inside it.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_ref_is_refused_rather_than_followed() {
+        let d = repo();
+        let h = write_commit(d.path(), "aa", "live", None, true);
+        set_branch(d.path(), "main", &h);
+
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("elsewhere");
+        fs::write(&target, &h).unwrap();
+        let link = d
+            .path()
+            .join(GFS_DIR)
+            .join(REFS_DIR)
+            .join(HEADS_DIR)
+            .join("sneaky");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let r = check(d.path(), Duration::ZERO).unwrap();
+        assert!(
+            r.dangling.iter().any(|x| x.from_commit.contains("sneaky")),
+            "the link is the finding: {:?}",
+            r.dangling
+        );
+        assert_eq!(r.exit_code(), 2, "{r:?}");
+    }
+
+    /// `Path::exists` is false for a permission error as well as for absence,
+    /// so an intact object inside an unopenable directory was reported as
+    /// missing. Repositories on the k8s hosts are root-owned, so this told any
+    /// non-root operator that a healthy repository was corrupt.
+    #[cfg(unix)]
+    #[test]
+    fn an_object_we_cannot_open_is_not_reported_as_missing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let d = repo();
+        let h = write_commit(d.path(), "aa", "live", None, true);
+        set_branch(d.path(), "main", &h);
+        let snap = hash_of(&format!("5{}", "aa"));
+        let shard = d.path().join(GFS_DIR).join(SNAPSHOTS_DIR).join(&snap[..2]);
+        fs::set_permissions(&shard, fs::Permissions::from_mode(0o000)).unwrap();
+
+        // A mode of 000 does not stop root, so ask rather than assume: if the
+        // directory is still readable there is no unreadable case to test.
+        if fs::read_dir(&shard).is_ok() {
+            fs::set_permissions(&shard, fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+
+        let r = check(d.path(), Duration::ZERO).unwrap();
+        // Restore before asserting, or the temp dir cannot be cleaned up.
+        fs::set_permissions(&shard, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            r.dangling.is_empty(),
+            "intact data behind a closed door is not missing data: {:?}",
+            r.dangling
+        );
+        assert!(
+            !r.unreadable.is_empty(),
+            "but it is worth saying out loud: {r:?}"
+        );
+        assert_eq!(
+            r.exit_code(),
+            3,
+            "and the check did not complete, so it claims neither clean nor corrupt: {r:?}"
+        );
+        assert!(
+            r.unreachable.is_empty(),
+            "a walk with a hole in it must not propose deletions: {:?}",
+            r.unreachable
+        );
     }
 }

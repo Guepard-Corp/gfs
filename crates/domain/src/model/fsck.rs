@@ -14,6 +14,37 @@
 //!   loose objects nor valid packs" — as its own line.
 
 use serde::{Deserialize, Serialize};
+use std::time::SystemTime;
+
+/// What a storage backend knows about one snapshot it holds.
+///
+/// Replaces the bare `hash -> size` map fsck used to take. That map could say
+/// only "this exists"; three separate defects came from the things it could not
+/// say — whether a snapshot was finished, when it was made, and whether a size
+/// of zero was measured or merely absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SnapshotFacts {
+    /// Whether the backend has finished making it.
+    ///
+    /// A snapshot that exists but is not ready is *in flight*. It must satisfy
+    /// both halves of the check at once: it is present, so a commit naming it is
+    /// not dangling; and it is unfinished, so it must never be collected. Ready
+    /// state was previously used as a filter before either question was asked,
+    /// which got both answers wrong — a pending snapshot made a healthy
+    /// repository read as corrupt, and nothing could suppress that.
+    pub ready: bool,
+    /// When the backend created it, for the grace window.
+    ///
+    /// `None` means undatable, which is treated as recent — the same safe
+    /// direction the filesystem walk takes.
+    pub created: Option<SystemTime>,
+    /// Blocks this snapshot holds exclusively, if the backend measured them.
+    ///
+    /// `None` is *unmeasured*, and must not be read as zero. Collapsing the two
+    /// made a repository whose pool could not be queried report "0 B would be
+    /// freed", which is a measurement, not a missing one.
+    pub bytes: Option<u64>,
+}
 
 /// What a stored entry is, once identified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,6 +188,13 @@ pub struct FsckReport {
     /// taken from.
     pub exclusive_bytes: Option<u64>,
 
+    /// Whether [`Self::exclusive_bytes`] is a floor rather than a total.
+    ///
+    /// True when the backend held a snapshot it could not size. The figure then
+    /// covers only what could be measured, and the unmeasured remainder is
+    /// unknown — not zero.
+    pub exclusive_is_partial: bool,
+
     /// Whether snapshots were verified at all.
     ///
     /// True when they were checked against a filesystem walk *or* against the
@@ -166,6 +204,16 @@ pub struct FsckReport {
     /// snapshots should be drawn from it; in particular a clean report does not
     /// mean the snapshots are fine.
     pub snapshots_checked: bool,
+
+    /// Entries that are present but could not be opened.
+    ///
+    /// Kept apart from both `dangling` and `unrecognised` because it is a
+    /// statement about *us*, not about the repository: the data may be perfectly
+    /// intact. `Path::exists` answers false for a permission error, so these
+    /// used to be reported as missing — telling an operator without read access
+    /// that their healthy repository was corrupt. Usually a permissions
+    /// problem, and the fix is to run as someone who can read the store.
+    pub unreadable: Vec<Unrecognised>,
 
     /// Whether the walk started from every root it should have.
     ///
@@ -214,9 +262,21 @@ impl FsckReport {
     /// - `0` — consistent, nothing to collect
     /// - `1` — unreachable objects found; a collector would have work to do
     /// - `2` — corruption found, which takes priority over `1`
+    /// - `3` — the check did not fully run, so it makes no claim either way
+    ///
+    /// `3` outranks `1`. Both `0` and `1` are *statements about the
+    /// repository* — one says it is clean, the other says exactly this much is
+    /// garbage — and a run that could not see the snapshots is entitled to
+    /// neither. On the Kubernetes backend with no reachable cluster the snapshot
+    /// half is simply absent, and the same repository minutes apart returned
+    /// "inconsistent" with the cluster up and a green "✓ consistent, exit 0"
+    /// with it down. The second answer was the dangerous one, and it was the
+    /// default on the node that actually holds repositories.
     pub fn exit_code(&self) -> i32 {
         if !self.dangling.is_empty() || !self.unrecognised.is_empty() {
             2
+        } else if !self.snapshots_checked || !self.unreadable.is_empty() {
+            3
         } else if !self.unreachable.is_empty() || !self.reclaimable_workspaces.is_empty() {
             1
         } else {
@@ -224,7 +284,11 @@ impl FsckReport {
         }
     }
 
-    /// True when nothing at all was found.
+    /// True when the check ran in full and found nothing.
+    ///
+    /// A run that could not verify the snapshots is never clean, however tidy
+    /// the half it did see. "I looked everywhere and found nothing" and "I could
+    /// not look" must not share an answer.
     pub fn is_clean(&self) -> bool {
         self.exit_code() == 0
     }
@@ -245,6 +309,8 @@ mod tests {
             referenced_bytes: 0,
             exclusive_bytes: None,
             snapshots_checked: true,
+            exclusive_is_partial: false,
+            unreadable: Vec::new(),
             reachability_complete: true,
             protected_by_grace: 0,
             grace_seconds: 0,

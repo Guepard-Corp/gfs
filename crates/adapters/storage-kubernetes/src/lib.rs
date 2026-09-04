@@ -22,6 +22,9 @@ use kube::api::{Api, DeleteParams, DynamicObject, ListParams, Patch, PatchParams
 use kube::core::{ApiResource, GroupVersionKind};
 use serde_json::json;
 
+use gfs_domain::model::fsck::SnapshotFacts;
+use std::time::SystemTime;
+
 const DEFAULT_NAMESPACE: &str = "gfs";
 const DEFAULT_PVC_SIZE_GI: &str = "1";
 
@@ -287,6 +290,156 @@ impl KubernetesStorage {
                     && let Some(hash) = hash_by_handle.get(tail)
                 {
                     out.insert(hash.clone(), used);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every GFS snapshot hash the cluster currently holds a `VolumeSnapshot`
+    /// for, taken from the `gfs.guepard.run/snapshot_hash` annotation this
+    /// adapter writes when it creates one.
+    ///
+    /// Exists so an integrity check has something to compare against on this
+    /// backend. On a filesystem backend a snapshot is a directory and can be
+    /// walked; here it is an API object, so the only way to know whether a
+    /// commit's snapshot still exists is to ask Kubernetes.
+    ///
+    /// Only snapshots that are `readyToUse` are returned. One that exists but
+    /// is not ready cannot restore anything, so counting it as present would
+    /// report a repository healthy when a checkout from it would fail.
+    /// The snapshots **this repository owns**, with what is known about each.
+    ///
+    /// `owner_prefix` is the repository's own `.gfs/snapshots` directory, and it
+    /// is the whole point of this signature. The namespace is shared by every
+    /// deployment on the cluster, and this used to list all of it: fsck in one
+    /// repository was handed 37 snapshots belonging to 14 others, found no local
+    /// commit referencing them — of course not, they are not its snapshots —
+    /// and reported another deployment's live branch tips as collectable, into
+    /// a plan file. The owning path was on each object the whole time, in the
+    /// `gfs.guepard.run/label` annotation written at creation, and simply unread.
+    ///
+    /// A snapshot that cannot be positively attributed to this repository is
+    /// left out. That direction is deliberate: excluding one of ours costs a
+    /// missed piece of garbage, while including one of theirs proposes deleting
+    /// live data.
+    pub async fn list_snapshot_facts(
+        &self,
+        owner_prefix: &str,
+    ) -> std::result::Result<std::collections::HashMap<String, SnapshotFacts>, StorageError> {
+        let api = self.api_volume_snapshots();
+        let list = api
+            .list(&ListParams::default())
+            .await
+            .map_err(|e| StorageError::Internal(format!("list volumesnapshots failed: {e}")))?;
+
+        let mut out: std::collections::HashMap<String, SnapshotFacts> =
+            std::collections::HashMap::new();
+        let mut hash_by_content: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+
+        for item in list {
+            let annotations = item.metadata.annotations.as_ref();
+            // Attribution first: everything below is about a snapshot we have
+            // already established is ours.
+            let owned = annotations
+                .and_then(|a| a.get("gfs.guepard.run/label"))
+                .map(|l| l.starts_with(owner_prefix))
+                .unwrap_or(false);
+            if !owned {
+                continue;
+            }
+            let Some(hash) = annotations
+                .and_then(|a| a.get("gfs.guepard.run/snapshot_hash"))
+                .map(|h| h.trim().to_ascii_lowercase())
+                .filter(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()))
+            else {
+                continue;
+            };
+
+            let ready = item
+                .data
+                .get("status")
+                .and_then(|s| s.get("readyToUse"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            // The cluster's own record of when it was made, which is what the
+            // grace window needs. A local file's timestamp says nothing here:
+            // there is no local file.
+            let created = item
+                .metadata
+                .creation_timestamp
+                .as_ref()
+                .map(|t| SystemTime::from(t.0));
+
+            if ready
+                && let Some(content) = item
+                    .data
+                    .get("status")
+                    .and_then(|s| s.get("boundVolumeSnapshotContentName"))
+                    .and_then(|v| v.as_str())
+            {
+                hash_by_content.insert(content.to_string(), hash.clone());
+            }
+
+            out.insert(
+                hash,
+                SnapshotFacts {
+                    ready,
+                    created,
+                    bytes: None,
+                },
+            );
+        }
+
+        // hop 2: content name -> ZFS snapshot handle
+        let contents = self.api_volume_snapshot_contents();
+        let clist = contents
+            .list(&ListParams::default())
+            .await
+            .map_err(|e| StorageError::Internal(format!("list vscontents failed: {e}")))?;
+        let mut hash_by_handle: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for item in clist {
+            let Some(name) = item.metadata.name.as_deref() else {
+                continue;
+            };
+            let Some(hash) = hash_by_content.get(name) else {
+                continue;
+            };
+            if let Some(handle) = item
+                .data
+                .get("status")
+                .and_then(|s| s.get("snapshotHandle"))
+                .and_then(|v| v.as_str())
+            {
+                hash_by_handle.insert(handle.to_string(), hash.clone());
+            }
+        }
+
+        // hop 3: handle -> exclusive bytes. Sizes stay `None` when this cannot
+        // run — `zfs list` exits 0 with no rows where there is no pool, and a
+        // zero written into the map there would read as a measurement.
+        let out_zfs = tokio::process::Command::new("zfs")
+            .args(["list", "-Hp", "-t", "snapshot", "-o", "name,used"])
+            .output()
+            .await
+            .map_err(|e| StorageError::Internal(format!("zfs list failed: {e}")))?;
+        if out_zfs.status.success() {
+            for line in String::from_utf8_lossy(&out_zfs.stdout).lines() {
+                let mut cols = line.split('\t');
+                let (Some(name), Some(used)) = (cols.next(), cols.next()) else {
+                    continue;
+                };
+                let Ok(used) = used.parse::<u64>() else {
+                    continue;
+                };
+                // `zfs list` prints `<pool>/<handle>`; the handle has no pool.
+                if let Some((_, tail)) = name.split_once('/')
+                    && let Some(hash) = hash_by_handle.get(tail)
+                    && let Some(facts) = out.get_mut(hash)
+                {
+                    facts.bytes = Some(used);
                 }
             }
         }

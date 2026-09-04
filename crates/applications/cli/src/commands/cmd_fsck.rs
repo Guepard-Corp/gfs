@@ -7,7 +7,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use gfs_domain::model::fsck::FsckReport;
-use gfs_domain::model::layout::{GC_DIR, GFS_DIR};
+use gfs_domain::model::fsck::SnapshotFacts;
+use gfs_domain::model::layout::{GC_DIR, GFS_DIR, SNAPSHOTS_DIR};
 use gfs_domain::repo_utils::fsck::{self, DEFAULT_GRACE, SnapshotSource};
 use serde_json::json;
 use std::collections::HashMap;
@@ -37,23 +38,19 @@ pub async fn run(
     // the only way to know whether a commit's snapshot still exists is to ask
     // the cluster. Asking is done here rather than in the domain: fsck should
     // not know what Kubernetes is.
-    let known: Option<HashMap<String, Option<u64>>> = if runtime_is_kubernetes(&repo_path) {
+    // Scoped to this repository's own snapshot directory. The cluster namespace
+    // is shared, so an unscoped listing hands fsck other deployments' snapshots,
+    // which no local commit references and which therefore look collectable.
+    let owner_prefix = repo_path
+        .join(GFS_DIR)
+        .join(SNAPSHOTS_DIR)
+        .to_string_lossy()
+        .into_owned();
+
+    let known: Option<HashMap<String, SnapshotFacts>> = if runtime_is_kubernetes(&repo_path) {
         match gfs_storage_kubernetes::KubernetesStorage::new(None).await {
-            Ok(s) => match s.list_ready_snapshot_hashes().await {
-                Ok(set) => {
-                    // Sizes are a bonus, not a requirement: if the join to ZFS
-                    // fails the inventory is still correct and worth using, so
-                    // each hash carries None rather than the call failing.
-                    let sizes = s.list_ready_snapshot_usage().await.unwrap_or_default();
-                    Some(
-                        set.into_iter()
-                            .map(|h| {
-                                let size = sizes.get(&h).copied();
-                                (h, size)
-                            })
-                            .collect(),
-                    )
-                }
+            Ok(s) => match s.list_snapshot_facts(&owner_prefix).await {
+                Ok(facts) => Some(facts),
                 Err(e) => {
                     // Reported, not fatal: the rest of the check is still
                     // worth running, and the report will say snapshots were
@@ -307,11 +304,23 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
         println_safe!(
             "  {}",
             dimmed(match report.exclusive_bytes {
-                // The backend told us what would actually be freed.
+                // Both bounds, because neither is the answer on its own. The
+                // referenced figure counts every shared block once per sharer,
+                // so it is an upper bound; the backend's figure sums what each
+                // snapshot holds *exclusively*, and blocks shared between two
+                // doomed snapshots belong to neither total, so it is a lower
+                // one. The truth is in between, and printing only the second
+                // under-reported a measured pool by 7x.
                 Some(exclusive) => format!(
-                    "{} objects, {} would be freed",
+                    "{} objects, between {} and {} would be freed{}",
                     report.unreachable.len(),
-                    fmt_bytes(exclusive)
+                    fmt_bytes(exclusive),
+                    fmt_bytes(report.referenced_bytes),
+                    if report.exclusive_is_partial {
+                        " (some could not be measured)"
+                    } else {
+                        ""
+                    }
                 ),
                 None => format!(
                     "{} objects, {} referenced",
@@ -323,8 +332,9 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
         println_safe!(
             "  {}",
             dimmed(if report.exclusive_bytes.is_some() {
-                "measured by the storage backend as the blocks these hold exclusively, so it \
-                 is what would actually be freed"
+                "the lower figure is what the storage backend says these hold exclusively, the \
+                 upper is what `du` would show; blocks shared with anything surviving are \
+                 freed by neither"
             } else {
                 "an upper bound, as `du` reports it: on a copy-on-write filesystem these share \
                  blocks with what they were cloned from, so the space freed is between zero \
@@ -377,6 +387,25 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
         }
     }
 
+    if !report.unreadable.is_empty() {
+        println_safe!("")?;
+        println_safe!(
+            "{}",
+            yellow("could not be read (present, but this process cannot open them):")
+        )?;
+        for u in &report.unreadable {
+            let short: String = u.hash.chars().take(7).collect();
+            println_safe!("  {}  {}", gold(&short), dimmed(&u.reason))?;
+        }
+        println_safe!(
+            "  {}",
+            dimmed(
+                "not a claim about the data, which may be perfectly intact \u{2014} usually a \
+                 permissions problem. Run as a user that can read the object store"
+            )
+        )?;
+    }
+
     if !report.unrecognised.is_empty() {
         println_safe!("")?;
         println_safe!("{}", red("unrecognised entries in the object store:"))?;
@@ -389,6 +418,24 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
     println_safe!("")?;
     if report.is_clean() {
         println_safe!("{} repository is consistent", green("\u{2713}"))?;
+    } else if !report.unreadable.is_empty() && report.dangling.is_empty() {
+        println_safe!(
+            "{}",
+            yellow(
+                "the check did not complete \u{2014} part of the store could not be read, so \
+                 what it referenced could not be followed"
+            )
+        )?;
+    } else if !report.snapshots_checked && report.dangling.is_empty() {
+        // No tick and no "consistent": half the graph was never looked at.
+        println_safe!(
+            "{}",
+            yellow(
+                "the check did not complete \u{2014} the objects checked out fine, but the \
+                 snapshots were not verified, so this says nothing about whether the \
+                 repository is whole"
+            )
+        )?;
     } else if report.dangling.is_empty() && report.unrecognised.is_empty() {
         // Deliberately does not say "everything above is collectable": the
         // working-copy section directly above says the opposite, and the two
