@@ -91,6 +91,15 @@ pub struct Unrecognised {
 /// removes them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReclaimableWorkspace {
+    /// Whether removing this is safe.
+    ///
+    /// Always `false` today, and a field rather than a doc note because a JSON
+    /// consumer cannot read doc notes. `checkout` only restores a workspace that
+    /// is *absent*, so deleting one destroys live database state it would
+    /// otherwise have preserved, and GFS has no dirty check that could say
+    /// whether that state mattered. It becomes `true` when checkout always
+    /// restores from the snapshot.
+    pub safe_to_remove: bool,
     /// Path relative to `.gfs/`, e.g. `workspaces/feature/0`.
     pub path: String,
     /// Why nothing needs it.
@@ -157,6 +166,16 @@ pub struct FsckReport {
     /// snapshots should be drawn from it; in particular a clean report does not
     /// mean the snapshots are fine.
     pub snapshots_checked: bool,
+
+    /// Whether the walk started from every root it should have.
+    ///
+    /// False when a ref could not be resolved — an empty file left by a crash
+    /// mid-write, or a value that is not a hash. One unresolvable root makes
+    /// everything it led to look unreached, so when this is false the
+    /// `unreachable` list is **suppressed rather than reported**: it would name
+    /// live data. The corresponding `dangling` entry says which ref is broken.
+    /// Nothing about collectability can be concluded from a run with this false.
+    pub reachability_complete: bool,
 
     /// How many entries were left out of `unreachable` only because they are
     /// newer than the grace cutoff.
@@ -226,6 +245,7 @@ mod tests {
             referenced_bytes: 0,
             exclusive_bytes: None,
             snapshots_checked: true,
+            reachability_complete: true,
             protected_by_grace: 0,
             grace_seconds: 0,
             reclaimable_workspaces: Vec::new(),

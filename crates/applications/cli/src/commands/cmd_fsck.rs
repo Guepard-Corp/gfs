@@ -13,6 +13,11 @@ use serde_json::json;
 use std::collections::HashMap;
 
 use crate::cli_utils::get_repo_dir;
+
+/// The check itself could not be completed, so the report says nothing about the
+/// repository. Distinct from 1 ("ran, found unreachable objects") and 2 ("ran,
+/// found corruption"), both of which are statements about the repository.
+const EXIT_COULD_NOT_RUN: i32 = 3;
 use crate::output::{cyan, dimmed, fmt_bytes, gold, green, red, yellow};
 use crate::println_safe;
 
@@ -72,8 +77,31 @@ pub async fn run(
         (None, false) => SnapshotSource::Filesystem,
     };
 
-    let report = fsck::check_with(&repo_path, grace, &source)
-        .context("not a GFS repository (run from a repo root or use --path <dir>)")?;
+    let report = match fsck::check_with(&repo_path, grace, &source) {
+        Ok(r) => r,
+        Err(e) => {
+            // Only claim "not a GFS repository" after looking. The check used to
+            // assert it for every failure, so a corrupt ref inside a perfectly
+            // valid repository was reported as the user being in the wrong
+            // directory — sending them to fix the one thing that was not wrong.
+            if !repo_path.join(GFS_DIR).is_dir() {
+                eprintln!(
+                    "{} not a GFS repository: no {GFS_DIR} in {} (run from a repo root or use \
+                     --path <dir>)",
+                    red("error:"),
+                    repo_path.display()
+                );
+            } else {
+                eprintln!("{} could not complete the check: {e}", red("error:"));
+            }
+            // Exit 3, not 1. 1 means "the check ran and found unreachable
+            // objects" — a routine, actionable outcome that a cron job may well
+            // ignore. Reusing it here would let a check that never ran be read
+            // as a check that found some garbage, which is the one confusion a
+            // status code exists to prevent.
+            return Ok(EXIT_COULD_NOT_RUN);
+        }
+    };
 
     // A plan is the prelude to a deletion, so refuse to produce one for a
     // repository that is already inconsistent — that is exactly the state in
@@ -141,10 +169,43 @@ fn runtime_is_kubernetes(repo_path: &std::path::Path) -> bool {
 }
 
 fn write_plan(repo_path: &std::path::Path, report: &FsckReport) -> Result<String> {
-    let mark_id = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-    let dir = repo_path.join(GFS_DIR).join(GC_DIR).join(&mark_id);
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to create the plan directory at {}", dir.display()))?;
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let root = repo_path.join(GFS_DIR).join(GC_DIR);
+
+    // `create_dir_all` succeeds on a directory that already exists, so two runs
+    // in the same second used to land on one id and the second silently
+    // overwrote the first plan — losing the record of what the first run
+    // decided, which is the only reason the artefact exists. `create_dir`
+    // fails on collision instead, and the suffix keeps both.
+    let (mark_id, dir) = {
+        let mut chosen = None;
+        for n in 0..100 {
+            let id = if n == 0 {
+                stamp.clone()
+            } else {
+                format!("{stamp}-{n}")
+            };
+            let dir = root.join(&id);
+            match std::fs::create_dir_all(&root).and_then(|()| std::fs::create_dir(&dir)) {
+                Ok(()) => {
+                    chosen = Some((id, dir));
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(anyhow::Error::from(e)).with_context(|| {
+                        format!("failed to create the plan directory at {}", dir.display())
+                    });
+                }
+            }
+        }
+        chosen.ok_or_else(|| {
+            anyhow::anyhow!(
+                "failed to allocate a plan id under {}: 100 already exist for this second",
+                root.display()
+            )
+        })?
+    };
 
     let plan = json!({
         "mark_id": mark_id,
@@ -199,6 +260,17 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
                 report.protected_by_grace,
                 report.grace_seconds / 3600
             ))
+        )?;
+    }
+
+    if !report.reachability_complete {
+        println_safe!(
+            "{}",
+            red(
+                "a ref could not be resolved, so the walk did not start from every root: \
+                 nothing is reported as collectable in this run, because everything behind \
+                 that ref would look unreached. Repair the ref below, then run again"
+            )
         )?;
     }
 
@@ -318,7 +390,22 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
     if report.is_clean() {
         println_safe!("{} repository is consistent", green("\u{2713}"))?;
     } else if report.dangling.is_empty() && report.unrecognised.is_empty() {
-        println_safe!("repository is consistent; everything listed above is collectable")?;
+        // Deliberately does not say "everything above is collectable": the
+        // working-copy section directly above says the opposite, and the two
+        // lines contradicting each other is worse than either alone.
+        if report.unreachable.is_empty() {
+            println_safe!(
+                "repository is consistent; the working copies above are unneeded but NOT safe \
+                 to remove"
+            )?;
+        } else if report.reclaimable_workspaces.is_empty() {
+            println_safe!("repository is consistent; the objects above are collectable")?;
+        } else {
+            println_safe!(
+                "repository is consistent; the objects above are collectable, the working \
+                 copies above are not"
+            )?;
+        }
     } else {
         println_safe!(
             "{}",

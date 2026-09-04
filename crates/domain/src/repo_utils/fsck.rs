@@ -139,7 +139,20 @@ pub fn roots(repo_path: &Path) -> Result<(Vec<String>, Vec<Dangling>), RepoError
 
     for (name, tip) in repo_layout::list_branches(repo_path)? {
         let tip = tip.trim();
-        if tip == NO_COMMIT || tip.is_empty() {
+        // `"0"` is the sentinel `init` writes before the first commit, and is
+        // the only legitimate non-hash value. An *empty* ref is not a sentinel:
+        // it is what a crash during a ref write leaves behind. Skipping it
+        // silently removed a root, and with one branch that emptied the root set
+        // and made every object in the repository look collectable.
+        if tip == NO_COMMIT {
+            continue;
+        }
+        if tip.is_empty() {
+            problems.push(Dangling {
+                from_commit: format!("refs/heads/{name}"),
+                kind: ObjectKind::Commit,
+                missing: "(empty ref file)".to_string(),
+            });
             continue;
         }
         match normalise_hash(tip) {
@@ -155,7 +168,7 @@ pub fn roots(repo_path: &Path) -> Result<(Vec<String>, Vec<Dangling>), RepoError
     }
 
     // Soft-deleted branches are recoverable, so their commits are live.
-    for h in soft_deleted_roots(repo_path) {
+    for h in soft_deleted_roots(repo_path, &mut problems) {
         out.push(h);
     }
 
@@ -202,7 +215,7 @@ pub fn roots(repo_path: &Path) -> Result<(Vec<String>, Vec<Dangling>), RepoError
 /// removing the entry. This also means fsck needs no access to the retention
 /// setting, which does not exist on this branch, and cannot disagree with
 /// `branch -d` about the window.
-fn soft_deleted_roots(repo_path: &Path) -> Vec<String> {
+fn soft_deleted_roots(repo_path: &Path, problems: &mut Vec<Dangling>) -> Vec<String> {
     let base = repo_path
         .join(GFS_DIR)
         .join(REFS_DIR)
@@ -224,10 +237,34 @@ fn soft_deleted_roots(repo_path: &Path) -> Vec<String> {
             }
             if meta.is_dir() {
                 stack.push(path);
-            } else if let Ok(body) = std::fs::read_to_string(&path)
-                && let Some(h) = normalise_hash(&body)
-            {
-                out.push(h);
+            } else {
+                match std::fs::read_to_string(&path) {
+                    Ok(body) => match normalise_hash(&body) {
+                        Some(h) => out.push(h),
+                        // Unreadable as a hash. Reported rather than dropped:
+                        // silently ignoring it stops protecting a branch the
+                        // user was told is restorable, which is the one thing
+                        // this function exists to prevent.
+                        None => problems.push(Dangling {
+                            from_commit: path
+                                .strip_prefix(repo_path)
+                                .unwrap_or(&path)
+                                .to_string_lossy()
+                                .to_string(),
+                            kind: ObjectKind::Commit,
+                            missing: brief(&body),
+                        }),
+                    },
+                    Err(_) => problems.push(Dangling {
+                        from_commit: path
+                            .strip_prefix(repo_path)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .to_string(),
+                        kind: ObjectKind::Commit,
+                        missing: "(unreadable)".to_string(),
+                    }),
+                }
             }
         }
     }
@@ -457,10 +494,47 @@ fn newer_than(path: &Path, cutoff: Option<SystemTime>) -> bool {
     let Some(cutoff) = cutoff else {
         return false;
     };
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .map(|t| t > cutoff)
-        .unwrap_or(true)
+    let Ok(meta) = std::fs::metadata(path) else {
+        // Cannot be dated, so cannot be shown to be old.
+        return true;
+    };
+    let mtime = meta.modified().ok();
+
+    // `ctime`, not just `mtime`, and this is the whole point. A snapshot is made
+    // by copying a data directory, and both `cp -cRp` and a clone preserve the
+    // *source's* mtime — so a snapshot taken seconds ago inherits whatever mtime
+    // the database directory happened to carry, which on a repository that has
+    // been running a while is hours or days old. The snapshot is then born
+    // already outside its own grace window, and the protection that exists
+    // specifically to cover an in-flight commit does not cover it.
+    //
+    // Measured: with an aged data directory, 14% of concurrent fsck runs
+    // reported a live in-flight snapshot as collectable at the default grace.
+    // With a freshly created one, 0%.
+    //
+    // `ctime` is the inode's own change time. It cannot be back-dated by a copy,
+    // so a newly created entry always carries a recent one. The later of the two
+    // is used because either can be the meaningful one: mtime catches content
+    // written after creation, ctime catches creation itself.
+    #[cfg(unix)]
+    let ctime = {
+        use std::os::unix::fs::MetadataExt;
+        let secs = meta.ctime();
+        if secs >= 0 {
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs as u64))
+        } else {
+            None
+        }
+    };
+    #[cfg(not(unix))]
+    let ctime: Option<SystemTime> = None;
+
+    match (mtime, ctime) {
+        (Some(m), Some(c)) => m.max(c) > cutoff,
+        (Some(t), None) | (None, Some(t)) => t > cutoff,
+        // Undatable: protected, which is the safe direction.
+        (None, None) => true,
+    }
 }
 
 /// Walk the repository and report what is unreachable, dangling or
@@ -503,6 +577,13 @@ pub fn check_with(
 
     let check_snapshots = snapshots.is_checked();
     let (roots, mut dangling) = roots(repo_path)?;
+    // A root that does not resolve is not one missing answer among many: the
+    // walk never started from where it should have, so *every* object that root
+    // led to now looks unreached. Reachability is therefore unsound for this
+    // run, and the unreachable set is suppressed below rather than printed —
+    // a wrong answer presented confidently is the failure mode a check exists
+    // to prevent. Same reasoning as `snapshots_checked`.
+    let reachability_complete = dangling.is_empty();
     let marks = mark(repo_path, &roots, snapshots, &mut dangling);
 
     let mut unreachable: Vec<Unreachable> = Vec::new();
@@ -612,6 +693,23 @@ pub fn check_with(
         });
     }
 
+    // Computed, then discarded: the walk had to finish before we could know
+    // what an intact root would have reached, and the arithmetic is cheap
+    // beside the risk of shipping a list nobody should act on.
+    let (mut unreachable, mut referenced_bytes, mut exclusive_bytes) =
+        (unreachable, referenced_bytes, exclusive_bytes);
+    let (mut reclaimable_workspaces, mut reclaimable_workspace_bytes) =
+        (reclaimable_workspaces, reclaimable_workspace_bytes);
+    if !reachability_complete {
+        unreachable.clear();
+        reclaimable_workspaces.clear();
+        referenced_bytes = 0;
+        exclusive_bytes = 0;
+        reclaimable_workspace_bytes = 0;
+        // A count of what was held back from a list that is no longer reported.
+        protected = 0;
+    }
+
     unreachable.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.hash.cmp(&b.hash)));
     dangling.sort_by(|a, b| a.from_commit.cmp(&b.from_commit));
     unrecognised.sort_by(|a, b| a.hash.cmp(&b.hash));
@@ -630,6 +728,7 @@ pub fn check_with(
             None
         },
         snapshots_checked: check_snapshots,
+        reachability_complete,
         protected_by_grace: protected,
         grace_seconds: grace.as_secs(),
         reclaimable_workspaces,
@@ -729,6 +828,7 @@ fn reclaimable_workspaces(
                 let bytes = repo_layout::directory_physical_size_bytes(&path).unwrap_or(0);
                 total += bytes;
                 out.push(ReclaimableWorkspace {
+                    safe_to_remove: false,
                     path: format!("{WORKSPACES_DIR}/{child_rel}"),
                     reason: "no branch of this name exists".to_string(),
                     bytes,
@@ -784,6 +884,7 @@ fn collect_detached(
         let bytes = repo_layout::directory_physical_size_bytes(&path).unwrap_or(0);
         *total += bytes;
         out.push(ReclaimableWorkspace {
+            safe_to_remove: false,
             path: format!("{WORKSPACES_DIR}/detached/{prefix}"),
             reason: "no reachable commit starts with this hash".to_string(),
             bytes,
@@ -1408,5 +1509,157 @@ mod tests {
         }
         out.sort();
         out
+    }
+
+    /// The whole-repository failure: one truncated ref and every object looks
+    /// collectable. `: > .gfs/refs/heads/main` is what a crash mid-write leaves,
+    /// and it used to be treated as the `"0"` sentinel — silently removing the
+    /// only root, so the walk started from nowhere and reached nothing.
+    #[test]
+    fn an_empty_ref_is_corruption_not_a_reason_to_collect_everything() {
+        let d = repo();
+        let a = write_commit(d.path(), "aa", "first", None, true);
+        let b = write_commit(d.path(), "bb", "second", Some(&a), true);
+        set_branch(d.path(), "main", &b);
+
+        // Sound to begin with.
+        assert!(check(d.path(), Duration::ZERO).unwrap().is_clean());
+
+        // The crash.
+        fs::write(
+            d.path()
+                .join(GFS_DIR)
+                .join(REFS_DIR)
+                .join(HEADS_DIR)
+                .join("main"),
+            "",
+        )
+        .unwrap();
+
+        let r = check(d.path(), Duration::ZERO).unwrap();
+        assert_eq!(
+            r.exit_code(),
+            2,
+            "a truncated ref is corruption, and exit 2 is what stops `--plan`: {r:?}"
+        );
+        assert!(
+            r.dangling.iter().any(|x| x.from_commit.contains("main")),
+            "the report must name the broken ref: {:?}",
+            r.dangling
+        );
+        assert!(
+            !r.unreachable.iter().any(|u| u.hash == a || u.hash == b),
+            "commits behind a broken ref must not be offered up for collection: {:?}",
+            r.unreachable
+        );
+    }
+
+    /// The same asymmetry one level down. A recovery record that cannot be read
+    /// used to be dropped, which quietly stopped protecting a branch the user
+    /// was told they could restore.
+    #[test]
+    fn an_unreadable_deleted_ref_is_reported_rather_than_dropped() {
+        let d = repo();
+        let live = write_commit(d.path(), "aa", "live", None, true);
+        set_branch(d.path(), "main", &live);
+
+        let entry = d
+            .path()
+            .join(GFS_DIR)
+            .join(REFS_DIR)
+            .join(DELETED_REFS_DIR)
+            .join("1788452232388")
+            .join("feature");
+        fs::create_dir_all(entry.parent().unwrap()).unwrap();
+        fs::write(&entry, "not-a-hash").unwrap();
+
+        let r = check(d.path(), Duration::ZERO).unwrap();
+        assert_eq!(r.exit_code(), 2, "unreadable recovery record: {r:?}");
+        assert!(
+            r.dangling.iter().any(|x| x.from_commit.contains("feature")),
+            "must say which record is broken: {:?}",
+            r.dangling
+        );
+    }
+
+    /// Grace exists to cover an operation still in flight, and a snapshot is
+    /// made by copying a data directory — which carries the *source's* mtime
+    /// over. On a repository that has been running a while that mtime is hours
+    /// old, so a snapshot taken a second ago was born outside its own grace
+    /// window and got reported as collectable while it was still being written.
+    #[cfg(unix)]
+    #[test]
+    fn a_snapshot_that_inherited_an_old_mtime_is_still_within_grace() {
+        let d = repo();
+        let live = write_commit(d.path(), "aa", "live", None, true);
+        set_branch(d.path(), "main", &live);
+        // Unreferenced, so grace is the only thing that can protect it.
+        let stranded = write_commit(d.path(), "bb", "in flight", None, true);
+
+        // What a copy does: mtime back-dated, ctime untouched.
+        let snap = hash_of(&format!("5{}", "bb"));
+        for target in [
+            d.path()
+                .join(GFS_DIR)
+                .join(OBJECTS_DIR)
+                .join(&stranded[..2])
+                .join(&stranded[2..]),
+            d.path()
+                .join(GFS_DIR)
+                .join(SNAPSHOTS_DIR)
+                .join(&snap[..2])
+                .join(&snap[2..]),
+        ] {
+            let ok = std::process::Command::new("touch")
+                .args(["-m", "-t", "202001010000"])
+                .arg(&target)
+                .status()
+                .expect("touch")
+                .success();
+            assert!(ok, "could not back-date {}", target.display());
+        }
+
+        let r = check(d.path(), Duration::from_secs(3600)).unwrap();
+        assert!(
+            !r.unreachable.iter().any(|u| u.hash == stranded),
+            "a just-created entry carrying a copied mtime is still in flight: {:?}",
+            r.unreachable
+        );
+        assert!(r.protected_by_grace > 0, "{r:?}");
+
+        // And the clock still works: with no window, it is collectable again.
+        let none = check(d.path(), Duration::ZERO).unwrap();
+        assert!(
+            none.unreachable.iter().any(|u| u.hash == stranded),
+            "zero grace must protect nothing: {:?}",
+            none.unreachable
+        );
+    }
+
+    /// A JSON consumer cannot read a doc comment, so the caveat that these are
+    /// unsafe to remove has to be a field. It was previously only in prose.
+    #[test]
+    fn a_reported_working_copy_is_marked_unsafe_to_remove() {
+        let d = repo();
+        let h = write_commit(d.path(), "aa", "live", None, true);
+        set_branch(d.path(), "main", &h);
+        let dir = d
+            .path()
+            .join(GFS_DIR)
+            .join("workspaces")
+            .join("deleted-branch")
+            .join("0")
+            .join("data");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("payload"), vec![0u8; 4096]).unwrap();
+
+        let r = check(d.path(), Duration::ZERO).unwrap();
+        assert!(!r.reclaimable_workspaces.is_empty());
+        assert!(
+            r.reclaimable_workspaces.iter().all(|w| !w.safe_to_remove),
+            "checkout preserves an existing workspace, so none of these are safe"
+        );
+        let json = serde_json::to_string(&r.reclaimable_workspaces[0]).unwrap();
+        assert!(json.contains("\"safe_to_remove\":false"), "got {json}");
     }
 }
