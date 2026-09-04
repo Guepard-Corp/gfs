@@ -127,7 +127,7 @@ impl<R: DatabaseProviderRegistry> ExportRepoUseCase<R> {
                     )));
                 }
             }
-            dir
+            resolved_output
         } else {
             path.join(".gfs").join("exports")
         };
@@ -542,6 +542,61 @@ mod tests {
         let output_dir = dir.path().join("export_out");
         let result = usecase.run(dir.path(), Some(output_dir), "sql").await;
         assert!(matches!(result, Err(ExportRepoError::TaskFailed { .. })));
+    }
+
+    #[tokio::test]
+    async fn export_default_output_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = EnvironmentConfig {
+            database_provider: "postgres".into(),
+            database_version: "17".into(),
+            database_port: None,
+        };
+        let runtime = RuntimeConfig {
+            runtime_provider: "docker".into(),
+            runtime_version: "24".into(),
+            container_name: "container-1".into(),
+        };
+        create_repo_with_config(dir.path(), &env, &runtime);
+
+        let usecase = ExportRepoUseCase::new(
+            Arc::new(MockCompute { exit_code: 0 }),
+            Arc::new(MockRegistry),
+        );
+
+        let output = usecase.run(dir.path(), None, "sql").await.unwrap();
+        assert!(output.file_path.ends_with("export.sql"));
+        assert!(output.file_path.to_string_lossy().contains(".gfs/exports"));
+    }
+
+    #[tokio::test]
+    async fn export_relative_output_dir_is_repo_relative() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = EnvironmentConfig {
+            database_provider: "postgres".into(),
+            database_version: "17".into(),
+            database_port: None,
+        };
+        let runtime = RuntimeConfig {
+            runtime_provider: "docker".into(),
+            runtime_version: "24".into(),
+            container_name: "container-1".into(),
+        };
+        create_repo_with_config(dir.path(), &env, &runtime);
+
+        let usecase = ExportRepoUseCase::new(
+            Arc::new(MockCompute { exit_code: 0 }),
+            Arc::new(MockRegistry),
+        );
+
+        let output = usecase
+            .run(dir.path(), Some(PathBuf::from("rel_out")), "sql")
+            .await
+            .unwrap();
+        assert_eq!(
+            output.file_path,
+            dir.path().join("rel_out").join("export.sql")
+        );
     }
 
     #[tokio::test]
