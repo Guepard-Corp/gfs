@@ -18,7 +18,7 @@ jobs:
       # Store as a repository secret (Settings → Secrets) so it is masked in logs.
       GFS_POSTHOG_API_KEY: ${{ secrets.GFS_POSTHOG_API_KEY }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
