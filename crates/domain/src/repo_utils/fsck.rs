@@ -101,13 +101,32 @@ fn is_object_leaf(name: &str) -> bool {
 /// this walker was quietly doing the opposite: every non-conforming name hit a
 /// `continue` and vanished. A stray file in the object store was reported as
 /// nothing at all, which is the one outcome worse than a false alarm.
-fn two_level(root: &Path) -> (Vec<(String, PathBuf)>, Vec<PathBuf>) {
+fn two_level(
+    repo_path: &Path,
+    root: &Path,
+    blind: &mut Blind,
+) -> (Vec<(String, PathBuf)>, Vec<PathBuf>) {
     let mut out = Vec::new();
     let mut junk = Vec::new();
-    let Ok(prefixes) = std::fs::read_dir(root) else {
-        return (out, junk);
+    let prefixes = match std::fs::read_dir(root) {
+        Ok(p) => p,
+        // An object store we cannot open is not an empty one. Returning nothing
+        // here used to make a repository whose store was unreadable report
+        // "checked 0 objects" and then "consistent".
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (out, junk),
+        Err(e) => {
+            blind.at(repo_path, root, format!("could not be listed: {e}"));
+            return (out, junk);
+        }
     };
-    for prefix in prefixes.flatten() {
+    for prefix in prefixes {
+        let prefix = match prefix {
+            Ok(p) => p,
+            Err(e) => {
+                blind.at(repo_path, root, format!("an entry could not be read: {e}"));
+                continue;
+            }
+        };
         let prefix_path = prefix.path();
         let Some(prefix_name) = prefix_path.file_name().and_then(|n| n.to_str()) else {
             continue;
@@ -122,10 +141,30 @@ fn two_level(root: &Path) -> (Vec<(String, PathBuf)>, Vec<PathBuf>) {
             junk.push(prefix_path);
             continue;
         }
-        let Ok(entries) = std::fs::read_dir(&prefix_path) else {
-            continue;
+        let entries = match std::fs::read_dir(&prefix_path) {
+            Ok(e) => e,
+            Err(e) => {
+                // A whole shard invisible: every object in it silently absent.
+                blind.at(
+                    repo_path,
+                    &prefix_path,
+                    format!("shard could not be listed: {e}"),
+                );
+                continue;
+            }
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    blind.at(
+                        repo_path,
+                        &prefix_path,
+                        format!("an entry could not be read: {e}"),
+                    );
+                    continue;
+                }
+            };
             let Some(rest) = entry.file_name().to_str().map(str::to_string) else {
                 continue;
             };
@@ -166,7 +205,10 @@ fn is_incidental(name: &str) -> bool {
 /// Soft-deleted refs inside their retention window belong here too and are not
 /// yet available — `refs/deleted` arrives with the recoverable-`branch -d`
 /// work. When it lands, add the source here and nothing else changes.
-pub fn roots(repo_path: &Path) -> Result<(Vec<String>, Vec<Dangling>), RepoError> {
+pub fn roots(
+    repo_path: &Path,
+    blind: &mut Blind,
+) -> Result<(Vec<String>, Vec<Dangling>), RepoError> {
     let mut out: Vec<String> = Vec::new();
     let mut problems: Vec<Dangling> = Vec::new();
 
@@ -217,7 +259,7 @@ pub fn roots(repo_path: &Path) -> Result<(Vec<String>, Vec<Dangling>), RepoError
     }
 
     // Soft-deleted branches are recoverable, so their commits are live.
-    for h in soft_deleted_roots(repo_path, &mut problems) {
+    for h in soft_deleted_roots(repo_path, &mut problems, blind) {
         out.push(h);
     }
 
@@ -225,9 +267,18 @@ pub fn roots(repo_path: &Path) -> Result<(Vec<String>, Vec<Dangling>), RepoError
     // whose tip the loop above already covered, so resolving it would report a
     // broken branch twice — once against the ref and once against HEAD. Only a
     // detached HEAD contributes a root the branches do not.
-    let head_raw = std::fs::read_to_string(repo_path.join(GFS_DIR).join(HEAD_FILE))
-        .map(|h| h.trim().to_string())
-        .unwrap_or_default();
+    let head_path = repo_path.join(GFS_DIR).join(HEAD_FILE);
+    let head_raw = match std::fs::read_to_string(&head_path) {
+        Ok(h) => h.trim().to_string(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            // A HEAD we cannot read may be detached, and a detached HEAD is the
+            // only root its commit has. Treating the read failure as "no
+            // detached HEAD" drops that root and makes the commit collectable.
+            blind.at(repo_path, &head_path, format!("could not be read: {e}"));
+            String::new()
+        }
+    };
     if !head_raw.is_empty() && !head_raw.starts_with("ref:") && head_raw != NO_COMMIT {
         match normalise_hash(&head_raw) {
             Some(h) => out.push(h),
@@ -264,7 +315,11 @@ pub fn roots(repo_path: &Path) -> Result<(Vec<String>, Vec<Dangling>), RepoError
 /// removing the entry. This also means fsck needs no access to the retention
 /// setting, which does not exist on this branch, and cannot disagree with
 /// `branch -d` about the window.
-fn soft_deleted_roots(repo_path: &Path, problems: &mut Vec<Dangling>) -> Vec<String> {
+fn soft_deleted_roots(
+    repo_path: &Path,
+    problems: &mut Vec<Dangling>,
+    blind: &mut Blind,
+) -> Vec<String> {
     let base = repo_path
         .join(GFS_DIR)
         .join(REFS_DIR)
@@ -273,8 +328,18 @@ fn soft_deleted_roots(repo_path: &Path, problems: &mut Vec<Dangling>) -> Vec<Str
     // Absent before the branch-recovery work lands, which must be a no-op.
     let mut stack = vec![base];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            // Absent is a real answer: `refs/deleted` exists only once a branch
+            // has been soft-deleted, so most repositories have none.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                // Unreadable is not. These are the roots that keep a
+                // soft-deleted branch alive, and failing to list them silently
+                // un-protects every branch under this directory.
+                blind.at(repo_path, &dir, format!("could not be listed: {e}"));
+                continue;
+            }
         };
         for entry in entries.flatten() {
             let path = entry.path();
@@ -347,6 +412,53 @@ pub enum SnapshotSource<'a> {
     Unavailable,
 }
 
+/// Every place this run could not see, and the one channel for saying so.
+///
+/// **The rule this type exists to enforce.** A question about the filesystem has
+/// three answers — yes, no, and *I could not look* — but the standard library
+/// hands back two. `Path::exists` is `false` for a directory you lack permission
+/// to open; `read_dir(..).flatten()` drops the entries that failed; every
+/// `unwrap_or_default()` on a read turns an unreadable file into an empty one.
+/// Each of those collapses the third answer into the second, and in a
+/// reachability check the second answer is the dangerous one: absent means
+/// *collectable*, or *corrupt*.
+///
+/// That single fault produced four separate defects in this file before it was
+/// named — an empty ref read as a sentinel, unverified snapshots reported as a
+/// clean repository, an unopenable object reported as missing, and an
+/// unparseable commit condemning its own ancestors. All four were fixed the same
+/// way, so the fix is now the type: anything that reads the filesystem takes a
+/// `&mut Blind`, and anywhere the answer is "could not look" says so here rather
+/// than picking one of the other two.
+///
+/// Noting something here is not cosmetic. It forces exit 3 and suppresses the
+/// collectable list, because a walk with a hole in it cannot name garbage — what
+/// it could not see is exactly what would look unreferenced.
+#[derive(Default)]
+pub struct Blind {
+    notes: Vec<Unrecognised>,
+}
+
+impl Blind {
+    /// `what` names the thing, relative to the repository where possible.
+    fn note(&mut self, what: impl Into<String>, why: impl Into<String>) {
+        self.notes.push(Unrecognised {
+            hash: what.into(),
+            reason: why.into(),
+            bytes: 0,
+        });
+    }
+
+    fn at(&mut self, repo_path: &Path, path: &Path, why: impl Into<String>) {
+        let shown = path
+            .strip_prefix(repo_path)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string();
+        self.note(shown, why);
+    }
+}
+
 /// Whether a thing is there, absent, or beyond our reach.
 ///
 /// The third case used to collapse into the second, because `Path::exists`
@@ -404,17 +516,25 @@ impl SnapshotSource<'_> {
 /// Kubernetes returns `Unavailable` here: the caller must supply the set,
 /// because only an adapter can ask the cluster.
 pub fn default_snapshot_source(repo_path: &Path) -> SnapshotSource<'static> {
-    let k8s = matches!(
-        repo_layout::get_runtime_config(repo_path)
-            .ok()
-            .flatten()
-            .map(|r| r.runtime_provider.to_ascii_lowercase()),
-        Some(ref p) if p == "kubernetes" || p == "k8s"
-    );
-    if k8s {
-        SnapshotSource::Unavailable
-    } else {
-        SnapshotSource::Filesystem
+    match repo_layout::get_runtime_config(repo_path) {
+        // No runtime section: a local repository, whose snapshots are
+        // directories.
+        Ok(None) => SnapshotSource::Filesystem,
+        Ok(Some(r)) => {
+            let p = r.runtime_provider.trim().to_ascii_lowercase();
+            if p == "kubernetes" || p == "k8s" {
+                SnapshotSource::Unavailable
+            } else {
+                SnapshotSource::Filesystem
+            }
+        }
+        // Unreadable config, so the backend is unknown. Not `Filesystem`:
+        // guessing wrong in that direction walks a directory that a Kubernetes
+        // repository never creates, finds nothing, and reports every commit in
+        // the repository as dangling — corruption invented out of an unreadable
+        // config file. `Unavailable` says the snapshots were not verified, which
+        // is exactly what happened.
+        Err(_) => SnapshotSource::Unavailable,
     }
 }
 
@@ -436,6 +556,15 @@ struct Marks {
     /// Objects reached and marked, with the kind the referring commit said they
     /// were. Validated after the walk; see [`check_with`].
     expected: Vec<(String, PathBuf, ObjectKind)>,
+    /// For each reachable commit: the snapshot it names, and the file list that
+    /// records what that snapshot should contain.
+    ///
+    /// The pair is needed together. An empty snapshot directory on its own
+    /// proves nothing — a commit of an empty data directory legitimately has
+    /// one, and flagging it made a freshly initialised repository report
+    /// corruption. It is only wrong when the commit's own file list says files
+    /// should be there.
+    snapshot_contents: Vec<(String, String, Option<String>)>,
 }
 
 /// Walk from `roots`, marking everything reachable and collecting dangling
@@ -445,7 +574,7 @@ fn mark(
     roots: &[String],
     snapshots: &SnapshotSource<'_>,
     dangling: &mut Vec<Dangling>,
-    unreadable: &mut Vec<Unrecognised>,
+    blind: &mut Blind,
 ) -> Marks {
     let mut marks = Marks::default();
     let mut queue: VecDeque<String> = VecDeque::new();
@@ -468,11 +597,7 @@ fn mark(
                 if presence(&objects_dir.join(&hash[..2]).join(&hash[2..]))
                     == Presence::Unreadable =>
             {
-                unreadable.push(Unrecognised {
-                    hash: hash.clone(),
-                    reason: "commit object could not be read".to_string(),
-                    bytes: 0,
-                });
+                blind.note(hash.clone(), "commit object could not be read");
                 continue;
             }
             Err(_) => {
@@ -498,12 +623,18 @@ fn mark(
                         // for collection.
                         found @ (Presence::Present | Presence::Unreadable) => {
                             if found == Presence::Unreadable {
-                                unreadable.push(Unrecognised {
-                                    hash: snap.clone(),
-                                    reason: "snapshot could not be read".to_string(),
-                                    bytes: 0,
-                                });
+                                blind.note(snap.clone(), "snapshot could not be read");
                             }
+                            marks.snapshot_contents.push((
+                                hash.clone(),
+                                snap.clone(),
+                                commit
+                                    .files_ref
+                                    .as_deref()
+                                    .map(str::trim)
+                                    .filter(|r| !r.is_empty())
+                                    .and_then(normalise_hash),
+                            ));
                             marks.snapshots.insert(snap);
                         }
                         Presence::Absent => dangling.push(Dangling {
@@ -551,11 +682,9 @@ fn mark(
                             kind,
                             missing: reference,
                         }),
-                        Presence::Unreadable => unreadable.push(Unrecognised {
-                            hash: reference,
-                            reason: format!("{} could not be read", kind.as_str()),
-                            bytes: 0,
-                        }),
+                        Presence::Unreadable => {
+                            blind.note(reference, format!("{} could not be read", kind.as_str()));
+                        }
                     }
                 }
                 None => dangling.push(Dangling {
@@ -719,8 +848,8 @@ pub fn check_with(
     };
 
     let check_snapshots = snapshots.is_checked();
-    let mut unreadable: Vec<Unrecognised> = Vec::new();
-    let (roots, mut dangling) = roots(repo_path)?;
+    let mut blind = Blind::default();
+    let (roots, mut dangling) = roots(repo_path, &mut blind)?;
     // A root that does not resolve is not one missing answer among many: the
     // walk never started from where it should have, so *every* object that root
     // led to now looks unreached. Reachability is therefore unsound for this
@@ -728,7 +857,7 @@ pub fn check_with(
     // a wrong answer presented confidently is the failure mode a check exists
     // to prevent. Same reasoning as `snapshots_checked`.
     let reachability_complete = dangling.is_empty();
-    let marks = mark(repo_path, &roots, snapshots, &mut dangling, &mut unreadable);
+    let marks = mark(repo_path, &roots, snapshots, &mut dangling, &mut blind);
 
     let mut unreachable: Vec<Unreachable> = Vec::new();
     let mut unrecognised: Vec<Unrecognised> = Vec::new();
@@ -736,7 +865,7 @@ pub fn check_with(
     let mut exclusive_bytes: u64 = 0;
     let mut protected: usize = 0;
 
-    let (object_leaves, object_junk) = two_level(&objects_dir);
+    let (object_leaves, object_junk) = two_level(repo_path, &objects_dir, &mut blind);
     for path in object_junk {
         unrecognised.push(Unrecognised {
             hash: path
@@ -821,20 +950,41 @@ pub fn check_with(
         }
     }
 
-    // F6's other half: a snapshot directory that exists but holds nothing. One
-    // `read_dir` per referenced snapshot, not a walk of its contents.
+    // A snapshot directory that exists but holds nothing, *when its commit says
+    // it should hold something*. The file list is the only thing that can tell
+    // the two apart: a commit of an empty data directory has an empty snapshot
+    // and an empty file list, and is perfectly sound.
     if matches!(snapshots, SnapshotSource::Filesystem) {
-        for hash in &marks.snapshots {
-            let (a, b) = hash.split_at(2);
+        for (commit, snap, files_ref) in &marks.snapshot_contents {
+            let (a, b) = snap.split_at(2);
             let dir = snapshots_dir.join(a).join(b);
-            let empty = std::fs::read_dir(&dir)
-                .map(|mut e| e.next().is_none())
-                .unwrap_or(false);
-            if empty {
+            let empty = match std::fs::read_dir(&dir) {
+                Ok(mut e) => e.next().is_none(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => {
+                    blind.at(repo_path, &dir, format!("could not be listed: {e}"));
+                    false
+                }
+            };
+            if !empty {
+                continue;
+            }
+            let Some(files_ref) = files_ref else {
+                continue;
+            };
+            let (fa, fb) = files_ref.split_at(2);
+            let expected_files = std::fs::read(objects_dir.join(fa).join(fb))
+                .ok()
+                .and_then(|b| repo_layout::decode_file_entries(&b).ok())
+                .map(|entries| entries.len())
+                .unwrap_or(0);
+            if expected_files > 0 {
                 dangling.push(Dangling {
-                    from_commit: hash.clone(),
+                    from_commit: commit.clone(),
                     kind: ObjectKind::Snapshot,
-                    missing: "(snapshot directory is empty)".to_string(),
+                    missing: format!(
+                        "{snap} (directory is empty, but {expected_files} file(s) recorded)"
+                    ),
                 });
             }
         }
@@ -881,7 +1031,7 @@ pub fn check_with(
             });
         }
     } else if check_snapshots {
-        let (snapshot_trees, snapshot_junk) = two_level(&snapshots_dir);
+        let (snapshot_trees, snapshot_junk) = two_level(repo_path, &snapshots_dir, &mut blind);
         for path in snapshot_junk {
             unrecognised.push(Unrecognised {
                 hash: path
@@ -913,13 +1063,25 @@ pub fn check_with(
         }
     }
 
-    let live_branches: HashSet<String> = repo_layout::list_branches(repo_path)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect();
+    // Not `unwrap_or_default()`. An empty set here does not mean "no branches";
+    // on a failed read it means "we could not tell", and every workspace would
+    // then look like one whose branch is gone — the whole list reported as
+    // reclaimable because a directory would not open.
+    let live_branches: HashSet<String> = match repo_layout::list_branches(repo_path) {
+        Ok(b) => b.into_iter().map(|(name, _)| name).collect(),
+        Err(e) => {
+            blind.note("refs/heads", format!("could not be listed: {e}"));
+            HashSet::new()
+        }
+    };
     let (reclaimable_workspaces, reclaimable_workspace_bytes, ws_protected, ws_unreadable) =
-        reclaimable_workspaces(repo_path, &live_branches, &marks.objects, cutoff);
+        reclaimable_workspaces(
+            repo_path,
+            &live_branches,
+            &marks.objects,
+            cutoff,
+            &mut blind,
+        );
     protected += ws_protected;
     // An unreadable workspace directory is a finding, not a clean result: every
     // other directory we cannot read produces one.
@@ -945,7 +1107,7 @@ pub fn check_with(
     // ref it could not resolve does. Both make the unreachable set a list of
     // live data, so both suppress it.
     let reachability_complete =
-        reachability_complete && unreadable.is_empty() && marks.truncated == 0;
+        reachability_complete && blind.notes.is_empty() && marks.truncated == 0;
     if !reachability_complete {
         unreachable.clear();
         reclaimable_workspaces.clear();
@@ -976,7 +1138,7 @@ pub fn check_with(
         exclusive_is_partial: exclusive_incomplete,
         snapshots_checked: check_snapshots,
         reachability_complete,
-        unreadable,
+        unreadable: blind.notes,
         protected_by_grace: protected,
         grace_seconds: grace.as_secs(),
         reclaimable_workspaces,
@@ -1009,11 +1171,21 @@ fn reclaimable_workspaces(
     live_branches: &HashSet<String>,
     reachable: &HashSet<String>,
     cutoff: Option<SystemTime>,
+    blind: &mut Blind,
 ) -> (Vec<ReclaimableWorkspace>, u64, usize, Vec<String>) {
     let root = repo_path.join(GFS_DIR).join(WORKSPACES_DIR);
-    let active = std::fs::read_to_string(repo_path.join(GFS_DIR).join(WORKSPACE_FILE))
-        .map(|s| PathBuf::from(s.trim().to_string()))
-        .unwrap_or_default();
+    // The one file that says which workspace is live. Unreadable used to become
+    // an empty path, matching nothing, so the checked-out workspace was reported
+    // as unneeded — the single most valuable directory in the repository.
+    let active_path = repo_path.join(GFS_DIR).join(WORKSPACE_FILE);
+    let active = match std::fs::read_to_string(&active_path) {
+        Ok(s) => PathBuf::from(s.trim().to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => PathBuf::new(),
+        Err(e) => {
+            blind.at(repo_path, &active_path, format!("could not be read: {e}"));
+            PathBuf::new()
+        }
+    };
 
     let mut out = Vec::new();
     let mut total = 0u64;
@@ -2233,12 +2405,29 @@ mod tests {
         );
     }
 
-    /// A snapshot directory that exists but holds nothing satisfies a presence
-    /// check while containing none of the data it was made to hold.
+    /// A snapshot whose directory is empty *while its own file list records
+    /// files* has lost its contents. The file list is what makes this
+    /// distinguishable: a commit of an empty data directory also has an empty
+    /// snapshot, and flagging that made a freshly initialised repository report
+    /// corruption.
     #[test]
-    fn a_snapshot_directory_with_nothing_in_it_is_not_a_snapshot() {
+    fn an_emptied_snapshot_is_caught_but_a_legitimately_empty_one_is_not() {
+        use crate::model::commit::FileEntry;
+
         let d = repo();
-        let h = write_commit(d.path(), "aa", "live", None, true);
+        let files = repo_layout::write_files_object(
+            d.path(),
+            &[FileEntry {
+                relative_path: "data.txt".into(),
+                file_size: 1,
+                owner: None,
+                group: None,
+                permissions: None,
+                file_attributes: None,
+            }],
+        )
+        .unwrap();
+        let h = write_commit_with_files(d.path(), "aa", &files);
         set_branch(d.path(), "main", &h);
         assert!(check(d.path(), Duration::ZERO).unwrap().is_clean());
 
@@ -2254,9 +2443,30 @@ mod tests {
         let r = check(d.path(), Duration::ZERO).unwrap();
         assert_eq!(r.exit_code(), 2, "{r:?}");
         assert!(
-            r.dangling.iter().any(|x| x.missing.contains("empty")),
+            r.dangling
+                .iter()
+                .any(|x| x.missing.contains("1 file(s) recorded")),
             "{:?}",
             r.dangling
+        );
+
+        // And the sound case: no files recorded, nothing in the directory.
+        let d2 = repo();
+        let empty_list = repo_layout::write_files_object(d2.path(), &[]).unwrap();
+        let h2 = write_commit_with_files(d2.path(), "aa", &empty_list);
+        set_branch(d2.path(), "main", &h2);
+        let snap2 = hash_of(&format!("5{}", "aa"));
+        let dir2 = d2
+            .path()
+            .join(GFS_DIR)
+            .join(SNAPSHOTS_DIR)
+            .join(&snap2[..2])
+            .join(&snap2[2..]);
+        fs::remove_file(dir2.join("data.txt")).unwrap();
+        let r2 = check(d2.path(), Duration::ZERO).unwrap();
+        assert!(
+            r2.is_clean(),
+            "an empty snapshot of an empty data directory is sound: {r2:?}"
         );
     }
 
@@ -2285,5 +2495,104 @@ mod tests {
             r.unreachable
         );
         assert!(!r.reachability_complete);
+    }
+
+    /// Make `path` unopenable, run `f`, restore. Returns `None` when the mode
+    /// had no effect, which is the case as root.
+    #[cfg(unix)]
+    fn while_unreadable<T>(path: &Path, f: impl FnOnce() -> T) -> Option<T> {
+        use std::os::unix::fs::PermissionsExt;
+        let original = fs::metadata(path).unwrap().permissions();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(path).is_ok() {
+            fs::set_permissions(path, original).unwrap();
+            return None;
+        }
+        let out = f();
+        fs::set_permissions(path, original).unwrap();
+        Some(out)
+    }
+
+    /// An object store that cannot be listed is not an empty one. This used to
+    /// report "checked 0 commits" and then "✓ consistent, exit 0" — the check
+    /// having examined nothing at all.
+    #[cfg(unix)]
+    #[test]
+    fn an_unlistable_object_store_is_not_an_empty_one() {
+        let d = repo();
+        let h = write_commit(d.path(), "aa", "live", None, true);
+        set_branch(d.path(), "main", &h);
+
+        let objects = d.path().join(GFS_DIR).join(OBJECTS_DIR);
+        let Some(r) = while_unreadable(&objects, || check(d.path(), Duration::ZERO).unwrap())
+        else {
+            return;
+        };
+
+        assert!(!r.is_clean(), "nothing was examined: {r:?}");
+        assert_eq!(r.exit_code(), 3, "{r:?}");
+        assert!(!r.unreadable.is_empty(), "{r:?}");
+        assert!(r.unreachable.is_empty(), "{:?}", r.unreachable);
+    }
+
+    /// The file naming the live workspace. Unreadable used to become an empty
+    /// path, matching nothing, so the checked-out workspace — the most valuable
+    /// directory in the repository — was reported as unneeded.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_workspace_pointer_does_not_condemn_the_live_workspace() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let d = repo();
+        let h = write_commit(d.path(), "aa", "live", None, true);
+        set_branch(d.path(), "main", &h);
+        let ws = d.path().join(GFS_DIR).join(WORKSPACES_DIR);
+        let live = ws.join("main").join("0").join("data");
+        fs::create_dir_all(&live).unwrap();
+        fs::write(live.join("payload"), vec![0u8; 4096]).unwrap();
+        let pointer = d.path().join(GFS_DIR).join(WORKSPACE_FILE);
+        fs::write(&pointer, live.to_string_lossy().as_ref()).unwrap();
+
+        assert!(check(d.path(), Duration::ZERO).unwrap().is_clean());
+
+        let original = fs::metadata(&pointer).unwrap().permissions();
+        fs::set_permissions(&pointer, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_to_string(&pointer).is_ok() {
+            fs::set_permissions(&pointer, original).unwrap();
+            return;
+        }
+        let r = check(d.path(), Duration::ZERO).unwrap();
+        fs::set_permissions(&pointer, original).unwrap();
+
+        assert!(
+            r.reclaimable_workspaces.is_empty(),
+            "an unreadable pointer says nothing about which workspace is live: {:?}",
+            r.reclaimable_workspaces
+        );
+        assert_eq!(r.exit_code(), 3, "{r:?}");
+    }
+
+    /// Guessing `Filesystem` for a repository whose runtime cannot be read walks
+    /// a directory a Kubernetes repository never creates, finds nothing, and
+    /// invents corruption out of an unreadable config file.
+    #[test]
+    fn an_unreadable_runtime_config_verifies_nothing_rather_than_guessing() {
+        let d = repo();
+        fs::write(d.path().join(GFS_DIR).join("config.toml"), "= not toml =").unwrap();
+        assert!(matches!(
+            default_snapshot_source(d.path()),
+            SnapshotSource::Unavailable
+        ));
+
+        // A repository with no runtime section is still a local one.
+        fs::write(
+            d.path().join(GFS_DIR).join("config.toml"),
+            "version = \"1\"\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            default_snapshot_source(d.path()),
+            SnapshotSource::Filesystem
+        ));
     }
 }

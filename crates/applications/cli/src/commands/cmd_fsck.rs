@@ -218,6 +218,20 @@ fn write_plan(repo_path: &std::path::Path, report: &FsckReport) -> Result<String
     Ok(mark_id)
 }
 
+/// Abbreviate a hash, and leave anything else alone.
+///
+/// These lists no longer hold only hashes: an unexpected file is reported by
+/// path, a broken ref by name, a missing thing by a parenthetical description.
+/// Blindly taking the first seven characters turned `.gfs/objects` into
+/// `.gfs/ob` and `(snapshot directory is empty)` into `(snapsh`.
+fn short(value: &str) -> String {
+    if value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit()) {
+        value.chars().take(7).collect()
+    } else {
+        value.to_string()
+    }
+}
+
 fn render_json(report: &FsckReport, plan_id: Option<&str>) -> Result<()> {
     let mut out = json!({
         "fsck": report,
@@ -291,7 +305,7 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
             yellow("unreachable (no branch or HEAD reaches these):")
         )?;
         for u in &report.unreachable {
-            let short: String = u.hash.chars().take(7).collect();
+            let short = short(&u.hash);
             println_safe!(
                 "  {:<9} {}  {:>10}{}",
                 u.kind.as_str(),
@@ -378,10 +392,10 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
             red("dangling (a commit references something missing):")
         )?;
         for d in &report.dangling {
-            let from: String = d.from_commit.chars().take(7).collect();
-            let missing: String = d.missing.chars().take(7).collect();
+            let from = short(&d.from_commit);
+            let missing = short(&d.missing);
             println_safe!(
-                "  commit {} references {} {}, which is missing",
+                "  {} references {} {}",
                 cyan(&from),
                 d.kind.as_str(),
                 gold(&missing)
@@ -396,8 +410,7 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
             yellow("could not be read (present, but this process cannot open them):")
         )?;
         for u in &report.unreadable {
-            let short: String = u.hash.chars().take(7).collect();
-            println_safe!("  {}  {}", gold(&short), dimmed(&u.reason))?;
+            println_safe!("  {}  {}", gold(short(&u.hash)), dimmed(&u.reason))?;
         }
         println_safe!(
             "  {}",
@@ -412,8 +425,7 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
         println_safe!("")?;
         println_safe!("{}", red("unrecognised entries in the object store:"))?;
         for u in &report.unrecognised {
-            let short: String = u.hash.chars().take(7).collect();
-            println_safe!("  {}  {}", gold(&short), dimmed(&u.reason))?;
+            println_safe!("  {}  {}", gold(short(&u.hash)), dimmed(&u.reason))?;
         }
     }
 
