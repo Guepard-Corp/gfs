@@ -47,7 +47,9 @@ pub async fn run(
         .to_string_lossy()
         .into_owned();
 
-    let known: Option<HashMap<String, SnapshotFacts>> = if runtime_is_kubernetes(&repo_path) {
+    let runtime = runtime_is_kubernetes(&repo_path);
+
+    let known: Option<HashMap<String, SnapshotFacts>> = if runtime == Some(true) {
         match gfs_storage_kubernetes::KubernetesStorage::new(None).await {
             Ok(s) => match s.list_snapshot_facts(&owner_prefix).await {
                 Ok(facts) => Some(facts),
@@ -68,10 +70,22 @@ pub async fn run(
         None
     };
 
-    let source = match (&known, runtime_is_kubernetes(&repo_path)) {
+    let source = match (&known, runtime) {
         (Some(set), _) => SnapshotSource::Known(set),
-        (None, true) => SnapshotSource::Unavailable,
-        (None, false) => SnapshotSource::Filesystem,
+        // Kubernetes, but the cluster could not be asked.
+        (None, Some(true)) => SnapshotSource::Unavailable,
+        (None, Some(false)) => SnapshotSource::Filesystem,
+        // The config would not read, so which backend holds the snapshots is
+        // unknown. Verifying nothing is the honest outcome; guessing either way
+        // invents a finding.
+        (None, None) => {
+            eprintln!(
+                "{} could not read the repository config, so the storage backend is unknown; \
+                 snapshots will not be verified",
+                yellow("warning:")
+            );
+            SnapshotSource::Unavailable
+        }
     };
 
     let report = match fsck::check_with(&repo_path, grace, &source) {
@@ -81,7 +95,15 @@ pub async fn run(
             // assert it for every failure, so a corrupt ref inside a perfectly
             // valid repository was reported as the user being in the wrong
             // directory — sending them to fix the one thing that was not wrong.
-            if !repo_path.join(GFS_DIR).is_dir() {
+            // `is_dir()` is false for a directory that exists but cannot be
+            // opened, so this asks for the reason rather than accepting the
+            // bare false — the same collapse this error message was written to
+            // fix in the first place.
+            let missing = matches!(
+                std::fs::metadata(repo_path.join(GFS_DIR)),
+                Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
+            );
+            if missing {
                 eprintln!(
                     "{} not a GFS repository: no {GFS_DIR} in {} (run from a repo root or use \
                      --path <dir>)",
@@ -153,16 +175,20 @@ pub async fn run(
 /// Written now, before anything has been removed by anyone. lakeFS writes its
 /// equivalent report in a `finally` after the sweep, which is why a killed run
 /// of theirs cannot be resumed.
-/// Whether this repository's snapshots live in Kubernetes rather than on disk.
-fn runtime_is_kubernetes(repo_path: &std::path::Path) -> bool {
-    gfs_domain::model::config::GfsConfig::load(repo_path)
-        .ok()
-        .and_then(|c| c.runtime)
-        .map(|r| {
-            let p = r.runtime_provider.trim().to_ascii_lowercase();
-            p == "kubernetes" || p == "k8s"
-        })
-        .unwrap_or(false)
+/// Whether this repository's snapshots live in Kubernetes rather than on disk,
+/// or `None` when the config could not be read and the answer is unknown.
+///
+/// `None` rather than `false`, for the reason the domain's `Blind` type exists:
+/// an unreadable config guessed as "not Kubernetes" makes the check walk a
+/// snapshot directory that a Kubernetes repository never creates, find nothing,
+/// and report every commit in it as dangling — corruption manufactured out of an
+/// unreadable file.
+fn runtime_is_kubernetes(repo_path: &std::path::Path) -> Option<bool> {
+    let config = gfs_domain::model::config::GfsConfig::load(repo_path).ok()?;
+    Some(config.runtime.is_some_and(|r| {
+        let p = r.runtime_provider.trim().to_ascii_lowercase();
+        p == "kubernetes" || p == "k8s"
+    }))
 }
 
 fn write_plan(repo_path: &std::path::Path, report: &FsckReport) -> Result<String> {
@@ -290,10 +316,13 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
     if !report.snapshots_checked {
         println_safe!(
             "{}",
+            // Says what happened, not why. The reason is printed at the point
+            // it is known — an unreachable cluster and an unreadable config both
+            // land here, and asserting the first for both told the reader the
+            // repository uses a runtime nobody had managed to determine.
             dimmed(
-                "snapshots were NOT verified: this repository uses the Kubernetes runtime and \
-                 the cluster could not be reached, so nothing here says whether the snapshots \
-                 a commit needs still exist"
+                "snapshots were NOT verified: the backend holding them could not be asked, so \
+                 nothing here says whether the snapshots a commit needs still exist"
             )
         )?;
     }
