@@ -382,12 +382,26 @@ pub fn directory_logical_size_bytes(dir: &Path) -> Result<u64, RepoError> {
     Ok(total)
 }
 
-/// Physical (on-disk) size of a directory tree in bytes.
+/// Bytes this directory tree *references*, as `du -s` would report them.
 ///
-/// On Unix this is the sum of allocated 512-byte blocks per file (equivalent to `du -s`).
-/// On APFS, COW snapshots share blocks with the source, so volume usage does not increase
-/// by this amount until the copy diverges; this value is still useful for reporting
-/// "disk usage of this tree" as tools like `du` would show.
+/// On Unix this is the sum of allocated 512-byte blocks per file. **It is not
+/// the space that removing the tree would free**, and the two differ by however
+/// much the tree shares with something else.
+///
+/// Every filesystem GFS runs on shares blocks. On APFS a snapshot is a
+/// `clonefile` of the workspace; on ZFS — which is what the Kubernetes backend
+/// sits on — a snapshot shares by construction. Measured: a 20 MB file cloned
+/// with `cp -c` reports `st_blocks = 39064` on *both* copies, so this function
+/// returns 20 MB for each while the volume grew by nothing. ZFS names the same
+/// distinction explicitly: this is `referenced`, not `used`.
+///
+/// **Never sum this across snapshots and call the total reclaimable.** Doing so
+/// counts every shared block once per sharer. On a real pool that over-reported
+/// 35 snapshots as 1.4 GB when the entire pool held 767 MB.
+///
+/// It is the right number for "how big is this tree", which is what `du`
+/// answers and what a single commit's `snapshot_size_bytes` records. It is the
+/// wrong number for "how much would I get back".
 #[cfg(unix)]
 pub fn directory_physical_size_bytes(dir: &Path) -> Result<u64, RepoError> {
     use std::os::unix::fs::MetadataExt;

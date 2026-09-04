@@ -182,6 +182,52 @@ impl KubernetesStorage {
     /// Instance teardown removes the pods/PVCs but not the per-commit snapshots;
     /// this reclaims them so they don't accumulate after a database is destroyed.
     /// Returns the number deleted.
+    /// Every GFS snapshot hash the cluster currently holds a `VolumeSnapshot`
+    /// for, taken from the `gfs.guepard.run/snapshot_hash` annotation this
+    /// adapter writes when it creates one.
+    ///
+    /// Exists so an integrity check has something to compare against on this
+    /// backend. On a filesystem backend a snapshot is a directory and can be
+    /// walked; here it is an API object, so the only way to know whether a
+    /// commit's snapshot still exists is to ask Kubernetes.
+    ///
+    /// Only snapshots that are `readyToUse` are returned. One that exists but
+    /// is not ready cannot restore anything, so counting it as present would
+    /// report a repository healthy when a checkout from it would fail.
+    pub async fn list_ready_snapshot_hashes(
+        &self,
+    ) -> std::result::Result<std::collections::HashSet<String>, StorageError> {
+        let api = self.api_volume_snapshots();
+        let list = api
+            .list(&ListParams::default())
+            .await
+            .map_err(|e| StorageError::Internal(format!("list volumesnapshots failed: {e}")))?;
+        let mut out = std::collections::HashSet::new();
+        for item in list {
+            let ready = item
+                .data
+                .get("status")
+                .and_then(|s| s.get("readyToUse"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !ready {
+                continue;
+            }
+            if let Some(h) = item
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get("gfs.guepard.run/snapshot_hash"))
+            {
+                let h = h.trim().to_ascii_lowercase();
+                if h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()) {
+                    out.insert(h);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub async fn delete_snapshots_for_pvc(
         &self,
         pvc_name: &str,

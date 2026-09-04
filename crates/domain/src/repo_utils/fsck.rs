@@ -29,7 +29,7 @@ use std::time::{Duration, SystemTime};
 use crate::model::commit::Commit;
 use crate::model::errors::RepoError;
 use crate::model::fsck::{
-    Dangling, FsckReport, ObjectKind, StaleWorkspace, Unreachable, Unrecognised,
+    Dangling, FsckReport, ObjectKind, ReclaimableWorkspace, Unreachable, Unrecognised,
 };
 use crate::model::layout::{
     BRANCH_WORKSPACE_SEGMENT, GFS_DIR, HEAD_FILE, OBJECTS_DIR, SNAPSHOTS_DIR, WORKSPACE_FILE,
@@ -177,20 +177,61 @@ pub fn roots(repo_path: &Path) -> Result<(Vec<String>, Vec<Dangling>), RepoError
     Ok((out, problems))
 }
 
-/// Whether snapshot trees for this repository live on the local filesystem.
+/// Where the truth about a snapshot's existence comes from.
 ///
-/// On the Kubernetes runtime a snapshot is a `VolumeSnapshot` object and
-/// `.gfs/snapshots/<2>/<62>` is never created, so checking the filesystem would
-/// report every commit as dangling. `GfsRepository::checkout` already treats a
-/// missing snapshot directory as normal there for the same reason.
-fn snapshots_are_local(repo_path: &Path) -> bool {
-    !matches!(
+/// A snapshot is only a directory on some backends. On the Kubernetes runtime
+/// it is a `VolumeSnapshot` object and `.gfs/snapshots/<2>/<62>` is never
+/// created, so walking the filesystem there would report every commit as
+/// dangling. Rather than skip the check and say nothing — which left the
+/// backend that matters most unverified — the caller supplies the set of
+/// snapshots the backend holds, and the same reachability logic runs against
+/// it unchanged.
+pub enum SnapshotSource<'a> {
+    /// Walk `.gfs/snapshots/`. Correct for the file, APFS and btrfs backends.
+    Filesystem,
+    /// Exactly these snapshot hashes exist, as reported by the backend. Used
+    /// for Kubernetes, where the adapter lists ready `VolumeSnapshot`s.
+    Known(&'a HashSet<String>),
+    /// The backend could not be asked. Snapshots are neither verified nor
+    /// reported, and the report says so rather than implying they are fine.
+    Unavailable,
+}
+
+impl SnapshotSource<'_> {
+    fn contains(&self, hash: &str, snapshots_dir: &Path) -> bool {
+        match self {
+            SnapshotSource::Filesystem => {
+                let (a, b) = hash.split_at(2);
+                snapshots_dir.join(a).join(b).is_dir()
+            }
+            SnapshotSource::Known(set) => set.contains(hash),
+            // Nothing is provably missing when nothing can be asked.
+            SnapshotSource::Unavailable => true,
+        }
+    }
+
+    fn is_checked(&self) -> bool {
+        !matches!(self, SnapshotSource::Unavailable)
+    }
+}
+
+/// The default source for a repository, from its configured runtime.
+///
+/// Kubernetes returns `Unavailable` here: the caller must supply the set,
+/// because only an adapter can ask the cluster.
+pub fn default_snapshot_source(repo_path: &Path) -> SnapshotSource<'static> {
+    let k8s = matches!(
         repo_layout::get_runtime_config(repo_path)
             .ok()
             .flatten()
             .map(|r| r.runtime_provider.to_ascii_lowercase()),
         Some(ref p) if p == "kubernetes" || p == "k8s"
-    )
+    );
+    if k8s {
+        SnapshotSource::Unavailable
+    } else {
+        SnapshotSource::Filesystem
+    }
 }
 
 /// What a marking walk reached, kept so the sweep can subtract it from disk.
@@ -207,7 +248,7 @@ struct Marks {
 fn mark(
     repo_path: &Path,
     roots: &[String],
-    check_snapshots: bool,
+    snapshots: &SnapshotSource<'_>,
     dangling: &mut Vec<Dangling>,
 ) -> Marks {
     let mut marks = Marks::default();
@@ -239,11 +280,10 @@ fn mark(
         marks.objects.insert(hash.clone());
         marks.commits += 1;
 
-        if check_snapshots {
+        if snapshots.is_checked() {
             match normalise_hash(&commit.snapshot_hash) {
                 Some(snap) => {
-                    let (a, b) = snap.split_at(2);
-                    if snapshots_dir.join(a).join(b).is_dir() {
+                    if snapshots.contains(&snap, &snapshots_dir) {
                         marks.snapshots.insert(snap);
                     } else {
                         dangling.push(Dangling {
@@ -363,6 +403,19 @@ fn newer_than(path: &Path, cutoff: Option<SystemTime>) -> bool {
 /// `grace` protects recently written entries. See the module docs for why that
 /// is a correctness requirement rather than a convenience.
 pub fn check(repo_path: &Path, grace: Duration) -> Result<FsckReport, RepoError> {
+    check_with(repo_path, grace, &default_snapshot_source(repo_path))
+}
+
+/// As [`check`], but the caller says where snapshot truth comes from.
+///
+/// The Kubernetes path goes through here: the CLI asks the storage adapter for
+/// the ready `VolumeSnapshot`s and passes them as [`SnapshotSource::Known`], so
+/// the same reachability logic verifies that backend too.
+pub fn check_with(
+    repo_path: &Path,
+    grace: Duration,
+    snapshots: &SnapshotSource<'_>,
+) -> Result<FsckReport, RepoError> {
     let gfs_dir = repo_path.join(GFS_DIR);
     if !gfs_dir.is_dir() {
         return Err(RepoError::NoRepoFound(repo_path.to_path_buf()));
@@ -382,13 +435,13 @@ pub fn check(repo_path: &Path, grace: Duration) -> Result<FsckReport, RepoError>
         )
     };
 
-    let check_snapshots = snapshots_are_local(repo_path);
+    let check_snapshots = snapshots.is_checked();
     let (roots, mut dangling) = roots(repo_path)?;
-    let marks = mark(repo_path, &roots, check_snapshots, &mut dangling);
+    let marks = mark(repo_path, &roots, snapshots, &mut dangling);
 
     let mut unreachable: Vec<Unreachable> = Vec::new();
     let mut unrecognised: Vec<Unrecognised> = Vec::new();
-    let mut reclaimable_bytes: u64 = 0;
+    let mut referenced_bytes: u64 = 0;
     let mut protected: usize = 0;
 
     for (hash, path) in two_level(&objects_dir) {
@@ -418,7 +471,7 @@ pub fn check(repo_path: &Path, grace: Duration) -> Result<FsckReport, RepoError>
                 } else {
                     None
                 };
-                reclaimable_bytes += bytes;
+                referenced_bytes += bytes;
                 unreachable.push(Unreachable {
                     kind,
                     hash,
@@ -435,7 +488,23 @@ pub fn check(repo_path: &Path, grace: Duration) -> Result<FsckReport, RepoError>
     }
 
     let mut checked_snapshots = 0usize;
-    if check_snapshots {
+    if let SnapshotSource::Known(set) = snapshots {
+        // The backend is the inventory. Anything it holds that no reachable
+        // commit named is collectable; size is unknown from here, so it is
+        // reported at zero rather than guessed.
+        for hash in set.iter() {
+            checked_snapshots += 1;
+            if marks.snapshots.contains(hash) {
+                continue;
+            }
+            unreachable.push(Unreachable {
+                kind: ObjectKind::Snapshot,
+                hash: hash.clone(),
+                summary: None,
+                bytes: 0,
+            });
+        }
+    } else if check_snapshots {
         for (hash, path) in two_level(&snapshots_dir) {
             checked_snapshots += 1;
             if marks.snapshots.contains(&hash) {
@@ -446,7 +515,7 @@ pub fn check(repo_path: &Path, grace: Duration) -> Result<FsckReport, RepoError>
                 continue;
             }
             let bytes = repo_layout::directory_physical_size_bytes(&path).unwrap_or(0);
-            reclaimable_bytes += bytes;
+            referenced_bytes += bytes;
             unreachable.push(Unreachable {
                 kind: ObjectKind::Snapshot,
                 hash,
@@ -461,8 +530,8 @@ pub fn check(repo_path: &Path, grace: Duration) -> Result<FsckReport, RepoError>
         .into_iter()
         .map(|(name, _)| name)
         .collect();
-    let (stale_workspaces, stale_workspace_bytes, ws_protected, ws_unreadable) =
-        stale_workspaces(repo_path, &live_branches, &marks.objects, cutoff);
+    let (reclaimable_workspaces, reclaimable_workspace_bytes, ws_protected, ws_unreadable) =
+        reclaimable_workspaces(repo_path, &live_branches, &marks.objects, cutoff);
     protected += ws_protected;
     // An unreadable workspace directory is a finding, not a clean result: every
     // other directory we cannot read produces one.
@@ -485,12 +554,12 @@ pub fn check(repo_path: &Path, grace: Duration) -> Result<FsckReport, RepoError>
         unreachable,
         dangling,
         unrecognised,
-        reclaimable_bytes,
-        snapshots_checked_on_disk: check_snapshots,
+        referenced_bytes,
+        snapshots_checked: check_snapshots,
         protected_by_grace: protected,
         grace_seconds: grace.as_secs(),
-        stale_workspaces,
-        stale_workspace_bytes,
+        reclaimable_workspaces,
+        reclaimable_workspace_bytes,
     })
 }
 
@@ -514,12 +583,12 @@ pub fn check(repo_path: &Path, grace: Duration) -> Result<FsckReport, RepoError>
 /// - `workspaces/<branch>/` is live while a ref of exactly that name exists;
 /// - `workspaces/detached/<prefix>/` is live while a reachable commit starts
 ///   with that prefix.
-fn stale_workspaces(
+fn reclaimable_workspaces(
     repo_path: &Path,
     live_branches: &HashSet<String>,
     reachable: &HashSet<String>,
     cutoff: Option<SystemTime>,
-) -> (Vec<StaleWorkspace>, u64, usize, Vec<String>) {
+) -> (Vec<ReclaimableWorkspace>, u64, usize, Vec<String>) {
     let root = repo_path.join(GFS_DIR).join(WORKSPACES_DIR);
     let active = std::fs::read_to_string(repo_path.join(GFS_DIR).join(WORKSPACE_FILE))
         .map(|s| PathBuf::from(s.trim().to_string()))
@@ -585,10 +654,11 @@ fn stale_workspaces(
                 }
                 let bytes = repo_layout::directory_physical_size_bytes(&path).unwrap_or(0);
                 total += bytes;
-                out.push(StaleWorkspace {
+                out.push(ReclaimableWorkspace {
                     path: format!("{WORKSPACES_DIR}/{child_rel}"),
                     reason: "no branch of this name exists".to_string(),
                     bytes,
+                    idle_days: idle_days(&path),
                 });
                 continue;
             }
@@ -608,7 +678,7 @@ fn collect_detached(
     active: &Path,
     reachable: &HashSet<String>,
     cutoff: Option<SystemTime>,
-    out: &mut Vec<StaleWorkspace>,
+    out: &mut Vec<ReclaimableWorkspace>,
     total: &mut u64,
     protected: &mut usize,
 ) {
@@ -639,12 +709,26 @@ fn collect_detached(
         }
         let bytes = repo_layout::directory_physical_size_bytes(&path).unwrap_or(0);
         *total += bytes;
-        out.push(StaleWorkspace {
+        out.push(ReclaimableWorkspace {
             path: format!("{WORKSPACES_DIR}/detached/{prefix}"),
             reason: "no reachable commit starts with this hash".to_string(),
             bytes,
+            idle_days: idle_days(&path),
         });
     }
+}
+
+/// Days since `path` was last written to, from its mtime.
+///
+/// Last *write*, not last read: `relatime`/`noatime` make atime unreliable, and
+/// a verification pass would itself look like access.
+fn idle_days(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| SystemTime::now().duration_since(t).ok())
+        .map(|d| d.as_secs() / 86_400)
+        .unwrap_or(0)
 }
 
 /// Size of one object entry, whether it is a file or a schema directory.
@@ -833,7 +917,7 @@ mod tests {
         .unwrap();
 
         let r = check(d.path(), Duration::ZERO).unwrap();
-        assert!(!r.snapshots_checked_on_disk);
+        assert!(!r.snapshots_checked);
         assert!(
             r.dangling.is_empty(),
             "a missing snapshot directory is normal on k8s: {:?}",
@@ -1012,13 +1096,17 @@ mod tests {
         .unwrap();
 
         let r = check(d.path(), Duration::ZERO).unwrap();
-        let paths: Vec<&str> = r.stale_workspaces.iter().map(|w| w.path.as_str()).collect();
+        let paths: Vec<&str> = r
+            .reclaimable_workspaces
+            .iter()
+            .map(|w| w.path.as_str())
+            .collect();
         assert_eq!(
             paths,
             vec!["workspaces/deleted-branch"],
             "only the workspace with no branch is stale: {paths:?}"
         );
-        assert!(r.stale_workspace_bytes > 0);
+        assert!(r.reclaimable_workspace_bytes > 0);
         // Waste, not corruption.
         assert_eq!(r.exit_code(), 1);
     }
@@ -1044,9 +1132,9 @@ mod tests {
 
         let r = check(d.path(), Duration::ZERO).unwrap();
         assert!(
-            r.stale_workspaces.is_empty(),
+            r.reclaimable_workspaces.is_empty(),
             "team/ holds a live branch: {:?}",
-            r.stale_workspaces
+            r.reclaimable_workspaces
         );
     }
 
@@ -1098,7 +1186,11 @@ mod tests {
         }
 
         let r = check(d.path(), Duration::ZERO).unwrap();
-        let paths: Vec<&str> = r.stale_workspaces.iter().map(|w| w.path.as_str()).collect();
+        let paths: Vec<&str> = r
+            .reclaimable_workspaces
+            .iter()
+            .map(|w| w.path.as_str())
+            .collect();
         assert_eq!(
             paths,
             vec!["workspaces/team/beta"],

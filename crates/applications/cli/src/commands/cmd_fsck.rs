@@ -8,8 +8,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use gfs_domain::model::fsck::FsckReport;
 use gfs_domain::model::layout::{GC_DIR, GFS_DIR};
-use gfs_domain::repo_utils::fsck::{self, DEFAULT_GRACE};
+use gfs_domain::repo_utils::fsck::{self, DEFAULT_GRACE, SnapshotSource};
 use serde_json::json;
+use std::collections::HashSet;
 
 use crate::cli_utils::get_repo_dir;
 use crate::output::{cyan, dimmed, fmt_bytes, gold, green, red, yellow};
@@ -27,13 +28,57 @@ pub async fn run(
         .map(std::time::Duration::from_secs)
         .unwrap_or(DEFAULT_GRACE);
 
-    let report = fsck::check(&repo_path, grace)
+    // On Kubernetes a snapshot is a VolumeSnapshot object, not a directory, so
+    // the only way to know whether a commit's snapshot still exists is to ask
+    // the cluster. Asking is done here rather than in the domain: fsck should
+    // not know what Kubernetes is.
+    let known: Option<HashSet<String>> = if runtime_is_kubernetes(&repo_path) {
+        match gfs_storage_kubernetes::KubernetesStorage::new(None).await {
+            Ok(s) => match s.list_ready_snapshot_hashes().await {
+                Ok(set) => Some(set),
+                Err(e) => {
+                    // Reported, not fatal: the rest of the check is still
+                    // worth running, and the report will say snapshots were
+                    // not verified rather than implying they passed.
+                    tracing::warn!("could not list VolumeSnapshots ({e}); snapshots unverified");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!("could not reach the cluster ({e}); snapshots unverified");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let source = match (&known, runtime_is_kubernetes(&repo_path)) {
+        (Some(set), _) => SnapshotSource::Known(set),
+        (None, true) => SnapshotSource::Unavailable,
+        (None, false) => SnapshotSource::Filesystem,
+    };
+
+    let report = fsck::check_with(&repo_path, grace, &source)
         .context("not a GFS repository (run from a repo root or use --path <dir>)")?;
 
     // A plan is the prelude to a deletion, so refuse to produce one for a
     // repository that is already inconsistent — that is exactly the state in
     // which a collector turns a recoverable incident into an unopenable one.
     // `--json` still reports everything, so nothing is hidden by this.
+    // A plan drawn without seeing the snapshots would list objects as
+    // collectable while knowing nothing about half the graph. Refuse: this is
+    // the same failure as reporting a repository clean when a check did not run.
+    if plan && !report.snapshots_checked {
+        eprintln!(
+            "{} refusing to write a collection plan: snapshots were not verified, so this run \
+             cannot tell which of them any commit still needs. Retry when the cluster is \
+             reachable",
+            red("error:")
+        );
+        return Ok(2);
+    }
+
     // Exits 2, not 1: the refusal is caused by corruption, and 1 already means
     // "unreachable objects found". Returning 1 here would make a script unable
     // to tell a broken repository from one that merely has garbage.
@@ -70,6 +115,18 @@ pub async fn run(
 /// Written now, before anything has been removed by anyone. lakeFS writes its
 /// equivalent report in a `finally` after the sweep, which is why a killed run
 /// of theirs cannot be resumed.
+/// Whether this repository's snapshots live in Kubernetes rather than on disk.
+fn runtime_is_kubernetes(repo_path: &std::path::Path) -> bool {
+    gfs_domain::model::config::GfsConfig::load(repo_path)
+        .ok()
+        .and_then(|c| c.runtime)
+        .map(|r| {
+            let p = r.runtime_provider.trim().to_ascii_lowercase();
+            p == "kubernetes" || p == "k8s"
+        })
+        .unwrap_or(false)
+}
+
 fn write_plan(repo_path: &std::path::Path, report: &FsckReport) -> Result<String> {
     let mark_id = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let dir = repo_path.join(GFS_DIR).join(GC_DIR).join(&mark_id);
@@ -112,7 +169,7 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
         "checked {} commits, {} file lists{}",
         report.checked_commits,
         report.checked_file_lists,
-        if report.snapshots_checked_on_disk {
+        if report.snapshots_checked {
             format!(", {} snapshots", report.checked_snapshots)
         } else {
             String::new()
@@ -132,12 +189,13 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
         )?;
     }
 
-    if !report.snapshots_checked_on_disk {
+    if !report.snapshots_checked {
         println_safe!(
             "{}",
             dimmed(
-                "snapshots were not checked: this repository uses the Kubernetes runtime, \
-                 where a snapshot is a VolumeSnapshot object rather than a directory"
+                "snapshots were NOT verified: this repository uses the Kubernetes runtime and \
+                 the cluster could not be reached, so nothing here says whether the snapshots \
+                 a commit needs still exist"
             )
         )?;
     }
@@ -166,7 +224,7 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
             dimmed(format!(
                 "{} objects, {}",
                 report.unreachable.len(),
-                fmt_bytes(report.reclaimable_bytes)
+                fmt_bytes(report.referenced_bytes)
             ))
         )?;
         println_safe!(
@@ -179,13 +237,13 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
         )?;
     }
 
-    if !report.stale_workspaces.is_empty() {
+    if !report.reclaimable_workspaces.is_empty() {
         println_safe!("")?;
         println_safe!(
             "{}",
             yellow("stale working copies (no branch or reachable commit needs these):")
         )?;
-        for w in &report.stale_workspaces {
+        for w in &report.reclaimable_workspaces {
             println_safe!(
                 "  {:<34} {:>10}  {}",
                 w.path,
@@ -198,8 +256,8 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
             dimmed(format!(
                 "{} working copies, {} \u{2014} rebuilt from the snapshot on the next checkout, \
                  so removing them costs nothing but time",
-                report.stale_workspaces.len(),
-                fmt_bytes(report.stale_workspace_bytes)
+                report.reclaimable_workspaces.len(),
+                fmt_bytes(report.reclaimable_workspace_bytes)
             ))
         )?;
     }

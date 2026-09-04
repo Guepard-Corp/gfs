@@ -50,7 +50,7 @@ pub struct Unreachable {
     /// recognise what they are about to lose.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
-    /// On-disk size. See [`FsckReport::reclaimable_bytes`] for what this does
+    /// On-disk size. See [`FsckReport::referenced_bytes`] for what this does
     /// and does not promise.
     pub bytes: u64,
 }
@@ -77,6 +77,12 @@ pub struct Unrecognised {
 
 /// A working copy on disk that nothing needs any more.
 ///
+/// Called *reclaimable* rather than *stale* because `stale` is taken twice in
+/// this space and means neither of these things: in jj it is a working copy
+/// that is merely out of date and is *repaired* (`jj workspace update-stale`),
+/// and in EdenFS it is a dead kernel mount. Nothing here is broken or in need
+/// of repair — it is intact and simply unneeded.
+///
 /// Workspaces are not part of the object graph — they are rebuildable caches,
 /// restored from a snapshot on the next checkout — so they are reported apart
 /// from `unreachable` and their bytes are counted separately. They are also
@@ -84,12 +90,24 @@ pub struct Unrecognised {
 /// directory, one per branch plus one per detached checkout, and nothing
 /// removes them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StaleWorkspace {
+pub struct ReclaimableWorkspace {
     /// Path relative to `.gfs/`, e.g. `workspaces/feature/0`.
     pub path: String,
     /// Why nothing needs it.
     pub reason: String,
     pub bytes: u64,
+    /// Days since the working copy was last written to.
+    ///
+    /// "Used" is defined narrowly and on purpose, following Perforce, whose
+    /// `p4 unload -ac` reclaims on access date and is explicit that merely
+    /// inspecting a client does not refresh the clock. Here it is the mtime of
+    /// the data directory — last *write*, not last read. Read time is not
+    /// usable: `relatime` and `noatime` make atime unreliable, and a snapshot
+    /// pass would itself count as access.
+    ///
+    /// Reported rather than acted on. It is what makes "unused for 200 days"
+    /// visible, and what an idle policy would eventually be built from.
+    pub idle_days: u64,
 }
 
 /// The outcome of `gfs fsck`.
@@ -103,23 +121,29 @@ pub struct FsckReport {
     pub dangling: Vec<Dangling>,
     pub unrecognised: Vec<Unrecognised>,
 
-    /// Sum of the on-disk sizes of the unreachable entries.
+    /// Bytes the unreachable entries *reference*, as `du` would report them.
     ///
-    /// This is what `du` would report for those trees, **not** what `df` would
-    /// give back. On a filesystem with reflink — APFS, and Btrfs or XFS with
-    /// reflink enabled — a snapshot shares blocks with the tree it was cloned
-    /// from, so the space actually freed by removing it is somewhere between
-    /// zero and this number. On a filesystem without reflink the two agree.
-    pub reclaimable_bytes: u64,
+    /// Deliberately not called reclaimable: it is an **upper bound**, and often
+    /// a wildly loose one. Every filesystem GFS runs on shares blocks — APFS
+    /// clones, ZFS snapshots under the Kubernetes backend — so each shared block
+    /// is counted once per sharer here, while removing one sharer frees none of
+    /// it. Measured on a real pool, this arithmetic priced 35 snapshots at
+    /// 1.4 GB when the whole pool held 767 MB.
+    ///
+    /// The space actually freed lies between zero and this number, and nothing
+    /// in GFS can currently narrow that range: it would need each filesystem's
+    /// own accounting, which is ZFS's `used` versus `referenced`.
+    pub referenced_bytes: u64,
 
-    /// Whether snapshot trees were checked on the local filesystem.
+    /// Whether snapshots were verified at all.
     ///
-    /// False on the Kubernetes runtime, where a snapshot is a `VolumeSnapshot`
-    /// object rather than a directory: `.gfs/snapshots/<2>/<62>` is never
-    /// created, so a filesystem walk would call every commit dangling. When
-    /// this is false the snapshot half of the report is simply absent, and no
-    /// conclusion about snapshots should be drawn from it.
-    pub snapshots_checked_on_disk: bool,
+    /// True when they were checked against a filesystem walk *or* against the
+    /// set the backend reported. False only when the backend could not be
+    /// asked — on the Kubernetes runtime with no reachable cluster. When false,
+    /// the snapshot half of the report is absent and no conclusion about
+    /// snapshots should be drawn from it; in particular a clean report does not
+    /// mean the snapshots are fine.
+    pub snapshots_checked: bool,
 
     /// How many entries were left out of `unreachable` only because they are
     /// newer than the grace cutoff.
@@ -134,12 +158,14 @@ pub struct FsckReport {
     pub grace_seconds: u64,
 
     /// Working copies no branch or reachable commit needs. Reported apart from
-    /// `unreachable` because they are caches rather than graph objects.
-    pub stale_workspaces: Vec<StaleWorkspace>,
+    /// `unreachable` because they are caches rather than graph objects — and,
+    /// unlike an unreachable snapshot, genuinely reclaimable: `checkout`
+    /// rebuilds one from its snapshot, so removing it costs time, not data.
+    pub reclaimable_workspaces: Vec<ReclaimableWorkspace>,
 
-    /// Bytes held by [`Self::stale_workspaces`], counted apart from
-    /// `reclaimable_bytes` for the same reason.
-    pub stale_workspace_bytes: u64,
+    /// Bytes held by [`Self::reclaimable_workspaces`]. Same upper-bound caveat
+    /// as [`Self::referenced_bytes`].
+    pub reclaimable_workspace_bytes: u64,
 }
 
 impl FsckReport {
@@ -152,7 +178,7 @@ impl FsckReport {
     pub fn exit_code(&self) -> i32 {
         if !self.dangling.is_empty() || !self.unrecognised.is_empty() {
             2
-        } else if !self.unreachable.is_empty() || !self.stale_workspaces.is_empty() {
+        } else if !self.unreachable.is_empty() || !self.reclaimable_workspaces.is_empty() {
             1
         } else {
             0
@@ -177,12 +203,12 @@ mod tests {
             unreachable: Vec::new(),
             dangling: Vec::new(),
             unrecognised: Vec::new(),
-            reclaimable_bytes: 0,
-            snapshots_checked_on_disk: true,
+            referenced_bytes: 0,
+            snapshots_checked: true,
             protected_by_grace: 0,
             grace_seconds: 0,
-            stale_workspaces: Vec::new(),
-            stale_workspace_bytes: 0,
+            reclaimable_workspaces: Vec::new(),
+            reclaimable_workspace_bytes: 0,
         }
     }
 
