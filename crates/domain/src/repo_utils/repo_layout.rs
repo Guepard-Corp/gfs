@@ -1478,14 +1478,22 @@ fn collect_branch_refs(dir: &Path, prefix: &str) -> Result<Vec<(String, String)>
 
 /// List every branch in `refs/heads/` as `(branch_name, tip_commit_hash)` pairs.
 ///
-/// Returns an empty vec when the heads directory is absent (fresh repo with no
-/// committed branch refs yet) rather than erroring.
+/// Returns an empty vec when the heads directory is **absent** (fresh repo with
+/// no committed branch refs yet) rather than erroring.
+///
+/// Absent, specifically, and not merely unreachable. `Path::exists` is also
+/// false when a *parent* directory cannot be opened, and collapsing the two here
+/// is unusually expensive: branch tips are the roots of every reachability walk
+/// in GFS, so "no branches" and "could not read the branches" differ by the
+/// entire repository. An unreadable `refs/` made `gfs fsck` see zero roots and
+/// therefore consider every object in the repository collectable.
 pub fn list_branches(repo_path: &Path) -> Result<Vec<(String, String)>, RepoError> {
     let refs_dir = repo_path.join(GFS_DIR).join(REFS_DIR).join(HEADS_DIR);
-    if !refs_dir.exists() {
-        return Ok(Vec::new());
+    match fs::metadata(&refs_dir) {
+        Ok(_) => collect_branch_refs(&refs_dir, ""),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(RepoError::from(e)),
     }
-    collect_branch_refs(&refs_dir, "")
 }
 
 /// Returns the list of ref names pointing to the given commit hash.

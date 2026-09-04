@@ -2595,4 +2595,31 @@ mod tests {
             SnapshotSource::Filesystem
         ));
     }
+
+    /// Branch tips are the roots of every reachability walk, so "no branches"
+    /// and "could not read the branches" differ by the entire repository.
+    /// `Path::exists` is false when a *parent* cannot be opened, so an
+    /// unreadable `refs/` made the walk start from nowhere and reach nothing —
+    /// with every object then looking collectable, at exit 1, where `--plan`
+    /// would still write.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_refs_parent_is_an_error_not_an_empty_branch_list() {
+        let d = repo();
+        let h = write_commit(d.path(), "aa", "live", None, true);
+        set_branch(d.path(), "main", &h);
+        assert!(check(d.path(), Duration::ZERO).unwrap().is_clean());
+
+        let refs = d.path().join(GFS_DIR).join(REFS_DIR);
+        let Some(result) = while_unreadable(&refs, || check(d.path(), Duration::ZERO)) else {
+            return;
+        };
+        match result {
+            Err(_) => {}
+            Ok(r) => panic!(
+                "an unreadable refs directory must not read as a repository with no \
+                 branches: {r:?}"
+            ),
+        }
+    }
 }

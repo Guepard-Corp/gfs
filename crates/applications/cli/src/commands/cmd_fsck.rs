@@ -139,6 +139,20 @@ pub async fn run(
         return Ok(2);
     }
 
+    // Any run that did not complete, for any reason: an unreadable object, a
+    // commit that would not parse, a ref that would not resolve. A plan drawn
+    // from an incomplete walk is a list of what the check could not see, which
+    // is precisely the live data. This gate previously fired only on exit 2, so
+    // a run that exited 3 still wrote a plan directory.
+    if plan && report.exit_code() == 3 {
+        eprintln!(
+            "{} refusing to write a collection plan: the check did not complete, so what it \
+             did not reach is indistinguishable from what nothing references",
+            red("error:")
+        );
+        return Ok(3);
+    }
+
     // Exits 2, not 1: the refusal is caused by corruption, and 1 already means
     // "unreachable objects found". Returning 1 here would make a script unable
     // to tell a broken repository from one that merely has garbage.
