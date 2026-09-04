@@ -425,6 +425,17 @@ struct Marks {
     snapshots: HashSet<String>,
     commits: usize,
     file_lists: usize,
+    /// Places the walk could not continue through.
+    ///
+    /// Only a *commit* can truncate a walk, because only a commit has children
+    /// to follow. A missing file list or snapshot is a leaf: the commit naming
+    /// it was still read, its parents were still queued, and reachability is
+    /// unaffected. A commit that will not parse is different — everything
+    /// behind it becomes invisible, and therefore looks collectable.
+    truncated: usize,
+    /// Objects reached and marked, with the kind the referring commit said they
+    /// were. Validated after the walk; see [`check_with`].
+    expected: Vec<(String, PathBuf, ObjectKind)>,
 }
 
 /// Walk from `roots`, marking everything reachable and collecting dangling
@@ -465,6 +476,7 @@ fn mark(
                 continue;
             }
             Err(_) => {
+                marks.truncated += 1;
                 dangling.push(Dangling {
                     from_commit: hash.clone(),
                     kind: ObjectKind::Commit,
@@ -527,6 +539,11 @@ fn mark(
                             if kind == ObjectKind::FileList {
                                 marks.file_lists += 1;
                             }
+                            marks.expected.push((
+                                reference.clone(),
+                                objects_dir.join(a).join(b),
+                                kind,
+                            ));
                             marks.objects.insert(reference);
                         }
                         Presence::Absent => dangling.push(Dangling {
@@ -560,11 +577,14 @@ fn mark(
                         queue.push_back(p);
                     }
                 }
-                None => dangling.push(Dangling {
-                    from_commit: hash.clone(),
-                    kind: ObjectKind::Commit,
-                    missing: brief(parent),
-                }),
+                None => {
+                    marks.truncated += 1;
+                    dangling.push(Dangling {
+                        from_commit: hash.clone(),
+                        kind: ObjectKind::Commit,
+                        missing: brief(parent),
+                    });
+                }
             }
         }
     }
@@ -771,6 +791,55 @@ pub fn check_with(
         }
     }
 
+    // Live objects, checked. The store scan below only looks at what is *not*
+    // marked, so until now a reachable file list could be replaced with
+    // arbitrary bytes and the report would call the repository consistent: the
+    // one object nobody was allowed to lose was the one nobody looked at.
+    //
+    // This is the cheap half of content checking and belongs here: it costs one
+    // parse per referenced object, so it scales with history, which is what the
+    // rest of this walk already scales with. Verifying that the *files inside* a
+    // snapshot still match their recorded entries scales with data size instead,
+    // and stays out of scope.
+    for (hash, path, expected) in &marks.expected {
+        match identify_object(path) {
+            Ok(actual) if actual == *expected => {}
+            Ok(actual) => unrecognised.push(Unrecognised {
+                hash: hash.clone(),
+                reason: format!(
+                    "referenced as {} but stored as {}",
+                    expected.as_str(),
+                    actual.as_str()
+                ),
+                bytes: object_size(path),
+            }),
+            Err(reason) => unrecognised.push(Unrecognised {
+                hash: hash.clone(),
+                reason: format!("referenced as {} but {reason}", expected.as_str()),
+                bytes: object_size(path),
+            }),
+        }
+    }
+
+    // F6's other half: a snapshot directory that exists but holds nothing. One
+    // `read_dir` per referenced snapshot, not a walk of its contents.
+    if matches!(snapshots, SnapshotSource::Filesystem) {
+        for hash in &marks.snapshots {
+            let (a, b) = hash.split_at(2);
+            let dir = snapshots_dir.join(a).join(b);
+            let empty = std::fs::read_dir(&dir)
+                .map(|mut e| e.next().is_none())
+                .unwrap_or(false);
+            if empty {
+                dangling.push(Dangling {
+                    from_commit: hash.clone(),
+                    kind: ObjectKind::Snapshot,
+                    missing: "(snapshot directory is empty)".to_string(),
+                });
+            }
+        }
+    }
+
     let mut checked_snapshots = 0usize;
     // Set when the backend held a snapshot it could not size. The total is then
     // a floor over an unknown remainder rather than a complete figure, and
@@ -872,7 +941,11 @@ pub fn check_with(
     // An object we could not open is a hole in the walk just as much as a root
     // we could not resolve: whatever it referenced is now unmarked and looks
     // collectable.
-    let reachability_complete = reachability_complete && unreadable.is_empty();
+    // A commit the walk could not read hides everything behind it, exactly as a
+    // ref it could not resolve does. Both make the unreachable set a list of
+    // live data, so both suppress it.
+    let reachability_complete =
+        reachability_complete && unreadable.is_empty() && marks.truncated == 0;
     if !reachability_complete {
         unreachable.clear();
         reclaimable_workspaces.clear();
@@ -2097,5 +2170,120 @@ mod tests {
             "a walk with a hole in it must not propose deletions: {:?}",
             r.unreachable
         );
+    }
+
+    /// Write a commit that references `files_ref`, so the object can be
+    /// tampered with afterwards.
+    fn write_commit_with_files(repo: &Path, seed: &str, files_ref: &str) -> String {
+        let hash = hash_of(seed);
+        let commit = serde_json::json!({
+            "hash": hash,
+            "message": "has a file list",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "parents": Vec::<String>::new(),
+            "snapshot_hash": hash_of(&format!("5{seed}")),
+            "files_ref": files_ref,
+            "author": "t", "author_date": "2026-01-01T00:00:00Z",
+            "committer": "t", "committer_date": "2026-01-01T00:00:00Z",
+        });
+        let objects = repo.join(GFS_DIR).join(OBJECTS_DIR);
+        fs::create_dir_all(objects.join(&hash[..2])).unwrap();
+        fs::write(
+            objects.join(&hash[..2]).join(&hash[2..]),
+            serde_json::to_string_pretty(&commit).unwrap(),
+        )
+        .unwrap();
+        let snap = hash_of(&format!("5{seed}"));
+        let dir = repo
+            .join(GFS_DIR)
+            .join(SNAPSHOTS_DIR)
+            .join(&snap[..2])
+            .join(&snap[2..]);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("data.txt"), "x").unwrap();
+        hash
+    }
+
+    /// The store scan only ever looked at objects nothing referenced, so the one
+    /// object that must not be lost was the one nobody parsed. Replacing a live
+    /// file list with arbitrary bytes used to report "✓ consistent", exit 0.
+    #[test]
+    fn a_live_object_that_is_not_what_it_claims_to_be_is_reported() {
+        let d = repo();
+        let files = hash_of("f1");
+        let objects = d.path().join(GFS_DIR).join(OBJECTS_DIR);
+        fs::create_dir_all(objects.join(&files[..2])).unwrap();
+        fs::write(
+            objects.join(&files[..2]).join(&files[2..]),
+            b"not a file list",
+        )
+        .unwrap();
+
+        let h = write_commit_with_files(d.path(), "aa", &files);
+        set_branch(d.path(), "main", &h);
+
+        let r = check(d.path(), Duration::ZERO).unwrap();
+        assert_eq!(r.exit_code(), 2, "{r:?}");
+        assert!(
+            r.unrecognised
+                .iter()
+                .any(|u| u.hash == files && u.reason.contains("referenced as file list")),
+            "must say what it was supposed to be: {:?}",
+            r.unrecognised
+        );
+    }
+
+    /// A snapshot directory that exists but holds nothing satisfies a presence
+    /// check while containing none of the data it was made to hold.
+    #[test]
+    fn a_snapshot_directory_with_nothing_in_it_is_not_a_snapshot() {
+        let d = repo();
+        let h = write_commit(d.path(), "aa", "live", None, true);
+        set_branch(d.path(), "main", &h);
+        assert!(check(d.path(), Duration::ZERO).unwrap().is_clean());
+
+        let snap = hash_of(&format!("5{}", "aa"));
+        let dir = d
+            .path()
+            .join(GFS_DIR)
+            .join(SNAPSHOTS_DIR)
+            .join(&snap[..2])
+            .join(&snap[2..]);
+        fs::remove_file(dir.join("data.txt")).unwrap();
+
+        let r = check(d.path(), Duration::ZERO).unwrap();
+        assert_eq!(r.exit_code(), 2, "{r:?}");
+        assert!(
+            r.dangling.iter().any(|x| x.missing.contains("empty")),
+            "{:?}",
+            r.dangling
+        );
+    }
+
+    /// The F1 failure again, one level in. A commit that will not parse hides
+    /// every ancestor behind it, so the walk reaches none of them and the report
+    /// offers up the history -- including the snapshot you would recover from.
+    #[test]
+    fn a_commit_that_will_not_parse_suppresses_the_collectable_list() {
+        let d = repo();
+        let root = write_commit(d.path(), "aa", "oldest", None, true);
+        let mid = write_commit(d.path(), "bb", "middle", Some(&root), true);
+        let tip = write_commit(d.path(), "cc", "newest", Some(&mid), true);
+        set_branch(d.path(), "main", &tip);
+        assert!(check(d.path(), Duration::ZERO).unwrap().is_clean());
+
+        // Corrupt the middle commit: root and its snapshot are now unwalkable.
+        let objects = d.path().join(GFS_DIR).join(OBJECTS_DIR);
+        fs::write(objects.join(&mid[..2]).join(&mid[2..]), b"{ not json").unwrap();
+
+        let r = check(d.path(), Duration::ZERO).unwrap();
+        assert_eq!(r.exit_code(), 2, "{r:?}");
+        assert!(
+            r.unreachable.is_empty(),
+            "the ancestors are hidden, not garbage \u{2014} listing them names the data you \
+             would recover from: {:?}",
+            r.unreachable
+        );
+        assert!(!r.reachability_complete);
     }
 }

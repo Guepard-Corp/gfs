@@ -264,9 +264,11 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
         println_safe!(
             "{}",
             red(
-                "a ref could not be resolved, so the walk did not start from every root: \
-                 nothing is reported as collectable in this run, because everything behind \
-                 that ref would look unreached. Repair the ref below, then run again"
+                "the walk could not reach the whole graph \u{2014} a ref that would not \
+                 resolve, a commit that would not parse, or an object that could not be \
+                 opened. Nothing is reported as collectable in this run, because everything \
+                 behind that point would look unreached whether or not it is live. Repair \
+                 what is listed below, then run again"
             )
         )?;
     }
