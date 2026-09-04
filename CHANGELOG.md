@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Features
 
 - feat: Native Qwery support — the installer now detects Qwery (`~/.qwery` or the `qwery`/`qwery-tui` CLI) and injects the GFS skills into `~/.qwery/skills/` and the Qwery agent into `~/.qwery/agents/`
+ - feat: add SQLite database provider to `gfs-compute-docker` (file-backed provider, import/export/schema support)
 
 ### Bug Fixes
 
