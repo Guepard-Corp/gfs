@@ -230,11 +230,22 @@ fsck verdict          consistent
 
 On a real database each of those is gigabytes rather than kilobytes.
 
-**They are not objects, and must not be reported as unreachable ones.** A
-workspace is a *cache*: `checkout` rebuilds it from the snapshot, so removing a
-stale one costs time, not data. That is a materially different promise from
-removing an unreachable snapshot, which is irreversible, and the report keeps
-the two apart with separate byte totals so neither number misleads.
+**They are not objects, and must not be reported as unreachable ones.** They are
+reported separately, with their own byte total, so neither number misleads.
+
+**Correction (2026-09-04): an earlier draft of this section called a workspace a
+cache and said removing one costs time, not data. That is false on today's
+`main`.** `GfsRepository::checkout` populates from a snapshot *only when the
+workspace does not exist* — the comment there says "preserve live DB state in
+branch workspace". So a workspace is authoritative, and deleting one destroys
+state checkout would have kept. The cache framing borrowed behaviour from PR #76
+("Always restore from the snapshot"), which is not merged.
+
+Consequences: this list is **report-only** until checkout always restores, and a
+collector must not act on it until GFS can tell a pristine workspace from a
+written-on one. That ordering matches every comparable system surveyed — git, jj,
+Perforce and EdenFS all decline to delete a working copy's files, and three of
+the four refuse or warn on uncommitted work.
 
 Liveness, in order:
 

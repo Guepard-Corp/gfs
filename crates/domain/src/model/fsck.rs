@@ -157,10 +157,17 @@ pub struct FsckReport {
     /// The grace period this run applied, in seconds.
     pub grace_seconds: u64,
 
-    /// Working copies no branch or reachable commit needs. Reported apart from
-    /// `unreachable` because they are caches rather than graph objects — and,
-    /// unlike an unreachable snapshot, genuinely reclaimable: `checkout`
-    /// rebuilds one from its snapshot, so removing it costs time, not data.
+    /// Working copies no branch or reachable commit needs, reported apart from
+    /// `unreachable` because they are not graph objects.
+    ///
+    /// **Reported, never safe to delete on today's `main`.** A workspace is not
+    /// a cache here: `GfsRepository::checkout` populates from a snapshot *only
+    /// when the workspace does not exist*, explicitly to preserve live database
+    /// state. So removing one destroys state that a checkout would have kept,
+    /// and no dirty check exists to say whether that state matters.
+    ///
+    /// It becomes a cache — and this list becomes actionable — once checkout
+    /// always restores from the snapshot. That change is in flight, not merged.
     pub reclaimable_workspaces: Vec<ReclaimableWorkspace>,
 
     /// Bytes held by [`Self::reclaimable_workspaces`]. Same upper-bound caveat

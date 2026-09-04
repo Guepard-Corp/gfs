@@ -254,8 +254,9 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
         println_safe!(
             "  {}",
             dimmed(format!(
-                "{} working copies, {} \u{2014} rebuilt from the snapshot on the next checkout, \
-                 so removing them costs nothing but time",
+                "{} working copies, {} \u{2014} listed, NOT safe to delete: checkout only \
+                 restores a workspace that is absent, so removing one destroys live database \
+                 state it would otherwise have preserved",
                 report.reclaimable_workspaces.len(),
                 fmt_bytes(report.reclaimable_workspace_bytes)
             ))
