@@ -32,8 +32,8 @@ use crate::model::fsck::{
     Dangling, FsckReport, ObjectKind, ReclaimableWorkspace, Unreachable, Unrecognised,
 };
 use crate::model::layout::{
-    BRANCH_WORKSPACE_SEGMENT, GFS_DIR, HEAD_FILE, OBJECTS_DIR, SNAPSHOTS_DIR, WORKSPACE_FILE,
-    WORKSPACES_DIR,
+    BRANCH_WORKSPACE_SEGMENT, DELETED_REFS_DIR, GFS_DIR, HEAD_FILE, OBJECTS_DIR, REFS_DIR,
+    SNAPSHOTS_DIR, WORKSPACE_FILE, WORKSPACES_DIR,
 };
 use crate::repo_utils::repo_layout;
 
@@ -154,6 +154,11 @@ pub fn roots(repo_path: &Path) -> Result<(Vec<String>, Vec<Dangling>), RepoError
         }
     }
 
+    // Soft-deleted branches are recoverable, so their commits are live.
+    for h in soft_deleted_roots(repo_path) {
+        out.push(h);
+    }
+
     // HEAD is read raw rather than resolved. An *attached* HEAD names a branch
     // whose tip the loop above already covered, so resolving it would report a
     // broken branch twice — once against the ref and once against HEAD. Only a
@@ -175,6 +180,58 @@ pub fn roots(repo_path: &Path) -> Result<(Vec<String>, Vec<Dangling>), RepoError
     out.sort();
     out.dedup();
     Ok((out, problems))
+}
+
+/// Every commit hash held by a soft-deleted ref under `refs/deleted/`.
+///
+/// `gfs branch -d` moves a ref aside rather than unlinking it, to
+/// `refs/deleted/<unix_millis>/<branch path>`, so the branch stays restorable.
+/// Those commits are therefore **not** garbage, and a mark phase that ignored
+/// them would report them collectable — and a collector acting on that report
+/// would delete exactly the data `gfs branch --restore` promises to give back.
+///
+/// Read straight off disk rather than through the branch-recovery API, on
+/// purpose. That API lives on an unmerged branch based on an older `main`, and
+/// depending on it would drag this work backwards. The on-disk layout is the
+/// contract here; if it ever changes, `deleted_refs_are_roots` fails.
+///
+/// **Age is deliberately ignored.** A ref past its retention window is still
+/// treated as a root while its file exists. fsck's job is to avoid proposing
+/// the collection of anything that still has a recovery record on disk, and
+/// over-retaining is the safe direction; expiry is `branch -d`'s to enforce by
+/// removing the entry. This also means fsck needs no access to the retention
+/// setting, which does not exist on this branch, and cannot disagree with
+/// `branch -d` about the window.
+fn soft_deleted_roots(repo_path: &Path) -> Vec<String> {
+    let base = repo_path
+        .join(GFS_DIR)
+        .join(REFS_DIR)
+        .join(DELETED_REFS_DIR);
+    let mut out = Vec::new();
+    // Absent before the branch-recovery work lands, which must be a no-op.
+    let mut stack = vec![base];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                stack.push(path);
+            } else if let Ok(body) = std::fs::read_to_string(&path)
+                && let Some(h) = normalise_hash(&body)
+            {
+                out.push(h);
+            }
+        }
+    }
+    out
 }
 
 /// Where the truth about a snapshot's existence comes from.
@@ -1238,6 +1295,100 @@ mod tests {
                 .unreachable
                 .is_empty(),
             "an enormous window protects everything"
+        );
+    }
+
+    /// A soft-deleted branch is recoverable, so its commits are live. Without
+    /// this, fsck would report them collectable and a collector acting on that
+    /// report would delete exactly what `gfs branch --restore` promises back.
+    #[test]
+    fn deleted_refs_are_roots() {
+        let d = repo();
+        let live = write_commit(d.path(), "aa", "on main", None, true);
+        set_branch(d.path(), "main", &live);
+        let deleted = write_commit(d.path(), "bb", "on a deleted branch", None, true);
+
+        // Without the recovery record it is garbage.
+        let before = check(d.path(), Duration::ZERO).unwrap();
+        assert!(
+            !before.unreachable.is_empty(),
+            "unreferenced commit should be collectable"
+        );
+
+        // The on-disk layout `gfs branch -d` writes:
+        // refs/deleted/<unix_millis>/<branch path>, holding the tip.
+        let entry = d
+            .path()
+            .join(GFS_DIR)
+            .join(REFS_DIR)
+            .join(DELETED_REFS_DIR)
+            .join("1788452232388")
+            .join("feature");
+        fs::create_dir_all(entry.parent().unwrap()).unwrap();
+        fs::write(&entry, &deleted).unwrap();
+
+        let after = check(d.path(), Duration::ZERO).unwrap();
+        assert!(
+            after.is_clean(),
+            "a recoverable branch must not be reported collectable: {:?}",
+            after.unreachable
+        );
+        assert_eq!(after.checked_commits, 2);
+    }
+
+    /// Nested branch names nest here too, and the whole thing must be a no-op
+    /// before the branch-recovery work lands and the directory exists at all.
+    #[test]
+    fn nested_deleted_refs_are_found_and_an_absent_directory_is_harmless() {
+        let d = repo();
+        let live = write_commit(d.path(), "aa", "on main", None, true);
+        set_branch(d.path(), "main", &live);
+
+        // No refs/deleted at all: unchanged behaviour.
+        assert!(check(d.path(), Duration::ZERO).unwrap().is_clean());
+
+        let deep = write_commit(d.path(), "bb", "team/alpha", None, true);
+        let entry = d
+            .path()
+            .join(GFS_DIR)
+            .join(REFS_DIR)
+            .join(DELETED_REFS_DIR)
+            .join("1788452232999")
+            .join("team")
+            .join("alpha");
+        fs::create_dir_all(entry.parent().unwrap()).unwrap();
+        fs::write(&entry, &deep).unwrap();
+
+        assert!(
+            check(d.path(), Duration::ZERO).unwrap().is_clean(),
+            "a nested deleted ref is still a root"
+        );
+    }
+
+    /// Age is ignored on purpose: while a recovery record exists on disk, the
+    /// data it names must not be proposed for collection. Expiry is
+    /// `branch -d`'s job, by removing the entry.
+    #[test]
+    fn an_expired_looking_deleted_ref_is_still_a_root() {
+        let d = repo();
+        let live = write_commit(d.path(), "aa", "on main", None, true);
+        set_branch(d.path(), "main", &live);
+        let old = write_commit(d.path(), "bb", "deleted long ago", None, true);
+
+        // A timestamp from 2020, far outside any retention window.
+        let entry = d
+            .path()
+            .join(GFS_DIR)
+            .join(REFS_DIR)
+            .join(DELETED_REFS_DIR)
+            .join("1577836800000")
+            .join("ancient");
+        fs::create_dir_all(entry.parent().unwrap()).unwrap();
+        fs::write(&entry, &old).unwrap();
+
+        assert!(
+            check(d.path(), Duration::ZERO).unwrap().is_clean(),
+            "over-retaining is the safe direction"
         );
     }
 
