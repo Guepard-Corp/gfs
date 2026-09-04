@@ -135,6 +135,19 @@ pub struct FsckReport {
     /// own accounting, which is ZFS's `used` versus `referenced`.
     pub referenced_bytes: u64,
 
+    /// Bytes that deleting the unreachable snapshots would actually free.
+    ///
+    /// `None` unless the backend could supply it. Only a backend can: it is
+    /// ZFS's `used`, the blocks a snapshot holds *exclusively*, and no walk of a
+    /// directory tree can compute it — which is why [`Self::referenced_bytes`]
+    /// exists separately and is only an upper bound.
+    ///
+    /// When both are present, expect them to differ by a lot. On a measured
+    /// pool the referenced figure was roughly 25x the exclusive one, because
+    /// every snapshot shares almost all of its blocks with the dataset it was
+    /// taken from.
+    pub exclusive_bytes: Option<u64>,
+
     /// Whether snapshots were verified at all.
     ///
     /// True when they were checked against a filesystem walk *or* against the
@@ -211,6 +224,7 @@ mod tests {
             dangling: Vec::new(),
             unrecognised: Vec::new(),
             referenced_bytes: 0,
+            exclusive_bytes: None,
             snapshots_checked: true,
             protected_by_grace: 0,
             grace_seconds: 0,

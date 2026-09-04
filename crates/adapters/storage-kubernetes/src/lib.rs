@@ -182,6 +182,117 @@ impl KubernetesStorage {
     /// Instance teardown removes the pods/PVCs but not the per-commit snapshots;
     /// this reclaims them so they don't accumulate after a database is destroyed.
     /// Returns the number deleted.
+    /// GFS snapshot hash to the bytes that deleting it would actually free.
+    ///
+    /// This is ZFS's `used` on the snapshot — its *exclusive* blocks — not the
+    /// `referenced` figure `du` and `directory_physical_size_bytes` report. The
+    /// two differ by however much the snapshot shares with its dataset, which on
+    /// a copy-on-write filesystem is nearly everything: measured on a real pool,
+    /// snapshots hold 169 KB to 2.65 MB each against ~39.7 MB datasets.
+    ///
+    /// Joined in three hops, because nothing carries both facts:
+    /// `VolumeSnapshot` (which knows the GFS hash, from the annotation this
+    /// adapter writes) → `boundVolumeSnapshotContentName` →
+    /// `VolumeSnapshotContent.status.snapshotHandle`, which is the ZFS snapshot
+    /// name → `zfs list -t snapshot`.
+    ///
+    /// Note that `restoreSize` on either object is the *provisioned* volume size
+    /// — 1 GiB regardless of content — and is useless for cost.
+    ///
+    /// A hash missing from the result means its size could not be determined,
+    /// not that it is free. Callers must not treat absent as zero.
+    pub async fn list_ready_snapshot_usage(
+        &self,
+    ) -> std::result::Result<std::collections::HashMap<String, u64>, StorageError> {
+        // hop 1: GFS hash -> bound content name
+        let api = self.api_volume_snapshots();
+        let list = api
+            .list(&ListParams::default())
+            .await
+            .map_err(|e| StorageError::Internal(format!("list volumesnapshots failed: {e}")))?;
+        let mut hash_by_content: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for item in list {
+            let ready = item
+                .data
+                .get("status")
+                .and_then(|s| s.get("readyToUse"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !ready {
+                continue;
+            }
+            let Some(hash) = item
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get("gfs.guepard.run/snapshot_hash"))
+                .map(|h| h.trim().to_ascii_lowercase())
+            else {
+                continue;
+            };
+            if let Some(content) = item
+                .data
+                .get("status")
+                .and_then(|s| s.get("boundVolumeSnapshotContentName"))
+                .and_then(|v| v.as_str())
+            {
+                hash_by_content.insert(content.to_string(), hash);
+            }
+        }
+
+        // hop 2: content name -> ZFS snapshot handle
+        let contents = self.api_volume_snapshot_contents();
+        let clist = contents
+            .list(&ListParams::default())
+            .await
+            .map_err(|e| StorageError::Internal(format!("list vscontents failed: {e}")))?;
+        let mut hash_by_handle: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for item in clist {
+            let Some(name) = item.metadata.name.as_deref() else {
+                continue;
+            };
+            let Some(hash) = hash_by_content.get(name) else {
+                continue;
+            };
+            if let Some(handle) = item
+                .data
+                .get("status")
+                .and_then(|s| s.get("snapshotHandle"))
+                .and_then(|v| v.as_str())
+            {
+                hash_by_handle.insert(handle.to_string(), hash.clone());
+            }
+        }
+
+        // hop 3: handle -> exclusive bytes
+        let out_zfs = tokio::process::Command::new("zfs")
+            .args(["list", "-Hp", "-t", "snapshot", "-o", "name,used"])
+            .output()
+            .await
+            .map_err(|e| StorageError::Internal(format!("zfs list failed: {e}")))?;
+        let mut out = std::collections::HashMap::new();
+        if out_zfs.status.success() {
+            for line in String::from_utf8_lossy(&out_zfs.stdout).lines() {
+                let mut cols = line.split('\t');
+                let (Some(name), Some(used)) = (cols.next(), cols.next()) else {
+                    continue;
+                };
+                let Ok(used) = used.parse::<u64>() else {
+                    continue;
+                };
+                // `zfs list` prints `<pool>/<handle>`; the handle has no pool.
+                if let Some((_, tail)) = name.split_once('/')
+                    && let Some(hash) = hash_by_handle.get(tail)
+                {
+                    out.insert(hash.clone(), used);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Every GFS snapshot hash the cluster currently holds a `VolumeSnapshot`
     /// for, taken from the `gfs.guepard.run/snapshot_hash` annotation this
     /// adapter writes when it creates one.

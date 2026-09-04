@@ -10,7 +10,7 @@ use gfs_domain::model::fsck::FsckReport;
 use gfs_domain::model::layout::{GC_DIR, GFS_DIR};
 use gfs_domain::repo_utils::fsck::{self, DEFAULT_GRACE, SnapshotSource};
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use crate::cli_utils::get_repo_dir;
 use crate::output::{cyan, dimmed, fmt_bytes, gold, green, red, yellow};
@@ -32,10 +32,23 @@ pub async fn run(
     // the only way to know whether a commit's snapshot still exists is to ask
     // the cluster. Asking is done here rather than in the domain: fsck should
     // not know what Kubernetes is.
-    let known: Option<HashSet<String>> = if runtime_is_kubernetes(&repo_path) {
+    let known: Option<HashMap<String, Option<u64>>> = if runtime_is_kubernetes(&repo_path) {
         match gfs_storage_kubernetes::KubernetesStorage::new(None).await {
             Ok(s) => match s.list_ready_snapshot_hashes().await {
-                Ok(set) => Some(set),
+                Ok(set) => {
+                    // Sizes are a bonus, not a requirement: if the join to ZFS
+                    // fails the inventory is still correct and worth using, so
+                    // each hash carries None rather than the call failing.
+                    let sizes = s.list_ready_snapshot_usage().await.unwrap_or_default();
+                    Some(
+                        set.into_iter()
+                            .map(|h| {
+                                let size = sizes.get(&h).copied();
+                                (h, size)
+                            })
+                            .collect(),
+                    )
+                }
                 Err(e) => {
                     // Reported, not fatal: the rest of the check is still
                     // worth running, and the report will say snapshots were
@@ -221,19 +234,30 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
         }
         println_safe!(
             "  {}",
-            dimmed(format!(
-                "{} objects, {}",
-                report.unreachable.len(),
-                fmt_bytes(report.referenced_bytes)
-            ))
+            dimmed(match report.exclusive_bytes {
+                // The backend told us what would actually be freed.
+                Some(exclusive) => format!(
+                    "{} objects, {} would be freed",
+                    report.unreachable.len(),
+                    fmt_bytes(exclusive)
+                ),
+                None => format!(
+                    "{} objects, {} referenced",
+                    report.unreachable.len(),
+                    fmt_bytes(report.referenced_bytes)
+                ),
+            })
         )?;
         println_safe!(
             "  {}",
-            dimmed(
-                "this is what a collector could remove, not space already free \u{2014} on a \
-                 copy-on-write filesystem these trees share blocks with the ones they \
-                 were cloned from"
-            )
+            dimmed(if report.exclusive_bytes.is_some() {
+                "measured by the storage backend as the blocks these hold exclusively, so it \
+                 is what would actually be freed"
+            } else {
+                "an upper bound, as `du` reports it: on a copy-on-write filesystem these share \
+                 blocks with what they were cloned from, so the space freed is between zero \
+                 and this"
+            })
         )?;
     }
 

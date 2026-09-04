@@ -22,7 +22,7 @@
 //! younger than the cutoff is treated as a **root**, not merely skipped, the
 //! way git's `reachable.c` does.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -189,9 +189,18 @@ pub fn roots(repo_path: &Path) -> Result<(Vec<String>, Vec<Dangling>), RepoError
 pub enum SnapshotSource<'a> {
     /// Walk `.gfs/snapshots/`. Correct for the file, APFS and btrfs backends.
     Filesystem,
-    /// Exactly these snapshot hashes exist, as reported by the backend. Used
-    /// for Kubernetes, where the adapter lists ready `VolumeSnapshot`s.
-    Known(&'a HashSet<String>),
+    /// Exactly these snapshot hashes exist, as reported by the backend, mapped
+    /// to the bytes deleting each would actually free. Used for Kubernetes,
+    /// where the adapter lists ready `VolumeSnapshot`s and joins them to ZFS.
+    ///
+    /// The value is the backend's *exclusive* figure — ZFS's `used` — not the
+    /// `referenced` number a filesystem walk produces. It is the only honest
+    /// answer to "how much would I get back", and it is available only because
+    /// the backend computes it; nothing GFS can do from a directory tree
+    /// reproduces it.
+    ///
+    /// A hash present with no size is not free, only unmeasured.
+    Known(&'a HashMap<String, Option<u64>>),
     /// The backend could not be asked. Snapshots are neither verified nor
     /// reported, and the report says so rather than implying they are fine.
     Unavailable,
@@ -204,7 +213,7 @@ impl SnapshotSource<'_> {
                 let (a, b) = hash.split_at(2);
                 snapshots_dir.join(a).join(b).is_dir()
             }
-            SnapshotSource::Known(set) => set.contains(hash),
+            SnapshotSource::Known(map) => map.contains_key(hash),
             // Nothing is provably missing when nothing can be asked.
             SnapshotSource::Unavailable => true,
         }
@@ -442,6 +451,7 @@ pub fn check_with(
     let mut unreachable: Vec<Unreachable> = Vec::new();
     let mut unrecognised: Vec<Unrecognised> = Vec::new();
     let mut referenced_bytes: u64 = 0;
+    let mut exclusive_bytes: u64 = 0;
     let mut protected: usize = 0;
 
     for (hash, path) in two_level(&objects_dir) {
@@ -488,20 +498,22 @@ pub fn check_with(
     }
 
     let mut checked_snapshots = 0usize;
-    if let SnapshotSource::Known(set) = snapshots {
-        // The backend is the inventory. Anything it holds that no reachable
-        // commit named is collectable; size is unknown from here, so it is
-        // reported at zero rather than guessed.
-        for hash in set.iter() {
+    if let SnapshotSource::Known(map) = snapshots {
+        // The backend is the inventory, and it also knows what each snapshot
+        // exclusively holds — which a directory walk cannot. These bytes are
+        // the real thing: what deleting it would free, not what `du` shows.
+        for (hash, size) in map.iter() {
             checked_snapshots += 1;
             if marks.snapshots.contains(hash) {
                 continue;
             }
+            let bytes = size.unwrap_or(0);
+            exclusive_bytes += bytes;
             unreachable.push(Unreachable {
                 kind: ObjectKind::Snapshot,
                 hash: hash.clone(),
                 summary: None,
-                bytes: 0,
+                bytes,
             });
         }
     } else if check_snapshots {
@@ -555,6 +567,11 @@ pub fn check_with(
         dangling,
         unrecognised,
         referenced_bytes,
+        exclusive_bytes: if matches!(snapshots, SnapshotSource::Known(_)) {
+            Some(exclusive_bytes)
+        } else {
+            None
+        },
         snapshots_checked: check_snapshots,
         protected_by_grace: protected,
         grace_seconds: grace.as_secs(),
