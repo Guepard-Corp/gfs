@@ -446,8 +446,18 @@ pub struct Blind {
 impl Blind {
     /// `what` names the thing, relative to the repository where possible.
     fn note(&mut self, what: impl Into<String>, why: impl Into<String>) {
+        let what = what.into();
+        // One thing we could not look at is one finding, however many walks trip
+        // over it. Two paths reach the same unreadable object -- the mark phase
+        // and the store scan -- and listing it twice reads as two problems, which
+        // sends the reader looking for a second fault that does not exist. First
+        // reason wins: it comes from the walk that needed the object, so it says
+        // what the failure cost.
+        if self.notes.iter().any(|n| n.hash == what) {
+            return;
+        }
         self.notes.push(Unrecognised {
-            hash: what.into(),
+            hash: what,
             reason: why.into(),
             bytes: 0,
         });
@@ -478,13 +488,24 @@ enum Presence {
 }
 
 fn presence(path: &Path) -> Presence {
-    match std::fs::metadata(path) {
-        Ok(_) => Presence::Present,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Presence::Absent,
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Presence::Absent,
         // Permission denied, a broken mount, an I/O error: all mean we did not
         // get to look, which is not the same as having looked and found nothing.
-        Err(_) => Presence::Unreadable,
+        Err(_) => return Presence::Unreadable,
+    };
+    // `metadata` is `stat`, which answers about the directory entry and ignores
+    // the file's own mode. A mode-000 file stats perfectly well and cannot be
+    // opened — the exact case `Unreadable` exists to name — so `stat` alone makes
+    // this a two-valued answer wearing a three-valued type. A file is therefore
+    // probed by opening it. Directories are not: traversal failure surfaces at
+    // the `read_dir` that needs it, and opening every directory here would cost a
+    // syscall per entry to learn something no caller asks at this point.
+    if meta.is_file() && std::fs::File::open(path).is_err() {
+        return Presence::Unreadable;
     }
+    Presence::Present
 }
 
 impl SnapshotSource<'_> {
@@ -726,16 +747,39 @@ fn mark(
 }
 
 /// Identify an unmarked entry in the object store.
-fn identify_object(path: &Path) -> Result<ObjectKind, String> {
-    if path.is_dir() {
-        return if path.join("schema.json").is_file() {
-            Ok(ObjectKind::Schema)
-        } else {
-            Err("directory in the object store with no schema.json".to_string())
-        };
+/// Why an entry in the object store could not be named.
+///
+/// The two are not interchangeable and collapsing them is the fault this module
+/// exists to avoid. `Malformed` is a claim about the bytes: we read them and they
+/// are not an object. `Unreadable` is a claim about *us*: the bytes may be
+/// perfectly intact and we never saw them, which is a hole in the walk and not
+/// corruption in the repository.
+enum Unidentified {
+    Unreadable(String),
+    Malformed(String),
+}
+
+fn identify_object(path: &Path) -> Result<ObjectKind, Unidentified> {
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_dir() => {
+            return if path.join("schema.json").is_file() {
+                Ok(ObjectKind::Schema)
+            } else {
+                Err(Unidentified::Malformed(
+                    "directory in the object store with no schema.json".to_string(),
+                ))
+            };
+        }
+        Ok(_) => {}
+        Err(e) => return Err(Unidentified::Unreadable(format!("could not be read: {e}"))),
     }
-    let Ok(bytes) = std::fs::read(path) else {
-        return Err("could not be read".to_string());
+    // `metadata` is `stat`, which answers about the directory entry and ignores
+    // the file's own mode, so a mode-000 object passes the check above and fails
+    // here. Reading is the only probe that settles it, which is why the read
+    // error is classified rather than folded into "not an object".
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => return Err(Unidentified::Unreadable(format!("could not be read: {e}"))),
     };
     if serde_json::from_slice::<Commit>(&bytes).is_ok() {
         return Ok(ObjectKind::Commit);
@@ -743,7 +787,9 @@ fn identify_object(path: &Path) -> Result<ObjectKind, String> {
     if repo_layout::decode_file_entries(&bytes).is_ok() {
         return Ok(ObjectKind::FileList);
     }
-    Err("not a commit, file list or schema object".to_string())
+    Err(Unidentified::Malformed(
+        "not a commit, file list or schema object".to_string(),
+    ))
 }
 
 /// Whether `path` was modified after `cutoff`, and so is protected.
@@ -916,11 +962,14 @@ pub fn check_with(
                     bytes,
                 });
             }
-            Err(reason) => unrecognised.push(Unrecognised {
+            Err(Unidentified::Malformed(reason)) => unrecognised.push(Unrecognised {
                 hash,
                 reason,
                 bytes,
             }),
+            // Not corruption: an object we could not open may be intact, and
+            // calling it corrupt sends the reader to repair a file that is fine.
+            Err(Unidentified::Unreadable(reason)) => blind.note(hash, reason),
         }
     }
 
@@ -946,11 +995,15 @@ pub fn check_with(
                 ),
                 bytes: object_size(path),
             }),
-            Err(reason) => unrecognised.push(Unrecognised {
+            Err(Unidentified::Malformed(reason)) => unrecognised.push(Unrecognised {
                 hash: hash.clone(),
                 reason: format!("referenced as {} but {reason}", expected.as_str()),
                 bytes: object_size(path),
             }),
+            Err(Unidentified::Unreadable(reason)) => blind.note(
+                hash.clone(),
+                format!("referenced as {} but {reason}", expected.as_str()),
+            ),
         }
     }
 
@@ -1486,6 +1539,59 @@ mod tests {
         let r = check(d.path(), Duration::ZERO).unwrap();
         assert_eq!(r.unrecognised.len(), 1, "{r:?}");
         assert_eq!(r.exit_code(), 2);
+    }
+
+    /// An object we cannot open is not an object we looked at and found broken.
+    /// `stat` succeeds on a mode-000 file, so a check built on `metadata` alone
+    /// calls it present, fails to read it, and reports corruption: a dangling
+    /// entry naming itself, plus an "unrecognised" line about a file that may be
+    /// perfectly intact. It sends the reader to repair something that is fine.
+    ///
+    /// Root ignores permission bits, so this cannot be written to pass under
+    /// every uid. It announces the skip instead of passing vacuously — a green
+    /// test that exercised nothing is worse than an absent one.
+    #[test]
+    fn an_object_that_stats_but_will_not_open_is_a_hole_not_corruption() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let d = repo();
+        let hash = write_commit(d.path(), "e", "unopenable", None, true);
+        set_branch(d.path(), "main", &hash);
+        let obj = d
+            .path()
+            .join(GFS_DIR)
+            .join(OBJECTS_DIR)
+            .join(&hash[..2])
+            .join(&hash[2..]);
+
+        fs::set_permissions(&obj, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::File::open(&obj).is_ok() {
+            eprintln!("SKIP: running as a uid that ignores mode bits (root); nothing exercised");
+            return;
+        }
+        assert!(
+            fs::metadata(&obj).is_ok(),
+            "precondition: stat still succeeds"
+        );
+
+        let r = check(d.path(), Duration::ZERO).unwrap();
+        let _ = fs::set_permissions(&obj, fs::Permissions::from_mode(0o644));
+
+        assert!(
+            r.dangling.is_empty(),
+            "an unreadable object is not a commit referencing something missing: {:?}",
+            r.dangling
+        );
+        assert!(
+            r.unrecognised.is_empty(),
+            "nor is it an entry we read and could not name: {:?}",
+            r.unrecognised
+        );
+        assert!(
+            !r.reachability_complete,
+            "the walk did not reach everything"
+        );
+        assert!(r.unreachable.is_empty(), "and so may propose nothing");
     }
 
     /// An absent HEAD is corruption, not a repository that happens to have no
