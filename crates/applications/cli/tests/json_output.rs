@@ -250,6 +250,111 @@ fn fsck_reports_an_unidentifiable_object_and_exits_two() {
     assert_eq!(v["fsck"]["unrecognised"].as_array().unwrap().len(), 1);
 }
 
+/// The counting test: build a repository whose garbage is known by construction,
+/// then assert fsck finds that and nothing else.
+///
+/// Two branches, one commit each, both deleted. Each commit contributes exactly
+/// three objects — the commit, its file list, its snapshot tree — so six is the
+/// whole answer, and `main` plus its own three must survive. The four fsck tests
+/// above never commit anything, so none of them exercises the walk on a real
+/// graph; a miscount there is invisible to all of them.
+///
+/// Asserting the exact set rather than a lower bound is the point. Over-reporting
+/// is the dangerous direction: everything fsck names is what a collector would
+/// later delete, so a test that only checks "at least the garbage" would pass on
+/// a walk that also condemned `main`.
+#[test]
+fn fsck_finds_exactly_the_garbage_two_deleted_branches_leave() {
+    let tmp = TempDir::new().unwrap();
+    assert_eq!(run_gfs(tmp.path(), &["init", "."]).0, 0, "init");
+
+    // `init .` records WORKSPACE relative to the repo root ("./.gfs/workspaces/..."),
+    // so it must be resolved against that root and not against the test process's cwd.
+    // `Path::join` returns the argument unchanged when it is absolute, so this is
+    // correct for both forms.
+    let workspace = |t: &std::path::Path| -> std::path::PathBuf {
+        t.join(
+            std::fs::read_to_string(t.join(".gfs/WORKSPACE"))
+                .unwrap()
+                .trim(),
+        )
+    };
+
+    std::fs::write(workspace(tmp.path()).join("a.txt"), b"base").unwrap();
+    assert_eq!(
+        run_gfs(tmp.path(), &["commit", "-m", "base"]).0,
+        0,
+        "base commit"
+    );
+
+    for b in ["g1", "g2"] {
+        assert_eq!(
+            run_gfs(tmp.path(), &["checkout", "-b", b]).0,
+            0,
+            "branch {b}"
+        );
+        std::fs::write(workspace(tmp.path()).join(format!("{b}.txt")), b).unwrap();
+        assert_eq!(
+            run_gfs(tmp.path(), &["commit", "-m", b]).0,
+            0,
+            "commit on {b}"
+        );
+    }
+    assert_eq!(
+        run_gfs(tmp.path(), &["checkout", "main"]).0,
+        0,
+        "back to main"
+    );
+    for b in ["g1", "g2"] {
+        assert_eq!(run_gfs(tmp.path(), &["branch", "-d", b]).0, 0, "delete {b}");
+    }
+
+    let (code, stdout, stderr) = run_gfs(tmp.path(), &["fsck", "--grace", "0", "--json"]);
+    assert_stderr_empty(&stderr);
+    let v = assert_stdout_json(&stdout);
+
+    assert_eq!(code, 1, "garbage found exits 1, got {code}");
+    assert_eq!(
+        v["fsck"]["dangling"].as_array().unwrap().len(),
+        0,
+        "nothing is broken"
+    );
+    assert!(
+        v["fsck"]["reachability_complete"].as_bool().unwrap(),
+        "the walk was whole"
+    );
+
+    let mut kinds: Vec<&str> = v["fsck"]["unreachable"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["kind"].as_str().unwrap())
+        .collect();
+    kinds.sort_unstable();
+    assert_eq!(
+        kinds,
+        [
+            "commit",
+            "commit",
+            "file_list",
+            "file_list",
+            "snapshot",
+            "snapshot"
+        ],
+        "exactly the two deleted branches, and main untouched"
+    );
+
+    assert!(
+        v["fsck"]["referenced_bytes"].as_u64().unwrap() > 0,
+        "the byte total must be reported, not left at zero"
+    );
+    assert_eq!(
+        v["fsck"]["checked_commits"].as_u64().unwrap(),
+        1,
+        "only main is reachable"
+    );
+}
+
 /// A plan is the prelude to a deletion, so it must not be produced for a
 /// repository that is already inconsistent.
 #[test]
