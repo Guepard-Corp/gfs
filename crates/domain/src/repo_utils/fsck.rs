@@ -134,10 +134,35 @@ fn two_level(
         if is_incidental(prefix_name) {
             continue;
         }
-        if prefix_name.len() != 2
-            || !prefix_name.chars().all(|c| c.is_ascii_hexdigit())
-            || !prefix_path.is_dir()
-        {
+        if prefix_name.len() != 2 || !prefix_name.chars().all(|c| c.is_ascii_hexdigit()) {
+            junk.push(prefix_path);
+            continue;
+        }
+        // `is_dir()` was the whole test here, and it is false both for "not a
+        // directory" and for "could not be stat'd" -- so an object store the
+        // process cannot traverse (mode 444: readable, not executable) turned
+        // every well-formed shard in it into "unexpected entry in the object
+        // store". The reader was handed a list of corruption to repair, all of it
+        // an artefact of the one permission we lacked.
+        let meta = match std::fs::symlink_metadata(&prefix_path) {
+            Ok(m) => m,
+            // Raced away between listing and stat: gone is gone, and there is
+            // nothing left to report about it.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                blind.at(
+                    repo_path,
+                    &prefix_path,
+                    format!("shard could not be stat'd: {e}"),
+                );
+                continue;
+            }
+        };
+        // A shard is a directory GFS created. A symlink in its place is an
+        // anomaly worth naming, and following it walks the object store out of
+        // the repository -- reporting paths under a directory that only looks
+        // like it is inside, and putting them in front of a collector.
+        if meta.file_type().is_symlink() || !meta.is_dir() {
             junk.push(prefix_path);
             continue;
         }
@@ -1539,6 +1564,73 @@ mod tests {
         let r = check(d.path(), Duration::ZERO).unwrap();
         assert_eq!(r.unrecognised.len(), 1, "{r:?}");
         assert_eq!(r.exit_code(), 2);
+    }
+
+    /// A shard is a directory GFS created. A symlink in its place is an anomaly,
+    /// and following it walks the object store out of the repository -- naming
+    /// paths under a directory that only *looks* like it is inside, and putting
+    /// them in front of whatever consumes the report.
+    #[test]
+    fn a_symlinked_shard_is_named_and_not_followed() {
+        let d = repo();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("precious.txt"), b"not mine").unwrap();
+        let shard = d.path().join(GFS_DIR).join(OBJECTS_DIR).join("ab");
+        std::os::unix::fs::symlink(outside.path(), &shard).unwrap();
+
+        let r = check(d.path(), Duration::ZERO).unwrap();
+
+        assert_eq!(
+            r.unrecognised.len(),
+            1,
+            "the link itself is the finding: {r:?}"
+        );
+        assert!(
+            r.unrecognised[0].hash.ends_with("ab"),
+            "names the shard, not what is behind it: {:?}",
+            r.unrecognised[0].hash
+        );
+        let all = format!("{r:?}");
+        assert!(
+            !all.contains("precious"),
+            "nothing outside the repository may appear in the report: {all}"
+        );
+    }
+
+    /// `is_dir()` is false both for "not a directory" and for "could not stat
+    /// it", so an object store the process cannot traverse (mode 444: readable,
+    /// not executable) turned every well-formed shard into corruption. The
+    /// reader got a list of objects to repair that were all perfectly intact.
+    ///
+    /// Root ignores mode bits, so this announces a skip rather than passing
+    /// vacuously.
+    #[test]
+    fn shards_behind_a_dir_we_cannot_traverse_are_a_hole_not_corruption() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let d = repo();
+        let hash = write_commit(d.path(), "b", "c", None, true);
+        set_branch(d.path(), "main", &hash);
+        let objects = d.path().join(GFS_DIR).join(OBJECTS_DIR);
+
+        fs::set_permissions(&objects, fs::Permissions::from_mode(0o444)).unwrap();
+        let blocked = fs::metadata(objects.join(&hash[..2])).is_err();
+        if !blocked {
+            let _ = fs::set_permissions(&objects, fs::Permissions::from_mode(0o755));
+            eprintln!("SKIP: this uid can traverse a mode-444 directory (root); nothing exercised");
+            return;
+        }
+
+        let r = check(d.path(), Duration::ZERO).unwrap();
+        let _ = fs::set_permissions(&objects, fs::Permissions::from_mode(0o755));
+
+        assert!(
+            r.unrecognised.is_empty(),
+            "a shard we could not stat is not an unexpected entry: {:?}",
+            r.unrecognised
+        );
+        assert!(!r.reachability_complete);
+        assert_eq!(r.exit_code(), 3, "could-not-complete, not corruption");
     }
 
     /// An object we cannot open is not an object we looked at and found broken.
