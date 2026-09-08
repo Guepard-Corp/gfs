@@ -250,6 +250,35 @@ fn fsck_reports_an_unidentifiable_object_and_exits_two() {
     assert_eq!(v["fsck"]["unrecognised"].as_array().unwrap().len(), 1);
 }
 
+/// `--json` means every outcome is machine-readable, including a failure. This
+/// path printed to stderr and left stdout empty, so a caller parsing the output
+/// got an empty string rather than an error it could act on.
+///
+/// `status`, `log` and `schema show` all emit `{"error": {...}}` on the same
+/// failure, so fsck was the one breaking the contract. It cannot reach the
+/// handler in `main.rs` that builds that object, because it reports this outcome
+/// as `Ok(3)` rather than an `Err`.
+#[test]
+fn fsck_json_emits_an_error_object_when_it_cannot_run() {
+    let tmp = TempDir::new().unwrap(); // never initialised: not a repository
+
+    let (code, stdout, _) = run_gfs(tmp.path(), &["fsck", "--json"]);
+    assert_eq!(code, 3, "could-not-run, not clean and not garbage");
+
+    let v = assert_stdout_json(&stdout);
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not a GFS repository"),
+        "the message must say what is wrong: {v}"
+    );
+    assert!(
+        v["error"]["details"].is_string(),
+        "same shape as every other command's error: {v}"
+    );
+}
+
 /// The counting test: build a repository whose garbage is known by construction,
 /// then assert fsck finds that and nothing else.
 ///

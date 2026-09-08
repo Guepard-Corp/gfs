@@ -103,15 +103,32 @@ pub async fn run(
                 std::fs::metadata(repo_path.join(GFS_DIR)),
                 Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
             );
-            if missing {
-                eprintln!(
-                    "{} not a GFS repository: no {GFS_DIR} in {} (run from a repo root or use \
+            let message = if missing {
+                format!(
+                    "not a GFS repository: no {GFS_DIR} in {} (run from a repo root or use \
                      --path <dir>)",
-                    red("error:"),
                     repo_path.display()
-                );
+                )
             } else {
-                eprintln!("{} could not complete the check: {e}", red("error:"));
+                format!("could not complete the check: {e}")
+            };
+            // `--json` means every outcome is machine-readable, including this
+            // one. Printing the error to stderr and nothing to stdout left a
+            // caller parsing an empty string -- and every sibling command
+            // (`status`, `log`, `schema show`) emits this shape on the same
+            // failure, so fsck was the one that broke the contract. Same object
+            // as `main.rs` builds for a returned Err; fsck cannot use that path
+            // because it reports this outcome as Ok(3) rather than an Err.
+            if json_output {
+                println_safe!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "error": { "message": message, "details": format!("{e:#}") }
+                    }))
+                    .unwrap_or_else(|_| "{\"error\":{\"message\":\"serialization failed\"}}".into())
+                )?;
+            } else {
+                eprintln!("{} {message}", red("error:"));
             }
             // Exit 3, not 1. 1 means "the check ran and found unreachable
             // objects" — a routine, actionable outcome that a cron job may well
