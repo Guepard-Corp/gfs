@@ -270,11 +270,15 @@ pub fn roots(
     let head_path = repo_path.join(GFS_DIR).join(HEAD_FILE);
     let head_raw = match std::fs::read_to_string(&head_path) {
         Ok(h) => h.trim().to_string(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        // Every failure here is a hole, absence included. Elsewhere NotFound is a
+        // real answer -- `refs/deleted` does not exist until a branch is soft-deleted
+        // -- but `init` always writes HEAD, so there is no repository in which it is
+        // legitimately missing. A HEAD we did not read may have been detached, and a
+        // detached HEAD is the only root its commit has, so treating the failure as
+        // "no detached HEAD" drops that root and offers a live commit for collection.
+        // That is the whole root set gone on one absent file, reported as a clean
+        // walk, because from here nothing looks wrong.
         Err(e) => {
-            // A HEAD we cannot read may be detached, and a detached HEAD is the
-            // only root its commit has. Treating the read failure as "no
-            // detached HEAD" drops that root and makes the commit collectable.
             blind.at(repo_path, &head_path, format!("could not be read: {e}"));
             String::new()
         }
@@ -1482,6 +1486,48 @@ mod tests {
         let r = check(d.path(), Duration::ZERO).unwrap();
         assert_eq!(r.unrecognised.len(), 1, "{r:?}");
         assert_eq!(r.exit_code(), 2);
+    }
+
+    /// An absent HEAD is corruption, not a repository that happens to have no
+    /// HEAD: `init` always writes one. It is also the only root whose loss empties
+    /// the root set silently -- a detached HEAD is the sole root its commit has, so
+    /// reading the absence as "nothing is detached" offers that live commit, its
+    /// file list and its snapshot for collection, and reports the walk as complete
+    /// while doing it.
+    ///
+    /// This is the one place the "NotFound is a real answer" rule does not hold.
+    /// It holds for `refs/deleted`, which does not exist until a branch is
+    /// soft-deleted; it never holds for HEAD.
+    #[test]
+    fn an_absent_head_is_a_hole_not_an_empty_answer() {
+        let d = repo();
+        let detached = write_commit(d.path(), "d", "reachable only via HEAD", None, true);
+        fs::write(d.path().join(GFS_DIR).join("HEAD"), &detached).unwrap();
+
+        let before = check(d.path(), Duration::ZERO).unwrap();
+        assert_eq!(
+            before.unreachable.len(),
+            0,
+            "precondition: nothing is garbage"
+        );
+
+        fs::remove_file(d.path().join(GFS_DIR).join("HEAD")).unwrap();
+        let after = check(d.path(), Duration::ZERO).unwrap();
+
+        assert!(
+            !after.reachability_complete,
+            "the walk did not start from every root, and must not claim it did"
+        );
+        assert!(
+            after.unreachable.is_empty(),
+            "nothing may be offered for collection when a root was never read: {:?}",
+            after.unreachable
+        );
+        assert_eq!(
+            after.exit_code(),
+            3,
+            "could-not-complete, not clean and not garbage"
+        );
     }
 
     /// fsck is the tool you run *because* the repository is broken, so a ref

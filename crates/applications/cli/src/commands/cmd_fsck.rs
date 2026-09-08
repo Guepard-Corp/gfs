@@ -450,7 +450,11 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
         println_safe!("")?;
         println_safe!(
             "{}",
-            yellow("could not be read (present, but this process cannot open them):")
+            // Not "present, but unopenable": an absent .gfs/HEAD lands here too, and
+            // `init` always writes one, so its absence is a hole rather than an answer.
+            // Saying "present" about a file that is gone is the class of wrong message
+            // this section exists to avoid.
+            yellow("the walk could not read these, so it did not start from every root:")
         )?;
         for u in &report.unreadable {
             println_safe!("  {}  {}", gold(short(&u.hash)), dimmed(&u.reason))?;
@@ -459,7 +463,8 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
             "  {}",
             dimmed(
                 "not a claim about the data, which may be perfectly intact \u{2014} usually a \
-                 permissions problem. Run as a user that can read the object store"
+                 permission the running user lacks, or a file that should exist and does \
+                 not. Fix what is listed and run again"
             )
         )?;
     }
