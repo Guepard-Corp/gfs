@@ -133,24 +133,7 @@ mod imp {
     /// source, and is dropped on `EPERM` because it requires ownership.
     fn open_source(src: &Path) -> Option<Fd> {
         fn first_regular_file(dir: &Path, budget: &mut u32) -> Option<std::path::PathBuf> {
-            if *budget == 0 {
-                return None;
-            }
-            let mut subdirs = Vec::new();
-            for entry in std::fs::read_dir(dir).ok()?.flatten() {
-                if *budget == 0 {
-                    return None;
-                }
-                *budget -= 1;
-                match entry.file_type() {
-                    Ok(t) if t.is_file() => return Some(entry.path()),
-                    Ok(t) if t.is_dir() => subdirs.push(entry.path()),
-                    _ => {}
-                }
-            }
-            subdirs
-                .into_iter()
-                .find_map(|d| first_regular_file(&d, budget))
+            super::find_probe_source(dir, budget)
         }
 
         // Bounded so an enormous or pathological tree cannot make the probe
@@ -226,19 +209,119 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Find a small regular file under `dir` to use as a clone source.
+///
+/// Small on purpose. On macOS `clonefile` produces a real clone of the source,
+/// so a process killed between the clone and the unlink would leave behind a
+/// file the size of whatever was picked. A data directory almost always has a
+/// tiny file near the top (PostgreSQL has `PG_VERSION`, three bytes), so
+/// preferring the smallest candidate seen keeps that residue negligible. The
+/// walk is bounded so a pathological tree cannot make the probe cost more than
+/// the copy it describes.
+#[cfg(unix)]
+pub(crate) fn find_probe_source(dir: &Path, budget: &mut u32) -> Option<std::path::PathBuf> {
+    const SMALL_ENOUGH: u64 = 64 * 1024;
+    let mut best: Option<(u64, std::path::PathBuf)> = None;
+    let mut subdirs = Vec::new();
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        if *budget == 0 {
+            break;
+        }
+        *budget -= 1;
+        match entry.file_type() {
+            Ok(t) if t.is_file() => {
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
+                if size <= SMALL_ENOUGH {
+                    return Some(entry.path());
+                }
+                if best.as_ref().is_none_or(|(b, _)| size < *b) {
+                    best = Some((size, entry.path()));
+                }
+            }
+            Ok(t) if t.is_dir() => subdirs.push(entry.path()),
+            _ => {}
+        }
+    }
+    for d in subdirs {
+        if *budget == 0 {
+            break;
+        }
+        if let Some(found) = find_probe_source(&d, budget) {
+            return Some(found);
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+#[cfg(target_os = "macos")]
+mod imp {
+    use super::{NoReflink, Outcome};
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    unsafe extern "C" {
+        /// `clonefile(2)` — APFS copy-on-write clone. Path-based, and the
+        /// destination must not exist, so unlike Linux there is no way to clone
+        /// into an unnamed inode.
+        fn clonefile(src: *const libc::c_char, dst: *const libc::c_char, flags: u32)
+        -> libc::c_int;
+    }
+
+    fn cstr(p: &Path) -> Option<CString> {
+        CString::new(p.as_os_str().as_bytes()).ok()
+    }
+
+    pub fn check(src: &Path, dst_dir: &Path) -> Outcome {
+        let mut budget = 512u32;
+        let src_file = if src.is_file() {
+            src.to_path_buf()
+        } else {
+            match super::find_probe_source(src, &mut budget) {
+                Some(f) => f,
+                None => return Outcome::Unknown,
+            }
+        };
+
+        let mut seed = [0u8; 16];
+        if std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut seed))
+            .is_err()
+        {
+            return Outcome::Unknown;
+        }
+        let name: String = seed.iter().map(|b| format!("{b:02x}")).collect();
+        let probe = dst_dir.join(format!(".gfs-clone-probe-{name}"));
+
+        let (Some(s), Some(d)) = (cstr(&src_file), cstr(&probe)) else {
+            return Outcome::Unknown;
+        };
+        let rc = unsafe { clonefile(s.as_ptr(), d.as_ptr(), 0) };
+        let err = std::io::Error::last_os_error().raw_os_error();
+        // Remove it whatever happened; a failed clone may still have created it.
+        let _ = std::fs::remove_file(&probe);
+
+        if rc == 0 {
+            return Outcome::Clones;
+        }
+        match err {
+            // Measured on a real HFS+ volume: ENOTSUP.
+            Some(libc::ENOTSUP) => Outcome::FullCopy(NoReflink::Unsupported),
+            // Measured across an APFS/HFS+ volume boundary, both directions.
+            Some(libc::EXDEV) => Outcome::FullCopy(NoReflink::CrossDevice),
+            // Anything else says nothing about the filesystem's capability.
+            _ => Outcome::Unknown,
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod imp {
     use super::Outcome;
     use std::path::Path;
 
-    /// Not yet implemented off Linux.
-    ///
-    /// macOS has the same defect and it is equally unreported: measured,
-    /// `/bin/cp -cRp` onto an HFS+ volume exits 0 and consumes the full size,
-    /// so a non-APFS, external, network or cross-volume destination silently
-    /// gets a full copy. The equivalent probe is `clonefile(2)` with the same
-    /// `ENOTSUP` / `EXDEV` classification. Until that exists, report nothing
-    /// rather than guess.
+    /// Windows has no clone concept at all — robocopy always copies bytes —
+    /// so there is no capability to probe and nothing conditional to report.
     pub fn check(_src: &Path, _dst_dir: &Path) -> Outcome {
         Outcome::Unknown
     }
