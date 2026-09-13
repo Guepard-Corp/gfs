@@ -154,6 +154,147 @@ impl KubernetesStorage {
     }
 
     /// Delete a PVC if it exists (best-effort; waits for removal).
+    /// Clone a snapshot into a NEW PVC, stamping `extra_labels` onto it.
+    ///
+    /// The labels are how a PVC stays attributable after creation. The
+    /// [`StoragePort::clone`] path stamps only `app.kubernetes.io/name=gfs`,
+    /// which is enough to recognise a GFS volume but not enough to say WHICH
+    /// instance owns it — so a destroy could not find an instance's per-branch
+    /// volumes to reclaim, and they would leak one ZFS clone per branch.
+    pub async fn clone_labelled(
+        &self,
+        target_id: VolumeId,
+        options: CloneOptions,
+        extra_labels: &BTreeMap<String, String>,
+    ) -> Result<VolumeStatus> {
+        let pvcs = self.api_pvcs();
+        let target = target_id.0.trim().to_string();
+        if target.is_empty() {
+            return Err(StorageError::Internal("empty target pvc name".into()));
+        }
+
+        let mut spec = PersistentVolumeClaimSpec {
+            access_modes: Some(vec!["ReadWriteOnce".to_string()]),
+            storage_class_name: k8s_storage_class(),
+            resources: Some(k8s_openapi::api::core::v1::VolumeResourceRequirements {
+                requests: Some(BTreeMap::from([(
+                    "storage".to_string(),
+                    k8s_openapi::apimachinery::pkg::api::resource::Quantity(format!(
+                        "{}Gi",
+                        k8s_pvc_size_gi()
+                    )),
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        if let Some(from) = options.from_snapshot {
+            // PVC from VolumeSnapshot
+            spec.data_source = Some(k8s_openapi::api::core::v1::TypedLocalObjectReference {
+                api_group: Some("snapshot.storage.k8s.io".to_string()),
+                kind: "VolumeSnapshot".to_string(),
+                name: from.0,
+            });
+        } else {
+            return Err(StorageError::Internal(
+                "clone without from_snapshot is not supported for kubernetes storage".into(),
+            ));
+        }
+
+        let pvc = PersistentVolumeClaim {
+            metadata: ObjectMeta {
+                name: Some(target.clone()),
+                namespace: Some(self.namespace.clone()),
+                labels: Some({
+                    let mut labels =
+                        BTreeMap::from([("app.kubernetes.io/name".to_string(), "gfs".to_string())]);
+                    labels.extend(extra_labels.clone());
+                    labels
+                }),
+                ..Default::default()
+            },
+            spec: Some(spec),
+            ..Default::default()
+        };
+
+        // Apply-create (idempotent)
+        pvcs.patch(
+            &target,
+            &PatchParams::apply("gfs").force(),
+            &Patch::Apply(&pvc),
+        )
+        .await
+        .map_err(|e| StorageError::Internal(format!("failed to create PVC from snapshot: {e}")))?;
+
+        Ok(VolumeStatus {
+            id: VolumeId(target),
+            mount_point: None,
+            status: MountStatus::Mounted,
+            size_bytes: 0,
+            used_bytes: 0,
+        })
+    }
+
+    /// Names of every PVC carrying `label_selector`, e.g. an instance label.
+    ///
+    /// Reclamation reads the cluster rather than a local record on purpose: a
+    /// record can be stale, hand-edited or lost with the repository directory,
+    /// and a volume nobody remembers is exactly the one that leaks.
+    /// Whether a PVC of this name exists in the namespace.
+    ///
+    /// Checkout asks this to decide between rebinding a branch's existing volume
+    /// and cloning it a new one. It must distinguish "absent" from "could not
+    /// tell": an API failure reported as absent would send checkout down the
+    /// clone path and create a second volume beside the live one.
+    pub async fn pvc_exists(&self, name: &str) -> std::result::Result<bool, StorageError> {
+        match self.api_pvcs().get_opt(name.trim()).await {
+            Ok(found) => Ok(found.is_some()),
+            Err(e) => Err(StorageError::Internal(format!(
+                "failed to look up PVC '{}': {e}",
+                name.trim()
+            ))),
+        }
+    }
+
+    /// Value of `label` on a PVC, if the PVC and the label both exist.
+    ///
+    /// Used to attribute a volume to its owning instance without parsing the
+    /// name. Names are ambiguous once a volume can be `{instance}-{branch}-data`
+    /// and instance names themselves contain dashes; the label is exact.
+    pub async fn pvc_label(
+        &self,
+        name: &str,
+        label: &str,
+    ) -> std::result::Result<Option<String>, StorageError> {
+        let pvc = self
+            .api_pvcs()
+            .get_opt(name.trim())
+            .await
+            .map_err(|e| StorageError::Internal(format!("failed to read PVC '{name}': {e}")))?;
+        Ok(pvc
+            .and_then(|pvc| pvc.metadata.labels)
+            .and_then(|labels| labels.get(label).cloned()))
+    }
+
+    pub async fn pvc_names_matching(
+        &self,
+        label_selector: &str,
+    ) -> std::result::Result<Vec<String>, StorageError> {
+        let pvcs = self.api_pvcs();
+        let list = pvcs
+            .list(&ListParams::default().labels(label_selector))
+            .await
+            .map_err(|e| StorageError::Internal(format!("failed to list PVCs: {e}")))?;
+        let mut names: Vec<String> = list
+            .items
+            .into_iter()
+            .filter_map(|pvc| pvc.metadata.name)
+            .collect();
+        names.sort();
+        Ok(names)
+    }
+
     pub async fn delete_pvc(&self, name: &str) -> std::result::Result<(), StorageError> {
         let pvcs = self.api_pvcs();
         let name = name.trim();
@@ -404,71 +545,8 @@ impl StoragePort for KubernetesStorage {
         target_id: VolumeId,
         options: CloneOptions,
     ) -> Result<VolumeStatus> {
-        let pvcs = self.api_pvcs();
-        let target = target_id.0.trim().to_string();
-        if target.is_empty() {
-            return Err(StorageError::Internal("empty target pvc name".into()));
-        }
-
-        let mut spec = PersistentVolumeClaimSpec {
-            access_modes: Some(vec!["ReadWriteOnce".to_string()]),
-            storage_class_name: k8s_storage_class(),
-            resources: Some(k8s_openapi::api::core::v1::VolumeResourceRequirements {
-                requests: Some(BTreeMap::from([(
-                    "storage".to_string(),
-                    k8s_openapi::apimachinery::pkg::api::resource::Quantity(format!(
-                        "{}Gi",
-                        k8s_pvc_size_gi()
-                    )),
-                )])),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        if let Some(from) = options.from_snapshot {
-            // PVC from VolumeSnapshot
-            spec.data_source = Some(k8s_openapi::api::core::v1::TypedLocalObjectReference {
-                api_group: Some("snapshot.storage.k8s.io".to_string()),
-                kind: "VolumeSnapshot".to_string(),
-                name: from.0,
-            });
-        } else {
-            return Err(StorageError::Internal(
-                "clone without from_snapshot is not supported for kubernetes storage".into(),
-            ));
-        }
-
-        let pvc = PersistentVolumeClaim {
-            metadata: ObjectMeta {
-                name: Some(target.clone()),
-                namespace: Some(self.namespace.clone()),
-                labels: Some(BTreeMap::from([(
-                    "app.kubernetes.io/name".to_string(),
-                    "gfs".to_string(),
-                )])),
-                ..Default::default()
-            },
-            spec: Some(spec),
-            ..Default::default()
-        };
-
-        // Apply-create (idempotent)
-        pvcs.patch(
-            &target,
-            &PatchParams::apply("gfs").force(),
-            &Patch::Apply(&pvc),
-        )
-        .await
-        .map_err(|e| StorageError::Internal(format!("failed to create PVC from snapshot: {e}")))?;
-
-        Ok(VolumeStatus {
-            id: VolumeId(target),
-            mount_point: None,
-            status: MountStatus::Mounted,
-            size_bytes: 0,
-            used_bytes: 0,
-        })
+        self.clone_labelled(target_id, options, &BTreeMap::new())
+            .await
     }
 
     async fn status(&self, id: &VolumeId) -> Result<VolumeStatus> {

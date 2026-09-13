@@ -1,5 +1,26 @@
-//! k3s-only: reprovision Postgres after GFS checkout (PVC restore + stable NodePort).
+//! k3s-only: put a branch's data volume in front of Postgres after a GFS checkout.
+//!
+//! A checkout here does NOT destroy anything. Each branch owns its own PVC, so
+//! switching branches means recreating the StatefulSet against a different
+//! `claimName` — the outgoing branch's volume is left exactly as it was,
+//! including work that has not been committed yet.
+//!
+//! This replaced a delete-and-re-clone: the single PVC `{instance}-data` was
+//! deleted and cloned back from the target commit's VolumeSnapshot. That threw
+//! away everything since the last commit, gave a branch no live state to return
+//! to, and made every checkout depend on a PVC delete draining — which a
+//! `snapshot.storage.kubernetes.io/pvc-as-source-protection` finalizer can block
+//! indefinitely, leaving the repository with no database and no way forward.
+//!
+//! Two paths now:
+//!
+//! - **Rebind** — the branch already has a volume. No snapshot, no clone, no
+//!   delete; just point the StatefulSet at it. This is the common case and the
+//!   one that preserves uncommitted work.
+//! - **Seed** — the branch has no volume yet, so clone one from the commit's
+//!   VolumeSnapshot. Still deletes nothing.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -7,10 +28,12 @@ use gfs_domain::model::config::{EnvironmentConfig, GfsConfig, RepoCredentials, R
 use gfs_domain::ports::compute::{Compute, ComputeDefinition, EnvVar, InstanceId};
 use gfs_domain::ports::database_provider::{ContainerProvider, DatabaseProviderRegistry};
 use gfs_domain::ports::repository::Repository;
-use gfs_domain::ports::storage::{CloneOptions, SnapshotId, StoragePort, VolumeId};
+use gfs_domain::ports::storage::{CloneOptions, SnapshotId, VolumeId};
+use gfs_domain::repo_utils::branch_volumes::{self, BranchVolumes};
 use gfs_storage_kubernetes::KubernetesStorage;
 
-use crate::KubernetesCompute;
+use crate::branch_volume::{branch_data_pvc, mount_existing_pvc, pvc_belongs_to_instance};
+use crate::{INSTANCE_LABEL_KEY, KubernetesCompute};
 
 #[derive(Debug, thiserror::Error)]
 pub enum K8sCheckoutReprovisionError {
@@ -34,13 +57,34 @@ pub enum K8sCheckoutReprovisionError {
 }
 
 /// Stable ZFS-backed PVC name for Postgres data (matches `ensure_pvc` / init).
+///
+/// Still the name a fresh repository starts on. It is no longer the name of
+/// *the* data volume, because each branch gets its own — see
+/// [`crate::branch_volume::branch_data_pvc`]. Callers outside this crate that
+/// want the volume currently in front of the database must read
+/// `config.mount_point`, which is authoritative, rather than deriving it here.
 pub fn stable_data_pvc(instance: &str) -> String {
-    format!("{}-data", instance.trim())
+    crate::branch_volume::stable_data_pvc_name(instance)
 }
 
-/// Inverse of [`stable_data_pvc`]: the owning instance of a `{instance}-data` PVC.
+/// Best-effort owning instance of a data PVC, by name.
+///
+/// Only correct for the `{instance}-data` shape. A per-branch volume cannot be
+/// parsed back — `{instance}-{slug}-{hash}-data` is ambiguous because instance
+/// names contain dashes too — so callers must prefer the instance LABEL and use
+/// this only as the fallback for volumes created before labels were stamped.
 fn source_instance_from_pvc(pvc_name: &str) -> Option<&str> {
     pvc_name.strip_suffix("-data").filter(|s| !s.is_empty())
+}
+
+/// The instance that owns `pvc`: its instance label, falling back to its name.
+async fn owning_instance_of_pvc(storage: &KubernetesStorage, pvc: &str) -> Option<String> {
+    match storage.pvc_label(pvc, INSTANCE_LABEL_KEY).await {
+        Ok(Some(instance)) if !instance.trim().is_empty() => return Some(instance),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("could not read the instance label of PVC '{pvc}': {e}"),
+    }
+    source_instance_from_pvc(pvc).map(str::to_string)
 }
 
 /// Keep the advertised credential truthful for the volume about to be mounted.
@@ -71,23 +115,140 @@ async fn adopt_credentials_for_restored_volume(
             return Ok(());
         }
     };
-    let Some(source_instance) = source_pvc.as_deref().and_then(source_instance_from_pvc) else {
+    let Some(source_pvc) = source_pvc
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    else {
         tracing::warn!(
             "snapshot '{vs_name}' has no recognizable source PVC; skipping credentials adoption"
         );
         return Ok(());
     };
+
+    // Ours, whichever branch it belongs to: checkout of the instance's own
+    // history, so the Secret is already truthful. This test used to be
+    // `source_instance_from_pvc(pvc) == target_instance`, which silently stopped
+    // holding once an instance could own more than one volume — stripping
+    // `-data` off `{instance}-feat-ab12cd34-data` yields something that is not an
+    // instance name, so the instance's OWN snapshot read as a foreign one and
+    // adoption was attempted against a Secret that does not exist.
+    if pvc_belongs_to_instance(source_pvc, target_instance) {
+        return Ok(());
+    }
+
+    let Some(source_instance) = owning_instance_of_pvc(storage, source_pvc).await else {
+        tracing::warn!(
+            "could not attribute source PVC '{source_pvc}' of snapshot '{vs_name}' to an \
+             instance; skipping credentials adoption"
+        );
+        return Ok(());
+    };
     if source_instance == target_instance {
-        // Checkout of the instance's own history: Secret already truthful.
         return Ok(());
     }
     compute
-        .adopt_credentials_secret(source_instance, target_instance)
+        .adopt_credentials_secret(&source_instance, target_instance)
         .await
         .map_err(|e| K8sCheckoutReprovisionError::Compute(e.to_string()))
 }
 
-/// Restore the pinned instance's data volume from a commit's VolumeSnapshot, then start Postgres.
+/// The branch whose data should be in front of the database, as a map key.
+///
+/// `get_current_branch` returns the commit hash on a detached HEAD, which is the
+/// right key anyway: a detached checkout is pinned to one commit, so its volume
+/// is keyed by that commit rather than by a branch that does not exist.
+async fn current_branch_key(
+    repository: &Arc<dyn Repository>,
+    repo_path: &Path,
+) -> Result<String, K8sCheckoutReprovisionError> {
+    let branch = repository
+        .get_current_branch(repo_path)
+        .await
+        .map_err(|e| K8sCheckoutReprovisionError::Repository(e.to_string()))?;
+    let branch = branch.trim().to_string();
+    if branch.is_empty() {
+        return Err(K8sCheckoutReprovisionError::NotConfigured(
+            "HEAD names neither a branch nor a commit".into(),
+        ));
+    }
+    Ok(branch)
+}
+
+/// What a checkout must do to put a branch's volume in front of the database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VolumePlan {
+    /// The branch's volume is already there — point the database at it. No
+    /// snapshot is read, nothing is cloned, and nothing is deleted, so this path
+    /// preserves whatever the branch has not committed yet.
+    Rebind(String),
+    /// The branch has no volume yet — clone one from the commit's snapshot.
+    Seed(String),
+}
+
+impl VolumePlan {
+    /// The PVC the plan ends up mounting.
+    pub fn pvc(&self) -> &str {
+        match self {
+            Self::Rebind(pvc) | Self::Seed(pvc) => pvc,
+        }
+    }
+}
+
+/// The volume a branch should be using: what the repository remembers, or a
+/// fresh derived name when it remembers nothing.
+///
+/// A recorded volume keeps its name even when it has gone missing, so a branch
+/// does not acquire a new name every time something goes wrong and leave the old
+/// one behind. It also means an adopted pre-branch-aware volume keeps the name it
+/// already has — a PVC cannot be renamed, so "deriving" one would silently mean
+/// cloning and abandoning the original.
+pub fn volume_for_branch(instance: &str, branch: &str, recorded: Option<&str>) -> String {
+    recorded
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| branch_data_pvc(instance, branch))
+}
+
+/// Decide between rebinding a branch's volume and seeding it a new one.
+///
+/// Kept separate from the cluster calls because this is the whole behaviour
+/// change and it is worth being able to test: everything else in the two paths
+/// is mechanical.
+pub fn plan_volume(volume: String, exists: bool) -> VolumePlan {
+    if exists {
+        VolumePlan::Rebind(volume)
+    } else {
+        VolumePlan::Seed(volume)
+    }
+}
+
+/// Record that `branch`'s data now lives in `pvc`.
+///
+/// Non-fatal: the database is already up by the time this runs, and refusing the
+/// checkout over a bookkeeping write would be worse than the consequence of
+/// losing it. A missing record makes the next visit to this branch clone a fresh
+/// volume from the branch tip instead of rebinding this one — the old behaviour,
+/// so uncommitted work is at risk, which is why it is logged loudly.
+fn record_branch_volume(repo_path: &Path, branch: &str, pvc: &str) {
+    if let Err(e) = branch_volumes::update(repo_path, |volumes| volumes.set(branch, pvc)) {
+        tracing::warn!(
+            "could not record that branch '{branch}' uses volume '{pvc}': {e}; \
+             a later checkout of this branch will clone a new volume from its last commit \
+             instead of returning to this one"
+        );
+    }
+}
+
+/// Put the current branch's data volume in front of Postgres.
+///
+/// Rebinds the branch's existing volume when it has one, and otherwise clones it
+/// a new volume from the commit's VolumeSnapshot. Deletes no volume in either
+/// case, so the branch being left keeps its live state.
+///
+/// `snapshot_hash` is the snapshot of the commit now at HEAD; it is only read on
+/// the seeding path.
 pub async fn restore_database_volume_from_snapshot<R: DatabaseProviderRegistry>(
     storage: &KubernetesStorage,
     compute: &KubernetesCompute,
@@ -108,70 +269,79 @@ pub async fn restore_database_volume_from_snapshot<R: DatabaseProviderRegistry>(
             K8sCheckoutReprovisionError::NotConfigured("runtime.container_name missing".into())
         })?;
 
-    let data_pvc = stable_data_pvc(&stable_instance);
-    let vs_name = format!("gfs-snap-{}", &snapshot_hash[..32.min(snapshot_hash.len())]);
+    // HEAD has already moved by the time we are called, so this is the branch
+    // being switched TO.
+    let branch = current_branch_key(&repository, repo_path).await?;
 
-    let legacy_pvcs: Vec<String> = cfg
-        .mount_point
-        .as_ref()
-        .map(|mp| mp.trim().to_string())
-        .filter(|mp| !mp.is_empty() && mp.as_str() != data_pvc.as_str())
-        .into_iter()
-        .collect();
+    let recorded = BranchVolumes::load(repo_path)
+        .map_err(|e| K8sCheckoutReprovisionError::Config(e.to_string()))?
+        .get(&branch)
+        .map(str::to_string);
 
-    let instance_id = InstanceId(stable_instance.clone());
+    let target_pvc = volume_for_branch(&stable_instance, &branch, recorded.as_deref());
 
-    // Confirm the snapshot we are about to restore FROM is usable BEFORE
-    // destroying anything. This wait used to sit after the teardown and the PVC
-    // delete, so a snapshot that was missing or never became ready cost the user
-    // their StatefulSet and their PVC before anyone checked. Now an unusable
-    // snapshot is a refusal that changes nothing.
-    storage
-        .wait_snapshot_ready(&vs_name)
+    // Refuse rather than guess: an API failure read as "absent" would send us
+    // down the seeding path and clone a second volume beside the live one.
+    let exists = storage
+        .pvc_exists(&target_pvc)
         .await
         .map_err(|e| K8sCheckoutReprovisionError::Storage(e.to_string()))?;
 
-    // RESTORE teardown: must PRESERVE the VolumeSnapshots — we delete the data PVC
-    // below and then clone it back FROM `vs_name`. Using the destroy teardown
-    // (`remove_instance_with_pvcs`) here would reclaim that snapshot (SEV1 data loss).
-    compute
-        .teardown_instance_keep_snapshots(&instance_id, &legacy_pvcs)
-        .await
-        .map_err(|e| K8sCheckoutReprovisionError::Compute(e.to_string()))?;
+    let plan = plan_volume(target_pvc.clone(), exists);
+    let instance_id = InstanceId(stable_instance.clone());
 
-    // Past this point the instance is gone. A PVC that will not delete leaves the
-    // repository with no database and no way forward — every retry repeats the
-    // teardown and fails here again. Observed: a lingering
-    // `snapshot.storage.kubernetes.io/pvc-as-source-protection` finalizer, held
-    // while VolumeSnapshots reference the PVC as their source, wedged a
-    // repository permanently. So say what happened and how to get out of it,
-    // rather than reporting a bare "still exists".
-    if let Err(e) = storage.delete_pvc(&data_pvc).await {
-        return Err(K8sCheckoutReprovisionError::Storage(format!(
-            "{e}\n  The instance has already been torn down, so this repository now has no \
-             database.\n  A PVC usually refuses to delete because a VolumeSnapshot still \
-             names it as source — check:\n    kubectl get pvc -n gfs {data_pvc}              -o jsonpath='{{.metadata.finalizers}}'\n    kubectl get volumesnapshot -n gfs              -o custom-columns=N:.metadata.name,READY:.status.readyToUse,SRC:.spec.source.persistentVolumeClaimName\n               Deleting the snapshots that name it releases the finalizer and the PVC drains."
-        )));
+    if matches!(plan, VolumePlan::Rebind(_)) {
+        // REBIND. Nothing is cloned and nothing is deleted, so this path cannot
+        // lose data and cannot be blocked by a PVC that will not drain.
+        tracing::info!("checkout: rebinding branch '{branch}' to its volume '{target_pvc}'");
+        compute
+            .teardown_compute_keep_volumes(&instance_id)
+            .await
+            .map_err(|e| K8sCheckoutReprovisionError::Compute(e.to_string()))?;
+    } else {
+        // SEED. The branch has no volume yet, so clone one from the commit.
+        let vs_name = format!("gfs-snap-{}", &snapshot_hash[..32.min(snapshot_hash.len())]);
+
+        // Confirm the snapshot is usable BEFORE touching the running instance,
+        // so an unusable one is a refusal that changes nothing.
+        storage
+            .wait_snapshot_ready(&vs_name)
+            .await
+            .map_err(|e| K8sCheckoutReprovisionError::Storage(e.to_string()))?;
+
+        tracing::info!(
+            "checkout: seeding branch '{branch}' volume '{target_pvc}' from snapshot '{vs_name}'"
+        );
+
+        // Compute only. The volume the outgoing branch is using stays bound to
+        // its own PVC and is not touched.
+        compute
+            .teardown_compute_keep_volumes(&instance_id)
+            .await
+            .map_err(|e| K8sCheckoutReprovisionError::Compute(e.to_string()))?;
+
+        adopt_credentials_for_restored_volume(storage, compute, &vs_name, &stable_instance).await?;
+
+        // Stamp the owning instance on the new volume. Without it a destroy
+        // cannot enumerate the instance's volumes and each branch leaks a ZFS
+        // clone that the repository has no record of.
+        let labels = BTreeMap::from([(INSTANCE_LABEL_KEY.to_string(), stable_instance.clone())]);
+        storage
+            .clone_labelled(
+                VolumeId(target_pvc.clone()),
+                CloneOptions {
+                    from_snapshot: Some(SnapshotId(vs_name)),
+                },
+                &labels,
+            )
+            .await
+            .map_err(|e| K8sCheckoutReprovisionError::Storage(e.to_string()))?;
     }
-    for legacy in &legacy_pvcs {
-        let _ = storage.delete_pvc(legacy).await;
-    }
 
-    adopt_credentials_for_restored_volume(storage, compute, &vs_name, &stable_instance).await?;
-
-    StoragePort::clone(
-        storage,
-        &VolumeId("unused".into()),
-        VolumeId(data_pvc.clone()),
-        CloneOptions {
-            from_snapshot: Some(SnapshotId(vs_name)),
-        },
-    )
-    .await
-    .map_err(|e| K8sCheckoutReprovisionError::Storage(e.to_string()))?;
+    record_branch_volume(repo_path, &branch, &target_pvc);
 
     // PVC may stay Pending until a pod consumes it (WaitForFirstConsumer).
-    reprovision_after_pvc_restore(compute, registry, repository, repo_path, data_pvc).await
+    reprovision_after_pvc_restore(compute, registry, repository, repo_path, target_pvc).await
 }
 
 /// Re-apply the repo's configured database name and user onto a provider-default
@@ -275,10 +445,14 @@ pub async fn reprovision_after_pvc_restore<R: DatabaseProviderRegistry>(
             K8sCheckoutReprovisionError::NotConfigured("runtime.container_name missing".into())
         })?;
 
-    let expected_pvc = stable_data_pvc(&stable_instance);
-    if data_pvc != expected_pvc {
+    // The volume must belong to THIS instance. This used to require it to be
+    // exactly `{instance}-data`, which stopped being expressible once each branch
+    // owns a volume — but the protection worth keeping is not the name, it is
+    // that we never put another repository's data in front of this database. So
+    // the check is widened to ownership, not removed.
+    if !pvc_belongs_to_instance(&data_pvc, &stable_instance) {
         return Err(K8sCheckoutReprovisionError::NotConfigured(format!(
-            "checkout PVC must be {expected_pvc}, got {data_pvc}"
+            "refusing to mount '{data_pvc}': it is not a volume of instance '{stable_instance}'"
         )));
     }
 
@@ -305,7 +479,17 @@ pub async fn reprovision_after_pvc_restore<R: DatabaseProviderRegistry>(
     })?;
 
     let creds = RepoCredentials::load(repo_path);
-    let def = checkout_definition(container, &cfg, &creds);
+    let mut def = checkout_definition(container, &cfg, &creds);
+    // Name the volume explicitly rather than letting the adapter derive
+    // `{instance}-data`: the branch's volume is usually NOT that name. The `pvc:`
+    // form also tells `provision_with_instance` the volume already exists, so it
+    // skips creating one — which is what we want, since the PVC was either
+    // cloned just now or has been there since the last visit to this branch.
+    //
+    // This overrides the `host_data_dir = None` that `checkout_definition` sets:
+    // that default derives `{instance}-data`, which is only correct while an
+    // instance owns exactly one volume.
+    def.host_data_dir = Some(mount_existing_pvc(&data_pvc));
 
     let instance_id = InstanceId(stable_instance.clone());
     // SS/svc already torn down in restore_database_volume_from_snapshot; keep cloned PVC.
@@ -376,6 +560,78 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn a_branch_with_no_recorded_volume_is_seeded_under_a_derived_name() {
+        let plan = plan_volume(volume_for_branch("gfs-pg-1", "feat/thing", None), false);
+        assert_eq!(
+            plan,
+            VolumePlan::Seed(branch_data_pvc("gfs-pg-1", "feat/thing"))
+        );
+    }
+
+    #[test]
+    fn a_branch_whose_volume_is_present_is_rebound_not_recloned() {
+        // The behaviour change this task exists for: returning to a branch must
+        // not clone from its last commit, because that is what discarded
+        // everything the branch had not committed.
+        let plan = plan_volume(
+            volume_for_branch("gfs-pg-1", "main", Some("gfs-pg-1-data")),
+            true,
+        );
+        assert_eq!(plan, VolumePlan::Rebind("gfs-pg-1-data".to_string()));
+    }
+
+    #[test]
+    fn a_recorded_volume_that_vanished_is_refilled_under_the_same_name() {
+        // Not given a fresh derived name: that would leave the old name behind
+        // and let a branch accumulate volumes across failures.
+        let plan = plan_volume(
+            volume_for_branch("gfs-pg-1", "main", Some("gfs-pg-1-data")),
+            false,
+        );
+        assert_eq!(plan, VolumePlan::Seed("gfs-pg-1-data".to_string()));
+    }
+
+    #[test]
+    fn an_adopted_legacy_volume_keeps_its_name_rather_than_being_renamed() {
+        // A repository that predates per-branch volumes has its data in
+        // `{instance}-data`. Once adopted, checkout must keep using that name —
+        // a PVC cannot be renamed, so "deriving" a new one would silently mean
+        // cloning and abandoning the original.
+        let plan = plan_volume(
+            volume_for_branch("gfs-pg-1", "main", Some("gfs-pg-1-data")),
+            true,
+        );
+        assert_eq!(plan.pvc(), "gfs-pg-1-data");
+        assert_ne!(plan.pvc(), branch_data_pvc("gfs-pg-1", "main"));
+    }
+
+    #[test]
+    fn a_blank_record_falls_back_to_the_derived_name() {
+        for recorded in [Some(""), Some("   "), None] {
+            let plan = plan_volume(volume_for_branch("gfs-pg-1", "main", recorded), false);
+            assert_eq!(
+                plan.pvc(),
+                branch_data_pvc("gfs-pg-1", "main"),
+                "recorded={recorded:?} must not produce an empty PVC name"
+            );
+        }
+    }
+
+    #[test]
+    fn every_planned_volume_passes_the_mount_guard() {
+        // The guard and the planner must agree, or checkout plans a volume that
+        // reprovision then refuses — leaving the database down.
+        for branch in ["main", "feat/thing", "détaché", "0123456789abcdef"] {
+            let plan = plan_volume(volume_for_branch("gfs-pg-1", branch, None), false);
+            assert!(
+                pvc_belongs_to_instance(plan.pvc(), "gfs-pg-1"),
+                "planner produced {} which the guard rejects",
+                plan.pvc()
+            );
+        }
+    }
 
     #[test]
     fn source_instance_round_trips_stable_data_pvc() {

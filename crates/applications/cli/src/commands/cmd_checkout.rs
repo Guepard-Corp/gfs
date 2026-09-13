@@ -58,22 +58,34 @@ pub async fn checkout(
         .map(|p| p.trim().eq_ignore_ascii_case("kubernetes"))
         .unwrap_or(false);
 
-    // On Kubernetes, checkout DELETES the data PVC and re-clones it from a
-    // VolumeSnapshot, so anything not committed is gone. That is unconditional —
-    // a property of how restore works there, not of the current state — so it can
-    // be said without needing to detect whether the database is actually dirty.
+    // Before HEAD moves, record that the branch being LEFT owns the volume it is
+    // currently using. Checkout gives each branch its own volume, but a
+    // repository created before that keeps its data in the one volume
+    // `{instance}-data`, and nothing records whose it is. Adopting it here — the
+    // one moment we still know both the branch and the volume — is what lets the
+    // first switch away from it be non-destructive too. Later switches do not
+    // need this: the volume is recorded when it is brought up.
     //
-    // Verified: a table created and not committed was silently absent after a
-    // checkout away and back, with a green tick and exit 0. Warning is the honest
-    // minimum until GFS can either detect uncommitted work or take a safety
-    // snapshot before the teardown.
-    if is_k8s && !json_output {
-        eprintln!(
-            "{} on Kubernetes, checkout restores the volume from a snapshot, so any \
-             change
-  made since the last `gfs commit` is discarded. Commit first to keep it.",
-            yellow("warning:")
-        );
+    // Best-effort. Failing a checkout over bookkeeping would be worse than the
+    // consequence, which is that returning to this branch clones a fresh volume
+    // from its last commit instead of returning to this one.
+    if is_k8s {
+        let active_pvc = GfsConfig::load(&repo_path)
+            .ok()
+            .and_then(|c| c.mount_point)
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty());
+        if let Some(pvc) = active_pvc
+            && let Ok(branch) = repository.get_current_branch(&repo_path).await
+            && let Err(e) = gfs_domain::repo_utils::branch_volumes::update(&repo_path, |volumes| {
+                volumes.adopt(branch.trim(), &pvc);
+            })
+        {
+            eprintln!(
+                "{} could not record the current branch's data volume: {e}",
+                yellow("warning:")
+            );
+        }
     }
 
     let commit_hash = if is_k8s {

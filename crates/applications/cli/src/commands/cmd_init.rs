@@ -143,7 +143,17 @@ pub async fn init(
         && cfg.mount_point.as_deref().unwrap_or("").trim().is_empty()
         && let Some(rt) = cfg.runtime.as_ref()
     {
-        cfg.mount_point = Some(format!("{}-data", rt.container_name.trim()));
+        let pvc = format!("{}-data", rt.container_name.trim());
+        // Claim that volume for the branch the repository starts on, so the first
+        // checkout away from it can leave it alone instead of treating it as an
+        // unowned leftover. Checkout gives each branch its own volume; this is the
+        // record for the very first one.
+        if let Ok(branch) = repository.get_current_branch(&target_path).await {
+            let _ = gfs_domain::repo_utils::branch_volumes::update(&target_path, |volumes| {
+                volumes.adopt(branch.trim(), &pvc);
+            });
+        }
+        cfg.mount_point = Some(pvc);
         let _ = cfg.save(&target_path);
     }
 

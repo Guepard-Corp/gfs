@@ -680,6 +680,7 @@ fn overlay_env(env: &mut Vec<(String, String)>, overrides: Vec<(String, String)>
     }
 }
 
+pub mod branch_volume;
 pub mod checkout;
 
 #[derive(Clone)]
@@ -1502,6 +1503,29 @@ impl KubernetesCompute {
         names
     }
 
+    /// Tear down the COMPUTE only: StatefulSet and Service. Every volume and
+    /// every snapshot survives.
+    ///
+    /// This is what switching branches needs. A pod can only mount a different
+    /// PVC by being recreated, so the StatefulSet has to go — but the volume it
+    /// was mounting holds the outgoing branch's live data, including whatever
+    /// has not been committed yet, and deleting it is what made a Kubernetes
+    /// checkout lossy. Rebinding instead of re-cloning also means no
+    /// VolumeSnapshot is involved, so the
+    /// `snapshot.storage.kubernetes.io/pvc-as-source-protection` finalizer
+    /// cannot wedge the repository the way a PVC delete can.
+    pub async fn teardown_compute_keep_volumes(&self, id: &InstanceId) -> Result<()> {
+        let _ = self
+            .api_statefulsets()
+            .delete(&id.0, &DeleteParams::default())
+            .await;
+        let _ = self
+            .api_services()
+            .delete(&Self::svc_name(&id.0), &DeleteParams::default())
+            .await;
+        Ok(())
+    }
+
     /// Tear down StatefulSet/Service and delete the instance PVCs, WITHOUT
     /// touching VolumeSnapshots. This is the teardown the checkout / clone-seed
     /// RESTORE path needs: it deletes the data PVC and then restores it FROM a
@@ -1554,13 +1578,48 @@ impl KubernetesCompute {
         let storage = gfs_storage_kubernetes::KubernetesStorage::new(Some(self.namespace.clone()))
             .await
             .ok();
-        for name in Self::pvc_names(id, extra_pvcs) {
-            if let Some(ref storage) = storage
-                && let Err(e) = storage.delete_snapshots_for_pvc(name.as_str()).await
+
+        // Reclaim EVERY volume the instance owns, not only the derived
+        // `{instance}-data` and the caller's extras. Since checkout gives each
+        // branch its own PVC, an instance can own many, and the caller does not
+        // necessarily know their names — `remove_instance` passes no extras at
+        // all, and so does the node daemon. Asking the cluster by label is the
+        // only enumeration that cannot go stale; without it a destroy leaves one
+        // ZFS clone per branch behind, invisible to the repository that made it.
+        let mut names = Self::pvc_names(id, extra_pvcs);
+        if let Some(ref storage) = storage {
+            match storage
+                .pvc_names_matching(&format!("{INSTANCE_LABEL_KEY}={}", id.0))
+                .await
             {
-                tracing::warn!(
-                    "remove_instance_with_pvcs: snapshot cleanup for '{name}' failed: {e}"
-                );
+                Ok(labelled) => {
+                    for name in labelled {
+                        if !names.iter().any(|n| n == &name) {
+                            names.push(name);
+                        }
+                    }
+                }
+                // A listing failure must not abort the destroy: the derived and
+                // caller-supplied names below are still worth reclaiming.
+                Err(e) => tracing::warn!(
+                    "remove_instance_with_pvcs: could not list PVCs of '{}': {e}",
+                    id.0
+                ),
+            }
+        }
+
+        for name in &names {
+            if let Some(ref storage) = storage {
+                // Snapshots first: a VolumeSnapshot naming this PVC as source
+                // holds a finalizer that blocks the PVC from draining.
+                if let Err(e) = storage.delete_snapshots_for_pvc(name.as_str()).await {
+                    tracing::warn!(
+                        "remove_instance_with_pvcs: snapshot cleanup for '{name}' failed: {e}"
+                    );
+                }
+                if let Err(e) = storage.delete_pvc(name.as_str()).await {
+                    tracing::warn!("remove_instance_with_pvcs: deleting PVC '{name}' failed: {e}");
+                }
             }
         }
         Ok(())
