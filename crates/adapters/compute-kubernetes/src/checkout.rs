@@ -120,6 +120,17 @@ pub async fn restore_database_volume_from_snapshot<R: DatabaseProviderRegistry>(
         .collect();
 
     let instance_id = InstanceId(stable_instance.clone());
+
+    // Confirm the snapshot we are about to restore FROM is usable BEFORE
+    // destroying anything. This wait used to sit after the teardown and the PVC
+    // delete, so a snapshot that was missing or never became ready cost the user
+    // their StatefulSet and their PVC before anyone checked. Now an unusable
+    // snapshot is a refusal that changes nothing.
+    storage
+        .wait_snapshot_ready(&vs_name)
+        .await
+        .map_err(|e| K8sCheckoutReprovisionError::Storage(e.to_string()))?;
+
     // RESTORE teardown: must PRESERVE the VolumeSnapshots — we delete the data PVC
     // below and then clone it back FROM `vs_name`. Using the destroy teardown
     // (`remove_instance_with_pvcs`) here would reclaim that snapshot (SEV1 data loss).
@@ -128,18 +139,23 @@ pub async fn restore_database_volume_from_snapshot<R: DatabaseProviderRegistry>(
         .await
         .map_err(|e| K8sCheckoutReprovisionError::Compute(e.to_string()))?;
 
-    storage
-        .delete_pvc(&data_pvc)
-        .await
-        .map_err(|e| K8sCheckoutReprovisionError::Storage(e.to_string()))?;
+    // Past this point the instance is gone. A PVC that will not delete leaves the
+    // repository with no database and no way forward — every retry repeats the
+    // teardown and fails here again. Observed: a lingering
+    // `snapshot.storage.kubernetes.io/pvc-as-source-protection` finalizer, held
+    // while VolumeSnapshots reference the PVC as their source, wedged a
+    // repository permanently. So say what happened and how to get out of it,
+    // rather than reporting a bare "still exists".
+    if let Err(e) = storage.delete_pvc(&data_pvc).await {
+        return Err(K8sCheckoutReprovisionError::Storage(format!(
+            "{e}\n  The instance has already been torn down, so this repository now has no \
+             database.\n  A PVC usually refuses to delete because a VolumeSnapshot still \
+             names it as source — check:\n    kubectl get pvc -n gfs {data_pvc}              -o jsonpath='{{.metadata.finalizers}}'\n    kubectl get volumesnapshot -n gfs              -o custom-columns=N:.metadata.name,READY:.status.readyToUse,SRC:.spec.source.persistentVolumeClaimName\n               Deleting the snapshots that name it releases the finalizer and the PVC drains."
+        )));
+    }
     for legacy in &legacy_pvcs {
         let _ = storage.delete_pvc(legacy).await;
     }
-
-    storage
-        .wait_snapshot_ready(&vs_name)
-        .await
-        .map_err(|e| K8sCheckoutReprovisionError::Storage(e.to_string()))?;
 
     adopt_credentials_for_restored_volume(storage, compute, &vs_name, &stable_instance).await?;
 

@@ -21,7 +21,7 @@ use serde_json::json;
 
 use super::compute_support::compute_for_repo;
 use crate::cli_utils::get_repo_dir;
-use crate::output::{cyan, dimmed, green};
+use crate::output::{cyan, dimmed, green, yellow};
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -57,6 +57,24 @@ pub async fn checkout(
         .and_then(|c| c.runtime.map(|r| r.runtime_provider))
         .map(|p| p.trim().eq_ignore_ascii_case("kubernetes"))
         .unwrap_or(false);
+
+    // On Kubernetes, checkout DELETES the data PVC and re-clones it from a
+    // VolumeSnapshot, so anything not committed is gone. That is unconditional —
+    // a property of how restore works there, not of the current state — so it can
+    // be said without needing to detect whether the database is actually dirty.
+    //
+    // Verified: a table created and not committed was silently absent after a
+    // checkout away and back, with a green tick and exit 0. Warning is the honest
+    // minimum until GFS can either detect uncommitted work or take a safety
+    // snapshot before the teardown.
+    if is_k8s && !json_output {
+        eprintln!(
+            "{} on Kubernetes, checkout restores the volume from a snapshot, so any \
+             change
+  made since the last `gfs commit` is discarded. Commit first to keep it.",
+            yellow("warning:")
+        );
+    }
 
     let commit_hash = if is_k8s {
         // Serialise against commit, which the generic use case does for us on the
