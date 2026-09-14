@@ -161,6 +161,11 @@ async fn create_branch(
     switch: bool,
     json_output: bool,
 ) -> Result<()> {
+    // A branch name becomes refs/heads/<name>, so an unchecked one is a
+    // filesystem write with a caller-supplied path in it.
+    gfs_domain::repo_utils::branch_name::validate_branch_name(name)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
     if switch {
         return cmd_checkout::checkout(
             Some(repo_path.to_path_buf()),

@@ -77,9 +77,10 @@ pub async fn checkout(
         // Validate refs before stopping compute — bad input must not leave the DB offline.
         let checkout_rev = if let Some(ref branch_name) = create_branch {
             let branch_name = branch_name.trim();
-            if branch_name.is_empty() {
-                anyhow::bail!("empty branch name");
-            }
+            // Same rule as `gfs branch`: this path creates the ref too, and an
+            // unchecked name here would escape just as readily.
+            gfs_domain::repo_utils::branch_name::validate_branch_name(branch_name)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             let start_rev = if revision.trim().is_empty() {
                 "HEAD"
             } else {
