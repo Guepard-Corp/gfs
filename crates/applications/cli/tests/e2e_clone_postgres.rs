@@ -132,6 +132,8 @@ fn e2e_clone_postgres() {
                 "exec",
                 REMOTE_NAME,
                 "pg_isready",
+                "-h",
+                "127.0.0.1",
                 "-U",
                 "postgres",
                 "-d",

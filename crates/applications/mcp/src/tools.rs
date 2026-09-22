@@ -1903,9 +1903,17 @@ mod tests {
         );
         let mut ready = false;
         for _ in 0..30 {
-            if docker(&["exec", &cn, "pg_isready", "-U", "postgres"])
-                .status
-                .success()
+            if docker(&[
+                "exec",
+                &cn,
+                "pg_isready",
+                "-h",
+                "127.0.0.1",
+                "-U",
+                "postgres",
+            ])
+            .status
+            .success()
             {
                 ready = true;
                 break;
