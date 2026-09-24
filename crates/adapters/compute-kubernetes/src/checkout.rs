@@ -211,12 +211,17 @@ fn configured_database_version(cfg: &GfsConfig) -> String {
 /// what a checkout would deploy can be asserted without a cluster, a repository
 /// on disk, or a provider registry. Same reason [`apply_repo_credentials_to_env`]
 /// is a free function.
+///
+/// Built through `definition_with_overrides`, never the bare `definition()`.
+/// `[compute.params]` is persisted in `.gfs/config.toml` precisely so a rebuild
+/// can re-apply it, and this path used to skip it — so a branch switch reverted
+/// a tuned database to the provider's defaults, silently.
 fn checkout_definition(
     container: &dyn ContainerProvider,
     cfg: &GfsConfig,
     creds: &RepoCredentials,
 ) -> ComputeDefinition {
-    let mut def = container.definition();
+    let mut def = container.definition_with_overrides(&cfg.compute_params());
     let base = def.image.split(':').next().unwrap_or(&def.image);
     def.image = format!("{base}:{}", configured_database_version(cfg));
     // Re-apply the repo's configured database name AND user (see
