@@ -17,7 +17,7 @@ use chrono::Utc;
 use gfs_domain::ports::compute::{
     Compute, ComputeCapabilities, ComputeDefinition, ComputeError, ExecOutput,
     InstanceConnectionInfo, InstanceId, InstanceState, InstanceStatus, LogEntry, LogStream,
-    LogsOptions, PortMapping, Result, RuntimeDescriptor, StartOptions,
+    LogsOptions, NodeAllocation, PortMapping, Result, RuntimeDescriptor, StartOptions,
 };
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::{
@@ -397,6 +397,115 @@ fn split_labels_and_annotations(
         }
     }
     (labels, annotations)
+}
+
+/// Parse a Kubernetes CPU quantity into millicores.
+///
+/// The API server hands these back in whichever form was written: `"4"`,
+/// `"3800m"`, `"0.5"`, and — on `allocatable` for some runtimes — nano or micro
+/// suffixes. Getting this wrong by a factor of 1000 in either direction is the
+/// kind of error that looks like correct behaviour until a node fills up.
+fn parse_cpu_millicores(quantity: &str) -> Option<u64> {
+    let q = quantity.trim();
+    if let Some(v) = q.strip_suffix('m') {
+        return v.parse::<u64>().ok();
+    }
+    if let Some(v) = q.strip_suffix('u') {
+        return v.parse::<u64>().ok().map(|micro| micro / 1_000);
+    }
+    if let Some(v) = q.strip_suffix('n') {
+        return v.parse::<u64>().ok().map(|nano| nano / 1_000_000);
+    }
+    // Whole or fractional cores. Round up: a request must never resolve to less
+    // than it asked for, and headroom must never look larger than it is.
+    let cores = q.parse::<f64>().ok()?;
+    if !cores.is_finite() || cores < 0.0 {
+        return None;
+    }
+    Some((cores * 1000.0).ceil() as u64)
+}
+
+/// Parse a Kubernetes memory quantity into MiB.
+///
+/// Binary suffixes (`Ki`, `Mi`, `Gi`, `Ti`) and decimal ones (`K`, `M`, `G`,
+/// `T`) mean different things — 1 MB is about 4.9% smaller than 1 MiB — and a
+/// bare figure is bytes. Conflating them silently misreports a node's headroom.
+fn parse_memory_mb(quantity: &str) -> Option<u64> {
+    const MIB: u64 = 1024 * 1024;
+    let q = quantity.trim();
+    let (value, multiplier) = if let Some(v) = q.strip_suffix("Ki") {
+        (v, 1024u64)
+    } else if let Some(v) = q.strip_suffix("Mi") {
+        (v, MIB)
+    } else if let Some(v) = q.strip_suffix("Gi") {
+        (v, 1024 * MIB)
+    } else if let Some(v) = q.strip_suffix("Ti") {
+        (v, 1024 * 1024 * MIB)
+    } else if let Some(v) = q.strip_suffix('K').or_else(|| q.strip_suffix('k')) {
+        (v, 1_000u64)
+    } else if let Some(v) = q.strip_suffix('M') {
+        (v, 1_000_000u64)
+    } else if let Some(v) = q.strip_suffix('G') {
+        (v, 1_000_000_000u64)
+    } else if let Some(v) = q.strip_suffix('T') {
+        (v, 1_000_000_000_000u64)
+    } else {
+        (q, 1u64)
+    };
+    let bytes = value.trim().parse::<f64>().ok()?;
+    if !bytes.is_finite() || bytes < 0.0 {
+        return None;
+    }
+    // Round DOWN to MiB here: this figure describes how much room exists, and
+    // rounding it up would invent capacity the node does not have.
+    Some(((bytes * multiplier as f64) / MIB as f64).floor() as u64)
+}
+
+/// A pod whose resources are no longer held by the scheduler.
+fn pod_is_terminal(pod: &Pod) -> bool {
+    matches!(
+        pod.status.as_ref().and_then(|s| s.phase.as_deref()),
+        Some("Succeeded" | "Failed")
+    )
+}
+
+/// Sum the CPU and memory *requests* of a pod's containers, in millicores/MiB.
+///
+/// Init containers are counted at their maximum rather than their sum, matching
+/// how the scheduler computes a pod's effective request: init containers run
+/// one at a time, so the pod needs the largest, not the total.
+fn pod_requests(pod: &Pod) -> (u64, u64) {
+    let Some(spec) = pod.spec.as_ref() else {
+        return (0, 0);
+    };
+    let request_of = |c: &Container| -> (u64, u64) {
+        let Some(requests) = c.resources.as_ref().and_then(|r| r.requests.as_ref()) else {
+            return (0, 0);
+        };
+        (
+            requests
+                .get("cpu")
+                .and_then(|q| parse_cpu_millicores(&q.0))
+                .unwrap_or(0),
+            requests
+                .get("memory")
+                .and_then(|q| parse_memory_mb(&q.0))
+                .unwrap_or(0),
+        )
+    };
+    let (mut cpu, mut memory) = (0u64, 0u64);
+    for c in &spec.containers {
+        let (a, b) = request_of(c);
+        cpu += a;
+        memory += b;
+    }
+    let (mut init_cpu, mut init_memory) = (0u64, 0u64);
+    for c in spec.init_containers.iter().flatten() {
+        let (a, b) = request_of(c);
+        init_cpu = init_cpu.max(a);
+        init_memory = init_memory.max(b);
+    }
+    (cpu.max(init_cpu), memory.max(init_memory))
 }
 
 /// Recover the [`InstanceId`] a managed pod belongs to from its instance label.
@@ -1413,6 +1522,71 @@ impl KubernetesCompute {
 
 #[async_trait]
 impl Compute for KubernetesCompute {
+    async fn node_allocation(&self) -> Result<Option<NodeAllocation>> {
+        // Only meaningful for the node this adapter actually schedules onto.
+        // Without a pinned node there is no single answer, and guessing one
+        // would be worse than declining to check.
+        let Some(node_name) = k8s_schedule_node_name() else {
+            return Ok(None);
+        };
+
+        let nodes: Api<k8s_openapi::api::core::v1::Node> = Api::all(self.client.clone());
+        let node = nodes.get(&node_name).await.map_err(|e| {
+            ComputeError::Internal(format!("k8s node get failed for {node_name}: {e}"))
+        })?;
+
+        // `allocatable`, not `capacity`: the kubelet reserves a slice for itself
+        // and the OS which no pod can ever be given.
+        let allocatable = node
+            .status
+            .as_ref()
+            .and_then(|s| s.allocatable.as_ref())
+            .ok_or_else(|| {
+                ComputeError::Internal(format!("node {node_name} reports no allocatable resources"))
+            })?;
+        let allocatable_cpu_millicores = allocatable
+            .get("cpu")
+            .and_then(|q| parse_cpu_millicores(&q.0))
+            .ok_or_else(|| {
+                ComputeError::Internal(format!(
+                    "node {node_name} reports no usable allocatable cpu"
+                ))
+            })?;
+        let allocatable_memory_mb = allocatable
+            .get("memory")
+            .and_then(|q| parse_memory_mb(&q.0))
+            .ok_or_else(|| {
+                ComputeError::Internal(format!(
+                    "node {node_name} reports no usable allocatable memory"
+                ))
+            })?;
+
+        // Every pod the scheduler still counts against this node, in any
+        // namespace — a database competes with system pods for the same bytes.
+        let pods: Api<Pod> = Api::all(self.client.clone());
+        let lp = ListParams::default().fields(&format!("spec.nodeName={node_name}"));
+        let placed = pods.list(&lp).await.map_err(|e| {
+            ComputeError::Internal(format!("k8s pod list failed for node {node_name}: {e}"))
+        })?;
+
+        let (mut committed_cpu, mut committed_memory) = (0u64, 0u64);
+        for pod in placed.items.iter().filter(|p| !pod_is_terminal(p)) {
+            let (cpu, memory) = pod_requests(pod);
+            committed_cpu += cpu;
+            committed_memory += memory;
+        }
+
+        Ok(Some(NodeAllocation {
+            allocatable_cpu_millicores: u32::try_from(allocatable_cpu_millicores)
+                .unwrap_or(u32::MAX),
+            allocatable_memory_mb: u32::try_from(allocatable_memory_mb).unwrap_or(u32::MAX),
+            // Saturate rather than wrap: an absurd sum must look like a full
+            // node, never an empty one.
+            committed_cpu_millicores: u32::try_from(committed_cpu).unwrap_or(u32::MAX),
+            committed_memory_mb: u32::try_from(committed_memory).unwrap_or(u32::MAX),
+        }))
+    }
+
     async fn provision(&self, definition: &ComputeDefinition) -> Result<InstanceId> {
         let instance = ensure_dns_label(&instance_name_from_definition(definition));
         // Fresh deploy is the ONLY writer of the credentials Secret. It must
@@ -2252,6 +2426,107 @@ mod tests {
             instance_name_from_definition(&definition_with_image("PostgreSQL:16"))
                 .starts_with("gfs-pg-")
         );
+    }
+
+    #[test]
+    fn cpu_quantities_parse_to_millicores() {
+        // Every shape the API server actually returns. A factor-of-1000 slip in
+        // any of these looks like correct behaviour until a node fills up.
+        assert_eq!(parse_cpu_millicores("4"), Some(4000));
+        assert_eq!(parse_cpu_millicores("3800m"), Some(3800));
+        assert_eq!(parse_cpu_millicores("0.5"), Some(500));
+        assert_eq!(parse_cpu_millicores("3500000u"), Some(3500));
+        assert_eq!(parse_cpu_millicores("3500000000n"), Some(3500));
+        assert_eq!(parse_cpu_millicores("nonsense"), None);
+    }
+
+    #[test]
+    fn a_fractional_core_rounds_up_never_down() {
+        // Rounding a request down hands back less than was asked for; rounding
+        // headroom down only ever under-reports room, which is the safe way to
+        // be wrong.
+        assert_eq!(parse_cpu_millicores("0.0001"), Some(1));
+    }
+
+    #[test]
+    fn memory_quantities_distinguish_binary_from_decimal() {
+        // 1 MB is ~4.9% smaller than 1 MiB. Conflating them misreports headroom
+        // by that much on every node, in the optimistic direction.
+        assert_eq!(parse_memory_mb("5907Mi"), Some(5907));
+        assert_eq!(parse_memory_mb("8Gi"), Some(8192));
+        assert_eq!(parse_memory_mb("6030340Ki"), Some(5889)); // 6030340*1024 B = 5889.004 MiB
+        assert_eq!(parse_memory_mb("1048576"), Some(1));
+        assert_eq!(parse_memory_mb("1M"), Some(0)); // 1_000_000 B < 1 MiB
+        assert_eq!(parse_memory_mb("1G"), Some(953)); // decimal, not 1024
+        assert_eq!(parse_memory_mb("nonsense"), None);
+    }
+
+    #[test]
+    fn a_terminal_pod_holds_nothing() {
+        let terminal = |phase: &str| Pod {
+            status: Some(k8s_openapi::api::core::v1::PodStatus {
+                phase: Some(phase.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(pod_is_terminal(&terminal("Succeeded")));
+        assert!(pod_is_terminal(&terminal("Failed")));
+        assert!(!pod_is_terminal(&terminal("Running")));
+        assert!(!pod_is_terminal(&terminal("Pending")));
+    }
+
+    fn container_requesting(name: &str, cpu: &str, memory: &str) -> Container {
+        Container {
+            name: name.to_string(),
+            resources: Some(ResourceRequirements {
+                requests: Some(BTreeMap::from([
+                    ("cpu".to_string(), Quantity(cpu.to_string())),
+                    ("memory".to_string(), Quantity(memory.to_string())),
+                ])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pod_requests_sum_containers_but_take_the_largest_init() {
+        // The scheduler's own rule: init containers run one at a time, so a pod
+        // needs the biggest of them, not their total. Summing would over-report
+        // commitment and refuse deploys that would have fitted.
+        let pod = Pod {
+            spec: Some(PodSpec {
+                containers: vec![
+                    container_requesting("db", "500m", "1Gi"),
+                    container_requesting("sidecar", "100m", "128Mi"),
+                ],
+                init_containers: Some(vec![
+                    container_requesting("seed", "2", "256Mi"),
+                    container_requesting("seal", "50m", "64Mi"),
+                ]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // containers sum to 600m / 1152Mi; the largest init is 2000m / 256Mi.
+        assert_eq!(pod_requests(&pod), (2000, 1152));
+    }
+
+    #[test]
+    fn a_pod_requesting_nothing_commits_nothing() {
+        let pod = Pod {
+            spec: Some(PodSpec {
+                containers: vec![Container {
+                    name: "db".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(pod_requests(&pod), (0, 0));
     }
 
     fn definition_with_resources(resources: Option<ComputeResources>) -> ComputeDefinition {

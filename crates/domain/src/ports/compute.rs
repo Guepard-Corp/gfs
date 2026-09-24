@@ -293,6 +293,21 @@ impl ComputeResources {
     }
 }
 
+/// What a runtime's scheduler has, and what is already spoken for.
+///
+/// Reported in the units the scheduler itself packs in: millicores and MiB, and
+/// **allocatable** rather than total, because a kubelet reserves a slice for
+/// itself and the OS that no pod can ever have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeAllocation {
+    pub allocatable_cpu_millicores: u32,
+    pub allocatable_memory_mb: u32,
+    /// Sum of the *requests* of everything already placed here — requests, not
+    /// usage, because that is what the scheduler packs against.
+    pub committed_cpu_millicores: u32,
+    pub committed_memory_mb: u32,
+}
+
 /// Definition of a compute instance: image, directories, env (with optional defaults), and ports.
 /// Used by [`Compute::provision`] to create and configure an instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -362,6 +377,21 @@ pub struct PortMapping {
 pub trait Compute: Send + Sync {
     /// Create and configure an instance from a definition. Returns the new instance id.
     async fn provision(&self, definition: &ComputeDefinition) -> Result<InstanceId>;
+
+    /// What the scheduler still has free where this runtime places instances.
+    ///
+    /// `None` means the runtime has no scheduler to be refused by — Docker
+    /// places a container on the machine it is told to, and an over-large
+    /// request fails at start rather than sitting unscheduled. Callers should
+    /// treat `None` as "not applicable" and skip the check, not as "no room".
+    ///
+    /// # Errors
+    ///
+    /// The runtime's own error if the query fails. A caller that cannot read
+    /// headroom should say so rather than assume there is room.
+    async fn node_allocation(&self) -> Result<Option<NodeAllocation>> {
+        Ok(None)
+    }
 
     /// Start the instance identified by `id`.
     async fn start(&self, id: &InstanceId, options: StartOptions) -> Result<InstanceStatus>;
