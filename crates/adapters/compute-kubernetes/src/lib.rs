@@ -22,9 +22,10 @@ use gfs_domain::ports::compute::{
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::{
     Container, EnvVarSource, PersistentVolumeClaim, PersistentVolumeClaimSpec, Pod,
-    PodSecurityContext, PodSpec, PodTemplateSpec, Probe, Secret, SecretKeySelector, Service,
-    ServicePort, ServiceSpec, TCPSocketAction, Volume, VolumeMount,
+    PodSecurityContext, PodSpec, PodTemplateSpec, Probe, ResourceRequirements, Secret,
+    SecretKeySelector, Service, ServicePort, ServiceSpec, TCPSocketAction, Volume, VolumeMount,
 };
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::{AttachParams, DeleteParams, ListParams, Patch, PatchParams, PostParams};
@@ -286,6 +287,118 @@ fn labels_for(instance: &str) -> BTreeMap<String, String> {
     m
 }
 
+/// Container resource requirements from a declaration, or `None` when nothing
+/// was declared.
+///
+/// Memory is emitted as both a request and a limit; CPU as a request only. The
+/// asymmetry is deliberate: the container is guaranteed its memory and cannot
+/// exceed it, so an out-of-memory event stays contained, while CPU has no
+/// ceiling so a database may burst into idle node capacity instead of being
+/// throttled beside an idle machine.
+///
+/// A zero in either dimension is treated as *no declaration*, not as `0m`.
+/// `ComputeResources::try_new` refuses a zero but is explicitly not a boundary —
+/// `Deserialize` builds the struct field by field and never calls it — so the
+/// decision about what a zero means belongs here, where the pod spec is built.
+fn resource_requirements_for(def: &ComputeDefinition) -> Option<ResourceRequirements> {
+    let declared = def.resources?;
+    if declared.cpu_millicores == 0 || declared.memory_mb == 0 {
+        return None;
+    }
+
+    // `Mi`, never `M`: `memory_mb` is mebibytes, and Kubernetes reads a bare `M`
+    // as a megabyte, which would put every limit ~4.9% under what was promised.
+    let memory = Quantity(format!("{}Mi", declared.memory_mb));
+
+    Some(ResourceRequirements {
+        requests: Some(BTreeMap::from([
+            (
+                "cpu".to_string(),
+                Quantity(format!("{}m", declared.cpu_millicores)),
+            ),
+            ("memory".to_string(), memory.clone()),
+        ])),
+        limits: Some(BTreeMap::from([("memory".to_string(), memory)])),
+        ..Default::default()
+    })
+}
+
+/// Whether Kubernetes will accept `value` as a label value.
+///
+/// At most 63 characters, beginning and ending alphanumeric, with `-`, `_` and
+/// `.` allowed between. Empty is valid. Anything else must travel as an
+/// annotation, whose values are unconstrained.
+fn is_valid_label_value(value: &str) -> bool {
+    if value.is_empty() {
+        return true;
+    }
+    if value.len() > 63 {
+        return false;
+    }
+    let bytes = value.as_bytes();
+    let alphanumeric = |byte: u8| byte.is_ascii_alphanumeric();
+    alphanumeric(bytes[0])
+        && alphanumeric(bytes[bytes.len() - 1])
+        && bytes
+            .iter()
+            .all(|&b| alphanumeric(b) || b == b'-' || b == b'_' || b == b'.')
+}
+
+/// Whether Kubernetes will accept `key` as a label or annotation key.
+///
+/// Both use the same syntax: an optional DNS-subdomain prefix and a `/`, then a
+/// name of at most 63 characters that begins and ends alphanumeric.
+fn is_valid_metadata_key(key: &str) -> bool {
+    let name = match key.split_once('/') {
+        Some((prefix, name)) => {
+            let prefix_ok = !prefix.is_empty()
+                && prefix.len() <= 253
+                && prefix.split('.').all(|part| {
+                    !part.is_empty()
+                        && part
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                });
+            if !prefix_ok {
+                return false;
+            }
+            name
+        }
+        None => key,
+    };
+    !name.is_empty() && is_valid_label_value(name) && name.len() <= 63
+}
+
+/// Split a definition's labels into what can be a Kubernetes label and what has
+/// to be an annotation.
+///
+/// The split is not cosmetic. `gfs.repo` carries a filesystem path, and a single
+/// invalid label value makes the API server reject the entire manifest — so a
+/// naive merge would take down every provision on this adapter. An entry whose
+/// *key* is invalid is dropped: annotation keys obey the same syntax, so there
+/// is nowhere valid to put it.
+fn split_labels_and_annotations(
+    definition_labels: &BTreeMap<String, String>,
+) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+    let mut labels = BTreeMap::new();
+    let mut annotations = BTreeMap::new();
+    for (key, value) in definition_labels {
+        if !is_valid_metadata_key(key) {
+            tracing::warn!(
+                key = %key,
+                "dropping definition label: not a valid Kubernetes metadata key"
+            );
+            continue;
+        }
+        if is_valid_label_value(value) {
+            labels.insert(key.clone(), value.clone());
+        } else {
+            annotations.insert(key.clone(), value.clone());
+        }
+    }
+    (labels, annotations)
+}
+
 /// Recover the [`InstanceId`] a managed pod belongs to from its instance label.
 fn instance_id_from_pod(pod: &Pod) -> Option<InstanceId> {
     pod.metadata
@@ -481,6 +594,21 @@ impl KubernetesCompute {
     }
 
     fn statefulset_manifest(&self, instance: &str, def: &ComputeDefinition) -> StatefulSet {
+        Self::statefulset_manifest_in(&self.namespace, instance, def)
+    }
+
+    /// The manifest builder, free of the client.
+    ///
+    /// Split out so what this adapter actually asks Kubernetes for can be
+    /// asserted in a unit test. `KubernetesCompute::new` needs a reachable
+    /// cluster, so anything reachable only through `&self` is untestable — and
+    /// "the pod carries the right limits" is exactly the claim that must not
+    /// rest on a live-cluster run alone.
+    fn statefulset_manifest_in(
+        namespace: &str,
+        instance: &str,
+        def: &ComputeDefinition,
+    ) -> StatefulSet {
         let labels = labels_for(instance);
         let svc_name = Self::svc_name(instance);
         let pvc_name = Self::pvc_name_for(instance, def);
@@ -643,14 +771,26 @@ impl KubernetesCompute {
             volume_mounts: Some(mounts),
             args: if args.is_empty() { None } else { Some(args) },
             readiness_probe,
+            resources: resource_requirements_for(def),
             ..Default::default()
         };
+
+        // The definition's labels join the object and its pod template, but NOT
+        // the selector: `spec.selector` is immutable after creation, so widening
+        // it would orphan every StatefulSet that already exists from its pods.
+        // The adapter-owned labels are merged last and win any key collision,
+        // because they are exactly what the selector matches.
+        let (definition_labels, definition_annotations) = split_labels_and_annotations(&def.labels);
+        let mut metadata_labels = definition_labels;
+        metadata_labels.extend(labels.clone());
+        let annotations = (!definition_annotations.is_empty()).then_some(definition_annotations);
 
         StatefulSet {
             metadata: ObjectMeta {
                 name: Some(instance.to_string()),
-                namespace: Some(self.namespace.clone()),
-                labels: Some(labels.clone()),
+                namespace: Some(namespace.to_string()),
+                labels: Some(metadata_labels.clone()),
+                annotations: annotations.clone(),
                 ..Default::default()
             },
             spec: Some(k8s_openapi::api::apps::v1::StatefulSetSpec {
@@ -662,7 +802,8 @@ impl KubernetesCompute {
                 },
                 template: PodTemplateSpec {
                     metadata: Some(ObjectMeta {
-                        labels: Some(labels.clone()),
+                        labels: Some(metadata_labels),
+                        annotations,
                         ..Default::default()
                     }),
                     spec: Some(PodSpec {
@@ -1763,6 +1904,8 @@ fn _unused(_p: &Path) {}
 
 #[cfg(test)]
 mod tests {
+    use gfs_domain::ports::compute::ComputeResources;
+
     use super::*;
     use gfs_domain::ports::compute::EnvVar;
     use k8s_openapi::ByteString;
@@ -2109,6 +2252,219 @@ mod tests {
             instance_name_from_definition(&definition_with_image("PostgreSQL:16"))
                 .starts_with("gfs-pg-")
         );
+    }
+
+    fn definition_with_resources(resources: Option<ComputeResources>) -> ComputeDefinition {
+        ComputeDefinition {
+            resources,
+            ..definition_with_image("postgres:17")
+        }
+    }
+
+    fn container_of(def: &ComputeDefinition) -> Container {
+        KubernetesCompute::statefulset_manifest_in("gfs", "gfs-pg-1", def)
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+            .containers
+            .remove(0)
+    }
+
+    #[test]
+    fn memory_is_requested_and_limited_but_cpu_is_only_requested() {
+        // A CPU ceiling would put a hard quota on latency-sensitive
+        // query work; the goal is to leave the weakest QoS class, not to throttle.
+        let def = definition_with_resources(Some(ComputeResources {
+            cpu_millicores: 625,
+            memory_mb: 1024,
+        }));
+
+        let resources = container_of(&def).resources.expect("no resource block");
+        let requests = resources.requests.unwrap();
+        let limits = resources.limits.unwrap();
+
+        assert_eq!(requests.get("cpu").unwrap().0, "625m");
+        assert_eq!(requests.get("memory").unwrap().0, "1024Mi");
+        assert_eq!(limits.get("memory").unwrap().0, "1024Mi");
+        assert!(
+            !limits.contains_key("cpu"),
+            "CPU must have no ceiling, found {:?}",
+            limits.get("cpu")
+        );
+    }
+
+    #[test]
+    fn memory_is_emitted_as_mebibytes_not_megabytes() {
+        // `Mi` vs `M` is a ~4.9% shortfall on every limit, and silent.
+        let def = definition_with_resources(Some(ComputeResources {
+            cpu_millicores: 500,
+            memory_mb: 2048,
+        }));
+
+        let limits = container_of(&def).resources.unwrap().limits.unwrap();
+
+        assert_eq!(limits.get("memory").unwrap().0, "2048Mi");
+    }
+
+    #[test]
+    fn no_declaration_means_no_resource_block() {
+        // A database deployed before any of this must behave exactly as before.
+        assert!(
+            container_of(&definition_with_resources(None))
+                .resources
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_zero_is_treated_as_no_declaration_rather_than_a_zero_request() {
+        // `ComputeResources::try_new` refuses a zero but serde bypasses it, so a
+        // zero can reach here off the wire. Emitting `0m` would be worse than
+        // emitting nothing: it asks the scheduler to reserve nothing while
+        // looking like enforcement.
+        for resources in [
+            ComputeResources {
+                cpu_millicores: 0,
+                memory_mb: 1024,
+            },
+            ComputeResources {
+                cpu_millicores: 625,
+                memory_mb: 0,
+            },
+        ] {
+            assert!(
+                container_of(&definition_with_resources(Some(resources)))
+                    .resources
+                    .is_none(),
+                "{resources:?} should be treated as absent"
+            );
+        }
+    }
+
+    #[test]
+    fn two_classes_produce_different_limits() {
+        // The defect this guards against: every size producing a
+        // byte-identical container.
+        let small = container_of(&definition_with_resources(Some(ComputeResources {
+            cpu_millicores: 625,
+            memory_mb: 1024,
+        })));
+        let large = container_of(&definition_with_resources(Some(ComputeResources {
+            cpu_millicores: 2500,
+            memory_mb: 4096,
+        })));
+
+        assert_ne!(small.resources, large.resources);
+    }
+
+    fn manifest_with_labels(pairs: &[(&str, &str)]) -> StatefulSet {
+        let def = ComputeDefinition {
+            labels: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..definition_with_image("postgres:17")
+        };
+        KubernetesCompute::statefulset_manifest_in("gfs", "gfs-pg-1", &def)
+    }
+
+    #[test]
+    fn definition_labels_reach_the_object_and_the_pod_template() {
+        // The adapter read `def.labels` nowhere, so the discovery
+        // labels `gfs init` sets never reached a pod on any path.
+        let manifest = manifest_with_labels(&[("gfs.role", "source"), ("gfs.managed", "true")]);
+
+        let object = manifest.metadata.labels.clone().unwrap();
+        let template = manifest
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .metadata
+            .as_ref()
+            .unwrap()
+            .labels
+            .clone()
+            .unwrap();
+
+        for labels in [&object, &template] {
+            assert_eq!(labels.get("gfs.role").map(String::as_str), Some("source"));
+            assert_eq!(labels.get("gfs.managed").map(String::as_str), Some("true"));
+        }
+    }
+
+    #[test]
+    fn the_selector_never_widens() {
+        // `spec.selector` is immutable after creation. Widening it would orphan
+        // every StatefulSet that already exists from its own pods.
+        let manifest = manifest_with_labels(&[("gfs.role", "source")]);
+
+        let selector = manifest
+            .spec
+            .unwrap()
+            .selector
+            .match_labels
+            .expect("no selector");
+
+        assert_eq!(selector, labels_for("gfs-pg-1"));
+        assert!(!selector.contains_key("gfs.role"));
+    }
+
+    #[test]
+    fn a_value_kubernetes_would_reject_becomes_an_annotation() {
+        // `gfs.repo` holds a filesystem path. One invalid label value makes the
+        // API server reject the whole manifest, so this is what stands between
+        // the label work and every provision on this adapter failing.
+        let manifest = manifest_with_labels(&[
+            ("gfs.repo", "/Users/someone/work/repo"),
+            ("gfs.role", "source"),
+        ]);
+
+        let labels = manifest.metadata.labels.clone().unwrap();
+        let annotations = manifest.metadata.annotations.clone().unwrap();
+
+        assert!(!labels.contains_key("gfs.repo"), "path leaked into a label");
+        assert_eq!(
+            annotations.get("gfs.repo").map(String::as_str),
+            Some("/Users/someone/work/repo")
+        );
+        assert_eq!(labels.get("gfs.role").map(String::as_str), Some("source"));
+    }
+
+    #[test]
+    fn the_adapters_own_labels_win_a_collision() {
+        // They are what the selector matches; a definition must not be able to
+        // point the selector at nothing.
+        let manifest = manifest_with_labels(&[(INSTANCE_LABEL_KEY, "not-this-instance")]);
+
+        let labels = manifest.metadata.labels.unwrap();
+
+        assert_eq!(
+            labels.get(INSTANCE_LABEL_KEY).map(String::as_str),
+            Some("gfs-pg-1")
+        );
+    }
+
+    #[test]
+    fn an_unusable_key_is_dropped_rather_than_breaking_the_manifest() {
+        // Annotation keys obey the same syntax as label keys, so there is
+        // nowhere valid to put it.
+        let manifest = manifest_with_labels(&[("not a valid key", "x"), ("gfs.role", "source")]);
+
+        let labels = manifest.metadata.labels.clone().unwrap();
+        let annotations = manifest.metadata.annotations.clone().unwrap_or_default();
+
+        assert!(!labels.contains_key("not a valid key"));
+        assert!(!annotations.contains_key("not a valid key"));
+        assert_eq!(labels.get("gfs.role").map(String::as_str), Some("source"));
+    }
+
+    #[test]
+    fn no_definition_labels_means_no_annotations_block() {
+        let manifest = manifest_with_labels(&[]);
+        assert!(manifest.metadata.annotations.is_none());
     }
 
     #[test]
