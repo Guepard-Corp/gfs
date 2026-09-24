@@ -1769,6 +1769,7 @@ mod tests {
 
     fn definition_with_env(env: Vec<EnvVar>) -> ComputeDefinition {
         ComputeDefinition {
+            resources: None,
             labels: Default::default(),
             image: "postgres:17".into(),
             env,
@@ -1989,6 +1990,7 @@ mod tests {
 
     fn definition_with_image(image: &str) -> ComputeDefinition {
         ComputeDefinition {
+            resources: None,
             image: image.into(),
             ..definition_with_env(vec![])
         }

@@ -37,6 +37,7 @@ impl ClickhouseProvider {
 
     fn definition_impl() -> ComputeDefinition {
         ComputeDefinition {
+            resources: None,
             labels: Default::default(),
             image: DEFAULT_IMAGE.to_string(),
             env: vec![
@@ -380,6 +381,7 @@ done"#,
 
         Ok(ExportSpec {
             definition: ComputeDefinition {
+                resources: None,
                 labels: Default::default(),
                 image: self.definition().image,
                 env: vec![],
@@ -524,6 +526,7 @@ fi"#,
 
         Ok(ImportSpec {
             definition: ComputeDefinition {
+                resources: None,
                 labels: Default::default(),
                 image: self.definition().image,
                 env: vec![],
@@ -645,6 +648,7 @@ COLUMNS_EOF
 
         Ok(Some(SchemaExtractionSpec {
             definition: ComputeDefinition {
+                resources: None,
                 labels: Default::default(),
                 image: self.definition().image,
                 env: vec![],

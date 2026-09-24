@@ -470,6 +470,7 @@ mod tests {
 
         fn definition(&self) -> ComputeDefinition {
             ComputeDefinition {
+                resources: None,
                 image: "postgres:17".into(),
                 env: vec![EnvVar {
                     name: "POSTGRES_USER".into(),

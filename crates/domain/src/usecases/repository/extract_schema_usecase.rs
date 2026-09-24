@@ -695,6 +695,7 @@ GFS_SCHEMA_COLUMNS
     impl ContainerProvider for MockSchemaProvider {
         fn definition(&self) -> ComputeDefinition {
             ComputeDefinition {
+                resources: None,
                 labels: Default::default(),
                 image: "mock:latest".into(),
                 env: vec![],
@@ -784,6 +785,7 @@ GFS_SCHEMA_COLUMNS
         let provider = MockSchemaProvider {
             schema_spec: Some(SchemaExtractionSpec {
                 definition: ComputeDefinition {
+                    resources: None,
                     labels: Default::default(),
                     image: "postgres:latest".into(),
                     env: vec![],
@@ -929,6 +931,7 @@ CREATE TABLE public.users (
         let provider = MockSchemaProvider {
             schema_spec: Some(SchemaExtractionSpec {
                 definition: ComputeDefinition {
+                    resources: None,
                     labels: Default::default(),
                     image: "postgres:latest".into(),
                     env: vec![],
@@ -1011,6 +1014,7 @@ GFS_SCHEMA_COLUMNS
         let provider = MockSchemaProvider {
             schema_spec: Some(SchemaExtractionSpec {
                 definition: ComputeDefinition {
+                    resources: None,
                     labels: Default::default(),
                     image: "postgres:latest".into(),
                     env: vec![],
@@ -1066,6 +1070,7 @@ GFS_SCHEMA_COLUMNS
         let provider = MockSchemaProvider {
             schema_spec: Some(SchemaExtractionSpec {
                 definition: ComputeDefinition {
+                    resources: None,
                     labels: Default::default(),
                     image: "postgres:latest".into(),
                     env: vec![],

@@ -332,6 +332,15 @@ pub struct ComputeDefinition {
     /// Empty by default; the runtime should attach nothing when this is empty.
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+
+    /// How much CPU and memory the instance is owed, if anything was declared.
+    ///
+    /// `None` means no declaration, and a runtime should then attach no
+    /// resource constraints at all rather than inventing a default — which is
+    /// also what a definition serialised before this field existed
+    /// deserialises to.
+    #[serde(default)]
+    pub resources: Option<ComputeResources>,
 }
 
 /// A single port mapping (host port optional; container port required).
@@ -741,6 +750,62 @@ mod tests {
         let back: ComputeResources =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).expect("round trip failed");
         assert_eq!(back, r);
+    }
+
+    #[test]
+    fn definition_without_a_resources_key_still_deserialises() {
+        // The shape a definition had before this field existed: every persisted
+        // definition and every in-flight payload from an older binary looks
+        // like this, and must still parse.
+        //
+        // What actually keeps `resources` optional is its `Option`, not its
+        // `#[serde(default)]` — serde already treats a missing `Option<T>` as
+        // `None`, and this test still passes with that attribute deleted
+        // (checked). The attribute is kept for symmetry with `labels`, where it
+        // is load-bearing: delete *that* one and this test fails with
+        // `missing field \`labels\`` (also checked). So this guards the
+        // contract, not the annotation.
+        let json = r#"{
+            "image": "postgres:17",
+            "env": [],
+            "ports": [],
+            "data_dir": "/var/lib/postgresql/data",
+            "host_data_dir": null,
+            "user": null,
+            "logs_dir": null,
+            "conf_dir": null,
+            "args": []
+        }"#;
+
+        let def: ComputeDefinition = serde_json::from_str(json).expect("old definition rejected");
+
+        assert!(def.resources.is_none());
+        assert!(def.labels.is_empty());
+        assert_eq!(def.image, "postgres:17");
+    }
+
+    #[test]
+    fn definition_round_trips_with_a_declaration() {
+        let json = serde_json::to_string(&ComputeDefinition {
+            image: "postgres:17".into(),
+            env: vec![],
+            ports: vec![],
+            data_dir: PathBuf::from("/var/lib/postgresql/data"),
+            host_data_dir: None,
+            user: None,
+            logs_dir: None,
+            conf_dir: None,
+            args: vec![],
+            labels: Default::default(),
+            resources: Some(ComputeResources::try_new(625, 1024).unwrap()),
+        })
+        .unwrap();
+
+        let back: ComputeDefinition = serde_json::from_str(&json).unwrap();
+
+        let r = back.resources.expect("declaration lost in the round trip");
+        assert_eq!(r.cpu_millicores, 625);
+        assert_eq!(r.memory_mb, 1024);
     }
 
     #[test]

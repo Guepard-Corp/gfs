@@ -577,6 +577,7 @@ mod tests {
     impl ContainerProvider for MockProvider {
         fn definition(&self) -> ComputeDefinition {
             ComputeDefinition {
+                resources: None,
                 labels: Default::default(),
                 image: "postgres:17".into(),
                 env: vec![],
