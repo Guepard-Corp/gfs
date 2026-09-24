@@ -29,6 +29,9 @@ pub enum ComputeError {
     #[error("instance is not paused: '{0}'")]
     NotPaused(String),
 
+    #[error("invalid resource spec: {0}")]
+    InvalidResourceSpec(String),
+
     /// The runtime does not support cgroup freezing (e.g. rootless Podman on
     /// cgroup v1).  Callers that cannot tolerate torn reads must refuse the
     /// operation: a file-level snapshot of an unfrozen database can capture
@@ -225,6 +228,69 @@ pub enum LogStream {
 pub struct EnvVar {
     pub name: String,
     pub default: Option<String>,
+}
+
+/// How much CPU and memory a container is owed, in the units an adapter applies.
+///
+/// The two dimensions are deliberately asymmetric:
+///
+/// - **Memory is a floor *and* a ceiling.** The container is guaranteed
+///   `memory_mb` and cannot exceed it, so an out-of-memory event stays
+///   contained to the database that caused it instead of pressuring its
+///   neighbours on the same node.
+/// - **CPU is a floor only.** The scheduler reserves `cpu_millicores` but
+///   imposes no ceiling, so a database may burst into otherwise-idle node
+///   capacity rather than being throttled while the node sits idle.
+///
+/// This is not the strongest scheduling class available — that would need a CPU
+/// ceiling too, and a hard quota on latency-sensitive query work costs more
+/// than it protects. It does lift a managed database out of the weakest class.
+///
+/// Millicores, not a clock speed. A caller that reasons in MHz resolves that
+/// against the node's own reported clock before declaring; what reaches an
+/// adapter is already in runtime units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComputeResources {
+    /// CPU floor in millicores, where 1000 is one core. Requested, never capped.
+    pub cpu_millicores: u32,
+
+    /// Memory floor and ceiling, in **mebibytes** (1 MiB = 1024 KiB).
+    ///
+    /// Named `_mb` to match the wire field, but the unit is binary: an adapter
+    /// emitting a Kubernetes quantity must write `Mi`, not `M`, or every limit
+    /// lands ~4.9% under what was promised.
+    pub memory_mb: u32,
+}
+
+impl ComputeResources {
+    /// Builds a declaration, rejecting a zero in either dimension.
+    ///
+    /// # Errors
+    ///
+    /// [`ComputeError::InvalidResourceSpec`] when either figure is zero. A zero
+    /// CPU request is not a smaller reservation but an absent one, and a zero
+    /// memory ceiling is a container that cannot start.
+    ///
+    /// This is a convenience for code that *builds* a declaration, not a
+    /// security boundary: `Deserialize` constructs the struct field-by-field
+    /// and never calls this. An adapter must therefore still treat a zero as
+    /// "no declaration" rather than emitting `0m` into a pod spec.
+    pub fn try_new(cpu_millicores: u32, memory_mb: u32) -> Result<Self> {
+        if cpu_millicores == 0 {
+            return Err(ComputeError::InvalidResourceSpec(
+                "cpu_millicores must be greater than zero".into(),
+            ));
+        }
+        if memory_mb == 0 {
+            return Err(ComputeError::InvalidResourceSpec(
+                "memory_mb must be greater than zero".into(),
+            ));
+        }
+        Ok(Self {
+            cpu_millicores,
+            memory_mb,
+        })
+    }
 }
 
 /// Definition of a compute instance: image, directories, env (with optional defaults), and ports.
@@ -640,5 +706,51 @@ mod tests {
             }
             _ => panic!("Expected DockerMountFailed"),
         }
+    }
+
+    #[test]
+    fn compute_resources_rejects_a_zero_cpu_floor() {
+        // Zero is not "a small reservation"; it is no reservation, which is the
+        // state this type exists to move databases out of.
+        let err = ComputeResources::try_new(0, 512).unwrap_err();
+        assert!(
+            matches!(err, ComputeError::InvalidResourceSpec(ref m) if m.contains("cpu_millicores")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn compute_resources_rejects_a_zero_memory_ceiling() {
+        let err = ComputeResources::try_new(500, 0).unwrap_err();
+        assert!(
+            matches!(err, ComputeError::InvalidResourceSpec(ref m) if m.contains("memory_mb")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn compute_resources_accepts_a_plausible_class() {
+        let r = ComputeResources::try_new(500, 2048).expect("valid class rejected");
+        assert_eq!(r.cpu_millicores, 500);
+        assert_eq!(r.memory_mb, 2048);
+    }
+
+    #[test]
+    fn compute_resources_round_trips_through_json() {
+        let r = ComputeResources::try_new(1250, 4096).unwrap();
+        let back: ComputeResources =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).expect("round trip failed");
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn deserialize_bypasses_the_constructor() {
+        // Documented behaviour, pinned so nobody later mistakes `try_new` for a
+        // validating boundary: a zero arrives intact off the wire, which is why
+        // the adapter — not this type — decides what a zero means.
+        let zeroed: ComputeResources =
+            serde_json::from_str(r#"{"cpu_millicores":0,"memory_mb":0}"#).unwrap();
+        assert_eq!(zeroed.cpu_millicores, 0);
+        assert_eq!(zeroed.memory_mb, 0);
     }
 }
