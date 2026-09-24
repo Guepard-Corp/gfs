@@ -4,8 +4,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use gfs_domain::model::config::{EnvironmentConfig, GfsConfig, RepoCredentials, RuntimeConfig};
-use gfs_domain::ports::compute::{Compute, EnvVar, InstanceId};
-use gfs_domain::ports::database_provider::DatabaseProviderRegistry;
+use gfs_domain::ports::compute::{Compute, ComputeDefinition, EnvVar, InstanceId};
+use gfs_domain::ports::database_provider::{
+    ContainerProvider, DatabaseProvider, DatabaseProviderRegistry,
+};
 use gfs_domain::ports::repository::Repository;
 use gfs_domain::ports::storage::{CloneOptions, SnapshotId, StoragePort, VolumeId};
 use gfs_storage_kubernetes::KubernetesStorage;
@@ -192,6 +194,43 @@ fn apply_repo_credentials_to_env(env: &mut [EnvVar], creds: &RepoCredentials) {
     }
 }
 
+/// The database version a repository is pinned to, or the historical default.
+///
+/// Shared so the definition and the config write-back at the end of a
+/// reprovision cannot disagree about which version was just deployed.
+fn configured_database_version(cfg: &GfsConfig) -> String {
+    cfg.environment
+        .as_ref()
+        .map(|e| e.database_version.clone())
+        .unwrap_or_else(|| "17".to_string())
+}
+
+/// The [`ComputeDefinition`] a checkout rebuilds the pod from.
+///
+/// Pure: the config and credentials are loaded by the caller and passed in, so
+/// what a checkout would deploy can be asserted without a cluster, a repository
+/// on disk, or a provider registry. Same reason [`apply_repo_credentials_to_env`]
+/// is a free function.
+fn checkout_definition(
+    container: &dyn ContainerProvider,
+    cfg: &GfsConfig,
+    creds: &RepoCredentials,
+) -> ComputeDefinition {
+    let mut def = container.definition();
+    let base = def.image.split(':').next().unwrap_or(&def.image);
+    def.image = format!("{base}:{}", configured_database_version(cfg));
+    // Re-apply the repo's configured database name AND user (see
+    // apply_repo_credentials_to_env): a checkout rebuilds the pod from the provider
+    // default (POSTGRES_DB=postgres, POSTGRES_USER=postgres), and the credentials
+    // Secret carries only the password — so without this a repo created with a custom
+    // --database-name/--database-user reverts to `postgres` after every checkout,
+    // breaking `gfs query` with `role "postgres" does not exist`.
+    apply_repo_credentials_to_env(&mut def.env, creds);
+    // PVC already exists from VolumeSnapshot restore; mount default `{instance}-data`.
+    def.host_data_dir = None;
+    def
+}
+
 /// Rebind the workspace PVC and recreate the StatefulSet/Service with the same instance name and NodePort.
 pub async fn reprovision_after_pvc_restore<R: DatabaseProviderRegistry>(
     compute: &KubernetesCompute,
@@ -229,11 +268,7 @@ pub async fn reprovision_after_pvc_restore<R: DatabaseProviderRegistry>(
         })?;
 
     let database_port = cfg.environment.as_ref().and_then(|e| e.database_port);
-    let database_version = cfg
-        .environment
-        .as_ref()
-        .map(|e| e.database_version.clone())
-        .unwrap_or_else(|| "17".to_string());
+    let database_version = configured_database_version(&cfg);
 
     let provider = registry
         .get(&provider_name)
@@ -245,19 +280,8 @@ pub async fn reprovision_after_pvc_restore<R: DatabaseProviderRegistry>(
         K8sCheckoutReprovisionError::UnknownProvider(format!("{provider_name}: {e}"))
     })?;
 
-    let mut def = container.definition();
-    let base = def.image.split(':').next().unwrap_or(&def.image);
-    def.image = format!("{base}:{database_version}");
-    // Re-apply the repo's configured database name AND user (see
-    // apply_repo_credentials_to_env): a checkout rebuilds the pod from the provider
-    // default (POSTGRES_DB=postgres, POSTGRES_USER=postgres), and the credentials
-    // Secret carries only the password — so without this a repo created with a custom
-    // --database-name/--database-user reverts to `postgres` after every checkout,
-    // breaking `gfs query` with `role "postgres" does not exist`.
     let creds = RepoCredentials::load(repo_path);
-    apply_repo_credentials_to_env(&mut def.env, &creds);
-    // PVC already exists from VolumeSnapshot restore; mount default `{instance}-data`.
-    def.host_data_dir = None;
+    let def = checkout_definition(container, &cfg, &creds);
 
     let instance_id = InstanceId(stable_instance.clone());
     // SS/svc already torn down in restore_database_volume_from_snapshot; keep cloned PVC.
