@@ -7,8 +7,10 @@ use thiserror::Error;
 use crate::utils::current_user;
 use crate::utils::data_dir;
 
-use crate::model::config::{EnvironmentConfig, RuntimeConfig};
-use crate::ports::compute::{Compute, ComputeError, RuntimeDescriptor, StartOptions};
+use crate::model::config::{EnvironmentConfig, GfsConfig, RuntimeConfig};
+use crate::ports::compute::{
+    Compute, ComputeError, ComputeResources, RuntimeDescriptor, StartOptions,
+};
 use crate::ports::database_provider::DatabaseProviderRegistry;
 use crate::ports::repository::{Repository, RepositoryError};
 
@@ -60,6 +62,21 @@ pub struct InitRepositoryUseCase<R: DatabaseProviderRegistry> {
     registry: Arc<R>,
 }
 
+/// The extras a provision carries beyond the database's own identity.
+///
+/// Grouped rather than passed positionally: `run` already took ten arguments,
+/// and each one added made the next easier to pass in the wrong slot.
+#[derive(Debug, Clone, Default)]
+pub struct ProvisionSpec {
+    /// Metadata labels for the runtime instance. Merged after the GFS-owned
+    /// discovery labels, so a caller can override `gfs.role`.
+    pub labels: std::collections::BTreeMap<String, String>,
+    /// What the selected performance profile promised, already resolved to
+    /// runtime units. Recorded with the repository so every rebuild re-applies
+    /// it instead of re-deriving it.
+    pub resources: Option<ComputeResources>,
+}
+
 impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
     pub fn new(
         repository: Arc<dyn Repository>,
@@ -89,7 +106,7 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         credentials: DatabaseCredentials,
         display_name: Option<String>,
         image: Option<String>,
-        labels: std::collections::BTreeMap<String, String>,
+        provision: ProvisionSpec,
     ) -> std::result::Result<(), InitRepoError> {
         // Validate the provider and version HERE, not only in the caller.
         //
@@ -131,7 +148,7 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
                 credentials,
                 display_name,
                 image,
-                labels,
+                provision,
             )
             .await?;
         }
@@ -149,7 +166,7 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         credentials: DatabaseCredentials,
         display_name: Option<String>,
         image: Option<String>,
-        labels: std::collections::BTreeMap<String, String>,
+        provision: ProvisionSpec,
     ) -> std::result::Result<(), InitRepoError> {
         let list = self.registry.list();
         let matched_name = list
@@ -303,8 +320,23 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
         .collect();
-        gfs_labels.extend(labels);
+        gfs_labels.extend(provision.labels);
         definition.labels = gfs_labels;
+        definition.resources = provision.resources;
+
+        // Record the spec with the repository before the container is built.
+        // A declaration applied only at first provision is not a guarantee:
+        // checkout, resume and autostart all rebuild from this record, and a
+        // rebuild that re-derives instead of re-reading is how the promise gets
+        // quietly dropped. Best-effort — a database running with the right
+        // limits but an unwritten record beats a failed deploy, and the warning
+        // says exactly what was lost.
+        if let Err(e) = GfsConfig::record_compute_resources(repo_path, provision.resources) {
+            tracing::warn!(
+                error = %e,
+                "could not record the resource spec; rebuilds will not re-apply it"
+            );
+        }
 
         let workspace_data_dir = self
             .repository
@@ -989,7 +1021,10 @@ mod tests {
                 DatabaseCredentials::default(),
                 None,
                 None,
-                labels.clone(),
+                ProvisionSpec {
+                    labels: labels.clone(),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -1050,7 +1085,10 @@ mod tests {
                 DatabaseCredentials::default(),
                 None,
                 None,
-                labels,
+                ProvisionSpec {
+                    labels,
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();

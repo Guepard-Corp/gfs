@@ -231,6 +231,11 @@ fn checkout_definition(
     // --database-name/--database-user reverts to `postgres` after every checkout,
     // breaking `gfs query` with `role "postgres" does not exist`.
     apply_repo_credentials_to_env(&mut def.env, creds);
+    // Re-apply the recorded resource spec rather than re-deriving one. The
+    // repository is the authoritative copy; a checkout that rebuilt
+    // the pod from the provider default would drop the limits exactly the way
+    // it used to drop the tuning parameters.
+    def.resources = cfg.compute_resources();
     // PVC already exists from VolumeSnapshot restore; mount default `{instance}-data`.
     def.host_data_dir = None;
     def
@@ -351,7 +356,7 @@ mod tests {
     use std::path::PathBuf;
 
     use gfs_domain::model::config::{ComputeConfig, EnvironmentConfig};
-    use gfs_domain::ports::compute::ComputeDefinition;
+    use gfs_domain::ports::compute::{ComputeDefinition, ComputeResources};
     use gfs_domain::ports::database_provider::{
         ConnectionParams, DatabaseProviderArg, ProviderError, SupportedFeature,
     };
@@ -528,6 +533,7 @@ mod tests {
                     .iter()
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect(),
+                resources: None,
             }),
         }
     }
@@ -562,6 +568,32 @@ mod tests {
             "the provider's own defaults were lost; args were {:?}",
             def.args
         );
+    }
+
+    #[test]
+    fn checkout_reapplies_the_recorded_resource_spec() {
+        // A rebuild must re-read the repository's record
+        // rather than re-derive from the provider default — the same failure
+        // mode that lost the tuning parameters, one field over.
+        let mut cfg = cfg_with_params(&[]);
+        cfg.compute.as_mut().unwrap().resources = Some(ComputeResources {
+            cpu_millicores: 625,
+            memory_mb: 1024,
+        });
+
+        let def = checkout_definition(&StubProvider, &cfg, &creds(None, None));
+
+        let applied = def.resources.expect("the recorded spec was dropped");
+        assert_eq!(applied.cpu_millicores, 625);
+        assert_eq!(applied.memory_mb, 1024);
+    }
+
+    #[test]
+    fn checkout_attaches_no_spec_when_none_was_recorded() {
+        // A database provisioned before enforcement existed keeps rebuilding
+        // unconstrained, rather than acquiring an invented limit.
+        let def = checkout_definition(&StubProvider, &cfg_with_params(&[]), &creds(None, None));
+        assert!(def.resources.is_none());
     }
 
     #[test]
