@@ -342,6 +342,15 @@ pub async fn reprovision_after_pvc_restore<R: DatabaseProviderRegistry>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use gfs_domain::model::config::{ComputeConfig, EnvironmentConfig};
+    use gfs_domain::ports::compute::ComputeDefinition;
+    use gfs_domain::ports::database_provider::{
+        ConnectionParams, DatabaseProviderArg, ProviderError, SupportedFeature,
+    };
+
     use super::*;
 
     #[test]
@@ -404,5 +413,159 @@ mod tests {
         let get = |n: &str| e.iter().find(|v| v.name == n).unwrap().default.as_deref();
         assert_eq!(get("POSTGRES_USER"), Some("postgres"));
         assert_eq!(get("POSTGRES_DB"), Some("postgres"));
+    }
+
+    /// Stands in for a real provider so the definition a checkout builds can be
+    /// asserted without a cluster. Deliberately a stub and not
+    /// `gfs-compute-docker`'s PostgreSQL provider: an adapter must not depend on
+    /// another adapter. `render_param_overrides` is byte-identical to the real
+    /// one (`compute-docker/src/containers/postgresql.rs:286`).
+    struct StubProvider;
+
+    impl DatabaseProvider for StubProvider {
+        fn name(&self) -> &str {
+            "postgres"
+        }
+
+        fn connection_string(
+            &self,
+            _: &ConnectionParams,
+        ) -> std::result::Result<String, ProviderError> {
+            Ok("postgres://localhost".into())
+        }
+
+        fn supported_versions(&self) -> Vec<String> {
+            vec!["17".into()]
+        }
+
+        fn supported_features(&self) -> Vec<SupportedFeature> {
+            vec![]
+        }
+
+        fn query_client_command(
+            &self,
+            _: &ConnectionParams,
+            _: Option<&str>,
+        ) -> std::result::Result<std::process::Command, ProviderError> {
+            Ok(std::process::Command::new("true"))
+        }
+
+        fn container(&self) -> Option<&dyn ContainerProvider> {
+            Some(self)
+        }
+    }
+
+    impl ContainerProvider for StubProvider {
+        fn prepare_for_snapshot(
+            &self,
+            _: &ConnectionParams,
+        ) -> gfs_domain::ports::database_provider::Result<Vec<String>> {
+            Ok(vec![])
+        }
+
+        fn definition(&self) -> ComputeDefinition {
+            ComputeDefinition {
+                image: "postgres:17".into(),
+                env: vec![EnvVar {
+                    name: "POSTGRES_USER".into(),
+                    default: Some("postgres".into()),
+                }],
+                ports: vec![],
+                data_dir: PathBuf::from("/var/lib/postgresql/data"),
+                host_data_dir: None,
+                user: None,
+                logs_dir: None,
+                conf_dir: None,
+                args: vec!["-c".into(), "listen_addresses=*".into()],
+                labels: Default::default(),
+            }
+        }
+
+        fn default_port(&self) -> u16 {
+            5432
+        }
+
+        fn default_args(&self) -> Vec<DatabaseProviderArg> {
+            vec![]
+        }
+
+        fn render_param_overrides(
+            &self,
+            params: &BTreeMap<String, String>,
+        ) -> Vec<DatabaseProviderArg> {
+            params
+                .iter()
+                .map(|(k, v)| DatabaseProviderArg {
+                    name: "-c".into(),
+                    value: format!("{k}={v}"),
+                })
+                .collect()
+        }
+    }
+
+    fn cfg_with_params(params: &[(&str, &str)]) -> GfsConfig {
+        GfsConfig {
+            mount_point: None,
+            version: String::new(),
+            description: String::new(),
+            user: None,
+            environment: Some(EnvironmentConfig {
+                database_provider: "postgres".into(),
+                database_version: "17".into(),
+                database_port: None,
+                display_name: None,
+            }),
+            runtime: None,
+            storage: None,
+            compute: Some(ComputeConfig {
+                params: params
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            }),
+        }
+    }
+
+    fn has_arg_pair(args: &[String], name: &str, value: &str) -> bool {
+        args.windows(2).any(|w| w[0] == name && w[1] == value)
+    }
+
+    #[test]
+    fn checkout_definition_carries_the_repositorys_tuning_parameters() {
+        // A checkout rebuilds the pod from scratch, and `[compute.params]` is
+        // persisted in .gfs/config.toml precisely so every rebuild can re-apply
+        // it. Every other provisioning site reads it back through
+        // `definition_with_overrides` — init_repo_usecase.rs:141,
+        // checkout_repo_usecase.rs:300, cmd_compute.rs:456, mcp/tools.rs:1156.
+        // This path did not, so a branch switch quietly reverted a tuned
+        // database to the provider's defaults with nothing reporting it.
+        let cfg = cfg_with_params(&[("max_connections", "200")]);
+
+        let def = checkout_definition(&StubProvider, &cfg, &creds(None, None));
+
+        assert!(
+            has_arg_pair(&def.args, "-c", "max_connections=200"),
+            "the repository's tuning parameters were dropped; args were {:?}",
+            def.args
+        );
+        // The override is appended after the defaults, not instead of them —
+        // for engines where the last occurrence wins, that ordering is what
+        // makes it an override rather than the only setting.
+        assert!(
+            has_arg_pair(&def.args, "-c", "listen_addresses=*"),
+            "the provider's own defaults were lost; args were {:?}",
+            def.args
+        );
+    }
+
+    #[test]
+    fn checkout_definition_adds_nothing_when_no_parameters_are_configured() {
+        // Guards the other direction: a repository that never tuned anything
+        // must still deploy exactly what the provider specifies.
+        let cfg = cfg_with_params(&[]);
+
+        let def = checkout_definition(&StubProvider, &cfg, &creds(None, None));
+
+        assert_eq!(def.args, StubProvider.definition().args);
     }
 }
