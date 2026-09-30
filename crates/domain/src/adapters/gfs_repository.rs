@@ -36,7 +36,7 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     {
         let source = src.join(".");
-        let status = Command::new("cp")
+        let status = Command::new(crate::utils::system_bin::resolve("cp"))
             .arg("-cRp")
             .arg(&source)
             .arg(dst)
@@ -52,7 +52,7 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         let source = src.join(".");
-        let output = Command::new("cp")
+        let output = Command::new(crate::utils::system_bin::resolve("cp"))
             .args(["--reflink=auto", "-a"])
             .arg(&source)
             .arg(dst)
@@ -73,7 +73,8 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
         if is_permission_error_output(&output)
             && is_likely_podman_runtime()
             && run_podman_unshare(&format!(
-                "LANG=C cp --reflink=auto -a {}/. {}",
+                "LANG=C {} --reflink=auto -a {}/. {}",
+                shell_quote(&crate::utils::system_bin::resolve("cp").to_string_lossy()),
                 shell_quote(&src.to_string_lossy()),
                 shell_quote(&dst.to_string_lossy())
             ))
