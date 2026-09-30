@@ -11,6 +11,12 @@ GFS provides an MCP (Model Context Protocol) server for AI agent integration, en
 
 - PostgreSQL (versions 13-18)
 - MySQL (versions 8.0-8.1)
+- SQLite (version 3) — file-based; needs no container runtime
+
+With SQLite, `init`, `commit`, `log`, `status`, `checkout`, `extract_schema`,
+`show_schema`, `diff_schema`, `export_database`, `import_database` and `query`
+all work with no container runtime running. `compute` and `user` do not apply:
+there is no server to start and no roles to manage.
 
 ## Installation
 
@@ -35,7 +41,7 @@ The server starts automatically when configured in your MCP client. It provides 
 
 ### 2. Check Available Tools
 
-The MCP server exposes 13 tools for database version control operations. All tools accept an optional `path` parameter to specify repository location.
+The MCP server exposes 14 tools for database version control operations. All tools accept an optional `path` parameter to specify repository location.
 
 ### 3. Verify Repository Status
 
@@ -118,7 +124,13 @@ Gets repository and database container status including current branch, HEAD com
 Parameters:
 - `path` (optional) - Repository location
 
-Returns: Branch name, commit hash, container state, connection info if running.
+Returns: `current_branch`, `head_commit` (absent before the first commit),
+`active_workspace_data_dir`, and `compute` when a container is configured. For
+SQLite, `connection_string` is a `sqlite:` URL to the file in the active
+workspace and there is no `compute` section.
+
+`gfs status` reports the same fields from the same source, so the CLI and this
+tool cannot disagree.
 
 ### 4. Commit Changes
 
@@ -159,7 +171,9 @@ Switches to existing branch, specific commit, or creates new branch.
 Parameters:
 - `revision` (required) - Branch name or commit hash
 - `path` (optional) - Repository location
-- `create_branch` (optional) - Create new branch if true
+- `create_branch` (optional) - **Name** of a new branch to create and switch to. A
+  string, not a boolean: `create_branch: true` is rejected with
+  `invalid type: boolean, expected a string`
 
 Returns: Success status and checked out revision.
 
@@ -184,8 +198,8 @@ Manages database container lifecycle.
 Parameters:
 - `action` (required) - Operation: status, start, stop, restart, pause, unpause, logs
 - `path` (optional) - Repository location
-- `tail` (optional, logs only) - Number of lines to show
-- `since` (optional, logs only) - Timestamp filter
+- `logs_tail` (optional, logs only) - Number of lines to show
+- `logs_since` (optional, logs only) - Timestamp filter
 
 Returns: Status information or log output based on action.
 
@@ -207,9 +221,17 @@ Executes SQL queries against the database or returns connection information.
 Parameters:
 - `query` (optional) - SQL query to execute (omit for connection info)
 - `path` (optional) - Repository location
-- `database` (optional) - Override database name
+- `database` (optional) - Override database name. Not accepted for SQLite: the
+  file *is* the database, so there is nothing to select, and passing it is an
+  error rather than a silently ignored argument.
 
-Returns: Query results or connection information if no query provided.
+Returns: Query results or connection information if no query provided. For
+SQLite the connection information is a `sqlite:` URL to the file in the active
+workspace, with no host or port.
+
+This tool runs the database's own client on the host — `psql`, `mysql`,
+`sqlite3` — so that binary must be installed. Nothing else in this list needs
+it: GFS reads SQLite through a linked engine.
 
 ### 9. Schema Operations
 
@@ -297,7 +319,7 @@ Tool: `import_database`
 Imports data from file into database.
 
 Parameters:
-- `file_path` (required) - Path to import file
+- `file` (required) - Path to import file
 - `path` (optional) - Repository location
 - `format` (optional) - Data format (sql, csv, json, custom)
 
@@ -314,7 +336,7 @@ Track schema changes alongside code changes for complete version control.
 Workflow:
 1. Use `status` to verify repository and container state
 2. Use `show_schema` to view current schema structure
-3. Use `checkout` with `create_branch` to create feature branch
+3. Use `checkout` with `create_branch: "<name>"` to create a feature branch
 4. Make schema changes via `query` tool
 5. Use `commit` to capture changes (schema automatically versioned)
 6. Use `diff_schema` to compare with main branch
@@ -341,7 +363,7 @@ Workflow:
 3. Use `checkout` to switch to specific commit
 4. Use `status` to verify state
 5. Use `query` to validate data
-6. Use `checkout` with `create_branch` if state is correct
+6. Use `checkout` with `create_branch: "<name>"` if state is correct
 
 ### Schema Migration Planning
 
@@ -386,7 +408,9 @@ If `show_schema` returns error about missing schema, the commit was created befo
 
 ### Tool Execution Fails
 
-Check that GFS CLI is installed on MCP server host. Verify Docker is running for database operations. Review error messages in tool response for specific issues.
+Check that GFS CLI is installed on the MCP server host. For a container-backed
+provider, verify the container runtime is running; SQLite needs none. Review the
+error message in the tool response — the tools name the actual problem.
 
 ## CLI Fallback with `--json`
 
@@ -412,7 +436,8 @@ gfs log --graph --all
 ```
 
 **Exit codes** for conditional logic:
-- `gfs status` → 0 (compute running) or 1 (compute down)
+- `gfs status` → 0 (compute running, **or** an embedded provider with no compute at
+  all) or 1 (a container-backed provider whose compute is down)
 - `gfs schema diff` → 0 (no changes), 1 (changes), 2 (breaking)
 
 ## Key Reminders
@@ -422,7 +447,9 @@ gfs log --graph --all
 3. **Use diff_schema before merging** - Review schema changes between branches
 4. **Check status first** - Verify repository and container state before operations
 5. **Path parameter** - Specify repository location or set GFS_REPO_PATH
-6. **Container must be running** - Database operations require active container
+6. **A container-backed provider needs its container running** - postgres, mysql and
+   clickhouse operations require an active container. SQLite does not: it is a file
+   this process opens, and `compute` has nothing to start
 7. **Show_schema for documentation** - Use to document database structure at any point
 8. **Extract_schema for current state** - Capture current schema without commit
 9. **Tool responses are structured** - Parse JSON responses for programmatic access

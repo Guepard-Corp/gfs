@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gfs_compute_docker::DockerCompute;
-use gfs_compute_docker::containers;
 use gfs_compute_kubernetes::KubernetesCompute;
+use gfs_db_providers as containers;
 use gfs_domain::ports::compute::Compute;
 use gfs_domain::ports::database_provider::InMemoryDatabaseProviderRegistry;
 use gfs_domain::usecases::repository::clone_repo_usecase::CloneRepoUseCase;

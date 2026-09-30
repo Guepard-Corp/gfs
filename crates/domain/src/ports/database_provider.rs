@@ -6,6 +6,7 @@
 //! [`DatabaseProviderRegistry::get`] / [`DatabaseProviderRegistry::list`] to look them up.
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use crate::model::db_user::{DeployEnvSpec, GrantSpec, RevokeSpec, RolePreset, RoleSpec};
@@ -37,6 +38,16 @@ pub enum ProviderError {
 
     #[error("unsupported format: '{0}'")]
     UnsupportedFormat(String),
+
+    /// The database is held by another writer and could not be quiesced.
+    ///
+    /// Kept distinct from [`ProviderError::InvalidParams`] because callers may
+    /// reasonably choose to proceed without quiescing when a database is merely
+    /// *busy* — but must never make that choice when the database could not be
+    /// opened or read at all, where proceeding would snapshot something
+    /// unusable.
+    #[error("database is busy: {0}")]
+    Busy(String),
 }
 
 pub type Result<T> = std::result::Result<T, RegistryError>;
@@ -201,6 +212,112 @@ pub struct CloneSpec {
 pub const SIGTERM: u32 = 15;
 
 // ---------------------------------------------------------------------------
+// Embedded engines
+// ---------------------------------------------------------------------------
+
+/// Key under which [`ConnectionParams::env`] carries the absolute path of the
+/// active workspace's data directory, for providers with a [`LocalEngine`].
+///
+/// The container path passes credentials and a host/port because it is talking
+/// to a server. An embedded engine instead needs to know where the workspace
+/// lives, and derives its own file layout from that directory. Passing the
+/// directory rather than a file path is deliberate: it keeps every filename a
+/// provider chooses inside that provider, so the orchestration layers never
+/// name another engine's files.
+pub const LOCAL_DATA_DIR_ENV: &str = "GFS_LOCAL_DATA_DIR";
+
+/// In-process database operations for providers that have no compute instance.
+///
+/// The rest of this port describes work as commands for a runtime to execute
+/// inside a running database instance. That shape assumes a server. An embedded
+/// engine — SQLite, or a future DuckDB-style provider — has no server: the
+/// database is a file, and the library that reads it is linked into this
+/// binary. Such a provider returns an engine from
+/// [`DatabaseProvider::local_engine`], and the orchestration layers call it
+/// instead of provisioning a container.
+///
+/// Implementations should link the engine rather than shell out to a client
+/// binary. Schema extraction records the engine version into commit metadata,
+/// so depending on whatever client happens to be installed would make the same
+/// schema produce different metadata on different machines.
+pub trait LocalEngine: Send + Sync {
+    /// Extract schema metadata, returning the same delimiter-separated payload
+    /// that a [`SchemaExtractionSpec`] command writes to stdout
+    /// (`GFS_SCHEMA_VERSION`, `GFS_SCHEMA_SCHEMAS`, `GFS_SCHEMA_TABLES`,
+    /// `GFS_SCHEMA_COLUMNS`, and optionally `GFS_SCHEMA_DDL`).
+    ///
+    /// Returning the same format as the container path means both feed one
+    /// parser, rather than each assembling metadata its own way.
+    fn extract_schema(
+        &self,
+        params: &ConnectionParams,
+    ) -> std::result::Result<String, ProviderError>;
+
+    /// Quiesce the database and hold it quiescent until the returned guard is
+    /// dropped.
+    ///
+    /// The counterpart to [`DatabaseProvider::prepare_for_snapshot`], whose
+    /// commands a runtime executes inside an instance before pausing it. An
+    /// embedded engine has no instance to pause, and — more importantly — the
+    /// process writing the database is the user's own application, which no
+    /// container could freeze either. So the engine must exclude writers itself,
+    /// using whatever locking it provides, and keep them excluded while the
+    /// storage layer copies the files.
+    ///
+    /// The caller holds the guard across `snapshot()` and drops it afterwards.
+    /// Returning `Ok(None)` means there was nothing to quiesce — a repository
+    /// initialised but never written to has no database yet, and that must not
+    /// fail the commit.
+    ///
+    /// Implementations should fail rather than block indefinitely when another
+    /// writer holds the database: the caller decides whether an unquiesced
+    /// snapshot is acceptable.
+    fn prepare_for_snapshot(
+        &self,
+        params: &ConnectionParams,
+    ) -> std::result::Result<Option<Box<dyn SnapshotGuard>>, ProviderError>;
+
+    /// Write the database to `destination` in `format`.
+    ///
+    /// The container path builds an [`ExportSpec`] for a sidecar to run; an
+    /// embedded engine has no sidecar, so it writes the file itself. The
+    /// caller has already decided where the file goes.
+    ///
+    /// Default: the provider advertises no export formats.
+    fn export(
+        &self,
+        params: &ConnectionParams,
+        format: &str,
+        destination: &Path,
+    ) -> std::result::Result<(), ProviderError> {
+        let _ = (params, destination);
+        Err(ProviderError::UnsupportedFormat(format.to_string()))
+    }
+
+    /// Replay `source` into the database.
+    ///
+    /// Default: the provider advertises no import formats.
+    fn import(
+        &self,
+        params: &ConnectionParams,
+        format: &str,
+        source: &Path,
+    ) -> std::result::Result<(), ProviderError> {
+        let _ = (params, source);
+        Err(ProviderError::UnsupportedFormat(format.to_string()))
+    }
+}
+
+/// Holds an embedded database quiescent for the lifetime of the value.
+///
+/// Dropping it releases whatever lock the engine took, so the caller keeps it
+/// alive for exactly as long as the storage snapshot is in progress.
+pub trait SnapshotGuard: Send {
+    /// What is being held, for diagnostics (e.g. `"sqlite write lock"`).
+    fn describe(&self) -> String;
+}
+
+// ---------------------------------------------------------------------------
 // Provider port
 // ---------------------------------------------------------------------------
 
@@ -210,55 +327,19 @@ pub trait DatabaseProvider: Send + Sync {
     /// Display name used to register and look up this provider (e.g. `"postgresql"`).
     fn name(&self) -> &str;
 
-    /// Compute definition used for provisioning (image, env, ports, data dir, etc.).
-    fn definition(&self) -> ComputeDefinition;
-
-    /// Default container port for this database (e.g. 5432 for PostgreSQL).
-    fn default_port(&self) -> u16;
-
-    /// Default arguments for this database provider.
-    fn default_args(&self) -> Vec<DatabaseProviderArg>;
-
-    /// Render user-supplied container parameter overrides (from
-    /// `[compute.params]`) into this provider's native argument syntax.
+    /// Whether this provider needs a running compute instance (container or VM).
     ///
-    /// Keys are logical setting names; the provider maps each into its own form
-    /// (e.g. PostgreSQL `-c name=value`, MySQL `--name=value`). The returned
-    /// args are appended *after* [`default_args`](Self::default_args), so for
-    /// engines where the last occurrence wins they override the defaults.
+    /// Client/server engines need one: the database is a process that must be
+    /// provisioned, started, paused and connected to over a port. Embedded
+    /// engines such as SQLite do not — the database is a file, opened
+    /// in-process by whichever program uses it, so there is nothing to
+    /// provision and nothing to connect to.
     ///
-    /// Default: returns nothing (provider does not support overrides).
-    fn render_param_overrides(
-        &self,
-        params: &BTreeMap<String, String>,
-    ) -> Vec<DatabaseProviderArg> {
-        let _ = params;
-        Vec::new()
-    }
-
-    /// [`definition`](Self::definition) with `params` rendered and appended to
-    /// `args`. Provisioning sites use this so container tuning from
-    /// `[compute.params]` is (re-)applied on every init/checkout/restart.
-    fn definition_with_overrides(&self, params: &BTreeMap<String, String>) -> ComputeDefinition {
-        let mut def = self.definition();
-        def.args.extend(
-            self.render_param_overrides(params)
-                .into_iter()
-                .flat_map(|a| {
-                    if a.value.is_empty() {
-                        vec![a.name]
-                    } else {
-                        vec![a.name, a.value]
-                    }
-                }),
-        );
-        def
-    }
-
-    /// Default signal sent to the database process when stopping (e.g. for graceful shutdown).
-    /// Returns the signal number (e.g. [`SIGTERM`] = 15 on Unix). Default implementation returns SIGTERM.
-    fn default_signal(&self) -> u32 {
-        SIGTERM
+    /// Derived from [`DatabaseProvider::local_engine`] rather than declared
+    /// separately, so a provider cannot claim to need no compute while offering
+    /// no way to run without it. Do not override.
+    fn requires_compute(&self) -> bool {
+        self.container().is_some()
     }
 
     /// Build a client connection string from host, port, and optional env (credentials, db name).
@@ -266,16 +347,6 @@ pub trait DatabaseProvider: Send + Sync {
         &self,
         params: &ConnectionParams,
     ) -> std::result::Result<String, ProviderError>;
-
-    /// Extract version string from the definition's image (e.g. `postgres:16` → `"16"`).
-    fn version_from_image(&self, definition: &ComputeDefinition) -> String {
-        definition
-            .image
-            .split(':')
-            .nth(1)
-            .unwrap_or("latest")
-            .to_string()
-    }
 
     /// List of supported version tags (e.g. `"16"`, `"8.0"`). Used for discovery/listing (e.g. `gfs providers`).
     fn supported_versions(&self) -> Vec<String>;
@@ -289,40 +360,6 @@ pub trait DatabaseProvider: Send + Sync {
             .into_iter()
             .find(|f| f.id == feature_id)
             .map(|f| f.description)
-    }
-
-    /// Prepare the database provider for snapshotting.
-    /// Returns a list of commands to run before taking the snapshot (e.g. `psql -U user -c "CHECKPOINT;"`).
-    /// The compute runtime runs these commands in the container before taking the snapshot.
-    fn prepare_for_snapshot(&self, params: &ConnectionParams) -> Result<Vec<String>>;
-
-    /// Return the user/group that should own files under the provider's `definition().data_dir`
-    /// inside the container (for example `"postgres:postgres"`).
-    ///
-    /// This is used for best-effort permission repair after checkout when the workspace
-    /// was populated from a snapshot created via container streaming (which intentionally
-    /// does not preserve original ownership/mode bits).
-    ///
-    /// Default: `None` (provider does not declare a canonical owner).
-    fn data_dir_owner(&self) -> Option<&'static str> {
-        None
-    }
-
-    /// Startup probes executed **inside the running database container** after checkout.
-    ///
-    /// Goal: turn “container is running” into “database is actually usable on this workspace”.
-    /// Probes should be:
-    /// - fast
-    /// - deterministic
-    /// - safe (no mutations unless explicitly intended)
-    ///
-    /// The compute runtime should execute these probes with root privileges when available,
-    /// because permission repair may be needed before the container’s default user can read
-    /// the mounted data directory.
-    ///
-    /// Default: empty (no health gate).
-    fn container_startup_probes(&self) -> &'static [&'static str] {
-        &[]
     }
 
     // -----------------------------------------------------------------------
@@ -339,40 +376,6 @@ pub trait DatabaseProvider: Send + Sync {
     /// Default: empty (provider does not advertise import support).
     fn supported_import_formats(&self) -> Vec<DataFormat> {
         vec![]
-    }
-
-    /// Describe how to export data in the given format as a sidecar task.
-    ///
-    /// Returns a [`ComputeDefinition`] for the tool sidecar, the shell command
-    /// to run inside it, and the output filename. The orchestrator will set
-    /// `definition.host_data_dir` before running the task.
-    ///
-    /// `params` carries the connection info the sidecar uses to reach the
-    /// database instance (host, port, credentials).
-    fn export_spec(
-        &self,
-        _params: &ConnectionParams,
-        format: &str,
-    ) -> std::result::Result<ExportSpec, ProviderError> {
-        Err(ProviderError::UnsupportedFormat(format.to_string()))
-    }
-
-    /// Describe how to import data in the given format as a sidecar task.
-    ///
-    /// Returns a [`ComputeDefinition`] for the tool sidecar, the shell command
-    /// to run inside it, and the expected input filename. The orchestrator will
-    /// set `definition.host_data_dir` before running the task.
-    ///
-    /// `params` carries the connection info the sidecar uses to reach the
-    /// database instance (host, port, credentials).
-    /// `input_filename` is the basename of the file to import (e.g. from the user's `--file` path).
-    fn import_spec(
-        &self,
-        _params: &ConnectionParams,
-        format: &str,
-        _input_filename: &str,
-    ) -> std::result::Result<ImportSpec, ProviderError> {
-        Err(ProviderError::UnsupportedFormat(format.to_string()))
     }
 
     // -----------------------------------------------------------------------
@@ -399,21 +402,6 @@ pub trait DatabaseProvider: Send + Sync {
         params: &ConnectionParams,
         query: Option<&str>,
     ) -> std::result::Result<std::process::Command, ProviderError>;
-
-    /// Shell command to run **inside** the running database instance (via [`Compute::exec`]).
-    ///
-    /// Uses container env vars and loopback — no host-side client binaries. Interactive
-    /// sessions are not supported; `sql` must be non-empty.
-    /// When `database` is `Some`, the query targets that database; otherwise it
-    /// uses the instance's configured default (e.g. `$POSTGRES_DB`).
-    fn query_in_instance_command(
-        &self,
-        sql: &str,
-        database: Option<&str>,
-    ) -> std::result::Result<String, ProviderError> {
-        let _ = (sql, database);
-        Err(ProviderError::UnsupportedFormat("query_in_instance".into()))
-    }
 
     // -----------------------------------------------------------------------
     // User / role management (`gfs user`)
@@ -597,6 +585,202 @@ pub trait DatabaseProvider: Send + Sync {
         HashMap::new()
     }
 
+    // -----------------------------------------------------------------------
+    // In-process execution
+    // -----------------------------------------------------------------------
+
+    /// The in-process engine backing this provider, if it has one.
+    ///
+    /// Returning `Some` is what makes a provider embedded: every operation the
+    /// container path performs by executing a command inside an instance, an
+    /// embedded provider performs here instead. See [`LocalEngine`].
+    ///
+    /// Default: `None` — the provider is a client/server database and needs a
+    /// compute instance.
+    fn local_engine(&self) -> Option<&dyn LocalEngine> {
+        None
+    }
+
+    /// The container-backed half of this provider, if it has one.
+    ///
+    /// Exactly one of this and [`DatabaseProvider::local_engine`] returns
+    /// `Some`: a database either runs as a server GFS provisions, or is a file
+    /// GFS opens in this process.
+    fn container(&self) -> Option<&dyn ContainerProvider> {
+        None
+    }
+}
+
+/// Everything a provider can only mean when its database runs as a server in a
+/// compute instance.
+///
+/// A client/server engine (postgres, mysql, clickhouse) returns one of these
+/// from [`DatabaseProvider::container`]. An embedded engine — SQLite, or a
+/// future DuckDB-style provider — does not, because it has no image to
+/// provision, no port to publish, and no instance to exec commands inside.
+/// Keeping these methods off [`DatabaseProvider`] is what makes a fabricated
+/// `ComputeDefinition` unrepresentable rather than merely discouraged.
+impl dyn DatabaseProvider + '_ {
+    /// The container half, or an error naming the provider that lacks one.
+    ///
+    /// Call sites that provision, pause, or exec inside an instance need this.
+    /// An embedded provider returns `None`, and the error says so plainly rather
+    /// than letting a caller proceed with a placeholder definition.
+    pub fn require_container(&self) -> std::result::Result<&dyn ContainerProvider, ProviderError> {
+        self.container().ok_or_else(|| {
+            ProviderError::InvalidParams(format!(
+                "provider '{}' runs in this process and has no compute instance",
+                self.name()
+            ))
+        })
+    }
+}
+
+pub trait ContainerProvider: Send + Sync {
+    /// Extract version string from the definition's image (e.g. `postgres:16` → `"16"`).
+    fn version_from_image(&self, definition: &ComputeDefinition) -> String {
+        definition
+            .image
+            .split(':')
+            .nth(1)
+            .unwrap_or("latest")
+            .to_string()
+    }
+
+    /// Shell command to run **inside** the running database instance (via [`Compute::exec`]).
+    ///
+    /// Uses container env vars and loopback — no host-side client binaries. Interactive
+    /// sessions are not supported; `sql` must be non-empty.
+    /// When `database` is `Some`, the query targets that database; otherwise it
+    /// uses the instance's configured default (e.g. `$POSTGRES_DB`).
+    fn query_in_instance_command(
+        &self,
+        sql: &str,
+        database: Option<&str>,
+    ) -> std::result::Result<String, ProviderError> {
+        let _ = (sql, database);
+        Err(ProviderError::UnsupportedFormat("query_in_instance".into()))
+    }
+
+    /// Compute definition used for provisioning (image, env, ports, data dir, etc.).
+    fn definition(&self) -> ComputeDefinition;
+
+    /// Default container port for this database (e.g. 5432 for PostgreSQL).
+    fn default_port(&self) -> u16;
+
+    /// Default arguments for this database provider.
+    fn default_args(&self) -> Vec<DatabaseProviderArg>;
+
+    /// Render user-supplied container parameter overrides (from
+    /// `[compute.params]`) into this provider's native argument syntax.
+    ///
+    /// Keys are logical setting names; the provider maps each into its own form
+    /// (e.g. PostgreSQL `-c name=value`, MySQL `--name=value`). The returned
+    /// args are appended *after* [`default_args`](Self::default_args), so for
+    /// engines where the last occurrence wins they override the defaults.
+    ///
+    /// Default: returns nothing (provider does not support overrides).
+    fn render_param_overrides(
+        &self,
+        params: &BTreeMap<String, String>,
+    ) -> Vec<DatabaseProviderArg> {
+        let _ = params;
+        Vec::new()
+    }
+
+    /// [`definition`](Self::definition) with `params` rendered and appended to
+    /// `args`. Provisioning sites use this so container tuning from
+    /// `[compute.params]` is (re-)applied on every init/checkout/restart.
+    fn definition_with_overrides(&self, params: &BTreeMap<String, String>) -> ComputeDefinition {
+        let mut def = self.definition();
+        def.args.extend(
+            self.render_param_overrides(params)
+                .into_iter()
+                .flat_map(|a| {
+                    if a.value.is_empty() {
+                        vec![a.name]
+                    } else {
+                        vec![a.name, a.value]
+                    }
+                }),
+        );
+        def
+    }
+
+    /// Default signal sent to the database process when stopping (e.g. for graceful shutdown).
+    /// Returns the signal number (e.g. [`SIGTERM`] = 15 on Unix). Default implementation returns SIGTERM.
+    fn default_signal(&self) -> u32 {
+        SIGTERM
+    }
+
+    /// Prepare the database provider for snapshotting.
+    /// Returns a list of commands to run before taking the snapshot (e.g. `psql -U user -c "CHECKPOINT;"`).
+    /// The compute runtime runs these commands in the container before taking the snapshot.
+    fn prepare_for_snapshot(&self, params: &ConnectionParams) -> Result<Vec<String>>;
+
+    /// Return the user/group that should own files under the provider's `definition().data_dir`
+    /// inside the container (for example `"postgres:postgres"`).
+    ///
+    /// This is used for best-effort permission repair after checkout when the workspace
+    /// was populated from a snapshot created via container streaming (which intentionally
+    /// does not preserve original ownership/mode bits).
+    ///
+    /// Default: `None` (provider does not declare a canonical owner).
+    fn data_dir_owner(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Startup probes executed **inside the running database container** after checkout.
+    ///
+    /// Goal: turn “container is running” into “database is actually usable on this workspace”.
+    /// Probes should be:
+    /// - fast
+    /// - deterministic
+    /// - safe (no mutations unless explicitly intended)
+    ///
+    /// The compute runtime should execute these probes with root privileges when available,
+    /// because permission repair may be needed before the container’s default user can read
+    /// the mounted data directory.
+    ///
+    /// Default: empty (no health gate).
+    fn container_startup_probes(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Describe how to export data in the given format as a sidecar task.
+    ///
+    /// Returns a [`ComputeDefinition`] for the tool sidecar, the shell command
+    /// to run inside it, and the output filename. The orchestrator will set
+    /// `definition.host_data_dir` before running the task.
+    ///
+    /// `params` carries the connection info the sidecar uses to reach the
+    /// database instance (host, port, credentials).
+    fn export_spec(
+        &self,
+        _params: &ConnectionParams,
+        format: &str,
+    ) -> std::result::Result<ExportSpec, ProviderError> {
+        Err(ProviderError::UnsupportedFormat(format.to_string()))
+    }
+
+    /// Describe how to import data in the given format as a sidecar task.
+    ///
+    /// Returns a [`ComputeDefinition`] for the tool sidecar, the shell command
+    /// to run inside it, and the expected input filename. The orchestrator will
+    /// set `definition.host_data_dir` before running the task.
+    ///
+    /// `params` carries the connection info the sidecar uses to reach the
+    /// database instance (host, port, credentials).
+    /// `input_filename` is the basename of the file to import (e.g. from the user's `--file` path).
+    fn import_spec(
+        &self,
+        _params: &ConnectionParams,
+        format: &str,
+        _input_filename: &str,
+    ) -> std::result::Result<ImportSpec, ProviderError> {
+        Err(ProviderError::UnsupportedFormat(format.to_string()))
+    }
+
     /// Return a sidecar spec for schema extraction, or `None` if not supported.
     ///
     /// When provided, schema extraction runs inside a container (no host-side
@@ -660,9 +844,13 @@ pub trait DatabaseProviderRegistry: Send + Sync {
     /// Return the provider for `name`, if registered.
     fn get(&self, name: &str) -> Option<Arc<dyn DatabaseProvider>>;
 
-    /// Return the definition for `name`, if registered. Convenience over `get(name).map(|p| p.definition())`.
+    /// Return the compute definition for `name`.
+    ///
+    /// `None` when the provider is not registered *or* has no container half —
+    /// an embedded provider has no definition to give.
     fn get_definition(&self, name: &str) -> Option<ComputeDefinition> {
-        self.get(name).map(|p| p.definition())
+        self.get(name)
+            .and_then(|p| p.container().map(|c| c.definition()))
     }
 
     /// Return all registered provider names.
@@ -714,6 +902,31 @@ impl DatabaseProviderRegistry for InMemoryDatabaseProviderRegistry {
     }
 }
 
+/// The name of the repository's provider, when that provider is embedded.
+///
+/// A repository backed by an embedded provider has no `runtime` section,
+/// because there is no container to record. Every caller that requires one is
+/// therefore about to report that no container is configured — and, before this
+/// existed, to advise `gfs compute start`, which then answered that there is no
+/// `container_name` in the repo config. Two commands, neither able to succeed,
+/// each pointing at the other.
+///
+/// Consulting the registry first turns that into a statement of fact.
+pub fn embedded_provider_name(
+    config: &crate::model::config::GfsConfig,
+    registry: &dyn DatabaseProviderRegistry,
+) -> Option<String> {
+    let name = config
+        .environment
+        .as_ref()
+        .map(|e| e.database_provider.trim())
+        .filter(|name| !name.is_empty())?;
+    registry
+        .get(name)
+        .filter(|provider| provider.local_engine().is_some())
+        .map(|_| name.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -729,26 +942,6 @@ mod tests {
     impl DatabaseProvider for TestProvider {
         fn name(&self) -> &str {
             &self.name
-        }
-        fn definition(&self) -> ComputeDefinition {
-            ComputeDefinition {
-                labels: Default::default(),
-                image: "test:latest".into(),
-                env: vec![],
-                ports: vec![],
-                data_dir: PathBuf::from("/data"),
-                host_data_dir: None,
-                user: None,
-                logs_dir: None,
-                conf_dir: None,
-                args: vec![],
-            }
-        }
-        fn default_port(&self) -> u16 {
-            5432
-        }
-        fn default_args(&self) -> Vec<DatabaseProviderArg> {
-            vec![]
         }
         fn connection_string(
             &self,
@@ -771,15 +964,42 @@ mod tests {
                 },
             ]
         }
-        fn prepare_for_snapshot(&self, _: &ConnectionParams) -> Result<Vec<String>> {
-            Ok(vec![])
-        }
         fn query_client_command(
             &self,
             _: &ConnectionParams,
             _: Option<&str>,
         ) -> std::result::Result<std::process::Command, ProviderError> {
             Ok(std::process::Command::new("true"))
+        }
+
+        fn container(&self) -> Option<&dyn ContainerProvider> {
+            Some(self)
+        }
+    }
+
+    impl ContainerProvider for TestProvider {
+        fn definition(&self) -> ComputeDefinition {
+            ComputeDefinition {
+                labels: Default::default(),
+                image: "test:latest".into(),
+                env: vec![],
+                ports: vec![],
+                data_dir: PathBuf::from("/data"),
+                host_data_dir: None,
+                user: None,
+                logs_dir: None,
+                conf_dir: None,
+                args: vec![],
+            }
+        }
+        fn default_port(&self) -> u16 {
+            5432
+        }
+        fn default_args(&self) -> Vec<DatabaseProviderArg> {
+            vec![]
+        }
+        fn prepare_for_snapshot(&self, _: &ConnectionParams) -> Result<Vec<String>> {
+            Ok(vec![])
         }
     }
 

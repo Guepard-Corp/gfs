@@ -159,6 +159,25 @@ pub fn remove_new_marker(working_dir: &Path) {
     fs::remove_file(&new_marker_path).unwrap();
 }
 
+/// Connection parameters for a provider with an in-process engine.
+///
+/// There is no host, port or credential to supply — the engine opens a file. It
+/// is told which directory the active workspace lives in and derives its own
+/// layout from there, so callers never name another provider's files.
+pub fn local_connection_params(
+    repo_path: &Path,
+) -> Result<crate::ports::database_provider::ConnectionParams, RepoError> {
+    let data_dir = get_active_workspace_data_dir(repo_path)?;
+    Ok(crate::ports::database_provider::ConnectionParams {
+        host: String::new(),
+        port: 0,
+        env: vec![(
+            crate::ports::database_provider::LOCAL_DATA_DIR_ENV.to_string(),
+            data_dir.to_string_lossy().into_owned(),
+        )],
+    })
+}
+
 /// Return the path recorded in `.gfs/WORKSPACE` — the directory where the
 /// database is currently running.
 ///

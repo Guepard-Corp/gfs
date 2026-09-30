@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use gfs_compute_docker::DockerCompute;
+use gfs_db_providers as containers;
 use gfs_domain::model::config::{GfsConfig, RuntimeConfig};
 use gfs_domain::ports::compute::{
     Compute, InstanceId, InstanceState, InstanceStatus, LogsOptions, RuntimeDescriptor,
@@ -48,6 +49,14 @@ fn resolve_id(path: Option<PathBuf>, action: &ComputeAction) -> Result<String> {
     let repo_path = path.unwrap_or_else(get_repo_dir);
     let config = GfsConfig::load(&repo_path)
         .context("not a gfs repository (use --path <repo> or run from a repo)")?;
+    if let Some(name) = embedded_provider(&config) {
+        anyhow::bail!(
+            "'{name}' is an embedded database — a file this process opens, not a server. \
+             There is no container to start, stop or inspect, and nothing to connect to: \
+             `gfs query` and `gfs commit` work directly on the file"
+        );
+    }
+
     let container_name = config
         .runtime
         .as_ref()
@@ -57,8 +66,32 @@ fn resolve_id(path: Option<PathBuf>, action: &ComputeAction) -> Result<String> {
     Ok(container_name.to_string())
 }
 
+/// The repo's provider, when it is one that runs in this process.
+fn embedded_provider(config: &GfsConfig) -> Option<String> {
+    let registry = InMemoryDatabaseProviderRegistry::new();
+    containers::register_all(&registry).ok()?;
+    gfs_domain::ports::database_provider::embedded_provider_name(config, &registry)
+}
+
 pub async fn run(path: Option<PathBuf>, action: ComputeAction, json_output: bool) -> Result<()> {
     if let ComputeAction::Config { ref key, ref value } = action {
+        // The embedded-provider refusal lives in `resolve_id`, and this arm
+        // returns before reaching it -- `resolve_id` even has an explicit
+        // `Config { .. } => return Ok(String::new())`, so the guard was
+        // structurally unreachable here. The other seven actions refuse on an
+        // embedded provider; this one accepted `db.port 5432` on a database
+        // that has no port, wrote it to config.toml, and told the caller to run
+        // `gfs compute restart` -- which then refuses.
+        let repo_path = path.clone().unwrap_or_else(get_repo_dir);
+        if let Ok(config) = GfsConfig::load(&repo_path)
+            && let Some(name) = embedded_provider(&config)
+        {
+            anyhow::bail!(
+                "'{name}' is an embedded database — a file this process opens, not a \
+                 server. There is no container to configure: `gfs query` and `gfs commit` \
+                 work directly on the file"
+            );
+        }
         return handle_config(path, key, value, json_output);
     }
     let repo_path = path.clone().unwrap_or_else(get_repo_dir);
@@ -427,12 +460,12 @@ async fn start_restart_or_recreate(
     };
 
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
-    gfs_compute_docker::containers::register_all(registry.as_ref())
-        .context("register providers")?;
+    gfs_db_providers::register_all(registry.as_ref()).context("register providers")?;
     let provider = registry
         .get(provider_name)
         .context("unknown database provider")?;
     let compute_data_path = provider
+        .require_container()?
         .definition()
         .data_dir
         .to_string_lossy()
@@ -453,7 +486,9 @@ async fn start_restart_or_recreate(
     compute.stop(instance_id).await?;
     compute.remove_instance(instance_id).await?;
 
-    let mut definition = provider.definition_with_overrides(&config.compute_params());
+    let mut definition = provider
+        .require_container()?
+        .definition_with_overrides(&config.compute_params());
     if let Some(ref env) = config.environment
         && !env.database_version.is_empty()
     {
@@ -538,9 +573,11 @@ async fn container_data_dir(
         return None;
     }
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
-    gfs_compute_docker::containers::register_all(registry.as_ref()).ok()?;
+    gfs_db_providers::register_all(registry.as_ref()).ok()?;
     let provider = registry.get(provider_name)?;
+    // An embedded provider has no container data path to report.
     let compute_data_path = provider
+        .container()?
         .definition()
         .data_dir
         .to_string_lossy()

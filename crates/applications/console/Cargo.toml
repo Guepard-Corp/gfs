@@ -26,6 +26,7 @@ rust-embed = { version = "8", features = ["mime-guess"] }
 # clone — reusing the domain model + the Docker compute adapter.
 gfs-domain = { workspace = true }
 gfs-compute-docker = { workspace = true }
+gfs-db-providers   = { workspace = true }
 # Run clone/compute via the CLI's exported command functions (in-process).
 gfs-cli = { workspace = true }
 

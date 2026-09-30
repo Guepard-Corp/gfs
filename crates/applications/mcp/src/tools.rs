@@ -1,20 +1,21 @@
 //! MCP tool implementations: thin adapter over domain use cases.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gfs_compute_docker::DockerCompute;
-use gfs_compute_docker::containers;
 use gfs_compute_kubernetes::KubernetesCompute;
+use gfs_db_providers as containers;
 use gfs_domain::adapters::gfs_repository::GfsRepository;
 use gfs_domain::model::config::{GfsConfig, RuntimeConfig};
 use gfs_domain::model::datasource::diff::compute_schema_diff;
 use gfs_domain::model::datasource::diff_formatter::JsonFormatter;
 use gfs_domain::ports::compute::{
-    Compute, InstanceId, InstanceState, InstanceStatus, LogsOptions, RuntimeDescriptor,
+    Compute, InstanceId, InstanceState, InstanceStatus, LogsOptions, NoopCompute, RuntimeDescriptor,
 };
 use gfs_domain::ports::database_provider::{
     ConnectionParams, DatabaseProviderRegistry, InMemoryDatabaseProviderRegistry,
+    embedded_provider_name,
 };
 use gfs_domain::ports::repository::{LogOptions, Repository};
 use gfs_domain::repo_utils::repo_layout;
@@ -68,6 +69,32 @@ async fn runtime_compute() -> Result<Arc<dyn Compute>, McpError> {
         Ok(Arc::new(
             DockerCompute::new().map_err(|e| to_error_data(e.to_string()))?,
         ))
+    }
+}
+
+/// Build the compute backend for the repository at `repo_path`, or a stub if it
+/// has no runtime.
+///
+/// A repository configured with an embedded provider such as SQLite has no
+/// container: nothing to connect to, and `DockerCompute::new()` fails at
+/// construction. That failure used to reach every tool in this file, because
+/// each one built a compute backend before deciding whether it needed one — so
+/// with no reachable daemon, even `init --database-provider sqlite` failed,
+/// having never intended to start a container. The CLI closed this in
+/// `compute_for_repo`; this is the same rule for MCP.
+///
+/// The stub is not a silent fallback: every compute call on it reports that the
+/// repository has no runtime, at the point a runtime is genuinely required.
+async fn runtime_compute_for_repo(repo_path: &Path) -> Result<Arc<dyn Compute>, McpError> {
+    let has_runtime = GfsConfig::load(repo_path)
+        .ok()
+        .and_then(|config| config.runtime)
+        .is_some_and(|runtime| !runtime.container_name.trim().is_empty());
+
+    if has_runtime {
+        runtime_compute().await
+    } else {
+        Ok(Arc::new(NoopCompute))
     }
 }
 
@@ -150,7 +177,7 @@ pub struct CheckoutRequest {
 pub struct InitRequest {
     #[schemars(description = "repo root path")]
     pub path: Option<String>,
-    #[schemars(description = "database provider e.g. postgres, mysql, clickhouse")]
+    #[schemars(description = "database provider e.g. postgres, mysql, clickhouse, sqlite")]
     pub database_provider: Option<String>,
     #[schemars(
         description = "database version e.g. 17 for postgres, 8.0 for mysql, 24.8.14.39 for clickhouse; required when database_provider is set"
@@ -300,7 +327,7 @@ impl GfsMcpHandler {
     }
 
     #[tool(
-        description = "List supported database providers (e.g. postgres, mysql, clickhouse) and their versions and features. Use when choosing or checking which databases this GFS server can run. Equivalent to gfs providers."
+        description = "List supported database providers (e.g. postgres, mysql, clickhouse, sqlite) and their versions and features. Use when choosing or checking which databases this GFS server can run. Equivalent to gfs providers."
     )]
     async fn list_providers(
         &self,
@@ -419,7 +446,7 @@ impl GfsMcpHandler {
     }
 
     #[tool(
-        description = "Initialize a new GFS repository backed by a database. Optional: path. If database_provider is set (e.g. postgres, mysql, clickhouse), database_version is required (e.g. 17 for postgres, 24.8.14.39 for clickhouse). Creates repo metadata and can start the database container. Equivalent to gfs init."
+        description = "Initialize a new GFS repository backed by a database. Optional: path. If database_provider is set (e.g. postgres, mysql, clickhouse, sqlite), database_version is required (e.g. 17 for postgres, 3 for sqlite, 24.8.14.39 for clickhouse). Creates repo metadata and, for a container-backed provider, can start the database container; sqlite is a file and starts nothing. Equivalent to gfs init."
     )]
     async fn init(
         &self,
@@ -672,25 +699,37 @@ async fn do_status(args: &serde_json::Value) -> Result<CallToolResult, McpError>
     let repo_path = repo_path_from_value(args);
 
     let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
-    let compute = runtime_compute().await?;
+    let compute = runtime_compute_for_repo(&repo_path).await?;
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
     containers::register_all(registry.as_ref())
         .map_err(|e| to_error_data(format!("register providers: {e}")))?;
 
-    let use_case = StatusRepoUseCase::new(repository, compute, registry);
+    let use_case = StatusRepoUseCase::new(repository.clone(), compute, registry.clone());
     let status = use_case
         .run(&repo_path)
         .await
         .map_err(|e| to_error_data(e.to_string()))?;
 
-    json_ok(json!({
-        "current_branch": status.current_branch,
-        "compute": status.compute.map(|c| json!({
-            "container_id": c.container_id,
-            "container_status": c.container_status,
-            "connection_string": c.connection_string,
-        })),
-    }))
+    // The whole response, not two hand-picked fields. The skill file promises
+    // "current branch, HEAD commit, and connection information"; this used to
+    // return the branch and a null compute section, which is less than the
+    // CLI's own `--json status`, and an agent following that description got
+    // two of five fields with nothing saying the rest were missing.
+    let mut payload = serde_json::to_value(&status)
+        .map_err(|e| to_error_data(format!("serialize status: {e}")))?;
+
+    // An embedded provider has no compute section to carry its connection
+    // string, so it had nowhere to appear at all.
+    if let Ok(config) = GfsConfig::load(&repo_path)
+        && let Some(name) = embedded_provider_name(&config, registry.as_ref())
+        && let Some(provider) = registry.get(&name)
+        && let Ok(params) = repo_layout::local_connection_params(&repo_path)
+        && let Ok(connection_string) = provider.connection_string(&params)
+    {
+        payload["connection_string"] = json!(connection_string);
+    }
+
+    json_ok(payload)
 }
 
 async fn do_commit(args: &serde_json::Value) -> Result<CallToolResult, McpError> {
@@ -722,7 +761,7 @@ async fn do_commit(args: &serde_json::Value) -> Result<CallToolResult, McpError>
         use gfs_domain::ports::storage::StoragePort;
         let storage: Arc<dyn StoragePort> = Arc::new(gfs_storage_apfs::ApfsStorage::new());
         let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
-        let compute: Arc<dyn Compute> = runtime_compute().await?;
+        let compute: Arc<dyn Compute> = runtime_compute_for_repo(&repo_path).await?;
         let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
         containers::register_all(registry.as_ref())
             .map_err(|e| to_error_data(format!("register providers: {e}")))?;
@@ -761,7 +800,7 @@ async fn do_commit(args: &serde_json::Value) -> Result<CallToolResult, McpError>
             Arc::new(gfs_storage_file::FileStorage::new())
         };
         let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
-        let compute: Arc<dyn Compute> = runtime_compute().await?;
+        let compute: Arc<dyn Compute> = runtime_compute_for_repo(&repo_path).await?;
         let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
         containers::register_all(registry.as_ref())
             .map_err(|e| to_error_data(format!("register providers: {e}")))?;
@@ -793,7 +832,7 @@ async fn do_commit(args: &serde_json::Value) -> Result<CallToolResult, McpError>
         use gfs_domain::ports::storage::StoragePort;
         let storage: Arc<dyn StoragePort> = Arc::new(gfs_storage_file::FileStorage::new());
         let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
-        let compute: Arc<dyn Compute> = runtime_compute().await?;
+        let compute: Arc<dyn Compute> = runtime_compute_for_repo(&repo_path).await?;
         let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
         containers::register_all(registry.as_ref())
             .map_err(|e| to_error_data(format!("register providers: {e}")))?;
@@ -885,7 +924,7 @@ async fn do_checkout(args: &serde_json::Value) -> Result<CallToolResult, McpErro
 
     let repo_path = repo_path_from_value(args);
     let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
-    let compute: Arc<dyn Compute> = runtime_compute().await?;
+    let compute: Arc<dyn Compute> = runtime_compute_for_repo(&repo_path).await?;
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
     containers::register_all(registry.as_ref())
         .map_err(|e| to_error_data(format!("register providers: {e}")))?;
@@ -915,14 +954,45 @@ async fn do_init(args: &serde_json::Value) -> Result<CallToolResult, McpError> {
         .map(String::from);
 
     let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
-    let compute: Option<Arc<dyn Compute>> = if database_provider.is_some() {
+    let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
+    containers::register_all(registry.as_ref())
+        .map_err(|e| to_error_data(format!("register providers: {e}")))?;
+
+    // The repo does not exist yet, so there is no runtime config to consult:
+    // whether a container is needed follows from the provider being asked for.
+    // An embedded provider has nothing to provision, and reaching for a
+    // container runtime here is what made `init --database-provider sqlite`
+    // fail without Docker. Mirrors cmd_init.rs.
+    let resolved = database_provider.as_deref().and_then(|name| {
+        registry
+            .list()
+            .iter()
+            .find(|n| n.eq_ignore_ascii_case(name))
+            .cloned()
+            .and_then(|n| registry.get(&n))
+    });
+
+    // An unknown name must report the name, not a Docker failure. The use case
+    // refuses it too — that is the guarantee — but only after a compute client
+    // has been built, and building one is what turned `--database-provider
+    // sqlite3`, a plausible typo, into a page of daemon troubleshooting for a
+    // database that needs no daemon.
+    if let Some(name) = database_provider.as_deref()
+        && resolved.is_none()
+    {
+        return Err(to_error_data(format!(
+            "unknown database provider '{name}'. Available: {}",
+            registry.list().join(", ")
+        )));
+    }
+
+    let embedded = resolved.is_some_and(|p| !p.requires_compute());
+
+    let compute: Option<Arc<dyn Compute>> = if database_provider.is_some() && !embedded {
         Some(runtime_compute().await?)
     } else {
         None
     };
-    let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
-    containers::register_all(registry.as_ref())
-        .map_err(|e| to_error_data(format!("register providers: {e}")))?;
 
     let use_case = InitRepositoryUseCase::new(repository, compute, registry);
     use_case
@@ -961,6 +1031,17 @@ async fn do_compute(args: &serde_json::Value) -> Result<CallToolResult, McpError
         None => {
             let config = GfsConfig::load(&repo_path)
                 .map_err(|e| to_error_data(format!("not a GFS repository: {e}")))?;
+            let registry = InMemoryDatabaseProviderRegistry::new();
+            containers::register_all(&registry)
+                .map_err(|e| to_error_data(format!("register providers: {e}")))?;
+            if let Some(provider) = embedded_provider_name(&config, &registry) {
+                return Err(to_error_data(format!(
+                    "'{provider}' is an embedded database — a file this process opens, not a \
+                     server. There is no container to start, stop or inspect, and nothing to \
+                     connect to: the commit, checkout and query tools work directly on the file"
+                )));
+            }
+
             let name = config
                 .runtime
                 .as_ref()
@@ -975,7 +1056,7 @@ async fn do_compute(args: &serde_json::Value) -> Result<CallToolResult, McpError
         }
     };
 
-    let compute = runtime_compute().await?;
+    let compute = runtime_compute_for_repo(&repo_path).await?;
     let instance_id = InstanceId(id);
 
     let result = match action {
@@ -1133,6 +1214,8 @@ async fn start_or_restart(
         .get(provider_name)
         .ok_or_else(|| to_error_data(format!("unknown database provider: {}", provider_name)))?;
     let compute_data_path = provider
+        .require_container()
+        .map_err(|e| to_error_data(e.to_string()))?
         .definition()
         .data_dir
         .to_string_lossy()
@@ -1153,7 +1236,10 @@ async fn start_or_restart(
             .remove_instance(instance_id)
             .await
             .map_err(|e| to_error_data(e.to_string()))?;
-        let mut definition = provider.definition_with_overrides(&config.compute_params());
+        let mut definition = provider
+            .require_container()
+            .map_err(|e| to_error_data(e.to_string()))?
+            .definition_with_overrides(&config.compute_params());
         if let Some(ref env) = config.environment
             && !env.database_version.is_empty()
         {
@@ -1250,20 +1336,26 @@ async fn do_export(args: &serde_json::Value) -> Result<CallToolResult, McpError>
         );
     }
 
+    // Left unset, this defaults to the repository being exported — not to
+    // `default_repo_path()`, which reads GFS_REPO_PATH or the server's own
+    // working directory. Those are the same only when the client never passes
+    // `path`; when it does, defaulting to the process's cwd made every export
+    // fail with "output directory must be within repository", naming a
+    // directory the caller never mentioned.
     let output_dir = args
         .get("output_dir")
         .and_then(|v| v.as_str())
-        .map(PathBuf::from)
-        .unwrap_or_else(default_repo_path);
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
 
-    let compute = runtime_compute().await?;
+    let compute = runtime_compute_for_repo(&repo_path).await?;
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
     containers::register_all(registry.as_ref())
         .map_err(|e| to_error_data(format!("register providers: {e}")))?;
 
     let use_case = ExportRepoUseCase::new(compute, registry);
     let output = use_case
-        .run(&repo_path, Some(output_dir), format)
+        .run(&repo_path, output_dir, format)
         .await
         .map_err(|e| to_error_data(e.to_string()))?;
 
@@ -1291,7 +1383,7 @@ async fn do_import(args: &serde_json::Value) -> Result<CallToolResult, McpError>
         .unwrap_or("")
         .to_string();
 
-    let compute = runtime_compute().await?;
+    let compute = runtime_compute_for_repo(&repo_path).await?;
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
     containers::register_all(registry.as_ref())
         .map_err(|e| to_error_data(format!("register providers: {e}")))?;
@@ -1375,7 +1467,7 @@ async fn do_user(args: &serde_json::Value) -> Result<CallToolResult, McpError> {
 
     GfsConfig::load(&repo_path).map_err(|e| to_error_data(format!("not a GFS repository: {e}")))?;
 
-    let compute = runtime_compute().await?;
+    let compute = runtime_compute_for_repo(&repo_path).await?;
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
     containers::register_all(registry.as_ref())
         .map_err(|e| to_error_data(format!("register providers: {e}")))?;
@@ -1558,16 +1650,7 @@ async fn do_query(args: &serde_json::Value) -> Result<CallToolResult, McpError> 
         to_error_data("no database configured (run init with --database-provider)")
     })?;
 
-    let runtime = config
-        .runtime
-        .as_ref()
-        .ok_or_else(|| to_error_data("no runtime configured"))?;
-
     let provider_name = &environment.database_provider;
-    let container_name = &runtime.container_name;
-
-    // Set up compute and registry
-    let compute = runtime_compute().await?;
 
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
     containers::register_all(registry.as_ref())
@@ -1578,9 +1661,41 @@ async fn do_query(args: &serde_json::Value) -> Result<CallToolResult, McpError> 
         .get(provider_name)
         .ok_or_else(|| to_error_data(format!("unknown database provider: {}", provider_name)))?;
 
+    // An embedded provider opens a file: there is no container to look up, no
+    // connection info to fetch, and no runtime to require. Resolving the runtime
+    // first is what made this tool report "no runtime configured" for a
+    // perfectly working SQLite repository. Mirrors cmd_query.rs.
+    if provider.local_engine().is_some() {
+        // The file *is* the database, so there is nothing for `database` to
+        // select. Say so rather than accepting the argument and ignoring it.
+        if database.is_some() {
+            return Err(to_error_data(format!(
+                "'database' does not apply to the '{provider_name}' provider: an embedded \
+                 database is a single file, and query always uses the one in the active \
+                 workspace"
+            )));
+        }
+        let params = repo_layout::local_connection_params(&repo_path)
+            .map_err(|e| to_error_data(format!("failed to resolve the active workspace: {e}")))?;
+        return run_query_client(&*provider, provider_name, &params, None, query.as_deref());
+    }
+
+    let runtime = config
+        .runtime
+        .as_ref()
+        .ok_or_else(|| to_error_data("no runtime configured"))?;
+
+    let container_name = &runtime.container_name;
+
+    // Set up compute
+    let compute = runtime_compute_for_repo(&repo_path).await?;
+
     // Get connection info from the running container
     let instance_id = InstanceId(container_name.clone());
-    let default_port = provider.default_port();
+    let default_port = provider
+        .require_container()
+        .map_err(|e| to_error_data(e.to_string()))?
+        .default_port();
 
     let conn_info = compute
         .get_connection_info(&instance_id, default_port)
@@ -1613,25 +1728,50 @@ async fn do_query(args: &serde_json::Value) -> Result<CallToolResult, McpError> 
         env,
     };
 
+    run_query_client(
+        &*provider,
+        provider_name,
+        &params,
+        Some((conn_info.host.as_str(), conn_info.port)),
+        query.as_deref(),
+    )
+}
+
+/// Run `query` with the provider's own client and capture the result, or
+/// describe the connection when there is no query.
+///
+/// `endpoint` is the host and port for a provider that has one. An embedded
+/// provider does not: its `ConnectionParams` carry a data directory rather than
+/// an address, so reporting `""`/`0` would be worse than reporting nothing.
+fn run_query_client(
+    provider: &dyn gfs_domain::ports::database_provider::DatabaseProvider,
+    provider_name: &str,
+    params: &ConnectionParams,
+    endpoint: Option<(&str, u16)>,
+    query: Option<&str>,
+) -> Result<CallToolResult, McpError> {
     // If no query provided, return connection info for the client
     if query.is_none() {
         let connection_string = provider
-            .connection_string(&params)
+            .connection_string(params)
             .map_err(|e| to_error_data(format!("failed to build connection string: {e}")))?;
+        let mut info = json!({
+            "provider": provider_name,
+            "connection_string": connection_string,
+        });
+        if let Some((host, port)) = endpoint {
+            info["host"] = json!(host);
+            info["port"] = json!(port);
+        }
         return json_ok(json!({
-            "connection_info": {
-                "provider": provider_name,
-                "host": conn_info.host,
-                "port": conn_info.port,
-                "connection_string": connection_string,
-            },
+            "connection_info": info,
             "note": "No query provided. Use the connection info above to connect, or provide a query parameter to execute SQL."
         }));
     }
 
     // Build the query command
     let mut cmd = provider
-        .query_client_command(&params, query.as_deref())
+        .query_client_command(params, query)
         .map_err(|e| to_error_data(format!("failed to build query command: {e}")))?;
 
     // Execute the command and capture output
@@ -1676,7 +1816,7 @@ async fn do_extract_schema(args: &serde_json::Value) -> Result<CallToolResult, M
     let args = if args.is_object() { args } else { &json!({}) };
     let repo_path = repo_path_from_value(args);
 
-    let compute = runtime_compute().await?;
+    let compute = runtime_compute_for_repo(&repo_path).await?;
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
     containers::register_all(registry.as_ref())
         .map_err(|e| to_error_data(format!("register providers: {e}")))?;
