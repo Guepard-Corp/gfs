@@ -130,7 +130,10 @@ impl<R: DatabaseProviderRegistry> CloneRepoUseCase<R> {
             .get("postgres")
             .ok_or_else(|| CloneRepoError::ProviderNotFound("postgres".into()))?;
 
-        let mut def = provider.definition();
+        let container = provider
+            .require_container()
+            .map_err(|e| CloneRepoError::Unsupported(e.to_string()))?;
+        let mut def = container.definition();
         def.env = vec![EnvVar {
             name: "PGPASSWORD".into(),
             default: Some(remote.password.clone()),
@@ -215,6 +218,10 @@ impl<R: DatabaseProviderRegistry> CloneRepoUseCase<R> {
             .get(&provider_name)
             .ok_or_else(|| CloneRepoError::ProviderNotFound(provider_name.clone()))?;
 
+        let container = provider
+            .require_container()
+            .map_err(|e| CloneRepoError::Unsupported(e.to_string()))?;
+
         let instance_id = InstanceId(container_name);
 
         // 3. The bootstrap runs INSIDE the database container, so it reaches the
@@ -229,19 +236,19 @@ impl<R: DatabaseProviderRegistry> CloneRepoUseCase<R> {
         //    The env still comes from the instance so the credentials match.
         let conn_info = self
             .compute
-            .get_task_connection_info(&instance_id, provider.default_port())
+            .get_task_connection_info(&instance_id, container.default_port())
             .await?;
 
         let local = ConnectionParams {
             host: "127.0.0.1".to_string(),
-            port: provider.default_port(),
+            port: container.default_port(),
             env: conn_info.env,
         };
 
         let remote_label = format!("{}:{}", remote.host, remote.port);
 
         // 4. Build the bootstrap spec.
-        let mut spec = provider
+        let mut spec = container
             .clone_bootstrap_spec(&local, &remote)
             .map_err(|e| CloneRepoError::Unsupported(e.to_string()))?;
         spec.definition.image = crate::usecases::repository::task_image::task_image_for_version(

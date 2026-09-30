@@ -4,7 +4,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
-use gfs_compute_docker::DockerCompute;
 use gfs_domain::model::config::GfsConfig;
 use gfs_domain::model::datasource::diff::compute_schema_diff;
 use gfs_domain::model::datasource::diff_formatter::{
@@ -14,7 +13,11 @@ use gfs_domain::ports::database_provider::InMemoryDatabaseProviderRegistry;
 use gfs_domain::repo_utils::repo_layout;
 use gfs_domain::usecases::repository::extract_schema_usecase::ExtractSchemaUseCase;
 
+use gfs_domain::adapters::gfs_repository::GfsRepository;
+use gfs_domain::ports::repository::Repository;
+
 use crate::cli_utils::get_repo_dir;
+use crate::commands::compute_support::compute_for_repo;
 use crate::output::{cyan, dimmed, green, header};
 
 /// Extract schema from the running database instance.
@@ -32,17 +35,26 @@ pub async fn run_extract(
         "schema extraction failed: not a gfs repository (use --path <repo> or run from a repo)",
     )?;
 
-    let compute = Arc::new(DockerCompute::new().map_err(|e| anyhow::anyhow!("{e}"))?);
+    // Route through the repository's configured runtime. A provider with no
+    // container — SQLite — resolves to a no-op runtime rather than failing to
+    // reach a Docker daemon it never needed.
+    let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
+    let compute = compute_for_repo(&repository, &repo_path).await?;
 
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
-    gfs_compute_docker::containers::register_all(registry.as_ref())
+    gfs_db_providers::register_all(registry.as_ref())
         .context("failed to register database providers")?;
 
     let use_case = ExtractSchemaUseCase::new(compute, registry);
     let result = use_case
         .run(&repo_path)
         .await
-        .context("schema extraction failed")?;
+        // No `.context()` here: anyhow's context Display prints only the
+        // context string, so wrapping hid the provider's message. The domain
+        // error already begins "schema extraction failed", and the part that
+        // was being discarded is the actionable half — "the workspace holds 2
+        // SQLite databases (a.db, b.db) … set GFS_SQLITE_DB_PATH to choose".
+        ?;
 
     // Serialize to JSON
     let json = if compact {
@@ -84,7 +96,10 @@ pub async fn run_show(
 
     // Load commit
     let commit_obj = repo_layout::get_commit_from_hash(&repo_path, &commit_hash)
-        .with_context(|| format!("failed to load commit {}", commit_hash))?;
+        // No `.with_context()`: anyhow renders the context string ALONE, so
+        // wrapping replaced "the repository has no commits yet" with "failed to
+        // load commit 0" — the half that says nothing.
+        ?;
 
     // Get schema hash
     let schema_hash = commit_obj.schema_hash.ok_or_else(|| {
@@ -152,10 +167,8 @@ pub async fn run_diff(
         .with_context(|| format!("failed to resolve commit '{}'", commit2))?;
 
     // Load commits
-    let commit1_obj = repo_layout::get_commit_from_hash(&repo_path, &hash1)
-        .with_context(|| format!("failed to load commit {}", hash1))?;
-    let commit2_obj = repo_layout::get_commit_from_hash(&repo_path, &hash2)
-        .with_context(|| format!("failed to load commit {}", hash2))?;
+    let commit1_obj = repo_layout::get_commit_from_hash(&repo_path, &hash1)?;
+    let commit2_obj = repo_layout::get_commit_from_hash(&repo_path, &hash2)?;
 
     // Get schema hashes
     let schema_hash1 = commit1_obj

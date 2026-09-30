@@ -84,6 +84,7 @@ GFS makes agent-driven database work safe by default:
 
 - **PostgreSQL** (versions 13-18)
 - **MySQL** (versions 8.0-8.1)
+- **SQLite** (version 3) — embedded, so no container runtime is required
 
 Run `gfs providers` to see all available providers and their supported versions.
 
@@ -739,6 +740,57 @@ scripts/e2e-clone-remote-source.sh drift "postgresql://user:pw@host:5432/db?sslm
 
 This is the only way to exercise the cost model at real scale, since the copy-vs-ask
 decision depends on measured link speed and real table sizes.
+
+### Concurrency and reclaim scripts
+
+Three things about commit are only observable under load or after a crash, and
+each has a script rather than a paragraph, so the claim can be re-checked
+instead of believed.
+
+```bash
+# Commit repeatedly while a separate process writes. Every snapshot must pass
+# integrity_check, hold a row count the database genuinely passed through, and
+# contain only whole transactions. The writer stops at GFS_TORTURE_MAX_ROWS
+# (default 2,000,000, about 90 MB) — without a cap it wrote 7.5 GB in twelve
+# rounds, because each round runs for as long as the growing commit takes.
+scripts/sqlite-snapshot-torture.py <repo> ./target/debug/gfs 20
+
+# List snapshot trees no commit refers to, and optionally delete them.
+scripts/gfs-reclaim-orphan-snapshots.py <repo> [--delete]
+```
+
+**Coverage note.** The SQLite e2e suites (`e2e_sqlite`, `mcp_sqlite_no_runtime`)
+are `cfg(unix)`, so they run on Linux as well as macOS.
+
+That matters because `storage-file` copies with `cp --reflink=auto`, which asks
+for a clone and *silently falls back to a full byte copy* when the filesystem
+cannot do one. The snapshot guard is only load-bearing on that fallback — a
+byte copy of a database being written to is where an unquiesced snapshot tears.
+Which path you get is a property of the filesystem, not the platform: APFS,
+btrfs, XFS with `reflink=1` (the default on modern `mkfs.xfs`) and recent ZFS
+all clone; **ext4 does not**, and ext4 is the common Linux default.
+
+So CI probes whether a reflink actually succeeds, rather than matching
+filesystem names — a name check reports plain `xfs` either way and would pass
+on a runner that had quietly started cloning, removing this coverage with every
+test still green. That matters more than
+it looks: on Linux `storage-file` uses `cp --reflink=auto`, which silently
+degrades to a deep copy on ext4, and a deep copy of a database being written to
+is where an unquiesced snapshot would tear. The concurrency test there asserts
+the invariants, but at a size sensible for CI it passes with the snapshot guard
+removed — the copy is too quick to tear. The torture script above is the one
+that shows why the guard has to exist.
+
+**Orphan snapshots.** A commit takes its snapshot before it writes the commit
+object, and the destination comes from the workspace path and a timestamp
+rather than from the content, so it is created up front. Killing `gfs commit`
+between those two points — `SIGKILL`, a lost session, a machine losing power —
+leaves a complete-looking snapshot tree that nothing references. Nothing is
+corrupt and the next commit works; the tree is simply never read again and
+never freed. Reproduced with a 640 MB orphan from one killed commit. There is
+no `gfs gc`, so the reclaim script above is the way to get the space back; it
+lists before it deletes, and only considers a snapshot orphaned when no object
+under `.gfs/objects` names it.
 
 ### Building for release
 

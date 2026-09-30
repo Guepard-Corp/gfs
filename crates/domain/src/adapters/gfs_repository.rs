@@ -356,6 +356,30 @@ fn create_empty_workspace(path: &Path) -> std::io::Result<()> {
 /// repository files can be owned by subordinate UIDs that are not chmod-able
 /// from the host user. In that case, we continue checkout and let the runtime
 /// handle access through its own namespace mapping.
+/// Whether this repository's restores come from something other than a
+/// filesystem snapshot.
+///
+/// On the Kubernetes runtime the real restore is a PVC VolumeSnapshot, so
+/// `.gfs/snapshots` is legitimately empty and a missing directory says nothing
+/// about whether the data survives. Everywhere else, a commit naming a snapshot
+/// that is not there means the data is gone.
+fn restore_is_not_filesystem_based(repo: &Path) -> bool {
+    GfsConfig::load(repo)
+        .ok()
+        .and_then(|config| config.runtime)
+        .map(|runtime| {
+            matches!(
+                runtime
+                    .runtime_provider
+                    .trim()
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "kubernetes" | "k8s" | "k3s"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn set_workspace_dir_permissions(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -543,6 +567,7 @@ impl Repository for GfsRepository {
             branch,
             commit_hash
         );
+
         Ok(commit_hash)
     }
 
@@ -594,6 +619,41 @@ impl Repository for GfsRepository {
             workspace_path,
             workspace_path.exists()
         );
+        // Refuse BEFORE the workspace is removed, not after.
+        //
+        // The check below used to be reached only when the workspace did not
+        // exist, so there was nothing to lose by the time it ran. Mainline then
+        // made the restore unconditional -- delete, then repopulate -- and the
+        // refusal moved to the far side of `remove_dir_all`. The message it
+        // prints tells you to recover by copying `.gfs/snapshots` from wherever
+        // the repository came from, while the working copy, which in exactly
+        // that scenario is the only surviving copy of the data, has just been
+        // deleted.
+        //
+        // Nothing here mutates the repository, so an early return is safe.
+        {
+            let commit = repo_layout::get_commit_from_hash(&repo, &commit_hash).map_err(map_err)?;
+            let snapshot_hash = &commit.snapshot_hash;
+            if !snapshot_hash.is_empty() && !restore_is_not_filesystem_based(&repo) {
+                let snapshot_dir = repo
+                    .join(GFS_DIR)
+                    .join(SNAPSHOTS_DIR)
+                    .join(&snapshot_hash[..2])
+                    .join(&snapshot_hash[2..]);
+                if !(snapshot_dir.exists() && snapshot_dir.is_dir()) {
+                    return Err(RepositoryError::Internal(format!(
+                        "commit {} refers to snapshot {} but '{}' does not exist. Its data \
+                         cannot be restored, so this checkout would silently hand you an \
+                         empty database. The workspace has been left untouched. If the \
+                         repository was copied, copy .gfs/snapshots as well",
+                        &commit_hash[..7.min(commit_hash.len())],
+                        &snapshot_hash[..7.min(snapshot_hash.len())],
+                        snapshot_dir.display()
+                    )));
+                }
+            }
+        }
+
         if workspace_path.exists() {
             // Files restored from a snapshot carry its read-only bits, which
             // `remove_dir_all` will not override.
@@ -626,14 +686,32 @@ impl Repository for GfsRepository {
                 if let Some(marker) = repo_layout::repair_marker_path(&workspace_path) {
                     let _ = fs::write(marker, b"");
                 }
-            } else {
-                // Expected on a fresh branch (no snapshot yet) and always on the k8s
-                // runtime, where the real restore is a PVC VolumeSnapshot rather than a
-                // filesystem snapshot. Not an error — seed an empty workspace.
+            } else if snapshot_hash.is_empty() || restore_is_not_filesystem_based(&repo) {
+                // Two legitimate cases: a commit that records no snapshot at
+                // all, and the k8s runtime, where the real restore is a PVC
+                // VolumeSnapshot rather than a filesystem one. Seed an empty
+                // workspace.
                 tracing::debug!(
                     "Checkout: no filesystem snapshot for this workspace; seeding empty workspace"
                 );
                 create_empty_workspace(&workspace_path).map_err(RepositoryError::Io)?;
+            } else {
+                // The commit NAMES a snapshot and it is not there. Seeding an
+                // empty workspace here reported success and handed over an
+                // empty database: `schema show` still printed the real DDL, so
+                // only a query noticed, and a commit taken from that state
+                // recorded the emptiness as a legitimate breaking change —
+                // `schema diff` called it a table drop. Snapshots are the bulky
+                // part of a repository and the first thing a partial copy or a
+                // careless backup leaves out.
+                return Err(RepositoryError::Internal(format!(
+                    "commit {} refers to snapshot {} but '{}' does not exist. Its data cannot \
+                     be restored, so this checkout would silently hand you an empty database. \
+                     If the repository was copied, copy .gfs/snapshots as well",
+                    &commit_hash[..7.min(commit_hash.len())],
+                    &snapshot_hash[..7.min(snapshot_hash.len())],
+                    snapshot_dir.display()
+                )));
             }
         }
         set_workspace_dir_permissions(&workspace_path).map_err(RepositoryError::Io)?;

@@ -35,6 +35,7 @@ path = "tests/schema/extract_clickhouse.rs"
 gfs-domain     = { workspace = true }
 gfs-telemetry  = { workspace = true }
 gfs-compute-docker        = { workspace = true }
+gfs-db-providers   = { workspace = true }
 gfs-compute-kubernetes    = { workspace = true }
 gfs-storage-file   = { workspace = true }
 gfs-storage-kubernetes = { workspace = true }
@@ -54,6 +55,8 @@ tokio-util         = "0.7"
 owo-colors         = { version = "4", features = ["supports-colors"] }
 rustls             = { version = "0.23", features = ["aws-lc-rs"] }
 [dev-dependencies]
+rusqlite = { workspace = true }
+serde_json = { workspace = true }
 gfs-domain         = { workspace = true }
 tempfile           = { workspace = true }
 once_cell          = "1.21"

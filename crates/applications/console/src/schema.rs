@@ -33,7 +33,7 @@ pub async fn extract(repo: &str) -> SchemaSnapshot {
         Err(e) => return unreachable(format!("docker: {e}")),
     };
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
-    if let Err(e) = gfs_compute_docker::containers::register_all(registry.as_ref()) {
+    if let Err(e) = gfs_db_providers::register_all(registry.as_ref()) {
         return unreachable(format!("provider registry: {e}"));
     }
 
