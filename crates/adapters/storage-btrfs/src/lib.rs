@@ -399,7 +399,9 @@ async fn copy_dir_contents(src: &Path, dst: &Path) -> Result<()> {
     }
 
     let source = src.join(".");
-    let output = Command::new("cp")
+    // Resolved rather than taken from `PATH` — see
+    // `gfs_domain::utils::system_bin`; `--reflink` is a GNU flag.
+    let output = Command::new(gfs_domain::utils::system_bin::resolve("cp"))
         .args(["--reflink=auto", "-a"])
         .arg(&source)
         .arg(dst)
