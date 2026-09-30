@@ -75,9 +75,35 @@ impl<R: DatabaseProviderRegistry> StatusRepoUseCase<R> {
         )
         .await;
 
+        // An embedded provider has no compute section, so its connection string
+        // had nowhere to appear even though the file it names is always there
+        // and `gfs init` prints it. A container-backed one keeps carrying its
+        // own inside `compute`.
+        let connection_string = environment
+            .as_ref()
+            .map(|e| e.database_provider.trim())
+            .filter(|name| !name.is_empty())
+            .and_then(|name| self.registry.get(name))
+            .filter(|provider| provider.local_engine().is_some())
+            .and_then(|provider| {
+                let params = crate::repo_utils::repo_layout::local_connection_params(path).ok()?;
+                provider.connection_string(&params).ok()
+            });
+
+        // "0" is the sentinel for a repository with no commits; reporting it
+        // as a commit id would be worse than reporting nothing.
+        let head_commit = self
+            .repository
+            .get_current_commit_id(path)
+            .await
+            .ok()
+            .filter(|id| id != "0");
+
         Ok(StatusResponse {
             current_branch,
             compute,
+            head_commit,
+            connection_string,
             active_workspace_data_dir,
             bind_mismatch_warning,
             // Populated by the CLI: the drift SQL is a psql-level concern that
@@ -170,6 +196,7 @@ async fn get_data_bind_host_path<R: DatabaseProviderRegistry>(
 ) -> Option<String> {
     let provider = registry.get(provider_name)?;
     let compute_data_path = provider
+        .container()?
         .definition()
         .data_dir
         .to_string_lossy()
@@ -193,7 +220,11 @@ async fn build_connection_string<R: DatabaseProviderRegistry>(
         Some(p) => p,
         None => return String::new(),
     };
-    let compute_port = provider.default_port();
+    let Some(container) = provider.container() else {
+        // An embedded provider has no endpoint to report.
+        return String::new();
+    };
+    let compute_port = container.default_port();
     let info = match compute.get_connection_info(instance_id, compute_port).await {
         Ok(i) => i,
         Err(_) => return String::new(),
@@ -224,8 +255,9 @@ mod tests {
         Compute, ComputeDefinition, InstanceId, InstanceState, InstanceStatus, StartOptions,
     };
     use crate::ports::database_provider::{
-        ConnectionParams, DatabaseProvider, DatabaseProviderArg, DatabaseProviderRegistry,
-        ProviderError, Result as RegistryResult, SIGTERM, SupportedFeature,
+        ConnectionParams, ContainerProvider, DatabaseProvider, DatabaseProviderArg,
+        DatabaseProviderRegistry, ProviderError, Result as RegistryResult, SIGTERM,
+        SupportedFeature,
     };
     use crate::ports::repository::Repository;
 
@@ -517,6 +549,32 @@ mod tests {
         fn name(&self) -> &str {
             "postgres"
         }
+        fn connection_string(
+            &self,
+            _: &ConnectionParams,
+        ) -> std::result::Result<String, ProviderError> {
+            Ok("postgres://localhost:5432".into())
+        }
+        fn supported_versions(&self) -> Vec<String> {
+            vec!["17".into()]
+        }
+        fn supported_features(&self) -> Vec<SupportedFeature> {
+            vec![]
+        }
+        fn query_client_command(
+            &self,
+            _: &ConnectionParams,
+            _: Option<&str>,
+        ) -> std::result::Result<std::process::Command, ProviderError> {
+            Ok(std::process::Command::new("true"))
+        }
+
+        fn container(&self) -> Option<&dyn ContainerProvider> {
+            Some(self)
+        }
+    }
+
+    impl ContainerProvider for MockProvider {
         fn definition(&self) -> ComputeDefinition {
             ComputeDefinition {
                 labels: Default::default(),
@@ -540,27 +598,8 @@ mod tests {
         fn default_signal(&self) -> u32 {
             SIGTERM
         }
-        fn connection_string(
-            &self,
-            _: &ConnectionParams,
-        ) -> std::result::Result<String, ProviderError> {
-            Ok("postgres://localhost:5432".into())
-        }
-        fn supported_versions(&self) -> Vec<String> {
-            vec!["17".into()]
-        }
-        fn supported_features(&self) -> Vec<SupportedFeature> {
-            vec![]
-        }
         fn prepare_for_snapshot(&self, _: &ConnectionParams) -> RegistryResult<Vec<String>> {
             Ok(vec![])
-        }
-        fn query_client_command(
-            &self,
-            _: &ConnectionParams,
-            _: Option<&str>,
-        ) -> std::result::Result<std::process::Command, ProviderError> {
-            Ok(std::process::Command::new("true"))
         }
     }
 

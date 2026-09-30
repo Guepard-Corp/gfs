@@ -89,7 +89,11 @@ impl<R: DatabaseProviderRegistry> ExecuteQueryUseCase<R> {
             .get(&provider_name)
             .ok_or_else(|| ExecuteQueryError::ProviderNotFound(provider_name.clone()))?;
 
-        let command = provider
+        let container = provider
+            .require_container()
+            .map_err(|e| ExecuteQueryError::Unsupported(e.to_string()))?;
+
+        let command = container
             .query_in_instance_command(sql, database)
             .map_err(|e| ExecuteQueryError::Unsupported(e.to_string()))?;
 
@@ -135,7 +139,7 @@ mod tests {
         InstanceStatus, LogsOptions, PortMapping, StartOptions,
     };
     use crate::ports::database_provider::{
-        ConnectionParams, DatabaseProvider, DatabaseProviderRegistry,
+        ConnectionParams, ContainerProvider, DatabaseProvider, DatabaseProviderRegistry,
         InMemoryDatabaseProviderRegistry, ProviderError, Result as RegistryResult, SIGTERM,
         SupportedFeature,
     };
@@ -301,6 +305,32 @@ mod tests {
         fn name(&self) -> &str {
             "mock-query"
         }
+        fn connection_string(
+            &self,
+            _: &ConnectionParams,
+        ) -> std::result::Result<String, ProviderError> {
+            Ok("mock://localhost".into())
+        }
+        fn supported_versions(&self) -> Vec<String> {
+            vec!["latest".into()]
+        }
+        fn supported_features(&self) -> Vec<SupportedFeature> {
+            vec![]
+        }
+        fn query_client_command(
+            &self,
+            _: &ConnectionParams,
+            _: Option<&str>,
+        ) -> std::result::Result<std::process::Command, ProviderError> {
+            Ok(std::process::Command::new("true"))
+        }
+
+        fn container(&self) -> Option<&dyn ContainerProvider> {
+            Some(self)
+        }
+    }
+
+    impl ContainerProvider for MockQueryProvider {
         fn definition(&self) -> ComputeDefinition {
             ComputeDefinition {
                 labels: Default::default(),
@@ -327,27 +357,8 @@ mod tests {
         fn default_signal(&self) -> u32 {
             SIGTERM
         }
-        fn connection_string(
-            &self,
-            _: &ConnectionParams,
-        ) -> std::result::Result<String, ProviderError> {
-            Ok("mock://localhost".into())
-        }
-        fn supported_versions(&self) -> Vec<String> {
-            vec!["latest".into()]
-        }
-        fn supported_features(&self) -> Vec<SupportedFeature> {
-            vec![]
-        }
         fn prepare_for_snapshot(&self, _: &ConnectionParams) -> RegistryResult<Vec<String>> {
             Ok(vec![])
-        }
-        fn query_client_command(
-            &self,
-            _: &ConnectionParams,
-            _: Option<&str>,
-        ) -> std::result::Result<std::process::Command, ProviderError> {
-            Ok(std::process::Command::new("true"))
         }
         fn query_in_instance_command(
             &self,

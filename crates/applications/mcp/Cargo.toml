@@ -17,6 +17,7 @@ rmcp          = { workspace = true }
 gfs-domain    = { workspace = true }
 gfs-telemetry = { workspace = true }
 gfs-compute-docker = { workspace = true }
+gfs-db-providers   = { workspace = true }
 gfs-compute-kubernetes = { workspace = true }
 gfs-storage-file = { workspace = true }
 tokio = { workspace = true }
@@ -30,6 +31,9 @@ tracing-subscriber = { workspace = true }
 axum = { version = "0.7", features = ["json", "macros"] }
 tokio-util = "0.7"
 atty = "0.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 gfs-storage-apfs = { workspace = true }

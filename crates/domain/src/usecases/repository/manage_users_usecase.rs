@@ -74,6 +74,25 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
             })?
             .to_string();
 
+        let provider = self
+            .registry
+            .get(&provider_name)
+            .ok_or_else(|| ManageUsersError::ProviderNotFound(provider_name.clone()))?;
+
+        // Resolved before the container, so an embedded provider gets an answer
+        // rather than a closed loop: it has no runtime section, so requiring one
+        // first advised `gfs compute start`, which then reported that there is
+        // no container_name in the repo config. Neither command could succeed
+        // and neither said why.
+        if provider.local_engine().is_some() {
+            return Err(ManageUsersError::Unsupported(format!(
+                "'{provider_name}' is an embedded database — a file opened by this process, \
+                 not a server. There is no connection to authenticate, so there are no roles, \
+                 passwords or privileges to manage; access is whatever the filesystem grants \
+                 to whoever can open the file"
+            )));
+        }
+
         let container_name = config
             .runtime
             .as_ref()
@@ -85,11 +104,6 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
                 )
             })?
             .to_string();
-
-        let provider = self
-            .registry
-            .get(&provider_name)
-            .ok_or_else(|| ManageUsersError::ProviderNotFound(provider_name.clone()))?;
 
         Ok((provider, container_name))
     }
@@ -566,8 +580,9 @@ mod tests {
         InstanceStatus, LogEntry, LogsOptions, PortMapping, StartOptions,
     };
     use crate::ports::database_provider::{
-        ConnectionParams, DatabaseProvider, DatabaseProviderArg, InMemoryDatabaseProviderRegistry,
-        ProviderError, Result as RegistryResult, SIGTERM, SupportedFeature,
+        ConnectionParams, ContainerProvider, DatabaseProvider, DatabaseProviderArg,
+        InMemoryDatabaseProviderRegistry, ProviderError, Result as RegistryResult, SIGTERM,
+        SupportedFeature,
     };
 
     /// Compute mock: records the last `exec` command and returns a canned output.
@@ -710,32 +725,6 @@ mod tests {
         fn name(&self) -> &str {
             "mock-role"
         }
-        fn definition(&self) -> ComputeDefinition {
-            ComputeDefinition {
-                labels: Default::default(),
-                image: "mock:latest".into(),
-                env: vec![],
-                ports: vec![PortMapping {
-                    compute_port: 5432,
-                    host_port: None,
-                }],
-                data_dir: PathBuf::from("/data"),
-                host_data_dir: None,
-                user: None,
-                logs_dir: None,
-                conf_dir: None,
-                args: vec![],
-            }
-        }
-        fn default_port(&self) -> u16 {
-            5432
-        }
-        fn default_args(&self) -> Vec<DatabaseProviderArg> {
-            vec![]
-        }
-        fn default_signal(&self) -> u32 {
-            SIGTERM
-        }
         fn connection_string(
             &self,
             _: &ConnectionParams,
@@ -747,9 +736,6 @@ mod tests {
         }
         fn supported_features(&self) -> Vec<SupportedFeature> {
             vec![]
-        }
-        fn prepare_for_snapshot(&self, _: &ConnectionParams) -> RegistryResult<Vec<String>> {
-            Ok(vec![])
         }
         fn query_client_command(
             &self,
@@ -822,6 +808,42 @@ mod tests {
         ) -> std::result::Result<String, ProviderError> {
             self.guard()?;
             Ok(format!("MOCK-LISTPRIVS:{role}"))
+        }
+
+        fn container(&self) -> Option<&dyn ContainerProvider> {
+            Some(self)
+        }
+    }
+
+    impl ContainerProvider for MockRoleProvider {
+        fn definition(&self) -> ComputeDefinition {
+            ComputeDefinition {
+                labels: Default::default(),
+                image: "mock:latest".into(),
+                env: vec![],
+                ports: vec![PortMapping {
+                    compute_port: 5432,
+                    host_port: None,
+                }],
+                data_dir: PathBuf::from("/data"),
+                host_data_dir: None,
+                user: None,
+                logs_dir: None,
+                conf_dir: None,
+                args: vec![],
+            }
+        }
+        fn default_port(&self) -> u16 {
+            5432
+        }
+        fn default_args(&self) -> Vec<DatabaseProviderArg> {
+            vec![]
+        }
+        fn default_signal(&self) -> u32 {
+            SIGTERM
+        }
+        fn prepare_for_snapshot(&self, _: &ConnectionParams) -> RegistryResult<Vec<String>> {
+            Ok(vec![])
         }
     }
 
