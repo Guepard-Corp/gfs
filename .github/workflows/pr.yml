@@ -41,11 +41,11 @@ jobs:
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build
-        run: cargo build --verbose
+        run: cargo build --locked --verbose
 
       - name: Run clippy
         if: matrix.os == 'ubuntu-latest'
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Check formatting
         if: matrix.os == 'ubuntu-latest'
@@ -53,8 +53,8 @@ jobs:
 
       - name: Run tests
         if: matrix.os == 'ubuntu-latest'
-        run: cargo test --verbose
+        run: cargo test --locked --verbose
 
       - name: Run tests (macOS/Windows)
         if: matrix.os != 'ubuntu-latest'
-        run: cargo test --verbose -- --skip clickhouse --skip postgres
+        run: cargo test --locked --verbose -- --skip clickhouse --skip postgres
