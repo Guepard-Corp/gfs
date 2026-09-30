@@ -45,6 +45,8 @@ pub enum RepoError {
     InvalidConfig(String),
     #[error("revision not found: '{0}'")]
     RevisionNotFound(String),
+    #[error("the repository has no commits yet")]
+    NoCommitsYet,
     #[error("short hash '{prefix}' is ambiguous\nPossible matches:\n{}", format_matches(.matches))]
     AmbiguousShortHash {
         prefix: String,
