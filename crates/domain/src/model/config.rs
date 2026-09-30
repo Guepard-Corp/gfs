@@ -105,7 +105,20 @@ pub struct GfsConfig {
 impl GfsConfig {
     pub fn load(repo_path: &Path) -> Result<Self, RepoError> {
         let config_path = repo_path.join(GFS_DIR).join(CONFIG_FILE);
-        let content = std::fs::read_to_string(config_path)?;
+        // A missing config is the ordinary "this is not a repository" case and
+        // deserves to say so. Letting `?` convert it made every one of them
+        // read "IO error while searching for repository: No such file or
+        // directory" — which names a file the caller never mentioned, is
+        // identical whether the directory exists or not, and describes a search
+        // this function does not perform. Other IO errors (a permission
+        // problem, a bad symlink) still surface as themselves.
+        let content = match std::fs::read_to_string(&config_path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(RepoError::NotARepository(repo_path.to_path_buf()));
+            }
+            Err(e) => return Err(RepoError::from(e)),
+        };
         let config =
             toml::from_str(&content).map_err(|e| RepoError::InvalidConfig(e.to_string()))?;
         Ok(config)
