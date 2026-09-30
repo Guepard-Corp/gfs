@@ -21,7 +21,7 @@ jobs:
     outputs:
       version: ${{ steps.new_version.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -202,7 +202,7 @@ jobs:
     env:
       GFS_POSTHOG_API_KEY: ${{ secrets.GFS_POSTHOG_API_KEY }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: v${{ needs.create-release.outputs.version }}
 
@@ -261,7 +261,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: v${{ needs.create-release.outputs.version }}
 
