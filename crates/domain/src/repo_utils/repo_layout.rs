@@ -468,13 +468,22 @@ fn collect_file_entries_into(
             let meta = entry.metadata().map_err(RepoError::from)?;
             let file_size = meta.len();
             let (owner, group, permissions) = file_metadata_owner_group_mode(&meta);
+            // mtime comes from the stat already taken for size and mode, so it is
+            // free. Size alone cannot see a write that replaces bytes in place.
+            let file_attributes = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| crate::model::commit::FileAttrs {
+                    mtime_ns: Some(d.as_nanos() as u64),
+                });
             out.push(FileEntry {
                 relative_path: rel_path,
                 file_size,
                 owner,
                 group,
                 permissions,
-                file_attributes: None,
+                file_attributes,
             });
         }
     }
@@ -1501,6 +1510,20 @@ pub fn branch_workspace_dir(repo_path: &Path, branch: &str) -> std::path::PathBu
 /// safe one for a false positive (a needless refusal, which `--force` clears)
 /// and the unsafe one for a false negative, so it is worth revisiting with a
 /// content hash if the commit object ever grows one.
+fn mtime_ns(e: &FileEntry) -> Option<u64> {
+    e.file_attributes.as_ref().and_then(|a| a.mtime_ns)
+}
+
+/// A file SQLite manages on the side, not data the user wrote.
+///
+/// `-shm` is the shared-memory index; it carries no committed data and appears
+/// from a plain read, so it never signals work. `-wal` also appears from a plain
+/// read, but at zero length -- once it holds committed frames it is work that a
+/// checkout would destroy, so only an empty one is ignored.
+fn is_ignorable_sidecar(path: &str, size: u64) -> bool {
+    path.ends_with("-shm") || (path.ends_with("-wal") && size == 0)
+}
+
 pub fn workspace_changes(
     workspace: &Path,
     baseline: &[FileEntry],
@@ -1509,16 +1532,33 @@ pub fn workspace_changes(
         return Ok(Vec::new());
     }
     let current = collect_file_entries(workspace, "")?;
-    let sizes: std::collections::HashMap<&str, u64> = baseline
+    let by_path: std::collections::HashMap<&str, &FileEntry> = baseline
         .iter()
-        .map(|e| (e.relative_path.as_str(), e.file_size))
+        .map(|e| (e.relative_path.as_str(), e))
         .collect();
 
     let mut changed: Vec<String> = current
         .iter()
-        .filter(|entry| match sizes.get(entry.relative_path.as_str()) {
-            Some(&size) => size != entry.file_size,
-            None => true,
+        .filter(|entry| {
+            if is_ignorable_sidecar(&entry.relative_path, entry.file_size) {
+                return false;
+            }
+            match by_path.get(entry.relative_path.as_str()) {
+                // Present in both: size, then mtime. mtime is only consulted when
+                // BOTH sides recorded one, so commits written before the field
+                // existed fall back to the size comparison rather than reporting
+                // every file changed.
+                Some(base) => {
+                    if base.file_size != entry.file_size {
+                        return true;
+                    }
+                    match (mtime_ns(base), mtime_ns(entry)) {
+                        (Some(a), Some(b)) => a != b,
+                        _ => false,
+                    }
+                }
+                None => true,
+            }
         })
         .map(|entry| entry.relative_path.clone())
         .collect();
@@ -1612,10 +1652,86 @@ mod tests {
         fs::write(ws.join("db"), "aaaaaaaa").unwrap();
         assert_eq!(workspace_changes(ws, &baseline).unwrap(), vec!["db"]);
 
-        // A new file.
+        // A new file, and `db` rewritten back to its original SIZE.
+        //
+        // `db` is still reported, and that is the point of the change rather
+        // than a regression: this answers "written since the baseline", not
+        // "differs from it". A file rewritten to the same length was still
+        // written, and for a gate that decides whether to destroy a workspace
+        // that is the safe direction to err in -- the caller can always pass
+        // `--force`. The old expectation of `["new"]` alone is exactly the
+        // blind spot being closed: SQLite writes in place, in 4096-byte pages,
+        // so a one-row INSERT is a size-identical write.
         fs::write(ws.join("db"), "aaaa").unwrap();
         fs::write(ws.join("new"), "x").unwrap();
-        assert_eq!(workspace_changes(ws, &baseline).unwrap(), vec!["new"]);
+        assert_eq!(workspace_changes(ws, &baseline).unwrap(), vec!["db", "new"]);
+    }
+
+    /// A commit written before `mtime_ns` existed must still give a usable
+    /// answer, not an error and not "everything changed".
+    ///
+    /// Every commit already on disk has `file_attributes: None`. If a missing
+    /// mtime were treated as "differs", the first checkout after upgrading
+    /// would refuse on every file in the workspace; if it were treated as an
+    /// error, `uncommitted_changes` swallows it and the refusal disappears
+    /// entirely. It falls back to the size comparison, which is exactly what
+    /// those commits were written against.
+    #[test]
+    fn a_baseline_without_mtime_falls_back_to_the_size_comparison() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        fs::write(ws.join("db"), "aaaa").unwrap();
+        let mut baseline = collect_file_entries(ws, "").unwrap();
+        // Exactly what a pre-upgrade commit holds.
+        for e in &mut baseline {
+            e.file_attributes = None;
+        }
+
+        // Rewritten, same size: invisible to size alone, and that is the
+        // documented limit of an old baseline -- not an error, not everything.
+        fs::write(ws.join("db"), "bbbb").unwrap();
+        assert!(
+            workspace_changes(ws, &baseline).unwrap().is_empty(),
+            "an old baseline degrades to the size comparison, it does not fail"
+        );
+
+        // A size change is still caught, so the old guarantee is intact.
+        fs::write(ws.join("db"), "bbbbbbbb").unwrap();
+        assert_eq!(workspace_changes(ws, &baseline).unwrap(), vec!["db"]);
+    }
+
+    /// Sidecars APPEARING must not read as uncommitted work.
+    ///
+    /// The suite covered only their disappearance. A baseline taken after a
+    /// clean close holds just the database; a bare `SELECT` recreates `-wal`
+    /// and `-shm`, and a plain baseline-miss rule counts both as new files, so
+    /// checkout refused after a read.
+    ///
+    /// An empty `-wal` is ignored, a NON-empty one is not: it holds committed
+    /// frames that a restore would destroy, so ignoring sidecars wholesale
+    /// would trade this false positive for a false negative.
+    #[test]
+    fn workspace_changes_ignores_sidecars_that_appear_but_not_a_populated_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        fs::write(ws.join("app.db"), "data").unwrap();
+        let baseline = collect_file_entries(ws, "").unwrap();
+
+        // A read recreates both sidecars; the -wal is empty.
+        fs::write(ws.join("app.db-shm"), "").unwrap();
+        fs::write(ws.join("app.db-wal"), "").unwrap();
+        assert!(
+            workspace_changes(ws, &baseline).unwrap().is_empty(),
+            "a plain read must not report uncommitted work"
+        );
+
+        // A -wal with frames in it is real work and must be reported.
+        fs::write(ws.join("app.db-wal"), "committed frames").unwrap();
+        assert_eq!(
+            workspace_changes(ws, &baseline).unwrap(),
+            vec!["app.db-wal"],
+            "a populated -wal holds data a restore would destroy"
+        );
     }
 
     /// A file that has GONE is not uncommitted work.
