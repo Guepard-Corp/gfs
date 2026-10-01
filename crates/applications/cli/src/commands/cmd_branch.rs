@@ -181,10 +181,10 @@ async fn create_branch(
                 .map_err(|e| anyhow::anyhow!("failed to get HEAD: {e}"))?
         };
 
-        // Check if branch already exists.
-        if repo_layout::is_branch(repo_path, name) {
-            anyhow::bail!("branch '{}' already exists", name);
-        }
+        // No pre-check here. `create_branch` refuses an existing ref at the open
+        // itself, so asking first only adds a second answer to the same question
+        // -- two different messages for one condition, and a window between the
+        // question and the write in which the answer can stop being true.
 
         // Write the ref file.
         let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
@@ -237,9 +237,14 @@ fn delete_branch(repo_path: &std::path::Path, name: &str, json_output: bool) -> 
     }
 
     let refs_dir = repo_path.join(GFS_DIR).join(REFS_DIR).join(HEADS_DIR);
-    let ref_path = refs_dir.join(name);
+    let ref_path =
+        repo_layout::branch_ref_path(repo_path, name).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    if !ref_path.exists() {
+    // `symlink_metadata`, not `exists()`: the latter follows the link, so a ref
+    // that is a dangling symlink reported "not found" and could not be deleted --
+    // while `create_branch` refused the same name as taken. Uncreatable and
+    // undeletable at once.
+    if std::fs::symlink_metadata(&ref_path).is_err() {
         anyhow::bail!("branch '{}' not found", name);
     }
 

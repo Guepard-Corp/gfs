@@ -15,9 +15,7 @@ use async_trait::async_trait;
 use crate::model::commit::{Commit, CommitWithRefs, FileEntry, NewCommit, file_entry_diff_stats};
 use crate::model::config::{EnvironmentConfig, GfsConfig, RuntimeConfig, UserConfig};
 use crate::model::errors::RepoError;
-use crate::model::layout::{
-    GFS_DIR, HEADS_DIR, OBJECTS_DIR, REFS_DIR, SNAPSHOTS_DIR, WORKSPACES_DIR,
-};
+use crate::model::layout::{GFS_DIR, OBJECTS_DIR, SNAPSHOTS_DIR, WORKSPACES_DIR};
 use crate::ports::repository::{LogOptions, RemoteOptions, Repository, RepositoryError, Result};
 use crate::repo_utils::repo_layout;
 use crate::utils::hash::hash_commit;
@@ -765,14 +763,28 @@ impl Repository for GfsRepository {
                 "(empty branch name)".to_string(),
             ));
         }
-        if repo_layout::is_branch(repo, name) {
-            return Err(RepositoryError::BranchAlreadyExists(name.to_string()));
-        }
-        let ref_path = repo.join(GFS_DIR).join(REFS_DIR).join(HEADS_DIR).join(name);
+        let ref_path = repo_layout::branch_ref_path(repo, name).map_err(map_err)?;
         if let Some(parent) = ref_path.parent() {
             fs::create_dir_all(parent).map_err(RepositoryError::Io)?;
         }
-        fs::write(&ref_path, commit_hash).map_err(RepositoryError::Io)?;
+        // `create_new`, not a predicate then a write: `exists()` is false both for
+        // "no such ref" and for "could not stat it", so an unreadable ref read as a
+        // free name and its tip was replaced. Losing a ref costs the branch *name* --
+        // the commits stay findable via `find_commits_by_prefix`.
+        use std::io::Write;
+        let mut f = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&ref_path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(RepositoryError::BranchAlreadyExists(name.to_string()));
+            }
+            Err(e) => return Err(RepositoryError::Io(e)),
+        };
+        f.write_all(commit_hash.as_bytes())
+            .map_err(RepositoryError::Io)?;
         Ok(())
     }
 
@@ -890,8 +902,13 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    // HEADS_DIR and REFS_DIR are test-only here now: this adapter used to build
+    // `refs/heads/<name>` inline in `checkout`, and #76 replaced that with the
+    // single-source `checkout_target()`. The tests still assert on the on-disk
+    // layout directly, so they keep the constants; the lib no longer needs them.
     use crate::model::layout::{
-        CONFIG_FILE, HEAD_FILE, MAIN_BRANCH, WORKSPACE_DATA_DIR, WORKSPACE_FILE, WORKSPACES_DIR,
+        CONFIG_FILE, HEAD_FILE, HEADS_DIR, MAIN_BRANCH, REFS_DIR, WORKSPACE_DATA_DIR,
+        WORKSPACE_FILE, WORKSPACES_DIR,
     };
     use crate::ports::repository::{LogOptions, Repository};
     use crate::utils::hash::hash_commit;
@@ -1021,6 +1038,63 @@ description = "test"
         assert_eq!(commit.snapshot_hash, "snap-json");
         assert_eq!(commit.author, "alice");
         assert_eq!(commit.hash, Some(hash));
+    }
+
+    /// Needs a ref whose `stat` fails but whose bytes are writable -- the state a
+    /// predicate cannot see. macOS `deny readattr` gives it; there is no portable
+    /// equivalent, since removing +x from the parent blocks the write too and both
+    /// shapes then error alike. Skips rather than reporting a pass it did not earn.
+    ///
+    /// A healthy repository does not work here: a predicate also refuses there.
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS ACLs")]
+    async fn a_ref_whose_stat_fails_is_not_overwritten() {
+        let temp = setup_repo();
+        let repo = temp.path();
+        let repository = GfsRepository::new();
+
+        let tip = "a".repeat(64);
+        repository.create_branch(repo, "feat", &tip).await.unwrap();
+        let ref_path = repo
+            .join(GFS_DIR)
+            .join(REFS_DIR)
+            .join(HEADS_DIR)
+            .join("feat");
+
+        let user = String::from_utf8(
+            std::process::Command::new("/usr/bin/id")
+                .arg("-un")
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let acl = std::process::Command::new("/bin/chmod")
+            .args(["+a", &format!("{} deny readattr", user.trim())])
+            .arg(&ref_path)
+            .status();
+        if !matches!(acl, Ok(st) if st.success()) || std::fs::metadata(&ref_path).is_ok() {
+            eprintln!("SKIP: could not make the ref unstat-able; nothing exercised");
+            return;
+        }
+
+        let err = repository
+            .create_branch(repo, "feat", &"b".repeat(64))
+            .await;
+        let _ = std::process::Command::new("/bin/chmod")
+            .arg("-N")
+            .arg(&ref_path)
+            .status();
+
+        assert!(
+            err.is_err(),
+            "an existing ref must not be replaced: {err:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&ref_path).unwrap(),
+            tip,
+            "the tip must be exactly as it was"
+        );
     }
 
     #[tokio::test]

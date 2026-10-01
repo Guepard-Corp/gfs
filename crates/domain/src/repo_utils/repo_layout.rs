@@ -102,7 +102,6 @@ pub fn init_repo_layout(working_dir: &Path, mount_point: Option<String>) -> Resu
     let snapshots_dir = gfs_dir.join(SNAPSHOTS_DIR);
     fs::create_dir_all(&snapshots_dir).map_err(RepoError::from)?;
 
-    // Create HEAD file
     let head_content = format!("ref: {}/{}/{}", REFS_DIR, HEADS_DIR, MAIN_BRANCH);
     fs::write(gfs_dir.join(HEAD_FILE), head_content).map_err(RepoError::from)?;
 
@@ -810,13 +809,87 @@ pub fn get_snapshot_from_commit(repo_path: &Path, commit_hash: &str) -> Result<S
     Ok(commit.snapshot_hash)
 }
 
+/// The path of a branch ref, or an error if the name would not stay inside
+/// `refs/heads`.
+///
+/// `Path::join` discards the prefix when the argument is absolute, so
+/// `refs_dir.join("/tmp/x")` is `/tmp/x`: a branch name could name any writable
+/// path on the machine, and `gfs branch /tmp/x` created a file there and reported
+/// success. `..` walks out the same way, landing in `.gfs/` itself.
+///
+/// Every caller that turns a branch name into a path goes through here, so the
+/// check cannot be bypassed by adding another one.
+pub fn branch_ref_path(repo_path: &Path, name: &str) -> Result<PathBuf, RepoError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(RepoError::invalid_layout(
+            "branch name is empty".to_string(),
+        ));
+    }
+    let bad = Path::new(trimmed)
+        .components()
+        .any(|c| !matches!(c, std::path::Component::Normal(_)));
+    if bad {
+        return Err(RepoError::invalid_layout(format!(
+            "branch name '{}' must not be absolute or contain '..'",
+            trimmed.escape_debug()
+        )));
+    }
+    let heads = repo_path.join(GFS_DIR).join(REFS_DIR).join(HEADS_DIR);
+    let candidate = heads.join(trimmed);
+
+    // Rejecting `..` and absolute names is not enough on its own: a symlink
+    // *already inside* refs/heads walks out just as well, and `sub/x` with
+    // `sub -> /tmp` wrote /tmp/x and reported success. Component checks cannot
+    // see that, because the escape is on disk rather than in the name.
+    //
+    // So resolve the nearest existing ancestor and require it to be under a
+    // resolved refs/heads. Canonicalising follows symlinks, which is the point:
+    // if the answer lands outside, the name is refused whatever it looked like.
+    let anchor = heads.canonicalize().unwrap_or_else(|_| heads.clone());
+    let mut existing = candidate.as_path();
+    let resolved = loop {
+        match existing.parent() {
+            Some(parent) => {
+                if let Ok(c) = parent.canonicalize() {
+                    break c;
+                }
+                existing = parent;
+            }
+            None => break anchor.clone(),
+        }
+    };
+    if !resolved.starts_with(&anchor) {
+        return Err(RepoError::invalid_layout(format!(
+            "branch name '{}' resolves outside refs/heads",
+            trimmed.escape_debug()
+        )));
+    }
+    Ok(candidate)
+}
+
+/// Whether `branch_name` names an existing ref.
+///
+/// Plain, deliberately: `rev_parse` and the error messages read this too, so
+/// resolving an unstat-able ref as "taken" would make a 300-character name report
+/// "already exists" rather than "File name too long", and would break `checkout
+/// <full-hash>` on a damaged `refs/heads` -- when recovery by hash is what you
+/// need. `create_branch` guards the overwrite at the write instead.
 pub fn is_branch(repo_path: &Path, branch_name: &str) -> bool {
     let refs_dir = repo_path.join(GFS_DIR).join(REFS_DIR).join(HEADS_DIR);
     let branch_path = refs_dir.join(branch_name);
     branch_path.exists()
 }
 
+/// Whether `commit_hash` names a stored object.
+///
+/// Plain, for the same reason as [`is_branch`]. The guard is against a panic, not
+/// a policy: `split_at(2)` panics below two bytes and when byte 2 falls inside a
+/// character (`"€"` is three bytes), and this is `pub`.
 pub fn is_commit(repo_path: &Path, commit_hash: &str) -> bool {
+    if !commit_hash.is_char_boundary(2) {
+        return false;
+    }
     let objects_dir = repo_path.join(GFS_DIR).join(OBJECTS_DIR);
     let (dir_part, file_part) = commit_hash.split_at(2);
     let object_path = objects_dir.join(dir_part).join(file_part);
@@ -2450,6 +2523,103 @@ name = "test-repo"
         // Now "develop" should exist
         let now_exists = is_branch(&repo_dir, "develop");
         assert!(now_exists);
+    }
+
+    /// `split_at(2)` panics below two bytes and also when byte 2 lands inside a
+    /// character -- `"€"` is three bytes and splits in the middle of one, so a
+    /// byte-length check alone does not cover it. `is_commit` is `pub`.
+    #[test]
+    fn is_commit_does_not_panic_on_a_hash_that_cannot_be_sharded() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_dir = temp_dir.path().join("repo");
+        init_repo_layout(&repo_dir, None).unwrap();
+
+        for bad in ["", "a", "\u{20ac}", "\u{20ac}abc"] {
+            assert!(!is_commit(&repo_dir, bad), "{bad:?} must not shard");
+        }
+        assert!(
+            !is_commit(&repo_dir, &"c".repeat(64)),
+            "well-formed but absent"
+        );
+    }
+
+    /// `Path::join` discards the prefix when the argument is absolute, so a branch
+    /// name could name any writable path on the machine: `gfs branch /tmp/x` wrote
+    /// a file there and reported success. `..` walks out the same way.
+    #[test]
+    fn a_branch_name_cannot_escape_refs_heads() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_dir = temp_dir.path().join("repo");
+        init_repo_layout(&repo_dir, None).unwrap();
+
+        for bad in ["/tmp/escaped", "../../traversed", "..", "a/../../b", ""] {
+            assert!(
+                branch_ref_path(&repo_dir, bad).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+        for good in ["feat", "team/alpha", "a.b", "1234"] {
+            let p = branch_ref_path(&repo_dir, good).unwrap();
+            assert!(
+                p.starts_with(repo_dir.join(GFS_DIR).join(REFS_DIR).join(HEADS_DIR)),
+                "{good:?} must stay inside refs/heads, got {p:?}"
+            );
+        }
+    }
+
+    /// Rejecting `..` and absolute names is not enough: a symlink already inside
+    /// `refs/heads` escapes just as well, and the name that does it looks
+    /// entirely ordinary. `sub/x` with `sub -> /tmp` wrote `/tmp/x` and reported
+    /// success -- on both platforms, and on the base build too.
+    ///
+    /// Unix-only because of how the escape is *built*, not because of what it
+    /// proves. `std::os::unix` does not exist on Windows, so an unguarded
+    /// reference here fails the whole `gfs-domain` test target to compile there
+    /// (E0433) rather than skipping one case. Creating a symlink on Windows also
+    /// needs `SeCreateSymbolicLinkPrivilege` or Developer Mode, so the setup is
+    /// not portable even spelled the Windows way.
+    ///
+    /// The guard itself is not unix-only: `branch_ref_path` canonicalises, and
+    /// canonicalisation resolves Windows junctions -- which an unprivileged user
+    /// *can* create -- just as it resolves symlinks. So the protection holds on
+    /// Windows; it is only unverified there.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_component_inside_refs_heads_cannot_escape() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_dir = temp_dir.path().join("repo");
+        init_repo_layout(&repo_dir, None).unwrap();
+
+        let outside = TempDir::new().unwrap();
+        let heads = repo_dir.join(GFS_DIR).join(REFS_DIR).join(HEADS_DIR);
+        std::os::unix::fs::symlink(outside.path(), heads.join("sub")).unwrap();
+
+        assert!(
+            branch_ref_path(&repo_dir, "sub/x").is_err(),
+            "a name whose parent resolves outside refs/heads must be refused"
+        );
+        // A real nested branch must still work, or the check is just a ban on '/'.
+        std::fs::create_dir_all(heads.join("team")).unwrap();
+        assert!(branch_ref_path(&repo_dir, "team/alpha").is_ok());
+    }
+
+    /// `get_commit_from_hash` shards with `split_at(2)`, which panics below two
+    /// bytes and when byte 2 falls inside a character. It is reached with whatever
+    /// a ref file holds, and a one-byte ref is what a crash during a ref write
+    /// leaves, so `gfs log` panicked on a damaged repository rather than reporting
+    /// it.
+    #[test]
+    fn a_ref_too_short_to_shard_is_an_error_not_a_panic() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_dir = temp_dir.path().join("repo");
+        init_repo_layout(&repo_dir, None).unwrap();
+
+        for bad in ["x", "", "\u{20ac}"] {
+            assert!(
+                get_commit_from_hash(&repo_dir, bad).is_err(),
+                "{bad:?} must error rather than panic"
+            );
+        }
     }
 
     #[test]
