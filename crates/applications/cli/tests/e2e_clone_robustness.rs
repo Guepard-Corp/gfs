@@ -107,7 +107,17 @@ fn start_remote(name: &str, image: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let ready = runtime_command()
-            .args(["exec", name, "pg_isready", "-U", "postgres", "-d", "shop"])
+            .args([
+                "exec",
+                name,
+                "pg_isready",
+                "-h",
+                "127.0.0.1",
+                "-U",
+                "postgres",
+                "-d",
+                "shop",
+            ])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);

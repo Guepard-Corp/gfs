@@ -72,6 +72,8 @@ fn start_postgres_container() {
                 "exec",
                 CONTAINER,
                 "pg_isready",
+                "-h",
+                "127.0.0.1",
                 "-U",
                 "postgres",
                 "-d",
