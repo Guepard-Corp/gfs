@@ -2,6 +2,18 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Metadata for one file in the snapshot data directory (flattened file list in a commit).
+/// Attributes captured from the same stat that yields size and mode.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Default)]
+pub struct FileAttrs {
+    /// Modification time in nanoseconds since the Unix epoch.
+    ///
+    /// This answers "written since the snapshot", not "differs from it": a file
+    /// rewritten back to identical bytes still reports changed. For a gate that
+    /// refuses rather than overwrites, that is the safe direction.
+    #[serde(default)]
+    pub mtime_ns: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileEntry {
     /// Path relative to the workspace `data/` folder.
@@ -14,9 +26,15 @@ pub struct FileEntry {
     pub group: Option<String>,
     /// File mode / permissions (e.g. octal "0600"); `None` when not available.
     pub permissions: Option<String>,
-    /// Optional platform-specific attributes (e.g. extended attributes, flags).
+    /// Optional per-file attributes.
+    ///
+    /// Typed, not `serde_json::Value`: file entries are serialized with bincode,
+    /// which encodes a `Value` but cannot decode one (`AnyNotSupported`), so a
+    /// populated free-form field produced an object that could never be read
+    /// back. `None` is a single zero byte in bincode whatever the inner type is,
+    /// so objects written before this field was typed still decode.
     #[serde(default)]
-    pub file_attributes: Option<serde_json::Value>,
+    pub file_attributes: Option<FileAttrs>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

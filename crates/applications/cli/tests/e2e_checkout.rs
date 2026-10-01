@@ -305,6 +305,85 @@ fn a_recreated_branch_does_not_inherit_the_deleted_one() {
     );
 }
 
+/// Deleting a branch must not destroy the only record of where it pointed.
+///
+/// A commit object stores its parents but no branch name, so once the ref file
+/// is gone the name -> tip binding exists nowhere: the commits survive on disk
+/// and can be found by scanning objects for dangling tips, but nothing says
+/// which of them was "b1". `branch -d` therefore moves the ref aside instead of
+/// unlinking it, and `--restore` puts it back.
+#[test]
+fn a_deleted_branch_can_be_restored_with_its_name_and_tip() {
+    let tmp = tempdir().expect("create temp dir");
+    let repo_path = tmp.path();
+    assert!(cli_runner::gfs_init(repo_path), "gfs init should succeed");
+    let repo = repo_path.to_str().unwrap();
+
+    let data_dir = workspace_data_dir_main_0(repo_path);
+    fs::write(data_dir.join("seed.txt"), "v1").unwrap();
+    assert!(cli_runner::gfs_commit(repo_path, "c1", None, None).0);
+
+    assert!(cli_runner::run_gfs(["gfs", "checkout", "--path", repo, "-b", "b1"]).0);
+    fs::write(read_workspace_path(repo_path).join("only-on-b1.txt"), "x").unwrap();
+    assert!(cli_runner::gfs_commit(repo_path, "b1 work", None, None).0);
+    let b1_tip = read_ref(repo_path, "b1");
+    assert!(cli_runner::run_gfs(["gfs", "checkout", "--path", repo, "main"]).0);
+
+    assert!(cli_runner::run_gfs(["gfs", "branch", "--path", repo, "-d", "b1"]).0);
+    assert!(
+        !repo_path.join(".gfs/refs/heads/b1").exists(),
+        "the live ref should be gone"
+    );
+
+    assert!(cli_runner::run_gfs(["gfs", "branch", "--path", repo, "--restore", "b1"]).0);
+    assert_eq!(
+        read_ref(repo_path, "b1"),
+        b1_tip,
+        "the restored branch must point at the commit it was deleted at"
+    );
+
+    // The workspace went with the branch, so this also proves the restore is
+    // usable rather than just a ref on disk: checkout rebuilds it from the
+    // snapshot.
+    assert!(cli_runner::run_gfs(["gfs", "checkout", "--path", repo, "b1"]).0);
+    assert_eq!(
+        workspace_contents(repo_path),
+        "only-on-b1.txt=x seed.txt=v1",
+        "the restored branch checks out the content it had when deleted"
+    );
+}
+
+/// Restoring must not trade one lost branch for another.
+#[test]
+fn restoring_a_name_that_is_live_again_is_refused() {
+    let tmp = tempdir().expect("create temp dir");
+    let repo_path = tmp.path();
+    assert!(cli_runner::gfs_init(repo_path), "gfs init should succeed");
+    let repo = repo_path.to_str().unwrap();
+
+    let data_dir = workspace_data_dir_main_0(repo_path);
+    fs::write(data_dir.join("seed.txt"), "v1").unwrap();
+    assert!(cli_runner::gfs_commit(repo_path, "c1", None, None).0);
+
+    assert!(cli_runner::run_gfs(["gfs", "checkout", "--path", repo, "-b", "b1"]).0);
+    assert!(cli_runner::run_gfs(["gfs", "checkout", "--path", repo, "main"]).0);
+    assert!(cli_runner::run_gfs(["gfs", "branch", "--path", repo, "-d", "b1"]).0);
+
+    // Same name, live again.
+    assert!(cli_runner::run_gfs(["gfs", "branch", "--path", repo, "b1"]).0);
+    let live_tip = read_ref(repo_path, "b1");
+
+    assert!(
+        !cli_runner::run_gfs(["gfs", "branch", "--path", repo, "--restore", "b1"]).0,
+        "restore must fail rather than overwrite the live branch"
+    );
+    assert_eq!(
+        read_ref(repo_path, "b1"),
+        live_tip,
+        "the live branch must be untouched by the refused restore"
+    );
+}
+
 /// A commit hash names exactly one content state.
 ///
 /// The detached workspace is named by the hash, and was reused as-is, so

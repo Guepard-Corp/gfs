@@ -535,6 +535,7 @@ mod tests {
                     .collect(),
                 resources: None,
             }),
+            deleted_branch_retention_days: None,
         }
     }
 
