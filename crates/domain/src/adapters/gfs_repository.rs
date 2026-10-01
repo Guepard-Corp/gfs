@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use crate::model::commit::{Commit, CommitWithRefs, FileEntry, NewCommit, file_entry_diff_stats};
 use crate::model::config::{EnvironmentConfig, GfsConfig, RuntimeConfig, UserConfig};
 use crate::model::errors::RepoError;
-use crate::model::layout::{GFS_DIR, OBJECTS_DIR, SNAPSHOTS_DIR};
+use crate::model::layout::{GFS_DIR, OBJECTS_DIR, SNAPSHOTS_DIR, WORKSPACES_DIR};
 use crate::ports::repository::{LogOptions, RemoteOptions, Repository, RepositoryError, Result};
 use crate::repo_utils::repo_layout;
 use crate::utils::hash::hash_commit;
@@ -36,7 +36,7 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     {
         let source = src.join(".");
-        let status = Command::new("cp")
+        let status = Command::new(crate::utils::system_bin::resolve("cp"))
             .arg("-cRp")
             .arg(&source)
             .arg(dst)
@@ -52,7 +52,7 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         let source = src.join(".");
-        let output = Command::new("cp")
+        let output = Command::new(crate::utils::system_bin::resolve("cp"))
             .args(["--reflink=auto", "-a"])
             .arg(&source)
             .arg(dst)
@@ -73,7 +73,8 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
         if is_permission_error_output(&output)
             && is_likely_podman_runtime()
             && run_podman_unshare(&format!(
-                "LANG=C cp --reflink=auto -a {}/. {}",
+                "LANG=C {} --reflink=auto -a {}/. {}",
+                shell_quote(&crate::utils::system_bin::resolve("cp").to_string_lossy()),
                 shell_quote(&src.to_string_lossy()),
                 shell_quote(&dst.to_string_lossy())
             ))
@@ -596,11 +597,31 @@ impl Repository for GfsRepository {
             return Err(RepositoryError::Internal(msg));
         }
 
+        // Everything between `workspaces/` and the trailing `<n>/data`, not just
+        // the last component of it.
+        //
+        // `file_name()` returns one segment, so a nested branch lost every
+        // component but the last: `feature/migration` became `migration`, and
+        // HEAD was then written as `ref: refs/heads/migration` while the ref
+        // file sat at `refs/heads/feature/migration`. The two disagreed, and
+        // `status` reported the truncated name. Nested names are supported
+        // elsewhere on purpose -- `validate_branch_name` accepts `team/alpha`,
+        // and the deleted-refs layout is keyed by time precisely so `a` and
+        // `a/b` can coexist -- and both skill files use `feature/migration` as
+        // their worked example.
         let branch_segment = workspace_path
             .parent()
             .and_then(|p| p.parent())
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
+            .and_then(|dir| {
+                let base = repo.join(GFS_DIR).join(WORKSPACES_DIR);
+                dir.strip_prefix(&base).ok().map(|rel| {
+                    rel.components()
+                        .map(|c| c.as_os_str().to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join("/")
+                })
+            })
+            .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "detached".to_string());
 
         // Always restore from the snapshot. Reusing a workspace that happens to

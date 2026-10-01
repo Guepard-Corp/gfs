@@ -195,6 +195,29 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
 
     pub async fn drop_role(&self, path: &Path, username: &str) -> Result<(), ManageUsersError> {
         reject_reserved_role(username)?;
+        // A management superuser must never be droppable, whatever it is named.
+        // `RESERVED_ROLES` fences the names this project ships, but the superuser's
+        // name is deployment-configurable (`POSTGRES_USER`), so a name list cannot
+        // be the only guard: a deployment that picks any other name gets an
+        // unfenced superuser, and this function reassigns a role's objects before
+        // dropping it -- so the failure mode is not "delete refused" but "the
+        // instance's objects are reassigned and the account the management exec
+        // seam itself connects as is destroyed".
+        //
+        // Fence on the property instead. `list_roles` already reports `is_superuser`;
+        // it was simply never consulted here. Fail closed, matching the rest of the
+        // managed-user paths: if the cluster cannot be listed we refuse the drop
+        // rather than guess.
+        if self
+            .list_roles(path)
+            .await?
+            .iter()
+            .any(|r| r.username == username && r.is_superuser)
+        {
+            return Err(ManageUsersError::InvalidInput(format!(
+                "'{username}' is a superuser and cannot be dropped via user management"
+            )));
+        }
         // Immediate revocation with no reconnect window: first disable login
         // (committed, so no NEW session can authenticate), then terminate the live
         // backends, then drop. Without the disable-login step a client with the
@@ -869,6 +892,7 @@ mod tests {
             }),
             storage: None,
             compute: None,
+            deleted_branch_retention_days: None,
         };
         config.save(&path).expect("save config");
         (temp, path)
@@ -1038,6 +1062,49 @@ mod tests {
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    /// The management superuser's name is deployment-configurable
+    /// (`POSTGRES_USER`), so the `RESERVED_ROLES` name list cannot be the only
+    /// guard -- on the Kubernetes path it is `guepard-admin`, which that list does
+    /// not contain. Dropping it would reassign the instance's objects and destroy
+    /// the account the management exec seam connects as, so the refusal is fenced
+    /// on `is_superuser`, which `list_roles` already reports.
+    #[tokio::test]
+    async fn a_superuser_is_never_droppable_whatever_it_is_named() {
+        let (_temp, repo) = repo_with_config("pg-c1");
+        let compute = MockCompute {
+            stdout: r#"[{"username":"guepard-admin","can_login":true,"is_superuser":true}]"#.into(),
+            ..Default::default()
+        };
+        let (uc, _c) = use_case(compute, true);
+        let err = uc.drop_role(&repo, "guepard-admin").await.unwrap_err();
+        match err {
+            ManageUsersError::InvalidInput(m) => {
+                assert!(
+                    m.contains("superuser"),
+                    "expected a superuser refusal, got: {m}"
+                )
+            }
+            other => panic!("expected InvalidInput refusal, got {other:?}"),
+        }
+    }
+
+    /// ...and the guard is on the property, not the name: an ordinary login role
+    /// with the same listing shape is still droppable, so the refusal above cannot
+    /// be passing for an unrelated reason.
+    #[tokio::test]
+    async fn a_non_superuser_with_the_same_shape_is_still_droppable() {
+        let (_temp, repo) = repo_with_config("pg-c1");
+        let compute = MockCompute {
+            stdout: r#"[{"username":"guepard-admin","can_login":true,"is_superuser":false}]"#
+                .into(),
+            ..Default::default()
+        };
+        let (uc, _c) = use_case(compute, true);
+        uc.drop_role(&repo, "guepard-admin")
+            .await
+            .expect("a non-superuser must still be droppable");
     }
 
     #[tokio::test]
