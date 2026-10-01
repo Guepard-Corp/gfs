@@ -2727,6 +2727,7 @@ mod tests {
                 runtime: Some(runtime.clone()),
                 storage: None,
                 compute: None,
+                deleted_branch_retention_days: None,
             };
             config.save(&path).expect("save .gfs/config.toml");
             // MockRepository getters: the source the snapshot arm reads.

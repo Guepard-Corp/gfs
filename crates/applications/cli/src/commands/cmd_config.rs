@@ -8,8 +8,8 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
-use gfs_domain::model::config::{GfsConfig, GlobalSettings};
+use anyhow::{Context, Result};
+use gfs_domain::model::config::{DEFAULT_DELETED_RETENTION_DAYS, GfsConfig, GlobalSettings};
 use gfs_domain::model::errors::RepoError;
 use gfs_domain::model::layout::GFS_DIR;
 use gfs_domain::repo_utils::repo_layout;
@@ -22,6 +22,7 @@ const KEY_USER_EMAIL: &str = "user.email";
 const KEY_STORAGE_COMPRESSION: &str = "storage.compression";
 const KEY_STORAGE_REFLINK: &str = "storage.reflink";
 const KEY_TELEMETRY_ENABLED: &str = "telemetry.enabled";
+const KEY_BRANCH_DELETED_RETENTION_DAYS: &str = "branch.deletedRetentionDays";
 
 const SUPPORTED_KEYS: &[&str] = &[
     KEY_USER_NAME,
@@ -29,6 +30,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     KEY_STORAGE_COMPRESSION,
     KEY_STORAGE_REFLINK,
     KEY_TELEMETRY_ENABLED,
+    KEY_BRANCH_DELETED_RETENTION_DAYS,
 ];
 
 /// Run `gfs config [--global] [--path <dir>] <key> [<value>]`.
@@ -97,6 +99,10 @@ fn get(repo_path: &std::path::Path, key: &str) -> Result<()> {
             .as_ref()
             .map(|s| s.enable_reflink.to_string())
             .unwrap_or_default(),
+        KEY_BRANCH_DELETED_RETENTION_DAYS => config
+            .deleted_branch_retention_days
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| DEFAULT_DELETED_RETENTION_DAYS.to_string()),
         KEY_TELEMETRY_ENABLED => {
             anyhow::bail!(
                 "'{}' is a global-only setting; use --global to read it",
@@ -169,6 +175,12 @@ fn set(repo_path: &std::path::Path, key: &str, value: &str) -> Result<()> {
             let mut storage = config.storage.clone().unwrap_or_default();
             storage.compression = Some(value.to_string());
             config.storage = Some(storage);
+        }
+        KEY_BRANCH_DELETED_RETENTION_DAYS => {
+            let days: u64 = value.parse().with_context(|| {
+                format!("'{key}' must be a whole number of days, got '{value}'")
+            })?;
+            config.deleted_branch_retention_days = Some(days);
         }
         KEY_STORAGE_REFLINK => {
             let mut storage = config.storage.clone().unwrap_or_default();

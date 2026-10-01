@@ -527,6 +527,7 @@ mod tests {
             runtime: Some(runtime.clone()),
             storage: None,
             compute: None,
+            deleted_branch_retention_days: None,
         };
         config.save(dir).unwrap();
     }
@@ -603,6 +604,7 @@ mod tests {
             }),
             storage: None,
             compute: None,
+            deleted_branch_retention_days: None,
         };
         config.save(dir.path()).unwrap();
 
@@ -638,6 +640,7 @@ mod tests {
             }),
             storage: None,
             compute: None,
+            deleted_branch_retention_days: None,
         };
         config.save(dir.path()).unwrap();
 
