@@ -43,6 +43,7 @@ fn write_repo(path: &std::path::Path, container: &str) {
         }),
         storage: None,
         compute: None,
+        deleted_branch_retention_days: None,
     };
     config.save(path).expect("save config");
 }
@@ -72,6 +73,8 @@ fn start_postgres_container() {
                 "exec",
                 CONTAINER,
                 "pg_isready",
+                "-h",
+                "127.0.0.1",
                 "-U",
                 "postgres",
                 "-d",

@@ -2910,10 +2910,20 @@ mod tests {
         // 30s is not enough on a loaded docker host -- and the readiness flag used
         // to be computed and then ignored, so the test charged on and failed later
         // with a confusing assertion instead of saying the server never came up.
+        // `-h 127.0.0.1` keeps the probe on TCP, which is the transport under test;
+        // the default unix socket can be ready while TCP is not.
         for _ in 0..90 {
-            if docker(&["exec", &cn, "pg_isready", "-U", "postgres"])
-                .status
-                .success()
+            if docker(&[
+                "exec",
+                &cn,
+                "pg_isready",
+                "-h",
+                "127.0.0.1",
+                "-U",
+                "postgres",
+            ])
+            .status
+            .success()
             {
                 ready = true;
                 break;
@@ -3041,10 +3051,20 @@ mod tests {
         // 30s is not enough on a loaded docker host -- and the readiness flag used
         // to be computed and then ignored, so the test charged on and failed later
         // with a confusing assertion instead of saying the server never came up.
+        // `-h 127.0.0.1` keeps the probe on TCP, which is the transport under test;
+        // the default unix socket can be ready while TCP is not.
         for _ in 0..90 {
-            if docker(&["exec", &cn, "pg_isready", "-U", "postgres"])
-                .status
-                .success()
+            if docker(&[
+                "exec",
+                &cn,
+                "pg_isready",
+                "-h",
+                "127.0.0.1",
+                "-U",
+                "postgres",
+            ])
+            .status
+            .success()
             {
                 ready = true;
                 break;
