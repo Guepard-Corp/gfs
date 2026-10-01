@@ -154,6 +154,8 @@ async fn create_branch(
             Some(repo_path.to_path_buf()),
             start_point.map(|s| s.to_string()),
             Some(name.to_string()),
+            // Creating a branch must not silently discard work either.
+            false,
             json_output,
         )
         .await;
@@ -226,6 +228,27 @@ fn delete_branch(repo_path: &std::path::Path, name: &str, json_output: bool) -> 
 
     std::fs::remove_file(&ref_path)
         .with_context(|| format!("failed to delete branch ref '{}'", name))?;
+
+    // The working copy outlives the ref unless it goes here too. It is keyed by
+    // branch NAME, so a later branch reusing the name would inherit this one's
+    // workspace. Reported rather than ignored: a workspace that silently failed
+    // to go is exactly the state this is meant to prevent.
+    let workspace = repo_layout::branch_workspace_dir(repo_path, name);
+    if workspace.exists() {
+        #[cfg(unix)]
+        let _ = std::process::Command::new("chmod")
+            .args(["-R", "u+w"])
+            .arg(&workspace)
+            .output();
+        std::fs::remove_dir_all(&workspace).with_context(|| {
+            format!(
+                "branch ref '{}' was deleted but its workspace at '{}' could not be removed; \
+                 remove it before creating a branch of the same name",
+                name,
+                workspace.display()
+            )
+        })?;
+    }
 
     // Clean up empty parent directories (for nested branches like feature/foo).
     let mut parent = ref_path.parent();

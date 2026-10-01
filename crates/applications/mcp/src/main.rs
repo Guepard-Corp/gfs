@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 
 use axum::Router;
 use gfs_mcp::GfsMcpHandler;
+use gfs_mcp::blank_line_filter::SkipBlankLines;
 use rmcp::ServiceExt;
 use rmcp::transport::{
     StreamableHttpServerConfig, stdio,
@@ -75,7 +76,16 @@ async fn run_stdio(
         "gfs-mcp starting (stdio transport)"
     );
 
-    let service = match GfsMcpHandler::new().serve(stdio()).await {
+    // Stdin goes through a filter that drops blank lines. Without it a single
+    // stray newline terminated the server with exit code 0 — indistinguishable
+    // from a clean client disconnect, so a supervisor saw a successful shutdown
+    // and any in-flight request was lost with no error. See
+    // `blank_line_filter` for why only blank lines are filtered.
+    let (input, output) = stdio();
+    let service = match GfsMcpHandler::new()
+        .serve((SkipBlankLines::new(input), output))
+        .await
+    {
         Ok(s) => s,
         Err(e) => {
             let msg = e.to_string();

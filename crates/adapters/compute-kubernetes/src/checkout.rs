@@ -239,7 +239,13 @@ pub async fn reprovision_after_pvc_restore<R: DatabaseProviderRegistry>(
         .get(&provider_name)
         .ok_or_else(|| K8sCheckoutReprovisionError::UnknownProvider(provider_name.clone()))?;
 
-    let mut def = provider.definition();
+    // Rebuilding a pod is definitionally a container operation, so this path
+    // requires the container half rather than assuming every provider has one.
+    let container = provider.require_container().map_err(|e| {
+        K8sCheckoutReprovisionError::UnknownProvider(format!("{provider_name}: {e}"))
+    })?;
+
+    let mut def = container.definition();
     let base = def.image.split(':').next().unwrap_or(&def.image);
     def.image = format!("{base}:{database_version}");
     // Re-apply the repo's configured database name AND user (see
@@ -288,7 +294,7 @@ pub async fn reprovision_after_pvc_restore<R: DatabaseProviderRegistry>(
         .map_err(|e| K8sCheckoutReprovisionError::Repository(e.to_string()))?;
 
     let conn = compute
-        .get_connection_info(&instance_id, provider.default_port())
+        .get_connection_info(&instance_id, container.default_port())
         .await
         .map_err(|e| K8sCheckoutReprovisionError::Compute(e.to_string()))?;
 

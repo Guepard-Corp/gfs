@@ -159,6 +159,25 @@ pub fn remove_new_marker(working_dir: &Path) {
     fs::remove_file(&new_marker_path).unwrap();
 }
 
+/// Connection parameters for a provider with an in-process engine.
+///
+/// There is no host, port or credential to supply — the engine opens a file. It
+/// is told which directory the active workspace lives in and derives its own
+/// layout from there, so callers never name another provider's files.
+pub fn local_connection_params(
+    repo_path: &Path,
+) -> Result<crate::ports::database_provider::ConnectionParams, RepoError> {
+    let data_dir = get_active_workspace_data_dir(repo_path)?;
+    Ok(crate::ports::database_provider::ConnectionParams {
+        host: String::new(),
+        port: 0,
+        env: vec![(
+            crate::ports::database_provider::LOCAL_DATA_DIR_ENV.to_string(),
+            data_dir.to_string_lossy().into_owned(),
+        )],
+    })
+}
+
 /// Return the path recorded in `.gfs/WORKSPACE` — the directory where the
 /// database is currently running.
 ///
@@ -203,6 +222,22 @@ pub fn get_current_branch(path: &Path) -> Result<String, RepoError> {
             "Invalid HEAD file content: {}",
             head_content
         )))
+    }
+}
+
+/// `Some(commit)` when HEAD is a raw commit hash (detached); `None` when attached
+/// to a branch. Mirrors the HEAD parsing in [`get_current_branch`]. A malformed HEAD
+/// (neither a `ref:` line nor exactly 64 hex chars) is reported as `None` (attached)
+/// here; the commit path surfaces such corruption separately when it resolves the
+/// current commit id, before any write.
+pub fn detached_head_commit(path: &Path) -> Result<Option<String>, RepoError> {
+    let gfs_dir = path.join(GFS_DIR);
+    let head_content = fs::read_to_string(gfs_dir.join(HEAD_FILE)).map_err(RepoError::from)?;
+    let trimmed = head_content.trim();
+    if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(Some(trimmed.to_string()))
+    } else {
+        Ok(None)
     }
 }
 
@@ -522,11 +557,35 @@ pub fn snapshot_diff(
     })
 }
 
+/// Split a 64-hex object hash into its `<2>/<62>` storage path parts.
+///
+/// Guarded, because `str::split_at` panics on a boundary past the end and the
+/// value that reaches here is not always a hash. A repository with no commits
+/// records the sentinel `"0"` as its current commit, so `gfs schema show HEAD`
+/// on a fresh repo — step two of the documented workflow — reached
+/// `"0".split_at(2)` and took the whole process down with
+/// `end byte index 2 is out of bounds for string of length 1`. Over MCP that
+/// was worse than a crash: the panic unwound the request while the server
+/// stayed up, so the call was never answered and the client waited forever.
+///
+/// Returning `RevisionNotFound` instead turns it into the same error every
+/// other bad revision produces.
+pub fn split_object_hash(hash: &str) -> Result<(&str, &str), RepoError> {
+    if hash.len() < 3 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(if hash == "0" {
+            RepoError::NoCommitsYet
+        } else {
+            RepoError::RevisionNotFound(hash.to_string())
+        });
+    }
+    Ok(hash.split_at(2))
+}
+
 pub fn get_commit_from_hash(repo_path: &Path, commit_hash: &str) -> Result<Commit, RepoError> {
     tracing::trace!("Getting commit from hash {}", commit_hash);
 
     let objects_dir = repo_path.join(GFS_DIR).join(OBJECTS_DIR);
-    let (dir_part, file_part) = commit_hash.split_at(2);
+    let (dir_part, file_part) = split_object_hash(commit_hash)?;
     let object_path = objects_dir.join(dir_part).join(file_part);
     let commit_json = fs::read_to_string(object_path).map_err(RepoError::from)?;
 
@@ -659,9 +718,25 @@ pub fn write_schema_object(
     let schema_json = serde_json::to_string_pretty(schema_metadata)
         .map_err(|e| RepoError::InvalidConfig(format!("failed to serialize schema: {}", e)))?;
 
-    // 2. Compute SHA-256 hash of schema.json content
+    // 2. Name the object after EVERYTHING it stores, not just half of it.
+    //
+    //    The hash covered `schema.json` alone while the directory it names also
+    //    holds `schema.sql`. Two commits whose structured metadata matches but
+    //    whose DDL differs — a dropped CHECK constraint, a changed foreign-key
+    //    action, a rewritten trigger body, a different collation — therefore
+    //    landed in the SAME directory, and the second write REPLACED the first
+    //    commit's `schema.sql`. `gfs schema show <old-commit>` then returned
+    //    the newer schema: a stored artefact changing retroactively, with
+    //    nothing to indicate it.
+    //
+    //    Including the DDL makes the name identify the content, which is what a
+    //    content-addressed store is for. A separator keeps the two fields from
+    //    running together, so a byte moved from the end of one to the start of
+    //    the other cannot produce the same digest.
     let mut hasher = Sha256::new();
     hasher.update(schema_json.as_bytes());
+    hasher.update(b"\0schema.sql\0");
+    hasher.update(schema_sql.as_bytes());
     let hash = format!("{:x}", hasher.finalize());
 
     // 3. Create directory: objects/<2>/<62>/
@@ -1035,6 +1110,107 @@ pub fn get_current_commit_id(repo_path: &Path) -> Result<String, RepoError> {
 
 /// Short commit id used for workspace directory path segment (avoids long paths on disk).
 /// If `commit_id` is longer than `SHORT_COMMIT_ID_LEN`, returns the prefix; otherwise returns as-is (e.g. `"0"`).
+/// Where a checkout of `revision` would land: its commit, and the workspace
+/// directory that would be rebuilt.
+///
+/// Extracted so the caller can ask what a checkout is about to overwrite BEFORE
+/// it overwrites it. `GfsRepository::checkout` uses the same function, because
+/// two copies of this rule that disagree is exactly how a guard ends up
+/// protecting a different directory from the one being destroyed.
+pub fn checkout_target(
+    repo: &Path,
+    revision: &str,
+) -> Result<(String, std::path::PathBuf), RepoError> {
+    let commit_hash = rev_parse(repo, revision)?;
+
+    // A branch name only keeps its own workspace while it still points at the
+    // commit being asked for; otherwise the checkout detaches.
+    let branch_segment = if is_branch(repo, revision) {
+        let tip = fs::read_to_string(
+            repo.join(GFS_DIR)
+                .join(REFS_DIR)
+                .join(HEADS_DIR)
+                .join(revision),
+        )
+        .map_err(RepoError::from)?;
+        if tip.trim() == commit_hash {
+            revision.to_string()
+        } else {
+            "detached".to_string()
+        }
+    } else {
+        "detached".to_string()
+    };
+
+    let workspace_segment = if branch_segment == "detached" {
+        short_commit_id_for_workspace(&commit_hash)
+    } else {
+        BRANCH_WORKSPACE_SEGMENT.to_string()
+    };
+
+    let path = repo
+        .join(GFS_DIR)
+        .join(WORKSPACES_DIR)
+        .join(&branch_segment)
+        .join(&workspace_segment)
+        .join(WORKSPACE_DATA_DIR);
+    Ok((commit_hash, path))
+}
+
+/// The directory holding a branch's working copy.
+pub fn branch_workspace_dir(repo_path: &Path, branch: &str) -> std::path::PathBuf {
+    repo_path.join(GFS_DIR).join(WORKSPACES_DIR).join(branch)
+}
+
+/// Paths in `workspace` that differ from `baseline`, i.e. uncommitted work.
+///
+/// Checkout restores the workspace from a snapshot, which overwrites whatever is
+/// there. Callers use this to refuse rather than overwrite silently.
+///
+/// WHAT IS COMPARED, and why it is only this. `FileEntry` records path, size,
+/// owner, group and mode; there is no content hash, so this is git's cheap tier
+/// (stat) without git's second tier (hash on suspicion).
+///
+/// * SIZE, for files present in both. A write to a SQLite database grows the
+///   database or its write-ahead log, so real work shows up here.
+/// * PRESENCE, for files in the workspace that the baseline does not have.
+/// * NOT permissions. A live workspace is 0700 and a snapshot is read-only, so
+///   they always differ and comparing them would report every workspace dirty.
+/// * NOT absences. SQLite deletes its `-wal` and `-shm` sidecars when the last
+///   connection closes, so a file that has gone away is the normal aftermath of
+///   reading the database, not uncommitted work.
+///
+/// The gap this leaves, stated rather than hidden: an edit that changes no
+/// file's size — an in-place UPDATE whose pages are checkpointed back to the
+/// same length — is not detected. The direction of the remaining error is the
+/// safe one for a false positive (a needless refusal, which `--force` clears)
+/// and the unsafe one for a false negative, so it is worth revisiting with a
+/// content hash if the commit object ever grows one.
+pub fn workspace_changes(
+    workspace: &Path,
+    baseline: &[FileEntry],
+) -> Result<Vec<String>, RepoError> {
+    if !workspace.exists() {
+        return Ok(Vec::new());
+    }
+    let current = collect_file_entries(workspace, "")?;
+    let sizes: std::collections::HashMap<&str, u64> = baseline
+        .iter()
+        .map(|e| (e.relative_path.as_str(), e.file_size))
+        .collect();
+
+    let mut changed: Vec<String> = current
+        .iter()
+        .filter(|entry| match sizes.get(entry.relative_path.as_str()) {
+            Some(&size) => size != entry.file_size,
+            None => true,
+        })
+        .map(|entry| entry.relative_path.clone())
+        .collect();
+    changed.sort();
+    Ok(changed)
+}
+
 pub fn short_commit_id_for_workspace(commit_id: &str) -> String {
     if commit_id.len() <= SHORT_COMMIT_ID_LEN {
         commit_id.to_string()
@@ -1104,6 +1280,159 @@ mod tests {
     use std::fs;
     use std::io;
     use tempfile::TempDir;
+
+    /// The dirty check reports work, and only work.
+    #[test]
+    fn workspace_changes_reports_writes_and_additions() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        fs::write(ws.join("db"), "aaaa").unwrap();
+        fs::write(ws.join("keep"), "same").unwrap();
+        let baseline = collect_file_entries(ws, "").unwrap();
+
+        // Untouched.
+        assert!(workspace_changes(ws, &baseline).unwrap().is_empty());
+
+        // A write that changes the size.
+        fs::write(ws.join("db"), "aaaaaaaa").unwrap();
+        assert_eq!(workspace_changes(ws, &baseline).unwrap(), vec!["db"]);
+
+        // A new file.
+        fs::write(ws.join("db"), "aaaa").unwrap();
+        fs::write(ws.join("new"), "x").unwrap();
+        assert_eq!(workspace_changes(ws, &baseline).unwrap(), vec!["new"]);
+    }
+
+    /// A file that has GONE is not uncommitted work.
+    ///
+    /// SQLite deletes its `-wal` and `-shm` sidecars when the last connection
+    /// closes, so treating an absence as a change would report every workspace
+    /// dirty after a plain read.
+    #[test]
+    fn workspace_changes_ignores_files_that_disappeared() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        fs::write(ws.join("db"), "aaaa").unwrap();
+        fs::write(ws.join("db-wal"), "").unwrap();
+        fs::write(ws.join("db-shm"), "x".repeat(32)).unwrap();
+        let baseline = collect_file_entries(ws, "").unwrap();
+
+        fs::remove_file(ws.join("db-wal")).unwrap();
+        fs::remove_file(ws.join("db-shm")).unwrap();
+        assert!(
+            workspace_changes(ws, &baseline).unwrap().is_empty(),
+            "closing the database is not uncommitted work"
+        );
+    }
+
+    /// Permissions are deliberately not compared.
+    ///
+    /// A live workspace is 0700 and the snapshot it came from is read-only, so
+    /// comparing modes would report every workspace dirty.
+    #[test]
+    fn workspace_changes_ignores_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let file = ws.join("db");
+        fs::write(&file, "aaaa").unwrap();
+        let mut baseline = collect_file_entries(ws, "").unwrap();
+        baseline[0].permissions = Some("0400".to_string());
+        assert!(workspace_changes(ws, &baseline).unwrap().is_empty());
+    }
+
+    /// A workspace that is not there yet has nothing to lose.
+    #[test]
+    fn workspace_changes_on_a_missing_workspace_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            workspace_changes(&dir.path().join("gone"), &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A schema object must be named by everything it stores.
+    ///
+    /// The hash covered `schema.json` alone while the directory it names also
+    /// holds `schema.sql`, so two commits with identical structured metadata
+    /// and different DDL — a dropped CHECK, a changed FK action, a rewritten
+    /// trigger — collided, and the second write REPLACED the first commit's
+    /// stored DDL. `gfs schema show <old>` then returned the newer schema.
+    #[test]
+    fn two_schemas_differing_only_in_ddl_do_not_collide() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata = crate::model::datasource::DatasourceMetadata {
+            version: "3".into(),
+            driver: "sqlite".into(),
+            schemas: vec![],
+            tables: vec![],
+            columns: vec![],
+            views: None,
+            functions: None,
+            indexes: None,
+            triggers: None,
+            materialized_views: None,
+            types: None,
+            foreign_tables: None,
+            policies: None,
+            table_privileges: None,
+            column_privileges: None,
+            config: None,
+            publications: None,
+            roles: None,
+            extensions: None,
+        };
+
+        let first =
+            write_schema_object(dir.path(), &metadata, "CREATE TABLE t(a INT CHECK(a > 0));")
+                .expect("first");
+        let second =
+            write_schema_object(dir.path(), &metadata, "CREATE TABLE t(a INT);").expect("second");
+
+        assert_ne!(
+            first, second,
+            "same metadata, different DDL — the objects must not share a name"
+        );
+
+        // And the first commit's DDL is still what it was.
+        let stored = |hash: &str| {
+            let (a, b) = hash.split_at(2);
+            fs::read_to_string(
+                dir.path()
+                    .join(GFS_DIR)
+                    .join(OBJECTS_DIR)
+                    .join(a)
+                    .join(b)
+                    .join("schema.sql"),
+            )
+            .expect("schema.sql")
+        };
+        assert!(stored(&first).contains("CHECK"), "the older DDL survived");
+        assert!(!stored(&second).contains("CHECK"));
+    }
+
+    /// A repository with no commits must not take the process down.
+    ///
+    /// `get_current_commit_id` returns the sentinel `"0"` before the first
+    /// commit, and `"0".split_at(2)` panics. `gfs schema show HEAD` on a fresh
+    /// repository is step two of the documented workflow, so this was reachable
+    /// immediately — and over MCP the panic unwound the request while the
+    /// server stayed up, leaving the client waiting forever.
+    #[test]
+    fn a_hash_that_is_not_a_hash_is_an_error_not_a_panic() {
+        assert!(matches!(
+            split_object_hash("0"),
+            Err(RepoError::NoCommitsYet)
+        ));
+        for bad in ["", "a", "ab", "zz1234", "not-hex-at-all"] {
+            assert!(
+                split_object_hash(bad).is_err(),
+                "{bad:?} is not an object hash"
+            );
+        }
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(split_object_hash(hash).unwrap(), ("01", &hash[2..]));
+    }
 
     #[test]
     fn short_commit_id_for_workspace_keeps_short_and_truncates_long() {

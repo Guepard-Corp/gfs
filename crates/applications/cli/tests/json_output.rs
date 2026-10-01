@@ -14,6 +14,10 @@ fn run_gfs(cwd: &Path, args: &[&str]) -> (i32, String, String) {
         .args(args)
         // Keep stderr clean for --json contract assertions.
         .env("RUST_LOG", "off")
+        // And keep it uncoloured: clap writes ANSI when colour is forced, which
+        // would otherwise make an assertion on the start of a line pass or fail
+        // depending on the environment the suite is run from.
+        .env("NO_COLOR", "1")
         .output()
         .expect("failed to run gfs");
 
@@ -154,4 +158,48 @@ fn json_error_compute_logs_without_config_is_json() {
     assert_stderr_empty(&stderr);
     let v = assert_stdout_json(&stdout);
     assert!(v.get("error").is_some(), "expected error envelope");
+}
+
+/// Covers both error paths, which are not interchangeable: a parse failure is
+/// formatted by clap, a runtime failure keeps the prefix `main` adds, and neither
+/// may double it.
+#[test]
+fn an_error_is_announced_once() {
+    let tmp = TempDir::new().unwrap();
+
+    // Parse failure: `init` takes its path positionally, so `--path` is unknown.
+    let (code, _, stderr) = run_gfs(tmp.path(), &["init", "--path", "somewhere"]);
+    assert_eq!(code, 1, "a usage error still exits 1");
+    // Counting the substring would be wrong: a message like "internal error: ..."
+    // legitimately contains it. Only the prefix is under test.
+    let first = stderr.lines().next().unwrap_or_default();
+    assert!(
+        first.starts_with("error: ") && !first.starts_with("error: error:"),
+        "clap already says 'error:' once: {first}"
+    );
+    assert!(
+        stderr.contains("Usage:"),
+        "clap's usage block must survive: {stderr}"
+    );
+
+    // clap renders bare help for these and prefixes nothing, so a test covering
+    // only a mistyped flag would not notice the line going missing.
+    for bare in [vec![], vec!["storage"], vec!["schema"], vec!["user"]] {
+        let (code, _, stderr) = run_gfs(tmp.path(), &bare);
+        assert_eq!(code, 1, "`gfs {}` exits 1", bare.join(" "));
+        assert!(
+            stderr.lines().any(|l| l.starts_with("error: ")),
+            "`gfs {}` must still announce an error: {stderr}",
+            bare.join(" ")
+        );
+    }
+
+    // Runtime failure: a valid command against a directory that is not a repo.
+    let (code, _, stderr) = run_gfs(tmp.path(), &["status"]);
+    assert_eq!(code, 1);
+    let first = stderr.lines().next().unwrap_or_default();
+    assert!(
+        first.starts_with("error: ") && !first.starts_with("error: error:"),
+        "and main's own prefix is still applied exactly once: {first}"
+    );
 }

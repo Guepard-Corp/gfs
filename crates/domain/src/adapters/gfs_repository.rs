@@ -15,10 +15,7 @@ use async_trait::async_trait;
 use crate::model::commit::{Commit, CommitWithRefs, FileEntry, NewCommit, file_entry_diff_stats};
 use crate::model::config::{EnvironmentConfig, GfsConfig, RuntimeConfig, UserConfig};
 use crate::model::errors::RepoError;
-use crate::model::layout::{
-    BRANCH_WORKSPACE_SEGMENT, GFS_DIR, HEADS_DIR, OBJECTS_DIR, REFS_DIR, SNAPSHOTS_DIR,
-    WORKSPACE_DATA_DIR, WORKSPACES_DIR,
-};
+use crate::model::layout::{GFS_DIR, HEADS_DIR, OBJECTS_DIR, REFS_DIR, SNAPSHOTS_DIR};
 use crate::ports::repository::{LogOptions, RemoteOptions, Repository, RepositoryError, Result};
 use crate::repo_utils::repo_layout;
 use crate::utils::hash::hash_commit;
@@ -39,7 +36,7 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     {
         let source = src.join(".");
-        let status = Command::new("cp")
+        let status = Command::new(crate::utils::system_bin::resolve("cp"))
             .arg("-cRp")
             .arg(&source)
             .arg(dst)
@@ -55,7 +52,7 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         let source = src.join(".");
-        let output = Command::new("cp")
+        let output = Command::new(crate::utils::system_bin::resolve("cp"))
             .args(["--reflink=auto", "-a"])
             .arg(&source)
             .arg(dst)
@@ -76,7 +73,8 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
         if is_permission_error_output(&output)
             && is_likely_podman_runtime()
             && run_podman_unshare(&format!(
-                "LANG=C cp --reflink=auto -a {}/. {}",
+                "LANG=C {} --reflink=auto -a {}/. {}",
+                shell_quote(&crate::utils::system_bin::resolve("cp").to_string_lossy()),
                 shell_quote(&src.to_string_lossy()),
                 shell_quote(&dst.to_string_lossy())
             ))
@@ -359,6 +357,30 @@ fn create_empty_workspace(path: &Path) -> std::io::Result<()> {
 /// repository files can be owned by subordinate UIDs that are not chmod-able
 /// from the host user. In that case, we continue checkout and let the runtime
 /// handle access through its own namespace mapping.
+/// Whether this repository's restores come from something other than a
+/// filesystem snapshot.
+///
+/// On the Kubernetes runtime the real restore is a PVC VolumeSnapshot, so
+/// `.gfs/snapshots` is legitimately empty and a missing directory says nothing
+/// about whether the data survives. Everywhere else, a commit naming a snapshot
+/// that is not there means the data is gone.
+fn restore_is_not_filesystem_based(repo: &Path) -> bool {
+    GfsConfig::load(repo)
+        .ok()
+        .and_then(|config| config.runtime)
+        .map(|runtime| {
+            matches!(
+                runtime
+                    .runtime_provider
+                    .trim()
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "kubernetes" | "k8s" | "k3s"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn set_workspace_dir_permissions(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -470,6 +492,15 @@ impl Repository for GfsRepository {
         // Resolve repo to an absolute path so snapshot_path matches where storage wrote the snapshot.
         let repo = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
 
+        // Refuse to commit at a detached HEAD before writing anything: a commit must
+        // land on a named branch, or it would be unreachable (orphaned). Time-travel
+        // and read-only inspection at a detached commit stay allowed; only the write
+        // is refused. This is the authoritative guard — every caller of the port
+        // reaches the write through here.
+        if let Some(commit) = repo_layout::detached_head_commit(&repo).map_err(map_err)? {
+            return Err(RepositoryError::DetachedHead(commit));
+        }
+
         // 1. Hash the commit content.
         let commit_hash =
             hash_commit(&new_commit).map_err(|e| RepositoryError::Internal(e.to_string()))?;
@@ -525,12 +556,11 @@ impl Repository for GfsRepository {
             .map_err(|e| RepositoryError::Internal(e.to_string()))?;
         fs::write(&object_path, json).map_err(RepositoryError::Io)?;
 
-        // 7. Advance the current branch ref to the new commit.
+        // 7. Advance the current branch ref to the new commit. HEAD is guaranteed
+        // attached to a branch here (a detached HEAD is refused at the top of this
+        // method), so the ref advance is unconditional.
         let branch = repo_layout::get_current_branch(&repo).map_err(map_err)?;
-        // Only update a named branch ref; skip when HEAD is detached (64-char hex).
-        if !(branch.len() == 64 && branch.chars().all(|c| c.is_ascii_hexdigit())) {
-            repo_layout::update_branch_ref(&repo, &branch, &commit_hash).map_err(map_err)?;
-        }
+        repo_layout::update_branch_ref(&repo, &branch, &commit_hash).map_err(map_err)?;
 
         tracing::info!(
             "Committed '{}' on branch '{}' → {}",
@@ -538,6 +568,7 @@ impl Repository for GfsRepository {
             branch,
             commit_hash
         );
+
         Ok(commit_hash)
     }
 
@@ -551,7 +582,10 @@ impl Repository for GfsRepository {
         }
 
         // Resolve revision to full commit hash.
-        let commit_hash = repo_layout::rev_parse(&repo, revision).map_err(map_err)?;
+        // Where this lands, decided in one place — `CheckoutRepoUseCase` asks the
+        // same function what is about to be overwritten before allowing it.
+        let (commit_hash, workspace_path) =
+            repo_layout::checkout_target(&repo, revision).map_err(map_err)?;
 
         // Reject initial state: cannot checkout "0".
         if commit_hash == "0" {
@@ -563,44 +597,71 @@ impl Repository for GfsRepository {
             return Err(RepositoryError::Internal(msg));
         }
 
-        // Determine HEAD update: branch name iff refs/heads/<revision> exists and tip matches.
-        let branch_segment = if repo_layout::is_branch(&repo, revision) {
-            let ref_path = repo
-                .join(GFS_DIR)
-                .join(REFS_DIR)
-                .join(HEADS_DIR)
-                .join(revision);
-            let tip = fs::read_to_string(&ref_path).map_err(RepositoryError::Io)?;
-            if tip.trim() == commit_hash {
-                revision.to_string()
-            } else {
-                "detached".to_string()
-            }
-        } else {
-            "detached".to_string()
-        };
+        let branch_segment = workspace_path
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "detached".to_string());
 
-        // Workspace path: one persistent dir per branch (workspaces/<branch>/0/data), or per-commit when detached.
-        let workspace_segment = if branch_segment == "detached" {
-            repo_layout::short_commit_id_for_workspace(&commit_hash)
-        } else {
-            BRANCH_WORKSPACE_SEGMENT.to_string()
-        };
-        let workspace_path = repo
-            .join(GFS_DIR)
-            .join(WORKSPACES_DIR)
-            .join(&branch_segment)
-            .join(&workspace_segment)
-            .join(WORKSPACE_DATA_DIR);
-
-        // Only populate from snapshot when the workspace does not exist (preserve live DB state in branch workspace).
-        let workspace_exists = workspace_path.exists();
+        // Always restore from the snapshot. Reusing a workspace that happens to
+        // still be on disk made checkout non-deterministic in three ways: a
+        // deleted branch's working copy was inherited by a new branch that
+        // reused the name; returning to a detached commit gave you whatever you
+        // last left in its directory rather than that commit; and uncommitted
+        // changes leaked across a branch switch. `Switched to X` now means the
+        // workspace holds X.
+        //
+        // Nothing is discarded silently: `CheckoutRepoUseCase` refuses when the
+        // workspace has uncommitted work, and only passes through once the
+        // caller has committed it or asked for `--force`.
         tracing::info!(
             "Checkout: workspace_path={:?}, exists={}",
             workspace_path,
-            workspace_exists
+            workspace_path.exists()
         );
-        if !workspace_exists {
+        // Refuse BEFORE the workspace is removed, not after.
+        //
+        // The check below used to be reached only when the workspace did not
+        // exist, so there was nothing to lose by the time it ran. Mainline then
+        // made the restore unconditional -- delete, then repopulate -- and the
+        // refusal moved to the far side of `remove_dir_all`. The message it
+        // prints tells you to recover by copying `.gfs/snapshots` from wherever
+        // the repository came from, while the working copy, which in exactly
+        // that scenario is the only surviving copy of the data, has just been
+        // deleted.
+        //
+        // Nothing here mutates the repository, so an early return is safe.
+        {
+            let commit = repo_layout::get_commit_from_hash(&repo, &commit_hash).map_err(map_err)?;
+            let snapshot_hash = &commit.snapshot_hash;
+            if !snapshot_hash.is_empty() && !restore_is_not_filesystem_based(&repo) {
+                let snapshot_dir = repo
+                    .join(GFS_DIR)
+                    .join(SNAPSHOTS_DIR)
+                    .join(&snapshot_hash[..2])
+                    .join(&snapshot_hash[2..]);
+                if !(snapshot_dir.exists() && snapshot_dir.is_dir()) {
+                    return Err(RepositoryError::Internal(format!(
+                        "commit {} refers to snapshot {} but '{}' does not exist. Its data \
+                         cannot be restored, so this checkout would silently hand you an \
+                         empty database. The workspace has been left untouched. If the \
+                         repository was copied, copy .gfs/snapshots as well",
+                        &commit_hash[..7.min(commit_hash.len())],
+                        &snapshot_hash[..7.min(snapshot_hash.len())],
+                        snapshot_dir.display()
+                    )));
+                }
+            }
+        }
+
+        if workspace_path.exists() {
+            // Files restored from a snapshot carry its read-only bits, which
+            // `remove_dir_all` will not override.
+            let _ = set_workspace_dir_permissions(&workspace_path);
+            fs::remove_dir_all(&workspace_path).map_err(RepositoryError::Io)?;
+        }
+        {
             let commit = repo_layout::get_commit_from_hash(&repo, &commit_hash).map_err(map_err)?;
             let snapshot_hash = commit.snapshot_hash;
             let snapshot_dir = repo
@@ -626,14 +687,32 @@ impl Repository for GfsRepository {
                 if let Some(marker) = repo_layout::repair_marker_path(&workspace_path) {
                     let _ = fs::write(marker, b"");
                 }
-            } else {
-                // Expected on a fresh branch (no snapshot yet) and always on the k8s
-                // runtime, where the real restore is a PVC VolumeSnapshot rather than a
-                // filesystem snapshot. Not an error — seed an empty workspace.
+            } else if snapshot_hash.is_empty() || restore_is_not_filesystem_based(&repo) {
+                // Two legitimate cases: a commit that records no snapshot at
+                // all, and the k8s runtime, where the real restore is a PVC
+                // VolumeSnapshot rather than a filesystem one. Seed an empty
+                // workspace.
                 tracing::debug!(
                     "Checkout: no filesystem snapshot for this workspace; seeding empty workspace"
                 );
                 create_empty_workspace(&workspace_path).map_err(RepositoryError::Io)?;
+            } else {
+                // The commit NAMES a snapshot and it is not there. Seeding an
+                // empty workspace here reported success and handed over an
+                // empty database: `schema show` still printed the real DDL, so
+                // only a query noticed, and a commit taken from that state
+                // recorded the emptiness as a legitimate breaking change —
+                // `schema diff` called it a table drop. Snapshots are the bulky
+                // part of a repository and the first thing a partial copy or a
+                // careless backup leaves out.
+                return Err(RepositoryError::Internal(format!(
+                    "commit {} refers to snapshot {} but '{}' does not exist. Its data cannot \
+                     be restored, so this checkout would silently hand you an empty database. \
+                     If the repository was copied, copy .gfs/snapshots as well",
+                    &commit_hash[..7.min(commit_hash.len())],
+                    &snapshot_hash[..7.min(snapshot_hash.len())],
+                    snapshot_dir.display()
+                )));
             }
         }
         set_workspace_dir_permissions(&workspace_path).map_err(RepositoryError::Io)?;
@@ -749,6 +828,10 @@ impl Repository for GfsRepository {
         repo_layout::get_current_commit_id(repo).map_err(map_err)
     }
 
+    async fn detached_head_commit(&self, repo: &Path) -> Result<Option<String>> {
+        repo_layout::detached_head_commit(repo).map_err(map_err)
+    }
+
     async fn get_runtime_config(&self, repo: &Path) -> Result<Option<RuntimeConfig>> {
         repo_layout::get_runtime_config(repo).map_err(map_err)
     }
@@ -785,7 +868,9 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    use crate::model::layout::{CONFIG_FILE, HEAD_FILE, MAIN_BRANCH, WORKSPACE_FILE};
+    use crate::model::layout::{
+        CONFIG_FILE, HEAD_FILE, MAIN_BRANCH, WORKSPACE_DATA_DIR, WORKSPACE_FILE, WORKSPACES_DIR,
+    };
     use crate::ports::repository::{LogOptions, Repository};
     use crate::utils::hash::hash_commit;
 
@@ -935,6 +1020,110 @@ description = "test"
         )
         .unwrap();
         assert_eq!(ref_content.trim(), hash);
+    }
+
+    /// A commit at a detached HEAD is refused (never orphaned): the engine returns
+    /// `DetachedHead`, writes no object, and leaves HEAD and the branch ref untouched.
+    #[tokio::test]
+    async fn commit_at_detached_head_is_refused_and_writes_no_object() {
+        fn count_objects(repo: &std::path::Path) -> usize {
+            fn walk(d: &std::path::Path) -> usize {
+                std::fs::read_dir(d)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|e| {
+                        let p = e.path();
+                        if p.is_dir() { walk(&p) } else { 1 }
+                    })
+                    .sum()
+            }
+            walk(&repo.join(GFS_DIR).join(OBJECTS_DIR))
+        }
+
+        let tmp = setup_repo();
+        let repo_path = tmp.path();
+        let gfs = GfsRepository::new();
+
+        let first = gfs
+            .commit(repo_path, make_new_commit("first", "snap-1"))
+            .await
+            .unwrap();
+
+        repo_layout::update_head_with_commit(repo_path, &first).unwrap();
+        let head_path = repo_path.join(GFS_DIR).join(HEAD_FILE);
+        assert_eq!(fs::read_to_string(&head_path).unwrap().trim(), first);
+
+        let objects_before = count_objects(repo_path);
+        let main_ref = repo_path
+            .join(GFS_DIR)
+            .join(REFS_DIR)
+            .join(HEADS_DIR)
+            .join(MAIN_BRANCH);
+        let main_before = fs::read_to_string(&main_ref).unwrap();
+
+        let err = gfs
+            .commit(repo_path, make_new_commit("detached-work", "snap-2"))
+            .await
+            .expect_err("commit at a detached HEAD must be refused");
+        assert!(
+            matches!(err, RepositoryError::DetachedHead(ref c) if *c == first),
+            "expected DetachedHead, got {err:?}",
+        );
+
+        assert_eq!(
+            count_objects(repo_path),
+            objects_before,
+            "no new object may be written on a refused commit",
+        );
+        assert_eq!(
+            fs::read_to_string(&head_path).unwrap().trim(),
+            first,
+            "HEAD must be unchanged",
+        );
+        assert_eq!(
+            fs::read_to_string(&main_ref).unwrap(),
+            main_before,
+            "main ref must be unchanged",
+        );
+    }
+
+    /// A branch whose NAME is 64 hex chars (e.g. named after a git SHA) is a
+    /// perfectly valid attached branch and must not be mistaken for a detached
+    /// HEAD: detection reads the raw HEAD form (`ref: refs/heads/...` vs a bare
+    /// hash), not the branch name.
+    #[tokio::test]
+    async fn commit_on_a_hex_named_branch_is_not_mistaken_for_detached() {
+        let tmp = setup_repo();
+        let repo_path = tmp.path();
+        let gfs = GfsRepository::new();
+
+        let first = gfs
+            .commit(repo_path, make_new_commit("first", "snap-1"))
+            .await
+            .unwrap();
+
+        // Attach HEAD to a branch whose name is 64 hex chars.
+        let hex_name = "a".repeat(64);
+        gfs.create_branch(repo_path, &hex_name, &first)
+            .await
+            .unwrap();
+        repo_layout::update_head_with_branch(repo_path, &hex_name).unwrap();
+
+        // A commit on that (attached) branch must succeed and advance it.
+        let second = gfs
+            .commit(repo_path, make_new_commit("second", "snap-2"))
+            .await
+            .expect("commit on a hex-named branch must not be refused as detached");
+        let ref_content = fs::read_to_string(
+            repo_path
+                .join(GFS_DIR)
+                .join(REFS_DIR)
+                .join(HEADS_DIR)
+                .join(&hex_name),
+        )
+        .unwrap();
+        assert_eq!(ref_content.trim(), second, "the hex-named branch advanced");
     }
 
     #[tokio::test]

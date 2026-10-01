@@ -60,6 +60,25 @@ async fn main() {
                     }))
                     .unwrap_or_else(|_| "{\"error\":{\"message\":\"serialization failed\"}}".into())
                 );
+            } else if let Some(parse) = err.downcast_ref::<clap::Error>().filter(|p| {
+                p.kind() != clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            }) {
+                // A parse failure already carries clap's own "error:", so
+                // prefixing it again printed "error: error: ...".
+                //
+                // `lib.rs` returns early for DisplayHelp and DisplayVersion, so
+                // every other kind arrives here -- including
+                // DisplayHelpOnMissingArgumentOrSubcommand (`gfs storage` with no
+                // subcommand), which renders bare help and carries no prefix at
+                // all. Deferring unconditionally would drop the "error:" line
+                // those commands owe.
+                //
+                // Match on the kind, not on the rendered text. `ErrorKind` is
+                // `#[non_exhaustive]` and grows additively, so a new kind costs
+                // one doubled prefix; clap's formatting carries no such guarantee,
+                // and a change to it would silently restore the doubling on every
+                // command at once.
+                let _ = parse.print();
             } else {
                 eprintln!("{} {err}", red("error:"));
             }

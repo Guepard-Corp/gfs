@@ -14,9 +14,10 @@ use crate::model::config::RuntimeConfig;
 use crate::ports::compute::{
     Compute, ComputeCapabilities, ComputeDefinition, ComputeError, InstanceId, RuntimeDescriptor,
 };
-use crate::ports::database_provider::DatabaseProviderRegistry;
+use crate::ports::database_provider::{DatabaseProviderRegistry, ProviderError, SnapshotGuard};
 use crate::ports::repository::{Repository, RepositoryError};
 use crate::repo_utils::repo_layout;
+use crate::repo_utils::repo_lock::{LockError, RepoLock};
 #[cfg(unix)]
 use crate::utils::current_user;
 use crate::utils::data_dir;
@@ -32,7 +33,22 @@ pub enum CheckoutRepoError {
 
     #[error("compute: {0}")]
     Compute(#[from] ComputeError),
+
+    #[error(
+        "the workspace has uncommitted changes that checkout would overwrite ({0}). \
+         Commit them first, or pass --force to discard them"
+    )]
+    WorkspaceDirty(String),
+
+    #[error("{0}")]
+    Busy(String),
 }
+
+/// How long a checkout waits for a running commit before giving up.
+///
+/// Long enough for a snapshot of a realistic database, short enough that a
+/// daemon is not parked indefinitely by a commit that has wedged.
+pub const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
 // ---------------------------------------------------------------------------
 // Use case
@@ -47,6 +63,8 @@ pub struct CheckoutRepoUseCase<R: DatabaseProviderRegistry> {
     repository: Arc<dyn Repository>,
     compute: Arc<dyn Compute>,
     registry: Arc<R>,
+    /// Discard uncommitted work instead of refusing. Off by default.
+    force: bool,
 }
 
 impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
@@ -59,7 +77,73 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
             repository,
             compute,
             registry,
+            force: false,
         }
+    }
+
+    /// Overwrite a workspace that has uncommitted changes rather than refusing.
+    ///
+    /// A builder rather than a `run` parameter on purpose: `run`'s signature is
+    /// part of this crate's public surface and the data-plane calls it directly,
+    /// so adding an argument would break a caller that has no opinion about
+    /// forcing.
+    pub fn with_force(mut self, force: bool) -> Self {
+        self.force = force;
+        self
+    }
+
+    /// The uncommitted changes this checkout would overwrite, as a short
+    /// description.
+    ///
+    /// Asks about the TARGET workspace, not the one being left, because that is
+    /// the directory the restore rebuilds. Getting this backwards is a live
+    /// hazard rather than a nicety: checking the workspace you leave both
+    /// refuses switches that would overwrite nothing — each branch has its own
+    /// directory, so leaving a dirty branch destroys nothing — and, worse, lets
+    /// you walk away from dirty work on one branch and come back to it from a
+    /// clean one, at which point the restore deletes it with no refusal at all.
+    ///
+    /// The baseline is the file list recorded on the commit being checked out,
+    /// which is the right one for that directory: committing on a branch
+    /// snapshots its workspace, so the two agree immediately afterwards and
+    /// everything written since is uncommitted.
+    ///
+    /// `None` whenever the question cannot be answered — an unresolvable
+    /// revision (a branch about to be created), no commits yet, or a commit
+    /// that predates file lists. Checkout then proceeds and reports its own
+    /// error, rather than refusing on a fact this does not have.
+    async fn uncommitted_changes(
+        &self,
+        path: &Path,
+        revision: &str,
+    ) -> std::result::Result<Option<String>, CheckoutRepoError> {
+        let Ok((commit_hash, workspace)) = repo_layout::checkout_target(path, revision) else {
+            return Ok(None);
+        };
+        if commit_hash == "0" {
+            return Ok(None);
+        }
+        let Ok(commit) = repo_layout::get_commit_from_hash(path, &commit_hash) else {
+            return Ok(None);
+        };
+        let Ok(Some(baseline)) = repo_layout::get_file_entries_for_commit(path, &commit) else {
+            return Ok(None);
+        };
+        let changed = repo_layout::workspace_changes(&workspace, &baseline)
+            .map_err(|e| CheckoutRepoError::Repository(RepositoryError::Internal(e.to_string())))?;
+        if changed.is_empty() {
+            return Ok(None);
+        }
+        let shown: Vec<&str> = changed.iter().take(3).map(String::as_str).collect();
+        Ok(Some(if changed.len() > shown.len() {
+            format!(
+                "{} and {} more",
+                shown.join(", "),
+                changed.len() - shown.len()
+            )
+        } else {
+            shown.join(", ")
+        }))
     }
 
     /// Check out `revision` (branch name or full 64-char commit hash) at `path`.
@@ -72,7 +156,52 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
         revision: String,
         create_branch: Option<String>,
     ) -> std::result::Result<String, CheckoutRepoError> {
+        // Refuse before anything is touched. Checkout restores the workspace
+        // from a snapshot, so work that was never committed is overwritten and
+        // unrecoverable. Neither silent option is acceptable: discarding loses
+        // data the user cannot get back, and preserving it across a switch
+        // leaves state that no command in GFS displays.
         let revision = revision.trim().to_string();
+
+        // Serialised against commit. A commit reads HEAD's commit as its parent
+        // BEFORE the snapshot and reads HEAD's branch AFTER it, so a checkout
+        // landing in between makes the commit advance the branch it moved TO,
+        // with a parent from the branch it moved FROM — and that branch's
+        // previous tip becomes unreachable from any ref. Reproduced four times
+        // out of four; see repo_utils::repo_lock.
+        //
+        // Waits rather than fails: the commit is the long operation, and a user
+        // switching branches during one wants the switch, not an error.
+        //
+        // Held first so the dirty-workspace check below reads a repo that no
+        // concurrent commit can be mutating; the guard drops on any early
+        // return, releasing the lock.
+        let _repo_lock = RepoLock::acquire_waiting(&path, LOCK_WAIT).map_err(|e| match e {
+            // "another operation", not "a commit": a second checkout holds this
+            // same lock, so the blocker is not always a commit.
+            LockError::Busy(_) => CheckoutRepoError::Busy(format!(
+                "another operation has held this repository's lock for over {} seconds; \
+                 starting a checkout now could interleave with it and lose a commit, so it \
+                 is not started. Retry once that operation finishes",
+                LOCK_WAIT.as_secs()
+            )),
+            LockError::Io(e) => CheckoutRepoError::Repository(RepositoryError::Io(e)),
+        })?;
+
+        // Refuse before anything is touched. The restore rebuilds the target
+        // workspace, so work that was never committed THERE is overwritten and
+        // unrecoverable. Neither silent option is acceptable: discarding loses
+        // data the user cannot get back, and keeping a stale directory means
+        // `Switched to X` does not give you X.
+        //
+        // Skipped when a branch is being created, since its workspace does not
+        // exist yet and there is nothing to lose.
+        if !self.force
+            && create_branch.is_none()
+            && let Some(changed) = self.uncommitted_changes(&path, &revision).await?
+        {
+            return Err(CheckoutRepoError::WorkspaceDirty(changed));
+        }
 
         // Validate the target ref BEFORE stopping compute — a bad revision must
         // not leave the database offline (mirrors the k8s checkout path).
@@ -126,6 +255,16 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
             }
         }
 
+        // A container-backed database is stopped just above, before the
+        // workspace changes underneath it. GFS cannot stop an embedded one —
+        // the writer is the user's own application — so the most it can do is
+        // refuse to move the workspace out from under a live writer, and hold
+        // the database still while the restore happens. Without this, checkout
+        // silently redirected GFS to a new directory while the application kept
+        // writing the abandoned one, and the next commit recorded an empty
+        // database as a success.
+        let _local_guard = self.quiesce_embedded(&path).await?;
+
         let commit_hash = self.do_checkout(&path, &revision, create_branch).await?;
 
         if let Some(ref id) = container_id {
@@ -134,6 +273,44 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
         }
 
         Ok(commit_hash)
+    }
+
+    /// Hold an embedded database still across a checkout, or refuse.
+    ///
+    /// Only genuine contention is refused. A database that cannot be opened at
+    /// all is not a reason to block a checkout — restoring a snapshot over it is
+    /// a reasonable way to recover from exactly that.
+    async fn quiesce_embedded(
+        &self,
+        path: &Path,
+    ) -> Result<Option<Box<dyn SnapshotGuard>>, CheckoutRepoError> {
+        let Ok(Some(environment)) = self.repository.get_environment_config(path).await else {
+            return Ok(None);
+        };
+        let Some(provider) = self.registry.get(&environment.database_provider) else {
+            return Ok(None);
+        };
+        let Some(engine) = provider.local_engine() else {
+            return Ok(None);
+        };
+        let Ok(params) = repo_layout::local_connection_params(path) else {
+            return Ok(None);
+        };
+
+        match engine.prepare_for_snapshot(&params) {
+            Ok(guard) => Ok(guard),
+            Err(ProviderError::Busy(e)) => Err(CheckoutRepoError::Repository(
+                RepositoryError::Internal(format!(
+                    "{e}. Refusing to switch: the workspace directory changes on checkout, \
+                     and an application still writing the current database would keep \
+                     writing a directory GFS no longer tracks — its work would not be \
+                     committed. Stop the process using the database and retry"
+                )),
+            )),
+            // Unopenable for some other reason: checkout replaces the workspace
+            // anyway, so let it proceed rather than trapping the user.
+            Err(_) => Ok(None),
+        }
     }
 
     async fn do_checkout(
@@ -203,7 +380,10 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
         };
 
         let params = crate::model::config::GfsConfig::load_compute_params(path);
-        let mut definition = provider.definition_with_overrides(&params);
+        let container = provider
+            .require_container()
+            .map_err(|e| CheckoutRepoError::Compute(ComputeError::Internal(e.to_string())))?;
+        let mut definition = container.definition_with_overrides(&params);
         if !environment.database_version.is_empty() {
             let base = definition
                 .image
@@ -258,8 +438,8 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
         let repair_target = definition
             .user
             .clone()
-            .or_else(|| provider.data_dir_owner().map(str::to_string));
-        let startup_probes = provider.container_startup_probes();
+            .or_else(|| container.data_dir_owner().map(str::to_string));
+        let startup_probes = container.container_startup_probes();
 
         let current_bind = self
             .compute
@@ -552,8 +732,9 @@ mod tests {
         Compute, ComputeDefinition, InstanceId, InstanceState, InstanceStatus, StartOptions,
     };
     use crate::ports::database_provider::{
-        ConnectionParams, DatabaseProvider, DatabaseProviderArg, DatabaseProviderRegistry,
-        ProviderError, Result as RegistryResult, SIGTERM, SupportedFeature,
+        ConnectionParams, ContainerProvider, DatabaseProvider, DatabaseProviderArg,
+        DatabaseProviderRegistry, ProviderError, Result as RegistryResult, SIGTERM,
+        SupportedFeature,
     };
     use crate::ports::repository::Repository;
 
@@ -845,6 +1026,32 @@ mod tests {
         fn name(&self) -> &str {
             "postgres"
         }
+        fn connection_string(
+            &self,
+            _: &ConnectionParams,
+        ) -> std::result::Result<String, ProviderError> {
+            Ok("postgres://localhost:5432".into())
+        }
+        fn supported_versions(&self) -> Vec<String> {
+            vec!["17".into()]
+        }
+        fn supported_features(&self) -> Vec<SupportedFeature> {
+            vec![]
+        }
+        fn query_client_command(
+            &self,
+            _: &ConnectionParams,
+            _: Option<&str>,
+        ) -> std::result::Result<std::process::Command, ProviderError> {
+            Ok(std::process::Command::new("true"))
+        }
+
+        fn container(&self) -> Option<&dyn ContainerProvider> {
+            Some(self)
+        }
+    }
+
+    impl ContainerProvider for MockProvider {
         fn definition(&self) -> ComputeDefinition {
             ComputeDefinition {
                 labels: Default::default(),
@@ -868,27 +1075,8 @@ mod tests {
         fn default_signal(&self) -> u32 {
             SIGTERM
         }
-        fn connection_string(
-            &self,
-            _: &ConnectionParams,
-        ) -> std::result::Result<String, ProviderError> {
-            Ok("postgres://localhost:5432".into())
-        }
-        fn supported_versions(&self) -> Vec<String> {
-            vec!["17".into()]
-        }
-        fn supported_features(&self) -> Vec<SupportedFeature> {
-            vec![]
-        }
         fn prepare_for_snapshot(&self, _: &ConnectionParams) -> RegistryResult<Vec<String>> {
             Ok(vec![])
-        }
-        fn query_client_command(
-            &self,
-            _: &ConnectionParams,
-            _: Option<&str>,
-        ) -> std::result::Result<std::process::Command, ProviderError> {
-            Ok(std::process::Command::new("true"))
         }
     }
 
@@ -1494,6 +1682,32 @@ mod tests {
         fn name(&self) -> &str {
             "postgres"
         }
+        fn connection_string(
+            &self,
+            _: &ConnectionParams,
+        ) -> std::result::Result<String, ProviderError> {
+            Ok("postgres://localhost:5432".into())
+        }
+        fn supported_versions(&self) -> Vec<String> {
+            vec!["17".into()]
+        }
+        fn supported_features(&self) -> Vec<SupportedFeature> {
+            vec![]
+        }
+        fn query_client_command(
+            &self,
+            _: &ConnectionParams,
+            _: Option<&str>,
+        ) -> std::result::Result<std::process::Command, ProviderError> {
+            Ok(std::process::Command::new("true"))
+        }
+
+        fn container(&self) -> Option<&dyn ContainerProvider> {
+            Some(self)
+        }
+    }
+
+    impl ContainerProvider for MockProviderWithProbe {
         fn definition(&self) -> ComputeDefinition {
             ComputeDefinition {
                 labels: Default::default(),
@@ -1517,27 +1731,8 @@ mod tests {
         fn default_signal(&self) -> u32 {
             SIGTERM
         }
-        fn connection_string(
-            &self,
-            _: &ConnectionParams,
-        ) -> std::result::Result<String, ProviderError> {
-            Ok("postgres://localhost:5432".into())
-        }
-        fn supported_versions(&self) -> Vec<String> {
-            vec!["17".into()]
-        }
-        fn supported_features(&self) -> Vec<SupportedFeature> {
-            vec![]
-        }
         fn prepare_for_snapshot(&self, _: &ConnectionParams) -> RegistryResult<Vec<String>> {
             Ok(vec![])
-        }
-        fn query_client_command(
-            &self,
-            _: &ConnectionParams,
-            _: Option<&str>,
-        ) -> std::result::Result<std::process::Command, ProviderError> {
-            Ok(std::process::Command::new("true"))
         }
         fn container_startup_probes(&self) -> &'static [&'static str] {
             &["pg_isready -U postgres"]

@@ -9,9 +9,9 @@ use gfs_domain::model::db_user::{
 };
 use gfs_domain::ports::compute::{ComputeDefinition, EnvVar, PortMapping};
 use gfs_domain::ports::database_provider::{
-    CloneSpec, ConnectionParams, DataFormat, DatabaseProvider, DatabaseProviderArg,
-    DatabaseProviderRegistry, ExportSpec, ImportSpec, ProviderError, RemoteSource, Result, SIGTERM,
-    SchemaExtractionSpec, SupportedFeature,
+    CloneSpec, ConnectionParams, ContainerProvider, DataFormat, DatabaseProvider,
+    DatabaseProviderArg, DatabaseProviderRegistry, ExportSpec, ImportSpec, ProviderError,
+    RemoteSource, Result, SIGTERM, SchemaExtractionSpec, SupportedFeature,
 };
 
 const NAME: &str = "postgres";
@@ -262,44 +262,6 @@ impl DatabaseProvider for PostgresqlProvider {
         NAME
     }
 
-    fn definition(&self) -> ComputeDefinition {
-        let mut def = Self::definition_impl();
-        def.args = self
-            .default_args()
-            .into_iter()
-            .flat_map(|a| [a.name, a.value])
-            .collect();
-        def
-    }
-
-    fn default_port(&self) -> u16 {
-        5432
-    }
-
-    fn default_args(&self) -> Vec<DatabaseProviderArg> {
-        Self::default_args_impl()
-    }
-
-    /// PostgreSQL takes runtime settings as repeated `-c name=value` flags; the
-    /// last occurrence wins, so these (appended after the defaults) override
-    /// `default_args` (e.g. `max_connections=200`).
-    fn render_param_overrides(
-        &self,
-        params: &std::collections::BTreeMap<String, String>,
-    ) -> Vec<DatabaseProviderArg> {
-        params
-            .iter()
-            .map(|(k, v)| DatabaseProviderArg {
-                name: "-c".into(),
-                value: format!("{k}={v}"),
-            })
-            .collect()
-    }
-
-    fn default_signal(&self) -> u32 {
-        SIGTERM
-    }
-
     fn connection_string(
         &self,
         params: &ConnectionParams,
@@ -363,26 +325,6 @@ impl DatabaseProvider for PostgresqlProvider {
         ]
     }
 
-    fn prepare_for_snapshot(&self, _params: &ConnectionParams) -> Result<Vec<String>> {
-        // Use TCP (127.0.0.1) + env vars so the command works when run via docker exec as root.
-        // Peer auth would fail for root; password auth over TCP works.
-        Ok(vec![
-            "PGPASSWORD=\"$POSTGRES_PASSWORD\" psql -h 127.0.0.1 -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -c \"CHECKPOINT;\""
-                .to_string(),
-        ])
-    }
-
-    fn data_dir_owner(&self) -> Option<&'static str> {
-        Some("postgres:postgres")
-    }
-
-    fn container_startup_probes(&self) -> &'static [&'static str] {
-        &[
-            "pg_isready -h 127.0.0.1 -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" >/dev/null",
-            "PGPASSWORD=\"$POSTGRES_PASSWORD\" psql -h 127.0.0.1 -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c \"SELECT 1;\" >/dev/null",
-        ]
-    }
-
     // -----------------------------------------------------------------------
     // Import / Export
     // -----------------------------------------------------------------------
@@ -427,195 +369,6 @@ impl DatabaseProvider for PostgresqlProvider {
         ]
     }
 
-    fn export_spec(
-        &self,
-        params: &ConnectionParams,
-        format: &str,
-    ) -> std::result::Result<ExportSpec, ProviderError> {
-        let (user, password, db) = conn_creds(params);
-
-        let (pg_format, filename, schema_only) = match format {
-            "sql" => ("plain", "export.sql", false),
-            "custom" => ("custom", "export.dump", false),
-            "schema" => ("plain", "schema.sql", true),
-            other => return Err(ProviderError::UnsupportedFormat(other.to_string())),
-        };
-
-        let schema_flag = if schema_only { " --schema-only" } else { "" };
-
-        Ok(ExportSpec {
-            definition: sidecar_definition(self.definition().image, password, "/data"),
-            command: format!(
-                "pg_dump -h {host} -p {port} -U {user} -d {db} --format={fmt}{schema_flag} -f /data/{file}",
-                host = params.host,
-                port = params.port,
-                user = user,
-                db = db,
-                fmt = pg_format,
-                schema_flag = schema_flag,
-                file = filename,
-            ),
-            output_filename: filename.to_string(),
-        })
-    }
-
-    fn import_spec(
-        &self,
-        params: &ConnectionParams,
-        format: &str,
-        input_filename: &str,
-    ) -> std::result::Result<ImportSpec, ProviderError> {
-        let (user, password, db) = conn_creds(params);
-
-        let command = match format {
-            "sql" => format!(
-                "psql -h {host} -p {port} -U {user} -d {db} -f /data/{file}",
-                host = params.host,
-                port = params.port,
-                user = user,
-                db = db,
-                file = input_filename,
-            ),
-            "custom" => format!(
-                "pg_restore -h {host} -p {port} -U {user} -d {db} /data/{file}",
-                host = params.host,
-                port = params.port,
-                user = user,
-                db = db,
-                file = input_filename,
-            ),
-            "csv" => format!(
-                "printf 'CREATE TABLE IF NOT EXISTS csv_import (id text, name text);\\n\\\\copy csv_import FROM ''/data/{}'' WITH (FORMAT csv, HEADER true);\\n' > /tmp/import.sql && psql -h {host} -p {port} -U {user} -d {db} -f /tmp/import.sql",
-                input_filename,
-                host = params.host,
-                port = params.port,
-                user = user,
-                db = db,
-            ),
-            other => return Err(ProviderError::UnsupportedFormat(other.to_string())),
-        };
-
-        Ok(ImportSpec {
-            definition: sidecar_definition(self.definition().image, password, "/data"),
-            command,
-            input_filename: input_filename.to_string(),
-        })
-    }
-
-    // -----------------------------------------------------------------------
-    // Lazy clone
-    // -----------------------------------------------------------------------
-
-    fn clone_bootstrap_spec(
-        &self,
-        local: &ConnectionParams,
-        remote: &RemoteSource,
-    ) -> std::result::Result<CloneSpec, ProviderError> {
-        let (user, password, db) = conn_creds(local);
-
-        let bootstrap_sql = build_clone_bootstrap_sql(remote);
-
-        // Step 1 — FAITHFUL schema: dump the remote's DDL (tables, triggers,
-        // functions, indexes, constraints, sequences, types) and replay it onto
-        // the local clone, so the source's real objects exist as real local heap
-        // tables. The `gfs` copy-on-read extension then serves each one lazily via
-        // its planner hook (no overlay views or INSTEAD OF triggers).
-        // `--no-owner --no-privileges` avoids depending on remote roles;
-        // restrict to the requested schemas when given.
-        let schema_flags = remote
-            .schemas
-            .iter()
-            .map(|s| format!(" -n {}", shell_single_quote(s)))
-            .collect::<String>();
-        let ssl_env = remote
-            .sslmode
-            .as_ref()
-            .map(|m| format!("PGSSLMODE={} ", shell_single_quote(m)))
-            .unwrap_or_default();
-        let dump = format!(
-            "{ssl_env}PGCONNECT_TIMEOUT=15 PGPASSWORD={rpass} pg_dump -h {rhost} -p {rport} -U {ruser} -d {rdb} --schema-only --no-owner --no-privileges{schemas} -f /tmp/gfs_faithful.sql",
-            ssl_env = ssl_env,
-            rpass = shell_single_quote(&remote.password),
-            rhost = remote.host,
-            rport = remote.port,
-            ruser = remote.user,
-            rdb = remote.dbname,
-            schemas = schema_flags,
-        );
-
-        // Step 1b — sanitize the dump for cross-version replay. A pg_dump client
-        // >= 17 unconditionally emits `SET transaction_timeout = 0;` in the header,
-        // but that GUC only exists on a server >= 17. Replaying it onto an older
-        // local server raises "unrecognized configuration parameter" — harmless to
-        // the schema, noisy in the logs, and fatal if anything ever tightens the
-        // replay to ON_ERROR_STOP. Strip the line; it is irrelevant to a DDL replay.
-        let sanitize = "sed -i '/^SET transaction_timeout/d' /tmp/gfs_faithful.sql";
-
-        // Step 2 — replay the faithful schema into the LOCAL database. Best-effort
-        // (no ON_ERROR_STOP): an object that can't be recreated locally (e.g. a
-        // missing extension) is skipped, and its table is later skipped during
-        // copy-on-read registration, rather than aborting the whole clone.
-        let replay = format!(
-            "psql -h {host} -p {port} -U {user} -d {db} -f /tmp/gfs_faithful.sql || true",
-            host = local.host,
-            port = local.port,
-            user = user,
-            db = db,
-        );
-
-        // Step 3 — bootstrap the FDW + register each table for copy-on-read with the
-        // `gfs` planner-hook extension (fed via a quoted heredoc; no shell expansion
-        // inside). ON_ERROR_STOP=1 so a real failure fails the clone.
-        let bootstrap = format!(
-            "psql -h {host} -p {port} -U {user} -d {db} -v ON_ERROR_STOP=1 <<'GFS_CLONE_BOOTSTRAP'\n{sql}\nGFS_CLONE_BOOTSTRAP\n",
-            host = local.host,
-            port = local.port,
-            user = user,
-            db = db,
-            sql = bootstrap_sql,
-        );
-
-        // Step 1c — wait for the clone to actually ACCEPT QUERIES before replaying
-        // onto it. The engine's port can be open (and the framework's TCP readiness
-        // probe satisfied) while postgres is still starting up, especially under
-        // host load -- replaying then fails with "connection refused". Poll a real
-        // SELECT 1 (same creds as the replay, via the sidecar's PGPASSWORD).
-        let wait_clone = format!(
-            "for i in $(seq 1 120); do if PGCONNECT_TIMEOUT=5 psql -h {host} -p {port} -U {user} -d {db} -c 'SELECT 1' >/dev/null 2>&1; then break; fi; sleep 1; done",
-            host = local.host,
-            port = local.port,
-            user = user,
-            db = db,
-        );
-
-        let command = format!(
-            "set -e\nexport PGCONNECT_TIMEOUT=15\n{wait_clone}\n{dump}\n{sanitize}\n{replay}\n{bootstrap}"
-        );
-
-        Ok(CloneSpec {
-            definition: sidecar_definition(self.definition().image, password, "/data"),
-            command,
-        })
-    }
-
-    fn supports_lazy_clone(&self) -> bool {
-        true
-    }
-
-    fn lazy_clone_detach_in_instance_commands(
-        &self,
-    ) -> std::result::Result<Vec<String>, ProviderError> {
-        const DETACH: &[&str] = &[
-            "DROP SERVER IF EXISTS gfs_remote_srv CASCADE",
-            "UPDATE gfs.clone_source SET whole_cached = true, no_partial = true \
-             WHERE EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'gfs')",
-        ];
-        DETACH
-            .iter()
-            .map(|sql| self.psql_inline_instance_command(sql))
-            .collect()
-    }
-
     // -----------------------------------------------------------------------
     // Query / Interactive Terminal
     // -----------------------------------------------------------------------
@@ -640,24 +393,6 @@ impl DatabaseProvider for PostgresqlProvider {
         }
 
         Ok(cmd)
-    }
-
-    fn query_in_instance_command(
-        &self,
-        sql: &str,
-        database: Option<&str>,
-    ) -> std::result::Result<String, ProviderError> {
-        const DELIM: &str = "GFS_SQL_EOF";
-        let body = gfs_domain::utils::shell::sql_heredoc_body(DELIM, sql)?;
-        // Target an explicit database when given (`gfs query --database`), else the
-        // container's configured POSTGRES_DB.
-        let db = match database.map(str::trim).filter(|s| !s.is_empty()) {
-            Some(name) => gfs_domain::utils::shell::shell_single_quote(name),
-            None => r#""${POSTGRES_DB:-postgres}""#.to_string(),
-        };
-        Ok(format!(
-            r#"PGPASSWORD="${{POSTGRES_PASSWORD:-postgres}}" psql -h 127.0.0.1 -U "${{POSTGRES_USER:-postgres}}" -d {db} -v ON_ERROR_STOP=1 -c "{body}""#
-        ))
     }
 
     // -----------------------------------------------------------------------
@@ -1058,6 +793,277 @@ impl DatabaseProvider for PostgresqlProvider {
         );
 
         queries
+    }
+
+    fn container(&self) -> Option<&dyn ContainerProvider> {
+        Some(self)
+    }
+}
+
+impl ContainerProvider for PostgresqlProvider {
+    fn definition(&self) -> ComputeDefinition {
+        let mut def = Self::definition_impl();
+        def.args = self
+            .default_args()
+            .into_iter()
+            .flat_map(|a| [a.name, a.value])
+            .collect();
+        def
+    }
+
+    fn default_port(&self) -> u16 {
+        5432
+    }
+
+    fn default_args(&self) -> Vec<DatabaseProviderArg> {
+        Self::default_args_impl()
+    }
+
+    /// PostgreSQL takes runtime settings as repeated `-c name=value` flags; the
+    /// last occurrence wins, so these (appended after the defaults) override
+    /// `default_args` (e.g. `max_connections=200`).
+    fn render_param_overrides(
+        &self,
+        params: &std::collections::BTreeMap<String, String>,
+    ) -> Vec<DatabaseProviderArg> {
+        params
+            .iter()
+            .map(|(k, v)| DatabaseProviderArg {
+                name: "-c".into(),
+                value: format!("{k}={v}"),
+            })
+            .collect()
+    }
+
+    fn default_signal(&self) -> u32 {
+        SIGTERM
+    }
+
+    fn prepare_for_snapshot(&self, _params: &ConnectionParams) -> Result<Vec<String>> {
+        // Use TCP (127.0.0.1) + env vars so the command works when run via docker exec as root.
+        // Peer auth would fail for root; password auth over TCP works.
+        Ok(vec![
+            "PGPASSWORD=\"$POSTGRES_PASSWORD\" psql -h 127.0.0.1 -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -c \"CHECKPOINT;\""
+                .to_string(),
+        ])
+    }
+
+    fn data_dir_owner(&self) -> Option<&'static str> {
+        Some("postgres:postgres")
+    }
+
+    fn container_startup_probes(&self) -> &'static [&'static str] {
+        &[
+            "pg_isready -h 127.0.0.1 -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" >/dev/null",
+            "PGPASSWORD=\"$POSTGRES_PASSWORD\" psql -h 127.0.0.1 -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c \"SELECT 1;\" >/dev/null",
+        ]
+    }
+
+    fn export_spec(
+        &self,
+        params: &ConnectionParams,
+        format: &str,
+    ) -> std::result::Result<ExportSpec, ProviderError> {
+        let (user, password, db) = conn_creds(params);
+
+        let (pg_format, filename, schema_only) = match format {
+            "sql" => ("plain", "export.sql", false),
+            "custom" => ("custom", "export.dump", false),
+            "schema" => ("plain", "schema.sql", true),
+            other => return Err(ProviderError::UnsupportedFormat(other.to_string())),
+        };
+
+        let schema_flag = if schema_only { " --schema-only" } else { "" };
+
+        Ok(ExportSpec {
+            definition: sidecar_definition(self.definition().image, password, "/data"),
+            command: format!(
+                "pg_dump -h {host} -p {port} -U {user} -d {db} --format={fmt}{schema_flag} -f /data/{file}",
+                host = params.host,
+                port = params.port,
+                user = user,
+                db = db,
+                fmt = pg_format,
+                schema_flag = schema_flag,
+                file = filename,
+            ),
+            output_filename: filename.to_string(),
+        })
+    }
+
+    fn import_spec(
+        &self,
+        params: &ConnectionParams,
+        format: &str,
+        input_filename: &str,
+    ) -> std::result::Result<ImportSpec, ProviderError> {
+        let (user, password, db) = conn_creds(params);
+
+        let command = match format {
+            "sql" => format!(
+                "psql -h {host} -p {port} -U {user} -d {db} -f /data/{file}",
+                host = params.host,
+                port = params.port,
+                user = user,
+                db = db,
+                file = input_filename,
+            ),
+            "custom" => format!(
+                "pg_restore -h {host} -p {port} -U {user} -d {db} /data/{file}",
+                host = params.host,
+                port = params.port,
+                user = user,
+                db = db,
+                file = input_filename,
+            ),
+            "csv" => format!(
+                "printf 'CREATE TABLE IF NOT EXISTS csv_import (id text, name text);\\n\\\\copy csv_import FROM ''/data/{}'' WITH (FORMAT csv, HEADER true);\\n' > /tmp/import.sql && psql -h {host} -p {port} -U {user} -d {db} -f /tmp/import.sql",
+                input_filename,
+                host = params.host,
+                port = params.port,
+                user = user,
+                db = db,
+            ),
+            other => return Err(ProviderError::UnsupportedFormat(other.to_string())),
+        };
+
+        Ok(ImportSpec {
+            definition: sidecar_definition(self.definition().image, password, "/data"),
+            command,
+            input_filename: input_filename.to_string(),
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Lazy clone (RFC 008)
+    // -----------------------------------------------------------------------
+
+    fn clone_bootstrap_spec(
+        &self,
+        local: &ConnectionParams,
+        remote: &RemoteSource,
+    ) -> std::result::Result<CloneSpec, ProviderError> {
+        let (user, password, db) = conn_creds(local);
+
+        let bootstrap_sql = build_clone_bootstrap_sql(remote);
+
+        // Step 1 — FAITHFUL schema: dump the remote's DDL (tables, triggers,
+        // functions, indexes, constraints, sequences, types) and replay it onto
+        // the local clone, so the source's real objects exist as real local heap
+        // tables. The `gfs` copy-on-read extension then serves each one lazily via
+        // its planner hook (no overlay views or INSTEAD OF triggers).
+        // `--no-owner --no-privileges` avoids depending on remote roles;
+        // restrict to the requested schemas when given.
+        let schema_flags = remote
+            .schemas
+            .iter()
+            .map(|s| format!(" -n {}", shell_single_quote(s)))
+            .collect::<String>();
+        let ssl_env = remote
+            .sslmode
+            .as_ref()
+            .map(|m| format!("PGSSLMODE={} ", shell_single_quote(m)))
+            .unwrap_or_default();
+        let dump = format!(
+            "{ssl_env}PGCONNECT_TIMEOUT=15 PGPASSWORD={rpass} pg_dump -h {rhost} -p {rport} -U {ruser} -d {rdb} --schema-only --no-owner --no-privileges{schemas} -f /tmp/gfs_faithful.sql",
+            ssl_env = ssl_env,
+            rpass = shell_single_quote(&remote.password),
+            rhost = remote.host,
+            rport = remote.port,
+            ruser = remote.user,
+            rdb = remote.dbname,
+            schemas = schema_flags,
+        );
+
+        // Step 1b — sanitize the dump for cross-version replay. A pg_dump client
+        // >= 17 unconditionally emits `SET transaction_timeout = 0;` in the header,
+        // but that GUC only exists on a server >= 17. Replaying it onto an older
+        // local server raises "unrecognized configuration parameter" — harmless to
+        // the schema, noisy in the logs, and fatal if anything ever tightens the
+        // replay to ON_ERROR_STOP. Strip the line; it is irrelevant to a DDL replay.
+        let sanitize = "sed -i '/^SET transaction_timeout/d' /tmp/gfs_faithful.sql";
+
+        // Step 2 — replay the faithful schema into the LOCAL database. Best-effort
+        // (no ON_ERROR_STOP): an object that can't be recreated locally (e.g. a
+        // missing extension) is skipped, and its table is later skipped during
+        // copy-on-read registration, rather than aborting the whole clone.
+        let replay = format!(
+            "psql -h {host} -p {port} -U {user} -d {db} -f /tmp/gfs_faithful.sql || true",
+            host = local.host,
+            port = local.port,
+            user = user,
+            db = db,
+        );
+
+        // Step 3 — bootstrap the FDW + register each table for copy-on-read with the
+        // `gfs` planner-hook extension (fed via a quoted heredoc; no shell expansion
+        // inside). ON_ERROR_STOP=1 so a real failure fails the clone.
+        let bootstrap = format!(
+            "psql -h {host} -p {port} -U {user} -d {db} -v ON_ERROR_STOP=1 <<'GFS_CLONE_BOOTSTRAP'\n{sql}\nGFS_CLONE_BOOTSTRAP\n",
+            host = local.host,
+            port = local.port,
+            user = user,
+            db = db,
+            sql = bootstrap_sql,
+        );
+
+        // Step 1c — wait for the clone to actually ACCEPT QUERIES before replaying
+        // onto it. The engine's port can be open (and the framework's TCP readiness
+        // probe satisfied) while postgres is still starting up, especially under
+        // host load -- replaying then fails with "connection refused". Poll a real
+        // SELECT 1 (same creds as the replay, via the sidecar's PGPASSWORD).
+        let wait_clone = format!(
+            "for i in $(seq 1 120); do if PGCONNECT_TIMEOUT=5 psql -h {host} -p {port} -U {user} -d {db} -c 'SELECT 1' >/dev/null 2>&1; then break; fi; sleep 1; done",
+            host = local.host,
+            port = local.port,
+            user = user,
+            db = db,
+        );
+
+        let command = format!(
+            "set -e\nexport PGCONNECT_TIMEOUT=15\n{wait_clone}\n{dump}\n{sanitize}\n{replay}\n{bootstrap}"
+        );
+
+        Ok(CloneSpec {
+            definition: sidecar_definition(self.definition().image, password, "/data"),
+            command,
+        })
+    }
+
+    fn supports_lazy_clone(&self) -> bool {
+        true
+    }
+
+    fn lazy_clone_detach_in_instance_commands(
+        &self,
+    ) -> std::result::Result<Vec<String>, ProviderError> {
+        const DETACH: &[&str] = &[
+            "DROP SERVER IF EXISTS gfs_remote_srv CASCADE",
+            "UPDATE gfs.clone_source SET whole_cached = true, no_partial = true \
+             WHERE EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'gfs')",
+        ];
+        DETACH
+            .iter()
+            .map(|sql| self.psql_inline_instance_command(sql))
+            .collect()
+    }
+
+    fn query_in_instance_command(
+        &self,
+        sql: &str,
+        database: Option<&str>,
+    ) -> std::result::Result<String, ProviderError> {
+        const DELIM: &str = "GFS_SQL_EOF";
+        let body = gfs_domain::utils::shell::sql_heredoc_body(DELIM, sql)?;
+        // Target an explicit database when given (`gfs query --database`), else the
+        // container's configured POSTGRES_DB.
+        let db = match database.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(name) => gfs_domain::utils::shell::shell_single_quote(name),
+            None => r#""${POSTGRES_DB:-postgres}""#.to_string(),
+        };
+        Ok(format!(
+            r#"PGPASSWORD="${{POSTGRES_PASSWORD:-postgres}}" psql -h 127.0.0.1 -U "${{POSTGRES_USER:-postgres}}" -d {db} -v ON_ERROR_STOP=1 -c "{body}""#
+        ))
     }
 
     fn schema_extraction_spec(

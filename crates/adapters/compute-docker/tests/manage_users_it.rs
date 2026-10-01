@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use gfs_compute_docker::DockerCompute;
-use gfs_compute_docker::containers;
+use gfs_db_providers as containers;
 use gfs_domain::model::config::{EnvironmentConfig, GfsConfig, RuntimeConfig};
 use gfs_domain::model::db_user::{
     GrantSpec, GrantableObject, Privilege, RevokeSpec, RolePreset, RoleSpec,

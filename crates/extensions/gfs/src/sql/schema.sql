@@ -2052,5 +2052,50 @@ CREATE VIEW gfs.clones AS
       LEFT JOIN gfs.clone_stats st USING (relid)
      ORDER BY s.relid::text;
 
+-- Readable by PUBLIC: all fifteen tables this extension creates
+-- (`grep -n '^CREATE TABLE gfs\.' schema.sql`) and both views. The original
+-- grant named eleven objects -- ten tables plus the gfs.clones view -- so
+-- source_baseline, source_table_baseline, sync_policy, drift_state,
+-- drift_notes and the gfs.source_map view had no grant at all, not even
+-- SELECT, though the hook reads them while serving ordinary queries.
 GRANT USAGE ON SCHEMA gfs TO PUBLIC;
-GRANT SELECT ON gfs.clone_source, gfs.cached, gfs.cached_predicate, gfs.copy_queue, gfs.tombstone, gfs.clone_stats, gfs.cost, gfs.budget, gfs.clone_mode, gfs.copy_watermark, gfs.clones TO PUBLIC;
+GRANT SELECT ON gfs.clone_source, gfs.cached, gfs.cached_predicate, gfs.copy_queue, gfs.tombstone, gfs.clone_stats, gfs.cost, gfs.budget, gfs.clone_mode, gfs.copy_watermark, gfs.source_baseline, gfs.source_table_baseline, gfs.sync_policy, gfs.drift_state, gfs.drift_notes, gfs.clones, gfs.source_map TO PUBLIC;
+
+-- Writable by PUBLIC: only the bookkeeping the planner hook maintains while
+-- serving an ordinary query, which runs as whatever role issued that query.
+-- Without it a plain SELECT from a non-superuser fails closed on its first read
+-- ("permission denied for table clone_source" via bump_access).
+--
+-- Granted per verb, not per table, and that distinction is load-bearing. Every
+-- other gfs table carries `relid regclass REFERENCES gfs.clone_source(relid)
+-- ON DELETE CASCADE` (eight of them), so DELETE on gfs.clone_source reaches
+-- straight through into tables that are otherwise read-only here -- emptying
+-- gfs.drift_state and gfs.source_table_baseline without ever needing a grant on
+-- them. The hook only ever UPDATEs gfs.clone_source (bump_access and friends),
+-- so withholding DELETE costs nothing and closes that path.
+--
+-- Each verb below is the set actually issued in the invoker's context:
+--   clone_source, clone_stats   UPDATE  -- raw SPI in catalog.rs / hydrate.rs
+--   cached                      INSERT, DELETE -- gfs.note_range, reached from
+--                                          do_hydrate (route.rs runs it in the
+--                                          foreground)
+--   copy_queue                  INSERT, DELETE -- raw SPI in catalog.rs
+--   cached_predicate            INSERT, UPDATE -- raw SPI in catalog.rs / hydrate.rs
+--   copy_watermark              INSERT, UPDATE -- gfs.note_copy, called by note_range
+--   tombstone                   INSERT  -- the gfs.note_tombstone AFTER DELETE
+--                                          trigger, firing in the customer's session
+--
+-- Everything else stays read-only. drift_state, drift_notes, source_baseline and
+-- source_table_baseline are written only by functions reached from the background
+-- worker (worker.rs -> gfs_run_upkeep, which connects as the bootstrap superuser)
+-- or from the CLI's source verbs, which run over the loopback exec seam as
+-- `psql -U postgres`. cost, clone_mode and sync_policy are policy knobs an owner
+-- sets. budget is the token bucket protecting the upstream source: it is written
+-- only by gfs.take_token(), already SECURITY DEFINER so a low-privilege caller can
+-- drive it without holding write access -- the pattern RFC 008 documents. Granting
+-- write there would let a clone's own role `DELETE FROM gfs.budget`, which makes
+-- take_token()'s `rate IS NULL` branch return 0 and disables the limit for good.
+GRANT UPDATE         ON gfs.clone_source, gfs.clone_stats TO PUBLIC;
+GRANT INSERT, DELETE ON gfs.cached, gfs.copy_queue TO PUBLIC;
+GRANT INSERT, UPDATE ON gfs.cached_predicate, gfs.copy_watermark TO PUBLIC;
+GRANT INSERT         ON gfs.tombstone TO PUBLIC;
