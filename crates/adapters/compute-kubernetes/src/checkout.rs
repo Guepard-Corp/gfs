@@ -5,9 +5,7 @@ use std::sync::Arc;
 
 use gfs_domain::model::config::{EnvironmentConfig, GfsConfig, RepoCredentials, RuntimeConfig};
 use gfs_domain::ports::compute::{Compute, ComputeDefinition, EnvVar, InstanceId};
-use gfs_domain::ports::database_provider::{
-    ContainerProvider, DatabaseProvider, DatabaseProviderRegistry,
-};
+use gfs_domain::ports::database_provider::{ContainerProvider, DatabaseProviderRegistry};
 use gfs_domain::ports::repository::Repository;
 use gfs_domain::ports::storage::{CloneOptions, SnapshotId, StoragePort, VolumeId};
 use gfs_storage_kubernetes::KubernetesStorage;
@@ -358,7 +356,7 @@ mod tests {
     use gfs_domain::model::config::{ComputeConfig, EnvironmentConfig};
     use gfs_domain::ports::compute::{ComputeDefinition, ComputeResources};
     use gfs_domain::ports::database_provider::{
-        ConnectionParams, DatabaseProviderArg, ProviderError, SupportedFeature,
+        ConnectionParams, DatabaseProvider, DatabaseProviderArg, ProviderError, SupportedFeature,
     };
 
     use super::*;
