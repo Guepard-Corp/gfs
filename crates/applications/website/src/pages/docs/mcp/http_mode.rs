@@ -29,7 +29,7 @@ gfs mcp web --port 8080"/>
     gfs mcp --path /path/to/repo web --port 8080"/>
 
             <h2>"Endpoint"</h2>
-            <p>"Clients send JSON-RPC requests to "<code>"POST http://127.0.0.1:PORT/mcp"</code>". The server uses the streamable HTTP transport. No authentication is required by default."</p>
+            <p>"Clients send JSON-RPC requests to "<code>"POST http://127.0.0.1:PORT/mcp"</code>". The server uses the streamable HTTP transport, and every request must carry "<code>"Authorization: Bearer <token>"</code>". Set "<code>"GFS_MCP_TOKEN"</code>", or read the token the server generates from "<code>"~/.gfs/mcp-token"</code>". The stdio transport needs no token."</p>
 
             <h2>"Use Cases"</h2>
             <ul>

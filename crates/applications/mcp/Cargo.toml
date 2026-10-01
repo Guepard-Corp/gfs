@@ -31,9 +31,11 @@ tracing-subscriber = { workspace = true }
 axum = { version = "0.7", features = ["json", "macros"] }
 tokio-util = "0.7"
 atty = "0.2"
+getrandom = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 gfs-storage-apfs = { workspace = true }
