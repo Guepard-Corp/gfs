@@ -15,7 +15,8 @@ use gfs_domain::model::config::GfsConfig;
 use gfs_domain::ports::compute::Compute;
 use gfs_domain::ports::database_provider::InMemoryDatabaseProviderRegistry;
 use gfs_domain::ports::repository::Repository;
-use gfs_domain::usecases::repository::checkout_repo_usecase::CheckoutRepoUseCase;
+use gfs_domain::repo_utils::repo_lock::RepoLock;
+use gfs_domain::usecases::repository::checkout_repo_usecase::{CheckoutRepoUseCase, LOCK_WAIT};
 use serde_json::json;
 
 use super::compute_support::compute_for_repo;
@@ -58,6 +59,21 @@ pub async fn checkout(
         .unwrap_or(false);
 
     let commit_hash = if is_k8s {
+        // Serialise against commit, which the generic use case does for us on the
+        // other arm. This arm does not go through it, so without this the lock
+        // exists and the Kubernetes runtime simply never takes it: `gfs commit`
+        // would acquire it and `gfs checkout` would walk straight past, leaving
+        // the very race this guards against open on the Kubernetes path.
+        //
+        // Scoped to this block on purpose. The `else` arm reaches the same lock
+        // inside `CheckoutRepoUseCase`, and `flock` is per open file description
+        // — taking it twice in one process would block against itself.
+        let _repo_lock = RepoLock::acquire_waiting(&repo_path, LOCK_WAIT).map_err(|e| {
+            anyhow::anyhow!(
+                "{e}; a checkout started now could interleave with it and lose a commit"
+            )
+        })?;
+
         // Validate refs before stopping compute — bad input must not leave the DB offline.
         let checkout_rev = if let Some(ref branch_name) = create_branch {
             let branch_name = branch_name.trim();
