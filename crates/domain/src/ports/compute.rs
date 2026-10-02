@@ -29,6 +29,9 @@ pub enum ComputeError {
     #[error("instance is not paused: '{0}'")]
     NotPaused(String),
 
+    #[error("invalid resource spec: {0}")]
+    InvalidResourceSpec(String),
+
     /// The runtime does not support cgroup freezing (e.g. rootless Podman on
     /// cgroup v1).  Callers that cannot tolerate torn reads must refuse the
     /// operation: a file-level snapshot of an unfrozen database can capture
@@ -227,6 +230,84 @@ pub struct EnvVar {
     pub default: Option<String>,
 }
 
+/// How much CPU and memory a container is owed, in the units an adapter applies.
+///
+/// The two dimensions are deliberately asymmetric:
+///
+/// - **Memory is a floor *and* a ceiling.** The container is guaranteed
+///   `memory_mb` and cannot exceed it, so an out-of-memory event stays
+///   contained to the database that caused it instead of pressuring its
+///   neighbours on the same node.
+/// - **CPU is a floor only.** The scheduler reserves `cpu_millicores` but
+///   imposes no ceiling, so a database may burst into otherwise-idle node
+///   capacity rather than being throttled while the node sits idle.
+///
+/// This is not the strongest scheduling class available — that would need a CPU
+/// ceiling too, and a hard quota on latency-sensitive query work costs more
+/// than it protects. It does lift a managed database out of the weakest class.
+///
+/// Millicores, not a clock speed. A caller that reasons in MHz resolves that
+/// against the node's own reported clock before declaring; what reaches an
+/// adapter is already in runtime units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComputeResources {
+    /// CPU floor in millicores, where 1000 is one core. Requested, never capped.
+    pub cpu_millicores: u32,
+
+    /// Memory floor and ceiling, in **mebibytes** (1 MiB = 1024 KiB).
+    ///
+    /// Named `_mb` to match the wire field, but the unit is binary: an adapter
+    /// emitting a Kubernetes quantity must write `Mi`, not `M`, or every limit
+    /// lands ~4.9% under what was promised.
+    pub memory_mb: u32,
+}
+
+impl ComputeResources {
+    /// Builds a declaration, rejecting a zero in either dimension.
+    ///
+    /// # Errors
+    ///
+    /// [`ComputeError::InvalidResourceSpec`] when either figure is zero. A zero
+    /// CPU request is not a smaller reservation but an absent one, and a zero
+    /// memory ceiling is a container that cannot start.
+    ///
+    /// This is a convenience for code that *builds* a declaration, not a
+    /// security boundary: `Deserialize` constructs the struct field-by-field
+    /// and never calls this. An adapter must therefore still treat a zero as
+    /// "no declaration" rather than emitting `0m` into a pod spec.
+    pub fn try_new(cpu_millicores: u32, memory_mb: u32) -> Result<Self> {
+        if cpu_millicores == 0 {
+            return Err(ComputeError::InvalidResourceSpec(
+                "cpu_millicores must be greater than zero".into(),
+            ));
+        }
+        if memory_mb == 0 {
+            return Err(ComputeError::InvalidResourceSpec(
+                "memory_mb must be greater than zero".into(),
+            ));
+        }
+        Ok(Self {
+            cpu_millicores,
+            memory_mb,
+        })
+    }
+}
+
+/// What a runtime's scheduler has, and what is already spoken for.
+///
+/// Reported in the units the scheduler itself packs in: millicores and MiB, and
+/// **allocatable** rather than total, because a kubelet reserves a slice for
+/// itself and the OS that no pod can ever have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeAllocation {
+    pub allocatable_cpu_millicores: u32,
+    pub allocatable_memory_mb: u32,
+    /// Sum of the *requests* of everything already placed here — requests, not
+    /// usage, because that is what the scheduler packs against.
+    pub committed_cpu_millicores: u32,
+    pub committed_memory_mb: u32,
+}
+
 /// Definition of a compute instance: image, directories, env (with optional defaults), and ports.
 /// Used by [`Compute::provision`] to create and configure an instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -266,6 +347,15 @@ pub struct ComputeDefinition {
     /// Empty by default; the runtime should attach nothing when this is empty.
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+
+    /// How much CPU and memory the instance is owed, if anything was declared.
+    ///
+    /// `None` means no declaration, and a runtime should then attach no
+    /// resource constraints at all rather than inventing a default — which is
+    /// also what a definition serialised before this field existed
+    /// deserialises to.
+    #[serde(default)]
+    pub resources: Option<ComputeResources>,
 }
 
 /// A single port mapping (host port optional; container port required).
@@ -287,6 +377,21 @@ pub struct PortMapping {
 pub trait Compute: Send + Sync {
     /// Create and configure an instance from a definition. Returns the new instance id.
     async fn provision(&self, definition: &ComputeDefinition) -> Result<InstanceId>;
+
+    /// What the scheduler still has free where this runtime places instances.
+    ///
+    /// `None` means the runtime has no scheduler to be refused by — Docker
+    /// places a container on the machine it is told to, and an over-large
+    /// request fails at start rather than sitting unscheduled. Callers should
+    /// treat `None` as "not applicable" and skip the check, not as "no room".
+    ///
+    /// # Errors
+    ///
+    /// The runtime's own error if the query fails. A caller that cannot read
+    /// headroom should say so rather than assume there is room.
+    async fn node_allocation(&self) -> Result<Option<NodeAllocation>> {
+        Ok(None)
+    }
 
     /// Start the instance identified by `id`.
     async fn start(&self, id: &InstanceId, options: StartOptions) -> Result<InstanceStatus>;
@@ -640,5 +745,107 @@ mod tests {
             }
             _ => panic!("Expected DockerMountFailed"),
         }
+    }
+
+    #[test]
+    fn compute_resources_rejects_a_zero_cpu_floor() {
+        // Zero is not "a small reservation"; it is no reservation, which is the
+        // state this type exists to move databases out of.
+        let err = ComputeResources::try_new(0, 512).unwrap_err();
+        assert!(
+            matches!(err, ComputeError::InvalidResourceSpec(ref m) if m.contains("cpu_millicores")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn compute_resources_rejects_a_zero_memory_ceiling() {
+        let err = ComputeResources::try_new(500, 0).unwrap_err();
+        assert!(
+            matches!(err, ComputeError::InvalidResourceSpec(ref m) if m.contains("memory_mb")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn compute_resources_accepts_a_plausible_class() {
+        let r = ComputeResources::try_new(500, 2048).expect("valid class rejected");
+        assert_eq!(r.cpu_millicores, 500);
+        assert_eq!(r.memory_mb, 2048);
+    }
+
+    #[test]
+    fn compute_resources_round_trips_through_json() {
+        let r = ComputeResources::try_new(1250, 4096).unwrap();
+        let back: ComputeResources =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).expect("round trip failed");
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn definition_without_a_resources_key_still_deserialises() {
+        // The shape a definition had before this field existed: every persisted
+        // definition and every in-flight payload from an older binary looks
+        // like this, and must still parse.
+        //
+        // What actually keeps `resources` optional is its `Option`, not its
+        // `#[serde(default)]` — serde already treats a missing `Option<T>` as
+        // `None`, and this test still passes with that attribute deleted
+        // (checked). The attribute is kept for symmetry with `labels`, where it
+        // is load-bearing: delete *that* one and this test fails with
+        // `missing field \`labels\`` (also checked). So this guards the
+        // contract, not the annotation.
+        let json = r#"{
+            "image": "postgres:17",
+            "env": [],
+            "ports": [],
+            "data_dir": "/var/lib/postgresql/data",
+            "host_data_dir": null,
+            "user": null,
+            "logs_dir": null,
+            "conf_dir": null,
+            "args": []
+        }"#;
+
+        let def: ComputeDefinition = serde_json::from_str(json).expect("old definition rejected");
+
+        assert!(def.resources.is_none());
+        assert!(def.labels.is_empty());
+        assert_eq!(def.image, "postgres:17");
+    }
+
+    #[test]
+    fn definition_round_trips_with_a_declaration() {
+        let json = serde_json::to_string(&ComputeDefinition {
+            image: "postgres:17".into(),
+            env: vec![],
+            ports: vec![],
+            data_dir: PathBuf::from("/var/lib/postgresql/data"),
+            host_data_dir: None,
+            user: None,
+            logs_dir: None,
+            conf_dir: None,
+            args: vec![],
+            labels: Default::default(),
+            resources: Some(ComputeResources::try_new(625, 1024).unwrap()),
+        })
+        .unwrap();
+
+        let back: ComputeDefinition = serde_json::from_str(&json).unwrap();
+
+        let r = back.resources.expect("declaration lost in the round trip");
+        assert_eq!(r.cpu_millicores, 625);
+        assert_eq!(r.memory_mb, 1024);
+    }
+
+    #[test]
+    fn deserialize_bypasses_the_constructor() {
+        // Documented behaviour, pinned so nobody later mistakes `try_new` for a
+        // validating boundary: a zero arrives intact off the wire, which is why
+        // the adapter — not this type — decides what a zero means.
+        let zeroed: ComputeResources =
+            serde_json::from_str(r#"{"cpu_millicores":0,"memory_mb":0}"#).unwrap();
+        assert_eq!(zeroed.cpu_millicores, 0);
+        assert_eq!(zeroed.memory_mb, 0);
     }
 }

@@ -36,6 +36,7 @@ impl MysqlProvider {
 
     fn definition_impl() -> ComputeDefinition {
         ComputeDefinition {
+            resources: None,
             labels: Default::default(),
             image: DEFAULT_IMAGE.to_string(),
             env: vec![
@@ -421,6 +422,7 @@ impl ContainerProvider for MysqlProvider {
         match format {
             "sql" => Ok(ExportSpec {
                 definition: ComputeDefinition {
+                    resources: None,
                     labels: Default::default(),
                     image: self.definition().image,
                     env: vec![],
@@ -443,6 +445,7 @@ impl ContainerProvider for MysqlProvider {
             }),
             "schema" => Ok(ExportSpec {
                 definition: ComputeDefinition {
+                    resources: None,
                     labels: Default::default(),
                     image: self.definition().image,
                     env: vec![],
@@ -481,6 +484,7 @@ impl ContainerProvider for MysqlProvider {
         match format {
             "sql" => Ok(ImportSpec {
                 definition: ComputeDefinition {
+                    resources: None,
                     labels: Default::default(),
                     image: self.definition().image,
                     env: vec![],
@@ -572,6 +576,7 @@ MYSQL_PWD="{password}" mysqldump -h {host} -P {port} -u root --no-data --skip-co
 
         Ok(Some(SchemaExtractionSpec {
             definition: ComputeDefinition {
+                resources: None,
                 labels: Default::default(),
                 image: self.definition().image,
                 env: vec![EnvVar {

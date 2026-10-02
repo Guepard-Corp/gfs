@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::errors::RepoError;
 use crate::model::layout::{CONFIG_FILE, GFS_DIR};
+use crate::ports::compute::ComputeResources;
 
 /// Returns the user's home directory ($HOME on Unix, %USERPROFILE% on Windows).
 fn home_dir() -> Option<PathBuf> {
@@ -81,6 +82,17 @@ impl fmt::Display for StorageConfig {
 pub struct ComputeConfig {
     #[serde(default)]
     pub params: std::collections::BTreeMap<String, String>,
+
+    /// The resource spec this database was provisioned with.
+    ///
+    /// Recorded here, beside the container tuning parameters, because a
+    /// declaration that applies only at first provision is not a guarantee:
+    /// every path that rebuilds the container reads it back. Keeping it with
+    /// the repository — rather than in a separate store, or re-fetched from the
+    /// whoever declared it — means it survives that source being unreachable and
+    /// inherits the clone semantics the repository already defines.
+    #[serde(default)]
+    pub resources: Option<ComputeResources>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -157,6 +169,36 @@ impl GfsConfig {
         Self::load(repo_path)
             .map(|c| c.compute_params())
             .unwrap_or_default()
+    }
+
+    /// The resource spec recorded for this repository, if one was.
+    ///
+    /// `None` means nothing was declared — a database provisioned before
+    /// enforcement existed, or one deployed without a profile. A rebuild must
+    /// then attach no constraints, exactly as it did before.
+    pub fn compute_resources(&self) -> Option<ComputeResources> {
+        self.compute.as_ref().and_then(|c| c.resources)
+    }
+
+    /// Record the resource spec for this repository so every later rebuild can
+    /// re-apply it.
+    ///
+    /// Writes through the whole config rather than patching the file, so the
+    /// record cannot drift from the rest of it. Called once, at provision.
+    ///
+    /// # Errors
+    ///
+    /// [`RepoError`] if the config cannot be read back or written.
+    pub fn record_compute_resources(
+        repo_path: &Path,
+        resources: Option<ComputeResources>,
+    ) -> Result<(), RepoError> {
+        let mut config = Self::load(repo_path)?;
+        config
+            .compute
+            .get_or_insert_with(ComputeConfig::default)
+            .resources = resources;
+        config.save(repo_path)
     }
 }
 
@@ -387,7 +429,10 @@ mod tests {
             environment: None,
             runtime: None,
             storage: None,
-            compute: Some(ComputeConfig { params }),
+            compute: Some(ComputeConfig {
+                params,
+                resources: None,
+            }),
             deleted_branch_retention_days: None,
         };
         config.save(dir.path()).unwrap();
@@ -561,5 +606,100 @@ mod tests {
             mode, 0o600,
             "load must self-heal a 0644 sidecar, got {mode:o}"
         );
+    }
+    #[test]
+    fn a_recorded_resource_spec_survives_a_reload() {
+        // The repository holds the authoritative copy, so a rebuild
+        // re-reads rather than re-derives.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(GFS_DIR)).unwrap();
+        GfsConfig {
+            mount_point: None,
+            version: String::new(),
+            description: String::new(),
+            user: None,
+            environment: None,
+            runtime: None,
+            storage: None,
+            compute: None,
+            deleted_branch_retention_days: None,
+        }
+        .save(dir.path())
+        .unwrap();
+
+        GfsConfig::record_compute_resources(
+            dir.path(),
+            Some(ComputeResources {
+                cpu_millicores: 625,
+                memory_mb: 1024,
+            }),
+        )
+        .unwrap();
+
+        let reloaded = GfsConfig::load(dir.path()).unwrap();
+        let recorded = reloaded.compute_resources().expect("spec was not recorded");
+        assert_eq!(recorded.cpu_millicores, 625);
+        assert_eq!(recorded.memory_mb, 1024);
+    }
+
+    #[test]
+    fn recording_a_spec_leaves_the_tuning_parameters_alone() {
+        // The two live in the same table. Writing one must not drop the other —
+        // that would trade one dropped-on-rebuild defect for another.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(GFS_DIR)).unwrap();
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("max_connections".to_string(), "200".to_string());
+        GfsConfig {
+            mount_point: None,
+            version: String::new(),
+            description: String::new(),
+            user: None,
+            environment: None,
+            runtime: None,
+            storage: None,
+            compute: Some(ComputeConfig {
+                params,
+                resources: None,
+            }),
+            deleted_branch_retention_days: None,
+        }
+        .save(dir.path())
+        .unwrap();
+
+        GfsConfig::record_compute_resources(
+            dir.path(),
+            Some(ComputeResources {
+                cpu_millicores: 625,
+                memory_mb: 1024,
+            }),
+        )
+        .unwrap();
+
+        let reloaded = GfsConfig::load(dir.path()).unwrap();
+        assert_eq!(
+            reloaded
+                .compute_params()
+                .get("max_connections")
+                .map(String::as_str),
+            Some("200")
+        );
+        assert!(reloaded.compute_resources().is_some());
+    }
+
+    #[test]
+    fn a_config_written_before_this_field_existed_reads_as_no_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(GFS_DIR)).unwrap();
+        std::fs::write(
+            dir.path().join(GFS_DIR).join(CONFIG_FILE),
+            "version = \"0.4.0\"\ndescription = \"\"\n\n[compute.params]\nmax_connections = \"200\"\n",
+        )
+        .unwrap();
+
+        let config = GfsConfig::load(dir.path()).expect("old config rejected");
+
+        assert!(config.compute_resources().is_none());
+        assert_eq!(config.compute_params().len(), 1);
     }
 }

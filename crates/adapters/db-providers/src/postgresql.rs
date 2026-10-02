@@ -107,6 +107,7 @@ impl PostgresqlProvider {
 
     fn definition_impl() -> ComputeDefinition {
         ComputeDefinition {
+            resources: None,
             labels: Default::default(),
             image: DEFAULT_IMAGE.to_string(),
             env: vec![
@@ -246,6 +247,7 @@ fn shell_single_quote(s: &str) -> String {
 /// set and the data exchange directory mounted at `data_dir`.
 fn sidecar_definition(image: String, password: &str, data_dir: &str) -> ComputeDefinition {
     ComputeDefinition {
+        resources: None,
         labels: Default::default(),
         image,
         env: vec![EnvVar {

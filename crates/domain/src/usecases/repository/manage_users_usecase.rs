@@ -841,6 +841,7 @@ mod tests {
     impl ContainerProvider for MockRoleProvider {
         fn definition(&self) -> ComputeDefinition {
             ComputeDefinition {
+                resources: None,
                 labels: Default::default(),
                 image: "mock:latest".into(),
                 env: vec![],

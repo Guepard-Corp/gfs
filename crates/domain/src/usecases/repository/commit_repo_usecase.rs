@@ -1455,6 +1455,7 @@ mod tests {
     impl ContainerProvider for MockProvider {
         fn definition(&self) -> ComputeDefinition {
             ComputeDefinition {
+                resources: None,
                 labels: Default::default(),
                 image: "mock:latest".into(),
                 env: vec![],
@@ -2644,6 +2645,7 @@ mod tests {
         impl crate::ports::database_provider::ContainerProvider for OverlapProvider {
             fn definition(&self) -> ComputeDefinition {
                 ComputeDefinition {
+                    resources: None,
                     labels: Default::default(),
                     image: "mock:latest".into(),
                     env: vec![],

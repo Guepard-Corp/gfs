@@ -986,6 +986,7 @@ mod tests {
     impl ContainerProvider for TestProvider {
         fn definition(&self) -> ComputeDefinition {
             ComputeDefinition {
+                resources: None,
                 labels: Default::default(),
                 image: "test:latest".into(),
                 env: vec![],
@@ -1062,6 +1063,7 @@ mod tests {
             name: "test".into(),
         };
         let def = ComputeDefinition {
+            resources: None,
             labels: Default::default(),
             image: "postgres:16".into(),
             env: vec![],
@@ -1075,6 +1077,7 @@ mod tests {
         };
         assert_eq!(provider.version_from_image(&def), "16");
         let def_latest = ComputeDefinition {
+            resources: None,
             labels: Default::default(),
             image: "postgres".into(),
             env: vec![],

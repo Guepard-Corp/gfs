@@ -4,8 +4,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use gfs_domain::model::config::{EnvironmentConfig, GfsConfig, RepoCredentials, RuntimeConfig};
-use gfs_domain::ports::compute::{Compute, EnvVar, InstanceId};
-use gfs_domain::ports::database_provider::DatabaseProviderRegistry;
+use gfs_domain::ports::compute::{Compute, ComputeDefinition, EnvVar, InstanceId};
+use gfs_domain::ports::database_provider::{ContainerProvider, DatabaseProviderRegistry};
 use gfs_domain::ports::repository::Repository;
 use gfs_domain::ports::storage::{CloneOptions, SnapshotId, StoragePort, VolumeId};
 use gfs_storage_kubernetes::KubernetesStorage;
@@ -192,6 +192,53 @@ fn apply_repo_credentials_to_env(env: &mut [EnvVar], creds: &RepoCredentials) {
     }
 }
 
+/// The database version a repository is pinned to, or the historical default.
+///
+/// Shared so the definition and the config write-back at the end of a
+/// reprovision cannot disagree about which version was just deployed.
+fn configured_database_version(cfg: &GfsConfig) -> String {
+    cfg.environment
+        .as_ref()
+        .map(|e| e.database_version.clone())
+        .unwrap_or_else(|| "17".to_string())
+}
+
+/// The [`ComputeDefinition`] a checkout rebuilds the pod from.
+///
+/// Pure: the config and credentials are loaded by the caller and passed in, so
+/// what a checkout would deploy can be asserted without a cluster, a repository
+/// on disk, or a provider registry. Same reason [`apply_repo_credentials_to_env`]
+/// is a free function.
+///
+/// Built through `definition_with_overrides`, never the bare `definition()`.
+/// `[compute.params]` is persisted in `.gfs/config.toml` precisely so a rebuild
+/// can re-apply it, and this path used to skip it — so a branch switch reverted
+/// a tuned database to the provider's defaults, silently.
+fn checkout_definition(
+    container: &dyn ContainerProvider,
+    cfg: &GfsConfig,
+    creds: &RepoCredentials,
+) -> ComputeDefinition {
+    let mut def = container.definition_with_overrides(&cfg.compute_params());
+    let base = def.image.split(':').next().unwrap_or(&def.image);
+    def.image = format!("{base}:{}", configured_database_version(cfg));
+    // Re-apply the repo's configured database name AND user (see
+    // apply_repo_credentials_to_env): a checkout rebuilds the pod from the provider
+    // default (POSTGRES_DB=postgres, POSTGRES_USER=postgres), and the credentials
+    // Secret carries only the password — so without this a repo created with a custom
+    // --database-name/--database-user reverts to `postgres` after every checkout,
+    // breaking `gfs query` with `role "postgres" does not exist`.
+    apply_repo_credentials_to_env(&mut def.env, creds);
+    // Re-apply the recorded resource spec rather than re-deriving one. The
+    // repository is the authoritative copy; a checkout that rebuilt
+    // the pod from the provider default would drop the limits exactly the way
+    // it used to drop the tuning parameters.
+    def.resources = cfg.compute_resources();
+    // PVC already exists from VolumeSnapshot restore; mount default `{instance}-data`.
+    def.host_data_dir = None;
+    def
+}
+
 /// Rebind the workspace PVC and recreate the StatefulSet/Service with the same instance name and NodePort.
 pub async fn reprovision_after_pvc_restore<R: DatabaseProviderRegistry>(
     compute: &KubernetesCompute,
@@ -229,11 +276,7 @@ pub async fn reprovision_after_pvc_restore<R: DatabaseProviderRegistry>(
         })?;
 
     let database_port = cfg.environment.as_ref().and_then(|e| e.database_port);
-    let database_version = cfg
-        .environment
-        .as_ref()
-        .map(|e| e.database_version.clone())
-        .unwrap_or_else(|| "17".to_string());
+    let database_version = configured_database_version(&cfg);
 
     let provider = registry
         .get(&provider_name)
@@ -245,19 +288,8 @@ pub async fn reprovision_after_pvc_restore<R: DatabaseProviderRegistry>(
         K8sCheckoutReprovisionError::UnknownProvider(format!("{provider_name}: {e}"))
     })?;
 
-    let mut def = container.definition();
-    let base = def.image.split(':').next().unwrap_or(&def.image);
-    def.image = format!("{base}:{database_version}");
-    // Re-apply the repo's configured database name AND user (see
-    // apply_repo_credentials_to_env): a checkout rebuilds the pod from the provider
-    // default (POSTGRES_DB=postgres, POSTGRES_USER=postgres), and the credentials
-    // Secret carries only the password — so without this a repo created with a custom
-    // --database-name/--database-user reverts to `postgres` after every checkout,
-    // breaking `gfs query` with `role "postgres" does not exist`.
     let creds = RepoCredentials::load(repo_path);
-    apply_repo_credentials_to_env(&mut def.env, &creds);
-    // PVC already exists from VolumeSnapshot restore; mount default `{instance}-data`.
-    def.host_data_dir = None;
+    let def = checkout_definition(container, &cfg, &creds);
 
     let instance_id = InstanceId(stable_instance.clone());
     // SS/svc already torn down in restore_database_volume_from_snapshot; keep cloned PVC.
@@ -318,6 +350,15 @@ pub async fn reprovision_after_pvc_restore<R: DatabaseProviderRegistry>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use gfs_domain::model::config::{ComputeConfig, EnvironmentConfig};
+    use gfs_domain::ports::compute::{ComputeDefinition, ComputeResources};
+    use gfs_domain::ports::database_provider::{
+        ConnectionParams, DatabaseProvider, DatabaseProviderArg, ProviderError, SupportedFeature,
+    };
+
     use super::*;
 
     #[test]
@@ -380,5 +421,188 @@ mod tests {
         let get = |n: &str| e.iter().find(|v| v.name == n).unwrap().default.as_deref();
         assert_eq!(get("POSTGRES_USER"), Some("postgres"));
         assert_eq!(get("POSTGRES_DB"), Some("postgres"));
+    }
+
+    /// Stands in for a real provider so the definition a checkout builds can be
+    /// asserted without a cluster. Deliberately a stub and not
+    /// `gfs-compute-docker`'s PostgreSQL provider: an adapter must not depend on
+    /// another adapter. `render_param_overrides` is byte-identical to the real
+    /// one (`compute-docker/src/containers/postgresql.rs:286`).
+    struct StubProvider;
+
+    impl DatabaseProvider for StubProvider {
+        fn name(&self) -> &str {
+            "postgres"
+        }
+
+        fn connection_string(
+            &self,
+            _: &ConnectionParams,
+        ) -> std::result::Result<String, ProviderError> {
+            Ok("postgres://localhost".into())
+        }
+
+        fn supported_versions(&self) -> Vec<String> {
+            vec!["17".into()]
+        }
+
+        fn supported_features(&self) -> Vec<SupportedFeature> {
+            vec![]
+        }
+
+        fn query_client_command(
+            &self,
+            _: &ConnectionParams,
+            _: Option<&str>,
+        ) -> std::result::Result<std::process::Command, ProviderError> {
+            Ok(std::process::Command::new("true"))
+        }
+
+        fn container(&self) -> Option<&dyn ContainerProvider> {
+            Some(self)
+        }
+    }
+
+    impl ContainerProvider for StubProvider {
+        fn prepare_for_snapshot(
+            &self,
+            _: &ConnectionParams,
+        ) -> gfs_domain::ports::database_provider::Result<Vec<String>> {
+            Ok(vec![])
+        }
+
+        fn definition(&self) -> ComputeDefinition {
+            ComputeDefinition {
+                resources: None,
+                image: "postgres:17".into(),
+                env: vec![EnvVar {
+                    name: "POSTGRES_USER".into(),
+                    default: Some("postgres".into()),
+                }],
+                ports: vec![],
+                data_dir: PathBuf::from("/var/lib/postgresql/data"),
+                host_data_dir: None,
+                user: None,
+                logs_dir: None,
+                conf_dir: None,
+                args: vec!["-c".into(), "listen_addresses=*".into()],
+                labels: Default::default(),
+            }
+        }
+
+        fn default_port(&self) -> u16 {
+            5432
+        }
+
+        fn default_args(&self) -> Vec<DatabaseProviderArg> {
+            vec![]
+        }
+
+        fn render_param_overrides(
+            &self,
+            params: &BTreeMap<String, String>,
+        ) -> Vec<DatabaseProviderArg> {
+            params
+                .iter()
+                .map(|(k, v)| DatabaseProviderArg {
+                    name: "-c".into(),
+                    value: format!("{k}={v}"),
+                })
+                .collect()
+        }
+    }
+
+    fn cfg_with_params(params: &[(&str, &str)]) -> GfsConfig {
+        GfsConfig {
+            mount_point: None,
+            version: String::new(),
+            description: String::new(),
+            user: None,
+            environment: Some(EnvironmentConfig {
+                database_provider: "postgres".into(),
+                database_version: "17".into(),
+                database_port: None,
+                display_name: None,
+            }),
+            runtime: None,
+            storage: None,
+            compute: Some(ComputeConfig {
+                params: params
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                resources: None,
+            }),
+            deleted_branch_retention_days: None,
+        }
+    }
+
+    fn has_arg_pair(args: &[String], name: &str, value: &str) -> bool {
+        args.windows(2).any(|w| w[0] == name && w[1] == value)
+    }
+
+    #[test]
+    fn checkout_definition_carries_the_repositorys_tuning_parameters() {
+        // A checkout rebuilds the pod from scratch, and `[compute.params]` is
+        // persisted in .gfs/config.toml precisely so every rebuild can re-apply
+        // it. Every other provisioning site reads it back through
+        // `definition_with_overrides` — init_repo_usecase.rs:141,
+        // checkout_repo_usecase.rs:300, cmd_compute.rs:456, mcp/tools.rs:1156.
+        // This path did not, so a branch switch quietly reverted a tuned
+        // database to the provider's defaults with nothing reporting it.
+        let cfg = cfg_with_params(&[("max_connections", "200")]);
+
+        let def = checkout_definition(&StubProvider, &cfg, &creds(None, None));
+
+        assert!(
+            has_arg_pair(&def.args, "-c", "max_connections=200"),
+            "the repository's tuning parameters were dropped; args were {:?}",
+            def.args
+        );
+        // The override is appended after the defaults, not instead of them —
+        // for engines where the last occurrence wins, that ordering is what
+        // makes it an override rather than the only setting.
+        assert!(
+            has_arg_pair(&def.args, "-c", "listen_addresses=*"),
+            "the provider's own defaults were lost; args were {:?}",
+            def.args
+        );
+    }
+
+    #[test]
+    fn checkout_reapplies_the_recorded_resource_spec() {
+        // A rebuild must re-read the repository's record
+        // rather than re-derive from the provider default — the same failure
+        // mode that lost the tuning parameters, one field over.
+        let mut cfg = cfg_with_params(&[]);
+        cfg.compute.as_mut().unwrap().resources = Some(ComputeResources {
+            cpu_millicores: 625,
+            memory_mb: 1024,
+        });
+
+        let def = checkout_definition(&StubProvider, &cfg, &creds(None, None));
+
+        let applied = def.resources.expect("the recorded spec was dropped");
+        assert_eq!(applied.cpu_millicores, 625);
+        assert_eq!(applied.memory_mb, 1024);
+    }
+
+    #[test]
+    fn checkout_attaches_no_spec_when_none_was_recorded() {
+        // A database provisioned before enforcement existed keeps rebuilding
+        // unconstrained, rather than acquiring an invented limit.
+        let def = checkout_definition(&StubProvider, &cfg_with_params(&[]), &creds(None, None));
+        assert!(def.resources.is_none());
+    }
+
+    #[test]
+    fn checkout_definition_adds_nothing_when_no_parameters_are_configured() {
+        // Guards the other direction: a repository that never tuned anything
+        // must still deploy exactly what the provider specifies.
+        let cfg = cfg_with_params(&[]);
+
+        let def = checkout_definition(&StubProvider, &cfg, &creds(None, None));
+
+        assert_eq!(def.args, StubProvider.definition().args);
     }
 }

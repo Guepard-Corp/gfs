@@ -13,7 +13,7 @@ use gfs_domain::ports::database_provider::{
 use gfs_domain::ports::repository::Repository;
 use gfs_domain::repo_utils::repo_layout;
 use gfs_domain::usecases::repository::init_repo_usecase::{
-    DatabaseCredentials, InitRepositoryUseCase,
+    DatabaseCredentials, InitRepositoryUseCase, ProvisionSpec,
 };
 use gfs_domain::usecases::repository::status_repo_usecase::StatusRepoUseCase;
 use serde_json::json;
@@ -125,7 +125,13 @@ pub async fn init(
             credentials,
             None,
             image,
-            labels,
+            ProvisionSpec {
+                labels,
+                // A standalone `gfs init` declares no resource limits: it has
+                // nothing to size them from. A caller that knows what a database
+                // should get passes a declaration through the port instead.
+                resources: None,
+            },
         )
         .await?;
 
