@@ -45,6 +45,12 @@ pub enum RepoError {
     MissingFile(PathBuf),
     #[error("Invalid config.toml: {0}")]
     InvalidConfig(String),
+    /// A name the caller supplied cannot be used, with the reason.
+    ///
+    /// Distinct from `InvalidConfig`, which prefixes "Invalid config.toml:" and
+    /// sent readers looking at a file that had nothing to do with it.
+    #[error("{0}")]
+    InvalidName(String),
     #[error("revision not found: '{0}'")]
     RevisionNotFound(String),
     #[error("the repository has no commits yet")]
