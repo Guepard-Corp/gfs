@@ -19,9 +19,41 @@ This crate uses **rmcp 0.16** with **stdio** (default) or **streamable HTTP**.
 
 **Daemon:** `gfs mcp start` spawns the binary with `--http`.
 
-## No authentication
+## Authentication
 
-**gfs-mcp does not require authentication.** There are no API keys, tokens, or login. The HTTP transport uses a **session ID** only to associate requests; that is not auth. If you see a message like *"Unauthorized"* or *"Authentication required"*, that comes from your **client**, not from gfs-mcp. Connect directly to `http://127.0.0.1:PORT/mcp`; no token or auth is required by this server.
+**The HTTP transport requires a bearer token.** Every request must carry
+`Authorization: Bearer <token>`; anything else is answered `401`. The session ID
+associates requests and is not authentication.
+
+Loopback is not a trust boundary — it is shared with every other process on the
+host, and these tools check out branches, run queries and manage database users.
+
+Where the token comes from:
+
+- `GFS_MCP_TOKEN`, if set. Use this when a client needs the same token across
+  restarts.
+- Otherwise one is generated per run from the OS CSPRNG and written to a file
+  created `0600`: `$GFS_MCP_TOKEN_FILE`, else `$XDG_STATE_HOME/gfs/mcp-token`,
+  else `~/.gfs/mcp-token`. The startup log prints the path, never the value.
+  If no location is writable the server refuses to start.
+
+```sh
+# pinned token
+GFS_MCP_TOKEN=$(openssl rand -hex 32) gfs-mcp --http 3000
+
+# or read back the generated one
+TOKEN=$(cat ~/.gfs/mcp-token)
+
+curl -X POST http://127.0.0.1:3000/mcp \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}'
+```
+
+The **stdio** transport is unaffected: it has no network surface, so clients such
+as Cursor need no token.
+
 
 ## MCP Inspector compatibility
 

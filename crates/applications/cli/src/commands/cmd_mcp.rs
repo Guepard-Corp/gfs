@@ -15,6 +15,7 @@ use std::process::Stdio;
 use anyhow::{Context, Result};
 use axum::Router;
 use gfs_mcp::GfsMcpHandler;
+use gfs_mcp::http_auth::{require_bearer, resolve_http_token, token_file_path, write_token_file};
 use rmcp::ServiceExt;
 use rmcp::transport::{
     StreamableHttpServerConfig, stdio,
@@ -103,15 +104,34 @@ async fn run_web_embedded(port: u16) -> Result<()> {
         config,
     );
 
-    let app = Router::new().nest_service("/mcp", mcp_service);
+    // Same guard as the standalone `gfs-mcp` binary: this serves the identical
+    // tool surface, so it cannot be the unauthenticated way in.
+    let (token, generated) = resolve_http_token().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let app = Router::new().nest_service("/mcp", mcp_service).layer(
+        axum::middleware::from_fn_with_state(std::sync::Arc::new(token.clone()), require_bearer),
+    );
 
     tracing::info!(
         addr = %bind,
-        "gfs-mcp starting (embedded HTTP, no auth). Connect to: POST http://{}/mcp",
+        "gfs-mcp starting (embedded HTTP, bearer token required). Connect to: POST http://{}/mcp",
         bind
     );
 
     println!("Starting MCP server on http://127.0.0.1:{}/mcp", port);
+    if generated {
+        let path = token_file_path().ok_or_else(|| {
+            anyhow::anyhow!("no writable location for a generated token; set GFS_MCP_TOKEN")
+        })?;
+        write_token_file(&path, &token).map_err(|e| {
+            anyhow::anyhow!(
+                "could not write {}: {e}; set GFS_MCP_TOKEN instead",
+                path.display()
+            )
+        })?;
+        println!("Bearer token written to {}", path.display());
+    } else {
+        println!("Bearer token taken from GFS_MCP_TOKEN");
+    }
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, app)
@@ -162,11 +182,39 @@ async fn spawn_daemon_process(
         .context("open MCP log file")?;
 
     if let Some(mcp_bin) = mcp_bin {
+        // Resolve the token HERE rather than letting the child generate one: the
+        // child's stdout goes to the log file, so a token it generated would be
+        // written somewhere the person who ran this command never sees. The parent
+        // decides it, reports it, and passes it down.
+        let (token, generated) = resolve_http_token().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let token_path = token_file_path().ok_or_else(|| {
+            anyhow::anyhow!("no writable location for the token file; set GFS_MCP_TOKEN")
+        })?;
+        // Write it whether generated or adopted, so the child has one file to
+        // read and the path below is always accurate.
+        write_token_file(&token_path, &token).map_err(|e| {
+            anyhow::anyhow!(
+                "could not write {}: {e}; set GFS_MCP_TOKEN instead",
+                token_path.display()
+            )
+        })?;
+        let token_note = if generated {
+            format!("bearer token in {}", token_path.display())
+        } else {
+            format!(
+                "bearer token from GFS_MCP_TOKEN, mirrored to {}",
+                token_path.display()
+            )
+        };
+
         // If binary exists, spawn it as daemon
         let child = std::process::Command::new(&mcp_bin)
             .arg("--http")
             .arg(port.to_string())
             .env("GFS_REPO_PATH", repo_path.as_os_str())
+            // The PATH travels, not the secret: `ps -E` on the child would
+            // otherwise print the token to any process that can list processes.
+            .env("GFS_MCP_TOKEN_FILE", token_path.as_os_str())
             .stdin(Stdio::null())
             .stdout(Stdio::from(log.try_clone()?))
             .stderr(Stdio::from(log))
@@ -178,10 +226,11 @@ async fn spawn_daemon_process(
         drop(child);
 
         println!(
-            "MCP daemon started (PID {}, http://127.0.0.1:{}/mcp, repo {}). No authentication required.",
+            "MCP daemon started (PID {}, http://127.0.0.1:{}/mcp, repo {}). {}.",
             pid,
             port,
-            repo_path.display()
+            repo_path.display(),
+            token_note
         );
         Ok(())
     } else {
@@ -234,7 +283,7 @@ async fn status(pid_file: &std::path::Path, default_port: u16) -> Result<()> {
 
     if let Some(pid) = running {
         println!(
-            "Daemon: running (PID {}, http://127.0.0.1:{}/mcp, no auth)",
+            "Daemon: running (PID {}, http://127.0.0.1:{}/mcp, bearer token required)",
             pid, default_port
         );
     } else if pid_file.exists() {

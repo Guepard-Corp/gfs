@@ -8,6 +8,7 @@
 //! over stdio or streamable HTTP (see [docs/http-service.md](docs/http-service.md)).
 
 pub mod blank_line_filter;
+pub mod http_auth;
 mod tools;
 
 pub use tools::GfsMcpHandler;

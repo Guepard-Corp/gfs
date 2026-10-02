@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 use axum::Router;
 use gfs_mcp::GfsMcpHandler;
 use gfs_mcp::blank_line_filter::SkipBlankLines;
+use gfs_mcp::http_auth::{require_bearer, resolve_http_token, token_file_path, write_token_file};
 use rmcp::ServiceExt;
 use rmcp::transport::{
     StreamableHttpServerConfig, stdio,
@@ -124,13 +125,42 @@ async fn run_http(
         config,
     );
 
-    let app = Router::new().nest_service("/mcp", mcp_service);
+    let (token, generated) = resolve_http_token()?;
+    let app = Router::new().nest_service("/mcp", mcp_service).layer(
+        axum::middleware::from_fn_with_state(std::sync::Arc::new(token.clone()), require_bearer),
+    );
 
     tracing::info!(
         addr = %bind,
-        "gfs-mcp starting (streamable HTTP, no auth). Connect to: POST http://{}/mcp",
+        "gfs-mcp starting (streamable HTTP, bearer token required). Connect to: POST http://{}/mcp",
         bind
     );
+    if generated {
+        // The token is a secret, so it goes to a 0600 file and the log carries
+        // only its path. Set GFS_MCP_TOKEN to pin one across restarts instead.
+        match token_file_path() {
+            Some(path) => match write_token_file(&path, &token) {
+                Ok(()) => tracing::warn!(
+                    path = %path.display(),
+                    "no GFS_MCP_TOKEN set; generated one for this run and wrote it to {}",
+                    path.display()
+                ),
+                Err(e) => {
+                    return Err(format!(
+                        "generated a token but could not write {}: {e}. \
+                         Set GFS_MCP_TOKEN instead.",
+                        path.display()
+                    )
+                    .into());
+                }
+            },
+            None => {
+                return Err("no GFS_MCP_TOKEN set and no writable location for a \
+                            generated one (HOME is unset). Set GFS_MCP_TOKEN."
+                    .into());
+            }
+        }
+    }
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, app)
