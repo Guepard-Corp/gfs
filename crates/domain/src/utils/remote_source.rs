@@ -90,6 +90,23 @@ pub fn parse_postgres_url(url: &str) -> Result<RemoteSource, ParseRemoteSourceEr
         })
     });
 
+    // Reject shell metacharacters at the boundary. Callers quote these before
+    // building commands, but the fields are also carried into a task pod's `sh -c`
+    // and into SQL literals by more than one caller, so refusing them here means a
+    // hostile URL fails loudly at parse time instead of relying on every downstream
+    // site remembering to quote. The password is deliberately exempt: it is always
+    // passed via PGPASSWORD or a quoted literal, and restricting it would reject
+    // legitimate generated secrets.
+    reject_unsafe_field("host", &host)?;
+    reject_unsafe_field("user", &user)?;
+    reject_unsafe_field("database name", dbname)?;
+    for s in &schemas {
+        reject_unsafe_field("schema", s)?;
+    }
+    if let Some(m) = &sslmode {
+        reject_unsafe_field("sslmode", m)?;
+    }
+
     Ok(RemoteSource {
         host,
         port,
@@ -101,9 +118,86 @@ pub fn parse_postgres_url(url: &str) -> Result<RemoteSource, ParseRemoteSourceEr
     })
 }
 
+/// Refuse a remote-source field that could change the meaning of a shell command
+/// or a SQL literal it is interpolated into.
+///
+/// Denylist rather than allowlist: database and role names legitimately carry a
+/// wide range of characters, and an allowlist tight enough to be safe would reject
+/// real ones. What is refused is the set that is never valid in a host, role or
+/// database name AND is meaningful to `sh` or to SQL quoting.
+fn reject_unsafe_field(field: &str, value: &str) -> Result<(), ParseRemoteSourceError> {
+    const FORBIDDEN: &[char] = &[
+        ';', '|', '&', '$', '`', '(', ')', '<', '>', '\\', '"', '\'', '*', '?', '!', '#', '\n',
+        '\r', '\t',
+    ];
+    if let Some(bad) = value
+        .chars()
+        .find(|c| FORBIDDEN.contains(c) || c.is_control())
+    {
+        return Err(ParseRemoteSourceError::Invalid(format!(
+            "remote {field} contains an unsupported character {bad:?}; \
+             host, user, database and schema names may not carry shell or quoting metacharacters"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_shell_metacharacters_in_remote_fields() {
+        // The exact shape that executed a command in the bootstrap task pod: the
+        // dbname carried `; <cmd>; #`, and the whole string was interpolated into
+        // an `sh -c` command.
+        let injected = "postgres://u:p@host:5432/db; echo PWNED; #";
+        let err = parse_postgres_url(injected).expect_err("must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unsupported character"),
+            "error must name the cause: {msg}"
+        );
+
+        // Each field independently.
+        for url in [
+            "postgres://u:p@ho$t:5432/db",
+            "postgres://u:p@host:5432/d`b`",
+            "postgres://u|x:p@host:5432/db",
+            "postgres://u:p@host:5432/db\nrm -rf /",
+        ] {
+            assert!(
+                parse_postgres_url(url).is_err(),
+                "must refuse metacharacters: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_ordinary_remote_urls() {
+        // The denylist must not reject real sources -- including the awkward
+        // shape seen in testing: a role with an underscore, a hyphenated host,
+        // and a query string.
+        for url in [
+            "postgres://user:pass@localhost:5432/mydb",
+            "postgresql://app_user:s3cr3t@db.example-host.com:5432/appdb?sslmode=require",
+            "postgres://u:p@192.0.2.10:5432/srcdb",
+        ] {
+            assert!(
+                parse_postgres_url(url).is_ok(),
+                "must accept an ordinary source: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_password_may_contain_metacharacters() {
+        // Generated secrets legitimately contain punctuation; the password is
+        // never interpolated unquoted, so restricting it would reject real inputs.
+        let r = parse_postgres_url("postgres://u:p$a`s|s@host:5432/db")
+            .expect("password punctuation must be accepted");
+        assert_eq!(r.password, "p$a`s|s");
+    }
 
     #[test]
     fn parses_full_url() {

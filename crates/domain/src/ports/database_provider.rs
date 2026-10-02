@@ -204,8 +204,14 @@ pub struct RemoteSource {
 pub struct CloneSpec {
     /// Compute definition for the tool sidecar.
     pub definition: ComputeDefinition,
-    /// Shell command to execute in the sidecar (against the local database).
+    /// Shell command to execute against the local database.
     pub command: String,
+    /// Directory on the instance's own data volume where the bootstrap keeps its
+    /// dump, its log and its exit-code sentinel. The caller launches `command`
+    /// detached, polls the sentinel here, and removes the directory once it has
+    /// read the outcome -- so a caller that dies mid-bootstrap leaves the evidence
+    /// in place instead of losing it with the connection.
+    pub scratch_dir: String,
 }
 
 /// Signal number for graceful shutdown. On Unix, 15 = SIGTERM.

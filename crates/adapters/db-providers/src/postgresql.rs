@@ -29,9 +29,36 @@ const CONTAINER_DATA_DIR: &str = "/var/lib/postgresql/data";
 const ENV_USER: &str = "POSTGRES_USER";
 const ENV_PASSWORD: &str = "POSTGRES_PASSWORD";
 const ENV_DB: &str = "POSTGRES_DB";
+
 const ENV_PGDATA: &str = "PGDATA";
 
 const DEFAULT_USER: &str = "postgres";
+
+/// Where the clone's schema dump is written.
+///
+/// Deliberately on the sidecar's mounted data directory, not `/tmp`. `/tmp` is the
+/// container's overlay root -- not a volume, a different device from the PVC -- and
+/// `statefulset_manifest_in` declares no `resources`, so nothing bounds it but node
+/// disk. Node disk pressure taints the node and every pod on it goes `Pending`.
+/// Latent while the dump runs in a short-lived task pod; load-bearing the moment the
+/// bootstrap runs inside the database pod, where filling the overlay takes the
+/// customer's database down with it. CloudNativePG puts its bootstrap dump on the
+/// data volume for the same reason.
+const SIDECAR_DATA_DIR: &str = "/data";
+
+/// Scratch directory for the clone bootstrap, on the instance's own data volume.
+///
+/// The bootstrap runs INSIDE the database container, where `/data` -- the
+/// throwaway sidecar's mount -- does not exist. It must also not be an `emptyDir` or
+/// `/tmp`: both land on node disk, unbounded, and node disk pressure taints the node
+/// and puts every pod on it `Pending`. On the data volume the dump is bounded by the
+/// PVC instead, which is the instance's own quota.
+///
+/// Measured on a live pod: a dot-prefixed subdirectory here is written and removed
+/// without disturbing the server (`SELECT 1` and `CHECKPOINT` both fine while it
+/// existed).
+const DUMP_DIR: &str = "/var/lib/postgresql/data/.gfs_bootstrap";
+const DUMP_PATH: &str = "/var/lib/postgresql/data/.gfs_bootstrap/faithful.sql";
 const DEFAULT_PASSWORD: &str = "postgres";
 const DEFAULT_DB: &str = "postgres";
 
@@ -876,7 +903,7 @@ impl ContainerProvider for PostgresqlProvider {
         let schema_flag = if schema_only { " --schema-only" } else { "" };
 
         Ok(ExportSpec {
-            definition: sidecar_definition(self.definition().image, password, "/data"),
+            definition: sidecar_definition(self.definition().image, password, SIDECAR_DATA_DIR),
             command: format!(
                 "pg_dump -h {host} -p {port} -U {user} -d {db} --format={fmt}{schema_flag} -f /data/{file}",
                 host = params.host,
@@ -928,7 +955,7 @@ impl ContainerProvider for PostgresqlProvider {
         };
 
         Ok(ImportSpec {
-            definition: sidecar_definition(self.definition().image, password, "/data"),
+            definition: sidecar_definition(self.definition().image, password, SIDECAR_DATA_DIR),
             command,
             input_filename: input_filename.to_string(),
         })
@@ -965,13 +992,19 @@ impl ContainerProvider for PostgresqlProvider {
             .map(|m| format!("PGSSLMODE={} ", shell_single_quote(m)))
             .unwrap_or_default();
         let dump = format!(
-            "{ssl_env}PGCONNECT_TIMEOUT=15 PGPASSWORD={rpass} pg_dump -h {rhost} -p {rport} -U {ruser} -d {rdb} --schema-only --no-owner --no-privileges{schemas} -f /tmp/gfs_faithful.sql",
+            "{ssl_env}PGCONNECT_TIMEOUT=15 PGPASSWORD={rpass} pg_dump -h {rhost} -p {rport} -U {ruser} -d {rdb} --schema-only --no-owner --no-privileges{schemas} -f {DUMP_PATH}",
             ssl_env = ssl_env,
+            // Every remote-supplied field is single-quoted. These arrive from a
+            // user-controlled `--from` URL and are interpolated into a string that
+            // is handed to `sh -c` in the task pod, so an unquoted one is arbitrary
+            // command execution in the pod whose address is written into the sealed
+            // database's pg_hba.conf moments later. `rport` is a u16 and cannot
+            // carry a metacharacter.
             rpass = shell_single_quote(&remote.password),
-            rhost = remote.host,
+            rhost = shell_single_quote(&remote.host),
             rport = remote.port,
-            ruser = remote.user,
-            rdb = remote.dbname,
+            ruser = shell_single_quote(&remote.user),
+            rdb = shell_single_quote(&remote.dbname),
             schemas = schema_flags,
         );
 
@@ -981,14 +1014,14 @@ impl ContainerProvider for PostgresqlProvider {
         // local server raises "unrecognized configuration parameter" — harmless to
         // the schema, noisy in the logs, and fatal if anything ever tightens the
         // replay to ON_ERROR_STOP. Strip the line; it is irrelevant to a DDL replay.
-        let sanitize = "sed -i '/^SET transaction_timeout/d' /tmp/gfs_faithful.sql";
+        let sanitize = format!("sed -i '/^SET transaction_timeout/d' {DUMP_PATH}");
 
         // Step 2 — replay the faithful schema into the LOCAL database. Best-effort
         // (no ON_ERROR_STOP): an object that can't be recreated locally (e.g. a
         // missing extension) is skipped, and its table is later skipped during
         // copy-on-read registration, rather than aborting the whole clone.
         let replay = format!(
-            "psql -h {host} -p {port} -U {user} -d {db} -f /tmp/gfs_faithful.sql || true",
+            "psql -h {host} -p {port} -U {user} -d {db} -f {DUMP_PATH} || true",
             host = local.host,
             port = local.port,
             user = user,
@@ -1021,12 +1054,20 @@ impl ContainerProvider for PostgresqlProvider {
         );
 
         let command = format!(
-            "set -e\nexport PGCONNECT_TIMEOUT=15\n{wait_clone}\n{dump}\n{sanitize}\n{replay}\n{bootstrap}"
+            // The scratch directory is created before the dump and removed after the
+            // bootstrap, success or failure -- it lives on the customer's data volume,
+            // so a dump left behind is their quota consumed for nothing.
+            "set -e\n\
+             export PGCONNECT_TIMEOUT=15\n\
+             mkdir -p {DUMP_DIR}\n\
+             trap 'rm -f {DUMP_PATH}' EXIT\n\
+             {wait_clone}\n{dump}\n{sanitize}\n{replay}\n{bootstrap}"
         );
 
         Ok(CloneSpec {
-            definition: sidecar_definition(self.definition().image, password, "/data"),
+            definition: sidecar_definition(self.definition().image, password, SIDECAR_DATA_DIR),
             command,
+            scratch_dir: DUMP_DIR.to_string(),
         })
     }
 
@@ -2386,6 +2427,216 @@ mod tests {
         );
     }
 
+    /// The `gfs` extension's shipped schema, pinned from a crate that is actually
+    /// in the workspace.
+    ///
+    /// `crates/extensions/gfs` is `exclude`d from the workspace (it needs
+    /// `cargo pgrx`), so `cargo test` never reaches a test placed there -- which is
+    /// most of the reason a change to these grants could go unnoticed.
+    const GFS_SCHEMA_SQL: &str = include_str!("../../../extensions/gfs/src/sql/schema.sql");
+
+    /// Unix-only: this writes executable stub binaries onto `PATH` and runs the
+    /// emitted command through `sh`, so it needs POSIX permissions and a POSIX
+    /// shell. Gated rather than adapted -- a Windows variant would exercise a
+    /// different shell's quoting and so would not test the property claimed here.
+    /// The production path this guards only ever runs inside a Linux container.
+    #[cfg(unix)]
+    #[test]
+    fn a_metacharacter_bearing_remote_cannot_execute_through_the_bootstrap_command() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        // Defence in depth. `parse_postgres_url` refuses these at the
+        // boundary, but `clone_bootstrap_spec` is a public trait method that can be
+        // handed a RemoteSource built any other way -- so the command it emits must
+        // be safe on its own. This RUNS the emitted script with stub binaries on
+        // PATH and asserts the injected command never executed.
+        let dir = std::env::temp_dir().join(format!("gfs-inj-{}", std::process::id()));
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let marker = dir.join("PWNED");
+
+        // Stubs: succeed, and create the dump file the later steps expect.
+        for name in ["pg_dump", "psql"] {
+            let p = bin.join(name);
+            let mut f = std::fs::File::create(&p).unwrap();
+            // Always exit 0. A stub that fails makes the command's `wait_clone`
+            // retry loop spin its full 120 iterations, which turns this test into
+            // a two-minute one and tells you nothing.
+            writeln!(f, "#!/bin/sh\n: > \"$GFS_TEST_DUMP\" 2>/dev/null\nexit 0").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // No quote characters in the payload. A payload containing `'` only works
+        // against a QUOTED target (it breaks out); against an unquoted one the
+        // shell re-quotes it into a single harmless word, so such a payload passes
+        // whether or not the bug is present -- it is not a check. This one executes
+        // precisely when the field reaches `sh -c` unquoted.
+        let injected = format!("h;touch {};#", marker.display());
+        let remote = RemoteSource {
+            host: injected.clone(),
+            port: 5432,
+            dbname: injected.clone(),
+            user: injected.clone(),
+            password: "pw".into(),
+            schemas: vec![],
+            sslmode: None,
+        };
+        let spec = PostgresqlProvider::new()
+            .clone_bootstrap_spec(&local_params(), &remote)
+            .expect("spec");
+
+        // Redirect only the hard-coded dump path at a writable temp file. The
+        // quoting under test is untouched.
+        let dump_tmp = dir.join("dump.sql");
+        let cmd = spec.command.replace(DUMP_PATH, dump_tmp.to_str().unwrap());
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env("GFS_TEST_DUMP", &dump_tmp)
+            .status()
+            .expect("sh");
+
+        let executed = marker.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            !executed,
+            "the injected command executed: a remote field reached `sh -c` unquoted \
+             (script exited {status:?})"
+        );
+    }
+
+    #[test]
+    fn the_clone_dump_is_written_to_the_data_volume_not_the_container_overlay() {
+        // `/tmp` is the container's overlay root: not a volume, a different device
+        // from the PVC, and `statefulset_manifest_in` declares no `resources`, so
+        // nothing bounds it but node disk. Node disk pressure taints the node and
+        // every pod on it goes Pending. Latent while the dump runs in a throwaway
+        // task pod; load-bearing once the bootstrap runs inside the database pod,
+        // where filling the overlay takes the customer's database down with it.
+        let spec = PostgresqlProvider::new()
+            .clone_bootstrap_spec(&local_params(), &sample_remote())
+            .expect("spec");
+        assert!(
+            !spec.command.contains("/tmp/gfs_faithful"),
+            "the dump must not be written to the container overlay:\n{}",
+            spec.command
+        );
+        assert!(
+            spec.command.contains(DUMP_PATH) && DUMP_PATH.starts_with(CONTAINER_DATA_DIR),
+            "the dump must live on the instance's data volume ({CONTAINER_DATA_DIR}), \
+             where it is bounded by the PVC rather than by node disk; got {DUMP_PATH}"
+        );
+        // Every step that touches the dump must agree on where it is.
+        assert_eq!(
+            spec.command.matches(DUMP_PATH).count(),
+            4,
+            "the four places that name the dump -- write, sanitize, replay and the \
+             cleanup trap -- must all resolve to one path:\n{}",
+            spec.command
+        );
+        // The scratch directory must be created, and removed on EVERY exit -- it
+        // sits on the customer's volume, so a dump left behind is their quota.
+        assert!(
+            spec.command.contains(&format!("mkdir -p {DUMP_DIR}")),
+            "the scratch dir must be created before the dump:\n{}",
+            spec.command
+        );
+        // The trap removes the DUMP only -- deliberately not the directory. The
+        // bootstrap runs detached and records its exit status and log in here; a
+        // trap that wiped the directory would destroy the evidence of the very run
+        // it belongs to, which is what a repair reads after a daemon dies.
+        assert!(
+            spec.command
+                .contains(&format!("trap 'rm -f {DUMP_PATH}' EXIT")),
+            "the dump must be removed on every exit:\n{}",
+            spec.command
+        );
+        assert!(
+            !spec.command.contains(&format!("rm -rf {DUMP_DIR}")),
+            "the trap must not take the log and sentinel with it:\n{}",
+            spec.command
+        );
+    }
+
+    #[test]
+    fn public_grant_matrix_is_per_verb_and_withholds_delete_on_clone_source() {
+        // The copy-on-read planner hook does bookkeeping writes on what the caller
+        // experiences as a plain SELECT, so a non-superuser tenant needs them. The
+        // grants are per VERB, not per table, and that is load-bearing:
+        // `gfs.clone_source` is referenced by eight ON DELETE CASCADE foreign keys,
+        // so granting DELETE there lets a tenant empty `drift_state` and
+        // `source_table_baseline` -- tables the change deliberately leaves
+        // read-only. Measured both ways with a row present beforehand.
+        let grants: Vec<&str> = GFS_SCHEMA_SQL
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("GRANT ") && l.contains("TO PUBLIC"))
+            .collect();
+        assert!(
+            !grants.is_empty(),
+            "no PUBLIC grants found -- has schema.sql moved? a silently empty \
+             matrix is exactly the failure this test exists to catch"
+        );
+        let all = grants.join("\n");
+
+        // The hook's own writes must be granted...
+        for (verbs, table) in [
+            ("UPDATE", "gfs.clone_source"),
+            ("UPDATE", "gfs.clone_stats"),
+            ("INSERT, DELETE", "gfs.cached"),
+            ("INSERT, DELETE", "gfs.copy_queue"),
+            ("INSERT, UPDATE", "gfs.cached_predicate"),
+            ("INSERT, UPDATE", "gfs.copy_watermark"),
+            ("INSERT", "gfs.tombstone"),
+        ] {
+            assert!(
+                all.lines().any(|l| l.contains(verbs) && l.contains(table)),
+                "missing `GRANT {verbs} ON {table} TO PUBLIC`; without it a \
+                 non-superuser read through the planner hook fails.\n{all}"
+            );
+        }
+
+        // ...and the cascade must stay shut.
+        for line in all.lines() {
+            if line.contains("gfs.clone_source") {
+                assert!(
+                    !line.contains("DELETE") && !line.contains("ALL"),
+                    "DELETE on gfs.clone_source cascades through eight FKs and \
+                     empties drift_state and source_table_baseline: {line}"
+                );
+            }
+        }
+        assert!(
+            !all.contains("GRANT ALL"),
+            "a blanket GRANT ALL defeats the per-verb narrowing:\n{all}"
+        );
+
+        // Read access the hook needs in order to plan at all.
+        assert!(
+            all.contains("GRANT USAGE ON SCHEMA gfs TO PUBLIC"),
+            "USAGE on schema gfs is required before any of the above matters"
+        );
+        for t in [
+            "gfs.clone_source",
+            "gfs.drift_state",
+            "gfs.source_table_baseline",
+        ] {
+            assert!(
+                all.lines()
+                    .any(|l| l.starts_with("GRANT SELECT") && l.contains(t)),
+                "missing SELECT on {t}"
+            );
+        }
+    }
+
     #[test]
     fn clone_bootstrap_spec_wraps_sql_in_local_psql_heredoc() {
         let provider = PostgresqlProvider::new();
@@ -2410,7 +2661,7 @@ mod tests {
         // replay so a pre-v17 local server doesn't choke on it.
         assert!(
             spec.command
-                .contains("sed -i '/^SET transaction_timeout/d' /tmp/gfs_faithful.sql")
+                .contains(&format!("sed -i '/^SET transaction_timeout/d' {DUMP_PATH}"))
         );
     }
 
@@ -2656,7 +2907,12 @@ mod tests {
         );
 
         let mut ready = false;
-        for _ in 0..30 {
+        // 30s is not enough on a loaded docker host -- and the readiness flag used
+        // to be computed and then ignored, so the test charged on and failed later
+        // with a confusing assertion instead of saying the server never came up.
+        // `-h 127.0.0.1` keeps the probe on TCP, which is the transport under test;
+        // the default unix socket can be ready while TCP is not.
+        for _ in 0..90 {
             if docker(&[
                 "exec",
                 &cn,
@@ -2674,6 +2930,11 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
+        assert!(
+            ready,
+            "postgres in {cn} never became ready; every assertion after this point \
+             would be reporting the wrong cause"
+        );
         exec_sql(&cn, "CREATE ROLE app_ro; CREATE TABLE public.t(id int);");
 
         let grant = provider
@@ -2787,7 +3048,12 @@ mod tests {
         );
 
         let mut ready = false;
-        for _ in 0..30 {
+        // 30s is not enough on a loaded docker host -- and the readiness flag used
+        // to be computed and then ignored, so the test charged on and failed later
+        // with a confusing assertion instead of saying the server never came up.
+        // `-h 127.0.0.1` keeps the probe on TCP, which is the transport under test;
+        // the default unix socket can be ready while TCP is not.
+        for _ in 0..90 {
             if docker(&[
                 "exec",
                 &cn,
@@ -2805,6 +3071,11 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
+        assert!(
+            ready,
+            "postgres in {cn} never became ready; every assertion after this point \
+             would be reporting the wrong cause"
+        );
 
         // An attacker with CREATE on `public` plants a function whose unqualified
         // name a naive privileged statement might resolve.

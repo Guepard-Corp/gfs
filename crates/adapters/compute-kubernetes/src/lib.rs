@@ -121,6 +121,44 @@ fn pod_is_ready(pod: &Pod) -> bool {
     running && ready
 }
 
+/// Readiness probe argv for a Postgres instance.
+///
+/// Free function so the shape is testable: `statefulset_manifest` needs a live
+/// client, so nothing pinned this, and that is how the defect below shipped.
+///
+/// `-U` is not optional. Without it libpq falls back to the OS user and the
+/// container runs as root, so every probe logged `FATAL: role "root" does not
+/// exist` -- once per period, per pod, for the life of the pod. Measured on the
+/// dev cluster: 400 of the last 400 log lines, 5s apart, matching periodSeconds.
+///
+/// The probe never noticed, which is why it survived: `pg_isready` exits 0
+/// either way, because a rejected login is still a response. It answers "did the
+/// server reply", not "could I log in".
+///
+/// Hardcoding `-U postgres` does NOT fix it -- POSTGRES_USER is the image's
+/// superuser and was `gfs_super` on the cluster, so that only swaps one FATAL for
+/// another (verified). Reading the variable needs a shell, since an exec probe is
+/// an argv vector with nothing to expand it.
+///
+/// `-d` is needed for the same reason and was missed on the first attempt: with a
+/// user but no database, `pg_isready` defaults the database name TO the username,
+/// so `-U gfs_super` alone produced `FATAL: database "gfs_super" does not exist`.
+/// Both or neither. `query_in_instance_command` in the docker provider already
+/// passed both -- that was the shape to copy.
+///
+/// Measured silent: over a 10s window the log carried 2 of these FATALs with no
+/// manual probes, and the same 2 with ten of these commands run inside it.
+fn postgres_readiness_command(port: i32) -> Vec<String> {
+    vec![
+        "sh".into(),
+        "-c".into(),
+        format!(
+            "pg_isready -q -h 127.0.0.1 -p {port} \
+             -U \"${{POSTGRES_USER:-postgres}}\" -d \"${{POSTGRES_DB:-postgres}}\""
+        ),
+    ]
+}
+
 /// Name of the engine container in every instance pod (see `statefulset_manifest`).
 const DB_CONTAINER_NAME: &str = "db";
 
@@ -585,14 +623,23 @@ impl KubernetesCompute {
             let exec_command: Option<Vec<String>> = if is_postgres {
                 // pg_isready exits 0 only once the server accepts connections; it
                 // reports "rejecting" (57P03) throughout initdb/WAL recovery.
-                Some(vec![
-                    "pg_isready".into(),
-                    "-q".into(),
-                    "-h".into(),
-                    "127.0.0.1".into(),
-                    "-p".into(),
-                    port.to_string(),
-                ])
+                //
+                // `-U` is not optional here. Without it libpq falls back to the OS
+                // user, and this container runs as root -- so every probe logged
+                // `FATAL: role "root" does not exist`, once per period, per pod,
+                // for the life of the pod. Measured on the dev cluster: 400 of the
+                // last 400 log lines, 5s apart, matching periodSeconds.
+                //
+                // The probe never noticed, which is why it survived: pg_isready
+                // exits 0 either way, because a rejected login is still a response.
+                // It answers "did the server reply", not "could I log in".
+                //
+                // Hardcoding `-U postgres` does NOT fix it -- POSTGRES_USER is the
+                // image's superuser and is `gfs_super` here, so that only swaps one
+                // FATAL for another (verified). Reading the variable needs a shell,
+                // since an exec probe is an argv vector with nothing to expand it;
+                // same wrapper the MySQL branch below already uses.
+                Some(postgres_readiness_command(port))
             } else if is_mysql {
                 // `mysqladmin ping` exits 0 when the server responds — including on
                 // an auth error — so it is a seal-independent liveness check that
@@ -1634,6 +1681,18 @@ impl Compute for KubernetesCompute {
         command: &str,
         linked_to: Option<&InstanceId>,
     ) -> Result<ExecOutput> {
+        self.run_task_impl(definition, command, linked_to).await
+    }
+}
+
+impl KubernetesCompute {
+    /// Shared body of [`Compute::run_task`].
+    async fn run_task_impl(
+        &self,
+        definition: &ComputeDefinition,
+        command: &str,
+        linked_to: Option<&InstanceId>,
+    ) -> Result<ExecOutput> {
         let pods: Api<Pod> = self.api_pods();
         let name = ensure_dns_label(&format!("gfs-task-{}", now_suffix()));
         let labels = labels_for(&name);
@@ -1698,11 +1757,19 @@ impl Compute for KubernetesCompute {
         let mut terminal_phase = String::from("Unknown");
         let mut exit_code: Option<i32> = None;
         // Clone bootstrap: wait for local DB (up to 120s) + pg_dump remote + FDW setup.
+        // A failure in here must NOT return early -- record it, leave the loop, and
+        // surface it after the cleanup below has run.
+        let mut poll_err: Option<ComputeError> = None;
         for _ in 0..360 {
-            let p = pods
-                .get(&name)
-                .await
-                .map_err(|e| ComputeError::Internal(format!("k8s task pod get failed: {e}")))?;
+            let p = match pods.get(&name).await {
+                Ok(p) => p,
+                Err(e) => {
+                    poll_err = Some(ComputeError::Internal(format!(
+                        "k8s task pod get failed: {e}"
+                    )));
+                    break;
+                }
+            };
             let phase = p
                 .status
                 .as_ref()
@@ -1731,6 +1798,11 @@ impl Compute for KubernetesCompute {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let stdout = fetch_task_pod_logs(&pods, &name).await;
         let _ = pods.delete(&name, &DeleteParams::default()).await;
+
+        // Surface a poll failure now that the task pod is gone.
+        if let Some(e) = poll_err {
+            return Err(e);
+        }
 
         // Derive the exit code: prefer the container's terminated state; fall
         // back to the pod phase (Failed → 1, Succeeded/Unknown → 0). A pod that
@@ -1765,6 +1837,7 @@ fn _unused(_p: &Path) {}
 mod tests {
     use super::*;
     use gfs_domain::ports::compute::EnvVar;
+
     use k8s_openapi::ByteString;
 
     fn definition_with_env(env: Vec<EnvVar>) -> ComputeDefinition {
@@ -1804,6 +1877,53 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    /// The probe used to omit `-U`, so libpq fell back to the OS user -- root in
+    /// this container -- and Postgres logged `FATAL: role "root" does not exist`
+    /// every period, for the life of every pod. `pg_isready` exits 0 regardless,
+    /// so nothing downstream could notice; only the server log showed it.
+    #[test]
+    fn postgres_readiness_probe_names_a_user() {
+        let cmd = postgres_readiness_command(5432).join(" ");
+
+        assert!(
+            cmd.contains("-U "),
+            "probe must name a user; without it libpq uses the OS user (root) \
+             and every probe logs a FATAL: {cmd}"
+        );
+        // Via the env var, not a literal: the superuser is whatever the image was
+        // given (`gfs_super` on the dev cluster), so `-U postgres` would just swap
+        // one `role ... does not exist` for another.
+        assert!(
+            cmd.contains("POSTGRES_USER"),
+            "the user must come from POSTGRES_USER, not be hardcoded: {cmd}"
+        );
+        // An exec probe is an argv vector, so the variable only expands if a
+        // shell is doing the expanding.
+        assert_eq!(
+            postgres_readiness_command(5432)[0],
+            "sh",
+            "an argv vector has nothing to expand ${{POSTGRES_USER}}; needs a shell"
+        );
+        // `-d` matters as much as `-U`, and was missed on the first attempt:
+        // with a user and no database, pg_isready defaults the database name TO
+        // the username, so `-U gfs_super` alone logged
+        // `FATAL: database "gfs_super" does not exist` -- one FATAL traded for
+        // another. Caught against a live pod, before this assertion existed.
+        assert!(
+            cmd.contains("-d "),
+            "probe must name a database; with -U alone pg_isready uses the \
+             username as the dbname and still logs a FATAL: {cmd}"
+        );
+        assert!(
+            cmd.contains("POSTGRES_DB"),
+            "the database must come from POSTGRES_DB, not be hardcoded: {cmd}"
+        );
+        assert!(
+            cmd.contains("-p 5432"),
+            "port must be threaded through: {cmd}"
+        );
     }
 
     #[test]
