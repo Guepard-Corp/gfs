@@ -316,6 +316,17 @@ fn fsck_finds_exactly_the_garbage_two_deleted_branches_leave() {
         "base commit"
     );
 
+    // `branch -d` soft-deletes into `refs/deleted/`, and fsck roots every
+    // soft-deleted ref regardless of age, so a deleted branch leaves no garbage
+    // while it is still recoverable. Zero retention is what "really gone" means
+    // to a user, and it is the only way this test can produce garbage without
+    // reaching behind the product to unlink refs itself.
+    assert_eq!(
+        run_gfs(tmp.path(), &["config", "branch.deletedRetentionDays", "0"]).0,
+        0,
+        "set zero retention"
+    );
+
     for b in ["g1", "g2"] {
         assert_eq!(
             run_gfs(tmp.path(), &["checkout", "-b", b]).0,
@@ -337,6 +348,27 @@ fn fsck_finds_exactly_the_garbage_two_deleted_branches_leave() {
     for b in ["g1", "g2"] {
         assert_eq!(run_gfs(tmp.path(), &["branch", "-d", b]).0, 0, "delete {b}");
     }
+
+    // Expiry is enforced inside `branch -d` itself -- there is no collector and no
+    // background process -- and it prunes with a strict `<` against now, so the
+    // most recent delete cannot prune its own entry. One more delete flushes it.
+    // `flush` carries no commit of its own, so its ref points at a commit `main`
+    // already roots and it contributes nothing to the garbage counted below.
+    assert_eq!(
+        run_gfs(tmp.path(), &["checkout", "-b", "flush"]).0,
+        0,
+        "flush branch"
+    );
+    assert_eq!(
+        run_gfs(tmp.path(), &["checkout", "main"]).0,
+        0,
+        "back to main again"
+    );
+    assert_eq!(
+        run_gfs(tmp.path(), &["branch", "-d", "flush"]).0,
+        0,
+        "delete flush, pruning g1 and g2"
+    );
 
     let (code, stdout, stderr) = run_gfs(tmp.path(), &["fsck", "--grace", "0", "--json"]);
     assert_stderr_empty(&stderr);
