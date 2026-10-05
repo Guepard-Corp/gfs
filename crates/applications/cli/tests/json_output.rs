@@ -428,6 +428,60 @@ fn fsck_finds_exactly_the_garbage_two_deleted_branches_leave() {
     );
 }
 
+/// A reader that closes early must not decide the verdict.
+///
+/// `println_safe!` used to `exit(0)` on the first BrokenPipe, so
+/// `gfs fsck --json | head -1` reported success on a corrupt repository, and
+/// `--json` through a bare `println!` panicked out at 101 -- a code outside the
+/// documented scheme entirely.
+#[test]
+fn a_closed_reader_does_not_replace_the_exit_status() {
+    use std::process::{Command, Stdio};
+
+    let tmp = TempDir::new().unwrap();
+    assert_eq!(run_gfs(tmp.path(), &["init", "."]).0, 0, "init");
+    // An entry the object store cannot identify: corruption, which exits 2.
+    let shard = tmp.path().join(".gfs/objects/zz");
+    std::fs::create_dir_all(&shard).unwrap();
+    std::fs::write(shard.join("garbage"), b"not an object").unwrap();
+
+    // The precondition. Without it a wrong exit status could look correct.
+    let (plain, _, _) = run_gfs(
+        tmp.path(),
+        &["fsck", "--grace", "0", "--disable-grace-period-check"],
+    );
+    assert_eq!(plain, 2, "precondition: this repository must be corrupt");
+
+    for args in [
+        vec!["fsck", "--grace", "0", "--disable-grace-period-check"],
+        vec![
+            "fsck",
+            "--grace",
+            "0",
+            "--disable-grace-period-check",
+            "--json",
+        ],
+    ] {
+        let mut child = Command::new(gfs_bin())
+            .current_dir(tmp.path())
+            .args(&args)
+            .env("RUST_LOG", "off")
+            .env("NO_COLOR", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn gfs");
+        // Close the read end immediately: the next write gets BrokenPipe.
+        drop(child.stdout.take());
+        let status = child.wait().expect("wait");
+        assert_eq!(
+            status.code(),
+            Some(2),
+            "a closed reader must not change the verdict for {args:?}"
+        );
+    }
+}
+
 /// RFC 009 D4 requires a floor in argument parsing and zero only behind a flag
 /// that names what it disables. Without the floor a mistyped window silently
 /// reports an in-flight commit as garbage -- and with `--plan`, persists that

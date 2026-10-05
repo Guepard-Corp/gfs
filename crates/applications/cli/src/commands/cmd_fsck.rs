@@ -312,7 +312,10 @@ fn render_json(report: &FsckReport, plan_id: Option<&str>) -> Result<()> {
     if let Some(id) = plan_id {
         out["plan"] = json!({ "mark_id": id });
     }
-    println!("{}", serde_json::to_string_pretty(&out)?);
+    // Not a bare `println!`: on a closed reader that panics, and the process
+    // then exits 101 -- outside the documented 0..=3 scheme and indistinguishable
+    // from a crash. `gfs fsck --json | head -1` is ordinary usage.
+    crate::println_safe!("{}", serde_json::to_string_pretty(&out)?)?;
     Ok(())
 }
 
