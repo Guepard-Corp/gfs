@@ -89,6 +89,28 @@ fn instance_expose_port() -> Option<i32> {
 }
 
 /// Kubernetes NodePort must be in 30000–32767; hostPort on the pod may use any assigned port.
+/// Pin a recorded NodePort onto the published mapping, and only that one.
+///
+/// A repository records ONE `database_port` — the endpoint its connection
+/// string advertises — so it can only pin one mapping. Writing it onto every
+/// mapping gave a multi-port provider the same NodePort twice, and the API
+/// server rejects the whole Service: `spec.ports[1].nodePort: Invalid value:
+/// 32306: provided port is already allocated`. Only clickhouse has two ports
+/// (9000 native, 8123 HTTP), and only a repository that has a recorded port
+/// reaches this, which is why a first deploy succeeded and a later branch
+/// switch did not.
+///
+/// The published mapping is the first by convention: a provider lists its
+/// `default_port()` first. Later mappings keep whatever they already carry.
+fn pin_published_node_port(ports: &mut [PortMapping], node_port: Option<u16>) {
+    let Some(port) = node_port.filter(|p| is_valid_k8s_node_port(i32::from(*p))) else {
+        return;
+    };
+    if let Some(published) = ports.first_mut() {
+        published.host_port = Some(port);
+    }
+}
+
 /// The Service's published ports for a definition's port mappings.
 ///
 /// `GFS_INSTANCE_NODE_PORT` names ONE port — the instance's published endpoint —
@@ -1488,11 +1510,7 @@ impl KubernetesCompute {
         node_port: Option<u16>,
     ) -> Result<InstanceId> {
         let mut ports = definition.ports.clone();
-        if let Some(port) = node_port.filter(|p| is_valid_k8s_node_port(i32::from(*p))) {
-            for mapping in &mut ports {
-                mapping.host_port = Some(port);
-            }
-        }
+        pin_published_node_port(&mut ports, node_port);
         let mut def = definition.clone();
         def.ports = ports;
         self.provision_with_instance(&def, instance_name).await
@@ -2502,7 +2520,32 @@ mod tests {
         assert_eq!(host_port_from_mapping(&m), Some(31000));
     }
 
+    /// A repository records one `database_port`, so it may pin one mapping.
+    /// Writing it onto every mapping gave clickhouse (9000 native, 8123 HTTP)
+    /// the same NodePort twice and the API server rejected the Service, which
+    /// took a database offline on every branch switch.
     #[test]
+    fn a_recorded_port_pins_the_published_mapping_only() {
+        let mut ports = vec![
+            PortMapping {
+                compute_port: 9000,
+                host_port: None,
+            },
+            PortMapping {
+                compute_port: 8123,
+                host_port: None,
+            },
+        ];
+
+        pin_published_node_port(&mut ports, Some(32306));
+
+        assert_eq!(ports[0].host_port, Some(32306), "the published port pins");
+        assert_eq!(
+            ports[1].host_port, None,
+            "the second port must not inherit the published NodePort"
+        );
+    }
+
     /// `GFS_INSTANCE_NODE_PORT` names one published endpoint, so it must pin at
     /// most one Service port. Applying it to every mapping gave clickhouse — the
     /// only provider with two (9000 native, 8123 HTTP) — the same NodePort twice,
@@ -2549,6 +2592,7 @@ mod tests {
         assert_eq!(pinned.len(), uniq.len(), "no NodePort appears twice");
     }
 
+    #[test]
     fn service_node_port_only_pins_ports_in_nodeport_range() {
         // A host port inside the NodePort range pins the Service NodePort.
         let in_range = PortMapping {
