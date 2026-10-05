@@ -88,6 +88,19 @@ fn resolve_host_bind_path(path: &Path) -> Result<std::path::PathBuf> {
     Ok(absolute.canonicalize().unwrap_or(absolute))
 }
 
+/// Host alias every container gets, mapped to the Docker host.
+///
+/// Docker Desktop provides `host.docker.internal` implicitly. colima and
+/// podman-machine do not -- inside a colima container no host alias resolves at
+/// all, only the gateway address -- so anything reaching back to a service on
+/// the host fails there with `could not translate host name`. A clone seeded
+/// from a host-local source is exactly that case.
+///
+/// `host-gateway` is resolved by the daemon to whatever the host is on that
+/// engine, so requesting it explicitly costs nothing where the alias already
+/// exists and supplies it where it does not.
+const HOST_ALIAS: &str = "host.docker.internal:host-gateway";
+
 /// Subdirectory of the bind-mounted data dir used as PGDATA when the bind-mount
 /// root is presented to the container as root-owned.
 ///
@@ -599,6 +612,7 @@ impl Compute for DockerCompute {
         let host_config = bollard::service::HostConfig {
             binds: if binds.is_empty() { None } else { Some(binds) },
             port_bindings: Some(port_bindings),
+            extra_hosts: Some(vec![HOST_ALIAS.to_string()]),
             ..Default::default()
         };
 
@@ -1093,6 +1107,7 @@ impl Compute for DockerCompute {
 
         let host_config = bollard::service::HostConfig {
             binds: if binds.is_empty() { None } else { Some(binds) },
+            extra_hosts: Some(vec![HOST_ALIAS.to_string()]),
             ..Default::default()
         };
 
