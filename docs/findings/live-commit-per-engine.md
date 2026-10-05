@@ -37,6 +37,61 @@ with the post-stop WAL and `backup_label` retained. A restore then replays WAL a
 *says so* — `redo starts at`, `consistent recovery state reached` — so PostgreSQL
 is the one engine where the restore carries its own evidence.
 
+### PostgreSQL on Kubernetes, measured
+
+The section above describes the Docker recipe. On Kubernetes the atomic
+`VolumeSnapshot` makes it unnecessary, and that is now measured rather than
+assumed — `postgres-live-commit-spike.md` recommended testing this first
+precisely because it removes a pause instead of adding a mechanism.
+
+Conditions were the unforgiving ones: `data_checksums off` and `wal_keep_size 0`,
+so a torn snapshot's corruption would not be detectable. A writer inserted 400
+rows per second throughout.
+
+```
+C1 before commit  15800
+C2 after commit   16200     <- writes never paused
+restored          16200     <- inside the bracket, at a single instant
+max(id)           16200
+count(distinct id) 16200
+```
+
+The restored cluster's log:
+
+```
+database system was interrupted; last known up at 15:11:18 UTC
+database system was not properly shut down; automatic recovery in progress
+redo starts at 0/17A4258
+invalid record length at 0/17B4930: expected at least 24, got 0
+redo done at 0/17B4908
+database system is ready to accept connections
+```
+
+**Read that `invalid record length` carefully.** It is the same line the spike
+flagged on the torn copy, and here it is benign: in crash recovery it is how
+Postgres finds the end of the log, and it appears at the WAL *tail*, immediately
+before `redo done`. The spike's failure was the same message occurring *early* —
+recovery stopping at a torn record with committed data beyond it. The message
+alone does not tell the two apart; what does is whether the restored data lands
+at one instant, which the bracket above shows.
+
+Note what the log does **not** say: `consistent recovery state reached`. That
+line belongs to base-backup recovery, driven by a `backup_label`. An atomic
+snapshot produces ordinary *crash* recovery instead, which ends at `redo done`.
+Anything specifying the Kubernetes path should expect the crash-recovery
+signature, not the base-backup one.
+
+`bt_index_parent_check` also passed, and that is recorded here only for
+completeness: the spike's deliberately torn copy passed it too, so it is not
+evidence either way. The load-bearing facts are the single-instant snapshot and
+the completed recovery.
+
+Consequence for the engine-assisted backup window: it is needed for the
+**non-atomic** adapters (`storage-apfs`, `storage-file`), where a tree walk sees
+different files at different instants. On `storage-kubernetes` and
+`storage-btrfs` the snapshot is already one instant, so `pg_backup_start` /
+`pg_backup_stop` would add machinery without adding safety.
+
 ### MySQL
 
 Restores from an atomic snapshot consistently, but **reports nothing either way**.
