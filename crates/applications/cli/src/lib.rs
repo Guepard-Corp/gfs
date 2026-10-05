@@ -572,8 +572,17 @@ enum TopLevel {
         /// Seconds an entry must have existed before it can be called garbage
         /// (default 86400). A commit writes its snapshot before the object that
         /// references it, so anything recent may belong to a running operation.
+        /// Values below the one-hour floor need
+        /// `--disable-grace-period-check`.
         #[arg(long, value_name = "SECONDS")]
         grace: Option<u64>,
+
+        /// Allow a grace below the one-hour floor, including zero. Named for what
+        /// it disables on purpose: without the grace period a commit still in
+        /// flight can be reported as garbage, and a plan written from such a run
+        /// records live data for a later collector to act on.
+        #[arg(long)]
+        disable_grace_period_check: bool,
 
         /// Path to the GFS repository root (default: current directory)
         #[arg(long)]
@@ -1039,8 +1048,14 @@ where
                 .await?;
                 Ok(0)
             }
-            TopLevel::Fsck { plan, grace, path } => {
-                commands::cmd_fsck::run(path, plan, grace, json_output).await
+            TopLevel::Fsck {
+                plan,
+                grace,
+                disable_grace_period_check,
+                path,
+            } => {
+                commands::cmd_fsck::run(path, plan, grace, disable_grace_period_check, json_output)
+                    .await
             }
             TopLevel::Status { path, output } => {
                 let output = resolve_output_format(output, json_output);

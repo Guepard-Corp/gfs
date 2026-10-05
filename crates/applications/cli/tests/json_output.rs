@@ -208,8 +208,11 @@ fn an_error_is_announced_once() {
 // fsck
 // ---------------------------------------------------------------------------
 
-/// `--grace 0` throughout: the default holds back anything written in the last
-/// 24 hours, which in a test is everything.
+/// Cases that must see freshly made garbage pass `--grace 0` with
+/// `--disable-grace-period-check`, because the default holds back anything
+/// written in the last 24 hours, which in a test is everything. Cases whose
+/// outcome does not depend on the window deliberately do NOT, so the one-hour
+/// floor is exercised rather than bypassed everywhere.
 ///
 /// A freshly initialised repository has nothing unreachable and nothing broken,
 /// so fsck must exit 0 — the code a script uses to decide there is no work.
@@ -219,7 +222,7 @@ fn fsck_on_a_fresh_repo_is_clean_and_exits_zero() {
     let (code, _, _) = run_gfs(tmp.path(), &["init", "."]);
     assert_eq!(code, 0, "init should succeed");
 
-    let (code, stdout, stderr) = run_gfs(tmp.path(), &["fsck", "--grace", "0", "--json"]);
+    let (code, stdout, stderr) = run_gfs(tmp.path(), &["fsck", "--json"]);
     assert_stderr_empty(&stderr);
     let v = assert_stdout_json(&stdout);
 
@@ -241,7 +244,7 @@ fn fsck_reports_an_unidentifiable_object_and_exits_two() {
     std::fs::create_dir_all(&shard).unwrap();
     std::fs::write(shard.join("c".repeat(62)), b"\xff\xfe not an object").unwrap();
 
-    let (code, stdout, stderr) = run_gfs(tmp.path(), &["fsck", "--grace", "0", "--json"]);
+    let (code, stdout, stderr) = run_gfs(tmp.path(), &["fsck", "--json"]);
     assert_stderr_empty(&stderr);
     let v = assert_stdout_json(&stdout);
 
@@ -370,7 +373,16 @@ fn fsck_finds_exactly_the_garbage_two_deleted_branches_leave() {
         "delete flush, pruning g1 and g2"
     );
 
-    let (code, stdout, stderr) = run_gfs(tmp.path(), &["fsck", "--grace", "0", "--json"]);
+    let (code, stdout, stderr) = run_gfs(
+        tmp.path(),
+        &[
+            "fsck",
+            "--grace",
+            "0",
+            "--disable-grace-period-check",
+            "--json",
+        ],
+    );
     assert_stderr_empty(&stderr);
     let v = assert_stdout_json(&stdout);
 
@@ -416,6 +428,43 @@ fn fsck_finds_exactly_the_garbage_two_deleted_branches_leave() {
     );
 }
 
+/// RFC 009 D4 requires a floor in argument parsing and zero only behind a flag
+/// that names what it disables. Without the floor a mistyped window silently
+/// reports an in-flight commit as garbage -- and with `--plan`, persists that
+/// judgement for a collector.
+#[test]
+fn a_grace_below_the_floor_is_refused_without_the_override() {
+    let tmp = TempDir::new().unwrap();
+    assert_eq!(run_gfs(tmp.path(), &["init", "."]).0, 0, "init");
+
+    for window in ["0", "1", "3599"] {
+        let (code, stdout, stderr) = run_gfs(tmp.path(), &["fsck", "--grace", window]);
+        assert_ne!(
+            code, 0,
+            "a grace of {window}s must not be accepted: {stdout}"
+        );
+        assert!(
+            stderr.contains("below the") && stderr.contains("floor"),
+            "the refusal must name the floor, got: {stderr}"
+        );
+        assert!(
+            stderr.contains("--disable-grace-period-check"),
+            "the refusal must name the override, got: {stderr}"
+        );
+    }
+
+    // The override is the documented way through, and it must work.
+    let (code, _, stderr) = run_gfs(
+        tmp.path(),
+        &["fsck", "--grace", "0", "--disable-grace-period-check"],
+    );
+    assert_eq!(code, 0, "the override must be honoured: {stderr}");
+
+    // And the floor itself is accepted without it.
+    let (code, _, stderr) = run_gfs(tmp.path(), &["fsck", "--grace", "3600"]);
+    assert_eq!(code, 0, "the floor itself must be accepted: {stderr}");
+}
+
 /// A plan is the prelude to a deletion, so it must not be produced for a
 /// repository that is already inconsistent.
 #[test]
@@ -427,7 +476,16 @@ fn fsck_refuses_to_write_a_plan_for_an_inconsistent_repo() {
     std::fs::create_dir_all(&shard).unwrap();
     std::fs::write(shard.join("c".repeat(62)), b"\xff\xfe not an object").unwrap();
 
-    let (code, _, _) = run_gfs(tmp.path(), &["fsck", "--plan", "--grace", "0"]);
+    let (code, _, _) = run_gfs(
+        tmp.path(),
+        &[
+            "fsck",
+            "--plan",
+            "--grace",
+            "0",
+            "--disable-grace-period-check",
+        ],
+    );
     assert_eq!(
         code, 2,
         "the refusal is caused by corruption, so it must not collide with 1 (garbage found)"
@@ -445,7 +503,16 @@ fn fsck_plan_writes_exactly_one_artefact() {
     let tmp = TempDir::new().unwrap();
     run_gfs(tmp.path(), &["init", "."]);
 
-    let (code, _, _) = run_gfs(tmp.path(), &["fsck", "--plan", "--grace", "0"]);
+    let (code, _, _) = run_gfs(
+        tmp.path(),
+        &[
+            "fsck",
+            "--plan",
+            "--grace",
+            "0",
+            "--disable-grace-period-check",
+        ],
+    );
     assert_eq!(code, 0);
 
     let gc = tmp.path().join(".gfs/gc");

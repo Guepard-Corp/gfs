@@ -49,6 +49,19 @@ const NO_COMMIT: &str = "0";
 /// whole database snapshots that never dedup.
 pub const DEFAULT_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// The smallest grace a caller may choose without explicitly disabling the
+/// check, as RFC 009 D4 requires following Dolt's `BackupPruneMinGracePeriod`.
+///
+/// One hour, not a round guess: a commit writes its snapshot tree before the
+/// object that references it, so any window shorter than the longest plausible
+/// commit lets an in-flight snapshot be called garbage. Measured commits here
+/// run in seconds, so an hour leaves three orders of magnitude of headroom
+/// while still allowing a deliberate shortening on a quiet repository.
+///
+/// This is policy, not mechanism: `check` still accepts any `Duration`, so the
+/// domain stays usable from tests and future callers that know what they want.
+pub const MIN_GRACE: Duration = Duration::from_secs(60 * 60);
+
 /// A value read off disk that should have been a hash, trimmed for display.
 ///
 /// Anything can end up in a ref file — a symlink to `/etc/passwd` makes the

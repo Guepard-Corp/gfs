@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use gfs_domain::model::fsck::FsckReport;
 use gfs_domain::model::fsck::SnapshotFacts;
 use gfs_domain::model::layout::{GC_DIR, GFS_DIR, SNAPSHOTS_DIR};
-use gfs_domain::repo_utils::fsck::{self, DEFAULT_GRACE, SnapshotSource};
+use gfs_domain::repo_utils::fsck::{self, DEFAULT_GRACE, MIN_GRACE, SnapshotSource};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -26,6 +26,7 @@ pub async fn run(
     path: Option<PathBuf>,
     plan: bool,
     grace_seconds: Option<u64>,
+    disable_grace_period_check: bool,
     json_output: bool,
 ) -> Result<i32> {
     let repo_path = path.unwrap_or_else(get_repo_dir);
@@ -33,6 +34,18 @@ pub async fn run(
     let grace = grace_seconds
         .map(std::time::Duration::from_secs)
         .unwrap_or(DEFAULT_GRACE);
+
+    // RFC 009 D4: a floor, and zero only behind a flag that names what it
+    // disables. Rejected here, before the repository is touched, so a mistyped
+    // window cannot produce a report at all -- let alone a `--plan` artefact
+    // naming a snapshot a running commit is about to reference.
+    if grace < MIN_GRACE && !disable_grace_period_check {
+        anyhow::bail!(
+            "a grace of {}s is below the {}s floor, so a commit still in flight              could be reported as garbage. Pass --disable-grace-period-check to              override it deliberately",
+            grace.as_secs(),
+            MIN_GRACE.as_secs()
+        );
+    }
 
     // On Kubernetes a snapshot is a VolumeSnapshot object, not a directory, so
     // the only way to know whether a commit's snapshot still exists is to ask
