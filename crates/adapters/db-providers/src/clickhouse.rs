@@ -313,8 +313,14 @@ impl ContainerProvider for ClickhouseProvider {
     }
 
     fn prepare_for_snapshot(&self, _params: &ConnectionParams) -> Result<Vec<String>> {
-        // `gfs commit` pauses the container before snapshotting. For ClickHouse we currently
-        // rely on that crash-consistent snapshot and do not run extra pre-snapshot commands.
+        // No pre-snapshot commands, and the reason depends on the runtime: Docker pauses
+        // the container around the snapshot, while Kubernetes does not and instead takes an
+        // atomic VolumeSnapshot with the database still serving
+        // (`db_live_during_snapshot`). Both give a restorable image without ClickHouse's
+        // help, so there is nothing to run here. Measured in
+        // `docs/findings/live-commit-per-engine.md`: a live commit under continuous inserts
+        // restored to the exact row count sampled at the commit instant, with CHECK TABLE
+        // clean. Soundness comes from snapshot atomicity, not from this hook.
         Ok(vec![])
     }
 
