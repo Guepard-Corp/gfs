@@ -382,6 +382,14 @@ fn soft_deleted_roots(
                 stack.push(path);
             } else {
                 match std::fs::read_to_string(&path) {
+                    Ok(body) if body.trim() == NO_COMMIT => {
+                        // A branch deleted before its first commit. `roots` skips
+                        // the same value for a live branch, and `restore_deleted_
+                        // branch_ref` accepts it, so it is a tombstone with nothing
+                        // behind it rather than a reference to a missing commit.
+                        // Reporting it as dangling condemns a healthy repository
+                        // and suppresses the whole collectable report with it.
+                    }
                     Ok(body) => match normalise_hash(&body) {
                         Some(h) => out.push(h),
                         // Unreadable as a hash. Reported rather than dropped:
@@ -2138,6 +2146,35 @@ mod tests {
         assert!(
             check(d.path(), Duration::ZERO).unwrap().is_clean(),
             "a nested deleted ref is still a root"
+        );
+    }
+
+    /// A tombstone can hold `NO_COMMIT`, and that is not a missing object.
+    #[test]
+    fn a_branch_deleted_before_its_first_commit_is_not_dangling() {
+        let d = repo();
+        let live = write_commit(d.path(), "aa", "on main", None, true);
+        set_branch(d.path(), "main", &live);
+
+        let entry = d
+            .path()
+            .join(GFS_DIR)
+            .join(REFS_DIR)
+            .join(DELETED_REFS_DIR)
+            .join("1791237274625")
+            .join("never-committed");
+        fs::create_dir_all(entry.parent().unwrap()).unwrap();
+        fs::write(&entry, NO_COMMIT).unwrap();
+
+        let report = check(d.path(), Duration::ZERO).unwrap();
+        assert!(
+            report.is_clean(),
+            "a tombstone with nothing behind it is not a reference to something missing"
+        );
+        assert!(
+            report.dangling.is_empty(),
+            "expected no dangling, got {:?}",
+            report.dangling
         );
     }
 
