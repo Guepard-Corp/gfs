@@ -234,6 +234,17 @@ fn checkout_definition(
     // the pod from the provider default would drop the limits exactly the way
     // it used to drop the tuning parameters.
     def.resources = cfg.compute_resources();
+    // Same reasoning for the discovery labels. `gfs.role` and `gfs.remote` are
+    // known only to whoever created the repository, so unlike the provider and
+    // version they cannot be recomputed here -- the repository's record is the
+    // only copy. Merged under the provider's own labels so a provider that
+    // starts emitting one keeps it.
+    let recorded = cfg.compute_labels();
+    if !recorded.is_empty() {
+        let mut labels = recorded;
+        labels.extend(std::mem::take(&mut def.labels));
+        def.labels = labels;
+    }
     // PVC already exists from VolumeSnapshot restore; mount default `{instance}-data`.
     def.host_data_dir = None;
     def
@@ -532,6 +543,7 @@ mod tests {
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect(),
                 resources: None,
+                labels: Default::default(),
             }),
             deleted_branch_retention_days: None,
         }
@@ -539,6 +551,37 @@ mod tests {
 
     fn has_arg_pair(args: &[String], name: &str, value: &str) -> bool {
         args.windows(2).any(|w| w[0] == name && w[1] == value)
+    }
+
+    /// The discovery labels are stamped once, at init. A checkout rebuilds the
+    /// pod from the provider's bare definition, so without re-applying them the
+    /// database loses `gfs.managed`, `gfs.role` and the rest on its first branch
+    /// switch — the same shape as the tuning-parameter drop, one field over.
+    #[test]
+    fn checkout_definition_carries_the_repositorys_discovery_labels() {
+        let mut cfg = cfg_with_params(&[]);
+        cfg.compute.as_mut().unwrap().labels = std::collections::BTreeMap::from([
+            ("gfs.managed".to_string(), "true".to_string()),
+            ("gfs.role".to_string(), "clone".to_string()),
+            ("gfs.remote".to_string(), "src.example:5432".to_string()),
+        ]);
+
+        let def = checkout_definition(&StubProvider, &cfg, &creds(None, None));
+
+        assert_eq!(
+            def.labels.get("gfs.managed").map(String::as_str),
+            Some("true")
+        );
+        // `clone`, not the `source` default: a value only the caller knew, which
+        // reconstruction from config could never have recovered.
+        assert_eq!(
+            def.labels.get("gfs.role").map(String::as_str),
+            Some("clone")
+        );
+        assert_eq!(
+            def.labels.get("gfs.remote").map(String::as_str),
+            Some("src.example:5432")
+        );
     }
 
     #[test]
