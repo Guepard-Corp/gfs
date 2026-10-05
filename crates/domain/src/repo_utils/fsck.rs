@@ -251,7 +251,24 @@ pub fn roots(
     let mut problems: Vec<Dangling> = Vec::new();
 
     let heads = repo_path.join(GFS_DIR).join(REFS_DIR).join(HEADS_DIR);
+    // `list_branches` answers `NotFound` with an empty list, which is a fair
+    // reading for a caller that wants to print branches. It is the wrong reading
+    // here, for the reason its own doc comment gives about the unreadable case:
+    // branch tips are the roots of every walk, so "no branches" and "the branch
+    // store is gone" differ by the entire repository. `init` always writes
+    // `refs/heads/main`, so there is no repository in which this is legitimately
+    // absent -- a partial copy or a careless restore is what leaves it missing,
+    // and that is exactly when every object looks unreferenced.
+    if !heads.exists() {
+        blind.at(
+            repo_path,
+            &heads,
+            "is missing, so no branch could be used as a root",
+        );
+    }
+    let mut named: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (name, tip) in repo_layout::list_branches(repo_path)? {
+        named.insert(name.clone());
         // A ref is a file. A symlink where one should be sends the walk outside
         // the repository to decide what is live inside it, and the sibling
         // walkers in this codebase already refuse to follow one. Reported here
@@ -321,6 +338,24 @@ pub fn roots(
             String::new()
         }
     };
+    // An attached HEAD is skipped below because the branch loop already covered
+    // its tip -- but only if that branch was actually listed. When the ref is
+    // gone and HEAD still names it, nothing covered it, and the commit it
+    // pointed at has lost its only root while the walk still reads as complete.
+    if let Some(branch) = head_raw
+        .strip_prefix("ref:")
+        .map(str::trim)
+        .and_then(|r| r.strip_prefix(&format!("{REFS_DIR}/{HEADS_DIR}/")))
+        .map(str::trim)
+        && !branch.is_empty()
+        && !named.contains(branch)
+    {
+        blind.at(
+            repo_path,
+            &heads.join(branch),
+            "is named by HEAD but was not found, so its history has no root",
+        );
+    }
     if !head_raw.is_empty() && !head_raw.starts_with("ref:") && head_raw != NO_COMMIT {
         match normalise_hash(&head_raw) {
             Some(h) => out.push(h),
@@ -383,12 +418,31 @@ fn soft_deleted_roots(
                 continue;
             }
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            // Each of the three failures below used to `continue`. Every one of
+            // them drops a root, and this is the function whose own contract is
+            // that a collector acting on its report "would delete exactly the
+            // data `gfs branch --restore` promises to give back". `roots` already
+            // reports a symlinked `refs/heads` entry rather than skipping it;
+            // these are the same input reaching the opposite answer.
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    blind.at(repo_path, &dir, format!("could not be walked: {e}"));
+                    continue;
+                }
+            };
             let path = entry.path();
             let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                blind.at(repo_path, &path, "could not be stat'd");
                 continue;
             };
             if meta.file_type().is_symlink() {
+                blind.at(
+                    repo_path,
+                    &path,
+                    "is a symbolic link, not a recovery record, so the branch it                      would have protected has no root",
+                );
                 continue;
             }
             if meta.is_dir() {
@@ -2159,6 +2213,102 @@ mod tests {
         assert!(
             check(d.path(), Duration::ZERO).unwrap().is_clean(),
             "a nested deleted ref is still a root"
+        );
+    }
+
+    /// An absent branch store is a hole, not a repository with no branches.
+    /// `init` always writes `refs/heads/main`, so this is a partial copy -- and
+    /// it is exactly when every object looks unreferenced.
+    #[test]
+    fn an_absent_branch_store_suppresses_the_collectable_list() {
+        let d = repo();
+        let live = write_commit(d.path(), "aa", "on main", None, true);
+        set_branch(d.path(), "main", &live);
+        let orphan = write_commit(d.path(), "bb", "genuinely unreachable", None, true);
+
+        // With the store intact the orphan is reported, which is what makes the
+        // assertion below mean something rather than passing on an empty set.
+        let before = check(d.path(), Duration::ZERO).unwrap();
+        assert!(
+            before
+                .unreachable
+                .iter()
+                .any(|u| u.hash.starts_with(&orphan[..8])),
+            "precondition: the orphan must be collectable while the store is intact"
+        );
+
+        // Detach HEAD onto the live commit first. With HEAD still attached to
+        // `main`, moving the store aside is caught by the attached-HEAD guard
+        // instead, and this test would pass with the absent-store guard removed
+        // -- which per-site calibration showed it did.
+        fs::write(d.path().join(GFS_DIR).join(HEAD_FILE), &live).unwrap();
+
+        let heads = d.path().join(GFS_DIR).join(REFS_DIR).join(HEADS_DIR);
+        let aside = d.path().join("heads-aside");
+        fs::rename(&heads, &aside).unwrap();
+
+        let after = check(d.path(), Duration::ZERO).unwrap();
+        assert!(
+            after.unreachable.is_empty(),
+            "a walk with no roots must name nothing, got {:?}",
+            after.unreachable
+        );
+        assert!(
+            !after.reachability_complete,
+            "the walk must declare itself incomplete"
+        );
+    }
+
+    /// An attached HEAD naming a branch that is not there lost its only root
+    /// while the walk still read as complete.
+    #[test]
+    fn an_attached_head_whose_branch_is_gone_is_a_hole() {
+        let d = repo();
+        let live = write_commit(d.path(), "aa", "on main", None, true);
+        set_branch(d.path(), "main", &live);
+        fs::write(
+            d.path().join(GFS_DIR).join(HEAD_FILE),
+            format!("ref: {REFS_DIR}/{HEADS_DIR}/gone"),
+        )
+        .unwrap();
+
+        let report = check(d.path(), Duration::ZERO).unwrap();
+        assert!(
+            !report.reachability_complete,
+            "HEAD names a branch that was never listed, so the walk has a hole"
+        );
+        assert!(report.unreachable.is_empty(), "and it must name nothing");
+    }
+
+    /// `roots` reports a symlinked `refs/heads` entry; the soft-deleted path used
+    /// to skip the identical input, unrooting a branch `--restore` still honours.
+    #[test]
+    fn a_symlinked_tombstone_is_reported_not_skipped() {
+        let d = repo();
+        let live = write_commit(d.path(), "aa", "on main", None, true);
+        set_branch(d.path(), "main", &live);
+        let doomed = write_commit(d.path(), "bb", "soft deleted", None, true);
+
+        let dir = d
+            .path()
+            .join(GFS_DIR)
+            .join(REFS_DIR)
+            .join(DELETED_REFS_DIR)
+            .join("1791242262279");
+        fs::create_dir_all(&dir).unwrap();
+        let holder = d.path().join("holder");
+        fs::write(&holder, &doomed).unwrap();
+        std::os::unix::fs::symlink(&holder, dir.join("doomed")).unwrap();
+
+        let report = check(d.path(), Duration::ZERO).unwrap();
+        assert!(
+            !report.reachability_complete,
+            "a tombstone we refused to follow is a hole, not an absence"
+        );
+        assert!(
+            report.unreachable.is_empty(),
+            "and nothing may be offered for collection, got {:?}",
+            report.unreachable
         );
     }
 
