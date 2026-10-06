@@ -313,6 +313,10 @@ pub fn roots(
         }
     }
 
+    // The window the double read exists for: a rename landing here used to be
+    // invisible to both reads. Test-only seam; a no-op in a release build.
+    between_ref_reads(repo_path);
+
     // Soft-deleted branches are recoverable, so their commits are live.
     for h in soft_deleted_roots(repo_path, &mut problems, blind) {
         out.push(h);
@@ -413,6 +417,41 @@ pub fn roots(
     out.dedup();
     Ok((out, problems))
 }
+
+/// Test-only seam: run something in the window between the two ref reads.
+///
+/// The race this guards against needs a rename to land between reading
+/// `refs/heads` and reading `refs/deleted`. On an unmodified binary that window
+/// is too narrow to hit -- a randomised search got 0 hits in 150 delete/restore cycles
+/// against 64 runs -- so without a seam the fix is untestable. This compiles
+/// only under `cfg(test)`: nothing is shipped, and the production build has no
+/// branch here at all.
+///
+/// Keyed on the repository path because tests run in parallel and a bare global
+/// would fire inside unrelated ones.
+/// A repository to match, and what to run when the walk reaches the window.
+#[cfg(test)]
+type RefReadHook = (std::path::PathBuf, std::sync::Arc<dyn Fn() + Send + Sync>);
+
+#[cfg(test)]
+pub(crate) static BETWEEN_REF_READS: std::sync::Mutex<Option<RefReadHook>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn between_ref_reads(repo_path: &Path) {
+    let hook = BETWEEN_REF_READS.lock().ok().and_then(|g| {
+        g.as_ref()
+            .filter(|(p, _)| p == repo_path)
+            .map(|(_, f)| f.clone())
+    });
+    if let Some(f) = hook {
+        f();
+    }
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn between_ref_reads(_repo_path: &Path) {}
 
 /// Every commit hash held by a soft-deleted ref under `refs/deleted/`.
 ///
@@ -2255,6 +2294,70 @@ mod tests {
         assert!(
             check(d.path(), Duration::ZERO).unwrap().is_clean(),
             "a nested deleted ref is still a root"
+        );
+    }
+
+    /// The race the double read exists for, made deterministic.
+    ///
+    /// A `branch --restore` renames `refs/deleted/<ms>/x` to `refs/heads/x`. If
+    /// that lands after fsck has read `refs/heads` and before it reads
+    /// `refs/deleted`, the branch is in neither snapshot and its whole history
+    /// loses its only root -- while the walk still reports itself complete. The
+    /// seam places the rename exactly there instead of racing for it from
+    /// outside, which a randomised search could not do in 150 attempts.
+    #[test]
+    fn a_restore_landing_between_the_ref_reads_does_not_unroot_its_history() {
+        let d = repo();
+        let main_tip = write_commit(d.path(), "aa", "on main", None, true);
+        set_branch(d.path(), "main", &main_tip);
+        let doomed_tip = write_commit(d.path(), "bb", "on doomed", None, true);
+
+        // A tombstone, as `branch -d` leaves one. `doomed` is NOT in refs/heads.
+        let stamp = d
+            .path()
+            .join(GFS_DIR)
+            .join(REFS_DIR)
+            .join(DELETED_REFS_DIR)
+            .join("1791242262279");
+        fs::create_dir_all(&stamp).unwrap();
+        fs::write(stamp.join("doomed"), &doomed_tip).unwrap();
+
+        // The restore, fired from inside the window: deleted -> heads.
+        let from = stamp.join("doomed");
+        let to = d
+            .path()
+            .join(GFS_DIR)
+            .join(REFS_DIR)
+            .join(HEADS_DIR)
+            .join("doomed");
+        let hook: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+            let _ = fs::rename(&from, &to);
+        });
+        *BETWEEN_REF_READS.lock().unwrap() = Some((d.path().to_path_buf(), hook));
+
+        let report = check(d.path(), Duration::ZERO).unwrap();
+
+        // Clear before asserting, so a failure cannot leak the hook into the
+        // rest of the suite.
+        *BETWEEN_REF_READS.lock().unwrap() = None;
+
+        // The rename really happened, or the test proved nothing.
+        assert!(
+            d.path()
+                .join(GFS_DIR)
+                .join(REFS_DIR)
+                .join(HEADS_DIR)
+                .join("doomed")
+                .exists(),
+            "precondition: the seam must have performed the restore"
+        );
+        assert!(
+            !report
+                .unreachable
+                .iter()
+                .any(|u| doomed_tip.starts_with(&u.hash[..8.min(u.hash.len())])),
+            "a branch restored mid-walk was offered for collection: {:?}",
+            report.unreachable
         );
     }
 
