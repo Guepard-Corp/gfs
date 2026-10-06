@@ -45,6 +45,25 @@ pub async fn checkout(
         }
     };
 
+    // Validated here, before the runtime is chosen, because this check used to sit
+    // inside the Kubernetes arm below and the filesystem arm reached none of it.
+    // `gfs branch <name>` and `gfs checkout -b <name>` both create a ref, so the
+    // same rules have to apply, and they did not: `checkout -b x.lock` and
+    // `checkout -b detached` were both accepted on a filesystem repository while
+    // `gfs branch` refused them. `detached` is the one that cost data -- it names
+    // the directory holding every detached working copy, so the new branch's
+    // workspace resolved onto that namespace and the checkout's repopulate wiped
+    // what was in it.
+    //
+    // `../escaped` was refused on both paths even before this, but by an unrelated
+    // containment check further down rather than by name validation -- which is why
+    // the gap went unnoticed: the one rule anybody would have tested for was
+    // covered by accident.
+    if let Some(ref branch_name) = create_branch {
+        gfs_domain::repo_utils::branch_name::validate_branch_name(branch_name.trim())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
     let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
     let compute: Arc<dyn Compute> = compute_for_repo(&repository, &repo_path).await?;
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
