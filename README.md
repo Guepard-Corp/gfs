@@ -552,6 +552,11 @@ Exit status is meaningful:
 | `2` | corruption found: something referenced is missing, or an entry could not be identified |
 | `3` | **the check could not be completed**, so the report says nothing about the repository |
 
+A usage error — a flag that does not exist, a value that will not parse, an unknown
+subcommand — also exits `3`, for every `gfs` command and not just this one. It is
+the same statement: the command did not run, so nothing here describes your
+repository. `--help` and `--version` exit `0`; they are requests, not errors.
+
 `3` is the one to handle first. It is not a statement about the repository — an
 unreadable object, a ref that would not resolve, or a Kubernetes backend whose
 cluster cannot be reached all produce it, and on a cluster-backed repository with

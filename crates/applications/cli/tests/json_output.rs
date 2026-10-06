@@ -169,7 +169,11 @@ fn an_error_is_announced_once() {
 
     // Parse failure: `init` takes its path positionally, so `--path` is unknown.
     let (code, _, stderr) = run_gfs(tmp.path(), &["init", "--path", "somewhere"]);
-    assert_eq!(code, 1, "a usage error still exits 1");
+    // 3, not 1: a rejected argument list means the command did not run, and 1 is
+    // reserved for a command that ran and reports a non-success outcome. This
+    // assertion is incidental to what the test is about -- announcing the error
+    // once -- but it pins the code, so it is corrected rather than dropped.
+    assert_eq!(code, 3, "a usage error could not run, so it exits 3");
     // Counting the substring would be wrong: a message like "internal error: ..."
     // legitimately contains it. Only the prefix is under test.
     let first = stderr.lines().next().unwrap_or_default();
@@ -186,7 +190,19 @@ fn an_error_is_announced_once() {
     // only a mistyped flag would not notice the line going missing.
     for bare in [vec![], vec!["storage"], vec!["schema"], vec!["user"]] {
         let (code, _, stderr) = run_gfs(tmp.path(), &bare);
-        assert_eq!(code, 1, "`gfs {}` exits 1", bare.join(" "));
+        // Also 3. These are clap's DisplayHelpOnMissingArgumentOrSubcommand: the
+        // invocation was incomplete, so the command never ran, and the assertion
+        // below confirms they do announce an error rather than merely offering
+        // help. Bare `gfs` therefore exits 3 as well, which is the one visibly
+        // unusual consequence of this scheme -- the alternative, mapping it back to
+        // 1, would return it to collision with "the command ran and found
+        // something".
+        assert_eq!(
+            code,
+            3,
+            "`gfs {}` did not run, so it exits 3",
+            bare.join(" ")
+        );
         assert!(
             stderr.lines().any(|l| l.starts_with("error: ")),
             "`gfs {}` must still announce an error: {stderr}",
@@ -480,6 +496,48 @@ fn a_closed_reader_does_not_replace_the_exit_status() {
             "a closed reader must not change the verdict for {args:?}"
         );
     }
+}
+
+/// A usage error must not borrow the code that means "the command ran and found
+/// something". `gfs fsck --typo` exited 1, which fsck documents as "unreachable
+/// objects found -- a collector would have work to do", so a script branching on
+/// 1 to run a collector was triggered by a mistyped flag.
+///
+/// The help cases are the control: they travel the same clap error path and must
+/// stay 0, or this fix would have broken `--help` for every command.
+#[test]
+fn a_usage_error_does_not_share_the_exit_code_of_a_finding() {
+    let tmp = TempDir::new().unwrap();
+    assert_eq!(run_gfs(tmp.path(), &["init", "."]).0, 0, "init");
+
+    for args in [
+        vec!["fsck", "--no-such-flag"],
+        vec!["fsck", "--grace", "notanumber"],
+        vec!["commit", "--no-such-flag"],
+        vec!["no-such-command"],
+    ] {
+        assert_eq!(
+            run_gfs(tmp.path(), &args).0,
+            3,
+            "a usage error could not run, so it is 3: {args:?}"
+        );
+    }
+
+    for args in [vec!["--help"], vec!["--version"], vec!["fsck", "--help"]] {
+        assert_eq!(
+            run_gfs(tmp.path(), &args).0,
+            0,
+            "a request is not an error: {args:?}"
+        );
+    }
+
+    // And an error from a command that DID run keeps 1, so this change did not
+    // quietly redefine the code for everything that fails.
+    assert_eq!(
+        run_gfs(tmp.path(), &["checkout", "no-such-branch"]).0,
+        1,
+        "it ran and failed, which is not the same as not running"
+    );
 }
 
 /// Three messages that described something other than what was wrong.
