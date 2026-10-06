@@ -160,13 +160,18 @@ pub async fn run(
     // collectable while knowing nothing about half the graph. Refuse: this is
     // the same failure as reporting a repository clean when a check did not run.
     if plan && !report.snapshots_checked {
-        eprintln!(
-            "{} refusing to write a collection plan: snapshots were not verified, so this run \
-             cannot tell which of them any commit still needs. Retry when the cluster is \
-             reachable",
-            red("error:")
+        // `report.exit_code()`, not a literal 2. Unverified snapshots make a run
+        // incomplete, which is 3; hardcoding 2 told a caller the repository was
+        // CORRUPT when nothing had been found wrong with it, and 2 is documented
+        // as "a collector must not run against this repository". On the
+        // Kubernetes backend with no reachable cluster that was the default
+        // answer. If there is also real corruption, `exit_code` is 2 anyway.
+        return refuse_plan(
+            json_output,
+            "refusing to write a collection plan: snapshots were not verified, so this run \
+             cannot tell which of them any commit still needs",
+            report.exit_code(),
         );
-        return Ok(2);
     }
 
     // Any run that did not complete, for any reason: an unreadable object, a
@@ -175,31 +180,53 @@ pub async fn run(
     // is precisely the live data. This gate previously fired only on exit 2, so
     // a run that exited 3 still wrote a plan directory.
     if plan && report.exit_code() == 3 {
-        eprintln!(
-            "{} refusing to write a collection plan: the check did not complete, so what it \
-             did not reach is indistinguishable from what nothing references",
-            red("error:")
+        return refuse_plan(
+            json_output,
+            "refusing to write a collection plan: the check did not complete, so what it did \
+             not reach is indistinguishable from what nothing references",
+            report.exit_code(),
         );
-        return Ok(3);
     }
 
     // Exits 2, not 1: the refusal is caused by corruption, and 1 already means
     // "unreachable objects found". Returning 1 here would make a script unable
     // to tell a broken repository from one that merely has garbage.
     if plan && !report.is_clean() && report.exit_code() == 2 {
-        eprintln!(
-            "{} refusing to write a collection plan: {} reference(s) point at something \
-             missing and {} entr(ies) could not be identified. Run `gfs fsck` to see them; \
-             a collector must not run against this repository",
-            red("error:"),
-            report.dangling.len(),
-            report.unrecognised.len()
+        return refuse_plan(
+            json_output,
+            &format!(
+                "refusing to write a collection plan: {} reference(s) point at something \
+                 missing and {} entr(ies) could not be identified. Run `gfs fsck` to see \
+                 them; a collector must not run against this repository",
+                report.dangling.len(),
+                report.unrecognised.len()
+            ),
+            report.exit_code(),
         );
-        return Ok(2);
     }
 
+    // A write failure is not a verdict. `write_plan(..)?` propagated an Err, and
+    // `main` turns any Err into exit 1 -- so on a clean repository whose `.gfs`
+    // is read-only (an operator inspecting a root-owned repo, or a read-only
+    // mount) `fsck --plan` exited 1, claiming a collector would have work to do,
+    // when the check had found nothing and the command had simply failed.
+    // Reported as could-not-run, which is what it is, and the check's own
+    // verdict goes with it.
     let plan_id = if plan {
-        Some(write_plan(&repo_path, &report)?)
+        match write_plan(&repo_path, &report) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                return refuse_plan(
+                    json_output,
+                    &format!(
+                        "the check completed and returned {}, but the plan could not be \
+                         written: {e:#}",
+                        report.exit_code()
+                    ),
+                    EXIT_COULD_NOT_RUN,
+                );
+            }
+        }
     } else {
         None
     };
@@ -307,6 +334,29 @@ fn write_plan(repo_path: &std::path::Path, report: &FsckReport) -> Result<String
 /// These lists no longer hold only hashes: an unexpected file is reported by
 /// path, a broken ref by name, a missing thing by a parenthetical description.
 /// Blindly taking the first seven characters turned `.gfs/objects` into
+/// Report a refusal to write a plan, on the channel the caller asked for.
+///
+/// Every one of these used to be a bare `eprintln!`, so `--plan --json` left
+/// stdout empty on all three paths while the comment twenty lines above
+/// explained why that was wrong for the could-not-run path. A helper, so a
+/// fourth refusal cannot be added that forgets again.
+///
+/// `exit_code` comes from the report rather than a literal: a refusal is a
+/// statement about the repository, and the report already knows which one.
+fn refuse_plan(json_output: bool, message: &str, exit_code: i32) -> Result<i32> {
+    if json_output {
+        println_safe!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "error": { "message": message, "details": message, "exit_code": exit_code }
+            }))
+            .unwrap_or_else(|_| "{\"error\":{\"message\":\"serialization failed\"}}".into())
+        )?;
+    } else {
+        eprintln!("{} {message}", red("error:"));
+    }
+    Ok(exit_code)
+}
 /// `.gfs/ob` and `(snapshot directory is empty)` into `(snapsh`.
 fn short(value: &str) -> String {
     if value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit()) {
