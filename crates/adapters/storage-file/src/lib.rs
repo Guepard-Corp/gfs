@@ -178,7 +178,9 @@ fn attrib_error(path: &Path, out: &std::process::Output) -> StorageError {
 ///
 /// * **macOS** – `cp -cRp` triggers clonefile(2) COW on APFS.
 /// * **Linux** – `cp --reflink=auto -a` uses Btrfs/XFS COW when available,
-///   and falls back to a regular deep copy on other filesystems.
+///   and falls back to a regular deep copy on other filesystems. That fallback
+///   is silent — exit 0, empty stderr — so the capability is probed first and
+///   the degradation reported. See [`gfs_domain::utils::reflink`].
 /// * **Windows** – `robocopy /E /COPY:DAT` (not `/COPYALL`, which needs audit privileges).
 async fn copy_dir(src: &str, dst: &str) -> Result<()> {
     let dst_path = Path::new(dst);
@@ -186,6 +188,10 @@ async fn copy_dir(src: &str, dst: &str) -> Result<()> {
         tokio::fs::create_dir_all(parent)
             .await
             .map_err(StorageError::Io)?;
+
+        // `--reflink=auto` degrades to a full byte copy in silence. Say so.
+        #[cfg(target_os = "linux")]
+        gfs_domain::utils::reflink::warn_if_full_copy(Path::new(src), parent);
     }
 
     // Windows: strip the `\\?\` extended-length-path prefix that

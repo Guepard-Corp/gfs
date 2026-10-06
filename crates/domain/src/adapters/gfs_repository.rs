@@ -51,6 +51,10 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
 
     #[cfg(target_os = "linux")]
     {
+        // Report, before the copy, when a restore will duplicate every byte
+        // rather than share extents with the snapshot it came from.
+        crate::utils::reflink::warn_if_full_copy(src, dst);
+
         let source = src.join(".");
         let output = Command::new(crate::utils::system_bin::resolve("cp"))
             .args(["--reflink=auto", "-a"])
