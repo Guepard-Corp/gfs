@@ -58,9 +58,16 @@ fn commit_with_path_succeeds_from_an_unrelated_working_directory() {
     // The precondition this test exists for. `init .` records a RELATIVE path,
     // and if that ever changes this test would still pass while exercising a
     // repository shape that was never broken — so assert it rather than assume.
+    //
+    // What matters is that the value has to be resolved against something, not
+    // how it is spelled: `init` builds it with `Path::join`, so the separators
+    // and the leading component are platform-native — `./.gfs/workspaces/...`
+    // on Unix, `.\.gfs\workspaces\...` on Windows. Asserting the `./` prefix
+    // asserted the spelling, and rejected a Windows repository that was in
+    // exactly the state under test.
     let recorded = seed(&repo);
     assert!(
-        recorded.starts_with("./"),
+        Path::new(&recorded).is_relative(),
         "`init .` is expected to record a relative workspace, got {recorded:?}; \
          this test no longer covers the case it was written for"
     );
