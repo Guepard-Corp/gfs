@@ -1116,7 +1116,13 @@ pub fn check_with(
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .to_string(),
-            reason: "unexpected entry in the object store".to_string(),
+            // "unexpected" on its own leaves the reader guessing. A shard is two
+            // hex characters; anything else here is something fsck cannot classify
+            // and therefore cannot tell a collector to keep or remove -- which is
+            // why it refuses rather than ignoring it.
+            reason: "not a two-character hex shard, so the object store holds an entry \
+                     fsck cannot classify"
+                .to_string(),
             bytes: object_size(&path),
         });
     }
@@ -1289,7 +1295,9 @@ pub fn check_with(
                     .unwrap_or(&path)
                     .to_string_lossy()
                     .to_string(),
-                reason: "unexpected entry in the snapshot store".to_string(),
+                reason: "not a two-character hex shard, so the snapshot store holds an \
+                         entry fsck cannot classify"
+                    .to_string(),
                 bytes: 0,
             });
         }

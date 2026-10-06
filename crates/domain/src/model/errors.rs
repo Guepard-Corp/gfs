@@ -33,7 +33,11 @@ pub enum CommitError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RepoError {
-    #[error("No .gfs repository found in {0} or any parent directory")]
+    // No caller searches upward -- status, log, branch and fsck each look in the
+    // one directory they were given -- so the old text sent people hunting for a
+    // parent that was never consulted. Naming the absent search is worth a clause:
+    // it explains why the working directory matters.
+    #[error("no .gfs directory in {0} (gfs does not search parent directories)")]
     NoRepoFound(PathBuf),
     #[error("not a GFS repository: '{0}' has no .gfs directory (run `gfs init` there)")]
     NotARepository(PathBuf),

@@ -113,11 +113,22 @@ pub async fn run(
         // unknown. Verifying nothing is the honest outcome; guessing either way
         // invents a finding.
         (None, None) => {
-            eprintln!(
-                "{} could not read the repository config, so the storage backend is unknown; \
-                 snapshots will not be verified",
-                yellow("warning:")
-            );
+            // Only warn when there is a repository whose config would not read.
+            // With no `.gfs` at all the config is absent for the obvious reason,
+            // and this warning fired first and then contradicted itself: a
+            // directory with no repository printed "could not read the repository
+            // config" and, one line later, "not a GFS repository".
+            // `is_dir()`, not `exists()`: a `.gfs` that is a regular file is not a
+            // repository either, and gating on mere existence let the warning fire
+            // beside "<path>/.gfs exists but is not a directory" -- two messages
+            // for one problem, the first of them beside the point.
+            if repo_path.join(GFS_DIR).is_dir() {
+                eprintln!(
+                    "{} could not read the repository config, so the storage backend is \
+                     unknown; snapshots will not be verified",
+                    yellow("warning:")
+                );
+            }
             SnapshotSource::Unavailable
         }
     };
@@ -137,11 +148,24 @@ pub async fn run(
                 std::fs::metadata(repo_path.join(GFS_DIR)),
                 Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
             );
+            // `.gfs` present but not a directory is its own case, and it used to
+            // fall through to the raw repository error -- which told the user no
+            // repository was found "in <dir> or any parent directory" when the
+            // thing was right there, as a file.
+            let not_a_directory = matches!(
+                std::fs::metadata(repo_path.join(GFS_DIR)),
+                Ok(ref m) if !m.is_dir()
+            );
             let message = if missing {
                 format!(
                     "not a GFS repository: no {GFS_DIR} in {} (run from a repo root or use \
                      --path <dir>)",
                     repo_path.display()
+                )
+            } else if not_a_directory {
+                format!(
+                    "not a GFS repository: {} exists but is not a directory",
+                    repo_path.join(GFS_DIR).display()
                 )
             } else {
                 format!("could not complete the check: {e}")

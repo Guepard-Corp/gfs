@@ -482,6 +482,64 @@ fn a_closed_reader_does_not_replace_the_exit_status() {
     }
 }
 
+/// Three messages that described something other than what was wrong.
+///
+/// The config warning fired wherever the config could not be read -- including
+/// where there was no repository to have one, so an empty directory printed
+/// "could not read the repository config" and then, one line later, "not a GFS
+/// repository". A `.gfs` that was a regular file fell through to an error saying
+/// no repository was found "in <dir> or any parent directory", when the thing was
+/// right there as a file and no command searches parents at all.
+#[test]
+fn a_directory_with_no_repository_does_not_warn_about_a_config_it_could_not_have() {
+    let tmp = TempDir::new().unwrap();
+    let (_, _, stderr) = run_gfs(tmp.path(), &["fsck"]);
+    assert!(
+        !stderr.contains("could not read the repository config"),
+        "no repository here, so there is no config to warn about: {stderr}"
+    );
+    assert!(
+        stderr.contains("not a GFS repository"),
+        "it must still say what is wrong: {stderr}"
+    );
+    assert!(
+        !stderr.contains("parent directory"),
+        "no gfs command searches parents, so it must not claim it did: {stderr}"
+    );
+}
+
+/// And the case that used to produce the parent-directory claim: `.gfs` present,
+/// but as a file.
+#[test]
+fn a_gfs_that_is_a_file_says_that_rather_than_that_nothing_was_found() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join(".gfs"), b"not a directory").unwrap();
+    let (_, _, stderr) = run_gfs(tmp.path(), &["fsck"]);
+    assert!(
+        stderr.contains("is not a directory"),
+        "the real problem is that .gfs is a file: {stderr}"
+    );
+    assert!(
+        !stderr.contains("could not read the repository config"),
+        "one problem, one message: {stderr}"
+    );
+}
+
+/// The control for both: a REAL repository whose config will not parse is exactly
+/// what that warning is for, and it must still fire. Without this the two above
+/// would pass just as well if the warning had been deleted.
+#[test]
+fn a_real_repository_with_an_unreadable_config_still_warns() {
+    let tmp = TempDir::new().unwrap();
+    assert_eq!(run_gfs(tmp.path(), &["init", "."]).0, 0, "init");
+    std::fs::write(tmp.path().join(".gfs/config.toml"), b"garbage {{{").unwrap();
+    let (_, _, stderr) = run_gfs(tmp.path(), &["fsck"]);
+    assert!(
+        stderr.contains("could not read the repository config"),
+        "this is the case the warning exists for: {stderr}"
+    );
+}
+
 /// The output layer is shared, so the closed-reader fix has to hold outside
 /// fsck too -- and measured on this branch it did not: `gfs log --json` with the
 /// reader gone exited 101, a panic, which is outside every exit code this CLI
