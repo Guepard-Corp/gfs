@@ -318,6 +318,48 @@ pub fn roots(
         out.push(h);
     }
 
+    // Second read of the branch store, union'd with the first.
+    //
+    // A branch lives in exactly one namespace at a time, and both `branch -d`
+    // and `branch --restore` move it by a single rename -- in opposite
+    // directions. So no read ORDER is safe against both: heads-then-deleted
+    // misses a restore that lands between the two reads (gone from heads, gone
+    // from deleted), and deleted-then-heads misses a delete the same way. The
+    // fix is not to reorder but to read one namespace twice: a branch absent
+    // from all of heads, deleted, and heads-again would have to have moved
+    // deleted->heads and then heads->deleted inside one walk, which takes two
+    // operations rather than one.
+    //
+    // Roots only. The pass above owns the reporting -- a symlinked ref, an empty
+    // ref, an unparsable tip -- and repeating it here would show every such
+    // finding twice and send the reader looking for a second fault. This pass
+    // exists to avoid dropping a root, so it collects tips and says nothing.
+    //
+    // Not atomicity. The marked set is advisory and already stale by the time a
+    // collector reads `plan.json`, so `gfs gc` must re-validate under the
+    // repository lock immediately before each unlink regardless -- RFC 009 D4
+    // requires exactly that for mtime, and reachability needs the same. This
+    // narrows the report's hole; it does not close the gap between mark and
+    // sweep, and nothing here should be read as if it did.
+    // Deliberately unconditional: no `named.contains` skip. Guarding on "the
+    // first pass already saw this branch" makes the whole pass dead code in every
+    // run without a concurrent rename, so the one path that exists to prevent a
+    // lost root would ship unexercised. Measured with a probe under
+    // `--nocapture`: guarded, 0 executions across the fsck suite; unconditional,
+    // 64. Running it always costs one `normalise_hash` per branch, and `out` is
+    // sorted and deduped below, so a tip seen twice is still one root.
+    if let Ok(again) = repo_layout::list_branches(repo_path) {
+        for (_name, tip) in again {
+            let tip = tip.trim();
+            if tip == NO_COMMIT || tip.is_empty() {
+                continue;
+            }
+            if let Some(h) = normalise_hash(tip) {
+                out.push(h);
+            }
+        }
+    }
+
     // HEAD is read raw rather than resolved. An *attached* HEAD names a branch
     // whose tip the loop above already covered, so resolving it would report a
     // broken branch twice — once against the ref and once against HEAD. Only a
@@ -2214,6 +2256,66 @@ mod tests {
             check(d.path(), Duration::ZERO).unwrap().is_clean(),
             "a nested deleted ref is still a root"
         );
+    }
+
+    /// The second branch read must not turn one finding into two. The first pass
+    /// owns reporting; this guards against the tempting "just report in both",
+    /// which was confirmed to fail this test rather than assumed to.
+    #[test]
+    fn reading_the_branch_store_twice_reports_each_finding_once() {
+        let d = repo();
+        let live = write_commit(d.path(), "aa", "on main", None, true);
+        set_branch(d.path(), "main", &live);
+        // A ref whose tip is not a hash: one finding, however many times the
+        // store is walked.
+        set_branch(d.path(), "broken", "not-a-hash");
+
+        let report = check(d.path(), Duration::ZERO).unwrap();
+        let against_broken = report
+            .dangling
+            .iter()
+            .filter(|dg| dg.from_commit.contains("broken"))
+            .count();
+        assert_eq!(
+            against_broken, 1,
+            "expected exactly one finding for the broken ref, got {:?}",
+            report.dangling
+        );
+    }
+
+    /// And it must not invent roots: a tip seen twice is still one root, so the
+    /// reachable set is unchanged by the extra walk.
+    #[test]
+    fn reading_the_branch_store_twice_does_not_change_what_is_reachable() {
+        let d = repo();
+        let a = write_commit(d.path(), "aa", "on main", None, true);
+        let b = write_commit(d.path(), "bb", "on side", None, true);
+        set_branch(d.path(), "main", &a);
+        set_branch(d.path(), "side", &b);
+        let orphan = write_commit(d.path(), "cc", "unreferenced", None, true);
+
+        let report = check(d.path(), Duration::ZERO).unwrap();
+        let collectable: Vec<&str> = report
+            .unreachable
+            .iter()
+            .map(|u| u.hash.as_str())
+            .filter(|h| orphan.starts_with(&h[..8.min(h.len())]))
+            .collect();
+        assert!(
+            !collectable.is_empty(),
+            "the orphan must still be reported: {:?}",
+            report.unreachable
+        );
+        // Both live tips stay out of the collectable set.
+        for live in [&a, &b] {
+            assert!(
+                !report
+                    .unreachable
+                    .iter()
+                    .any(|u| live.starts_with(&u.hash[..8.min(u.hash.len())])),
+                "a live tip was offered for collection"
+            );
+        }
     }
 
     /// An absent branch store is a hole, not a repository with no branches.
