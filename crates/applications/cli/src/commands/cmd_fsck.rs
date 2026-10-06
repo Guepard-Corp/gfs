@@ -529,9 +529,9 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
         println_safe!(
             "  {}",
             dimmed(format!(
-                "{} working copies, {} \u{2014} listed, NOT safe to delete: checkout only \
-                 restores a workspace that is absent, so removing one destroys live database \
-                 state it would otherwise have preserved",
+                "{} working copies, {} \u{2014} listed for review, not collected: the \
+                 branch each belonged to is gone, so nothing will restore them, and nothing \
+                 here can tell whether one holds uncommitted work no commit records",
                 report.reclaimable_workspaces.len(),
                 fmt_bytes(report.reclaimable_workspace_bytes)
             ))
@@ -614,8 +614,8 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
         // lines contradicting each other is worse than either alone.
         if report.unreachable.is_empty() {
             println_safe!(
-                "repository is consistent; the working copies above are unneeded but NOT safe \
-                 to remove"
+                "repository is consistent; the working copies above are unneeded but are \
+                 listed for review rather than collected"
             )?;
         } else if report.reclaimable_workspaces.is_empty() {
             println_safe!("repository is consistent; the objects above are collectable")?;

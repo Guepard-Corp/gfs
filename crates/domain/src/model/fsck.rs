@@ -124,12 +124,20 @@ pub struct Unrecognised {
 pub struct ReclaimableWorkspace {
     /// Whether removing this is safe.
     ///
-    /// Always `false` today, and a field rather than a doc note because a JSON
-    /// consumer cannot read doc notes. `checkout` only restores a workspace that
-    /// is *absent*, so deleting one destroys live database state it would
-    /// otherwise have preserved, and GFS has no dirty check that could say
-    /// whether that state mattered. It becomes `true` when checkout always
-    /// restores from the snapshot.
+    /// Still `false`, and a field rather than a doc note because a JSON consumer
+    /// cannot read doc notes. The original reason has expired: `checkout` no
+    /// longer preserves an existing workspace -- it unconditionally removes and
+    /// repopulates it -- and a dirty check does exist, refusing a checkout that
+    /// would overwrite uncommitted work.
+    ///
+    /// It stays `false` for a different reason. The workspaces listed here are
+    /// the ones whose branch is *gone*, so no checkout will ever target them,
+    /// which means that dirty check never runs for them either. Deciding whether
+    /// such a workspace holds work no commit records would mean diffing it
+    /// against the deleted branch's tip, which may itself be unreachable. Until
+    /// that question is answered cheaply, `true` here would risk deleting a
+    /// developer's uncommitted work in the one category that is usually the
+    /// largest thing in a repository.
     pub safe_to_remove: bool,
     /// Path relative to `.gfs/`, e.g. `workspaces/feature/0`.
     pub path: String,
@@ -255,14 +263,18 @@ pub struct FsckReport {
     /// Working copies no branch or reachable commit needs, reported apart from
     /// `unreachable` because they are not graph objects.
     ///
-    /// **Reported, never safe to delete on today's `main`.** A workspace is not
-    /// a cache here: `GfsRepository::checkout` populates from a snapshot *only
-    /// when the workspace does not exist*, explicitly to preserve live database
-    /// state. So removing one destroys state that a checkout would have kept,
-    /// and no dirty check exists to say whether that state matters.
+    /// **Reported, not yet collectable.** Checkout now always restores from the
+    /// snapshot -- it removes the workspace and repopulates it, rather than
+    /// preserving an existing one -- so a workspace *is* a cache for any branch
+    /// that still exists, and the earlier reason for never touching these has
+    /// gone.
     ///
-    /// It becomes a cache — and this list becomes actionable — once checkout
-    /// always restores from the snapshot. That change is in flight, not merged.
+    /// What remains is narrower: every workspace listed here belongs to a branch
+    /// that no longer exists, so nothing will ever restore it and the dirty
+    /// check that guards a rebuild never runs for it. Whether it holds work no
+    /// commit records cannot be answered without a baseline that may itself be
+    /// unreachable, so they are reported for a human to review rather than
+    /// marked collectable.
     pub reclaimable_workspaces: Vec<ReclaimableWorkspace>,
 
     /// Bytes held by [`Self::reclaimable_workspaces`]. Same upper-bound caveat
