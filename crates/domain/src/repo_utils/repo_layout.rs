@@ -1639,6 +1639,44 @@ fn is_ignorable_sidecar(path: &str, size: u64) -> bool {
     path.ends_with("-shm") || (path.ends_with("-wal") && size == 0)
 }
 
+/// Whether a `workspace_changes` comparison could consult mtime for every file
+/// it found in both places.
+///
+/// `workspace_changes` falls back to comparing size alone when either side lacks
+/// `mtime_ns` -- `FileAttrs.mtime_ns` is `Option` behind `#[serde(default)]` so
+/// commits written before the field existed still decode. An empty change list
+/// from a size-only comparison means "no file changed length", which for a
+/// database is nearly worthless: PostgreSQL pages and SQLite pages are
+/// fixed-width, so an in-place update changes content without changing size.
+///
+/// A caller that only reports differences can ignore this. A caller that acts on
+/// the absence of differences -- deleting something because it "matches" -- must
+/// not, which is why this is a separate query rather than a stricter comparison:
+/// making `workspace_changes` itself report every file changed would turn every
+/// pre-`mtime_ns` commit into a false positive for `gfs status`.
+pub fn workspace_changes_are_conclusive(
+    workspace: &Path,
+    baseline: &[FileEntry],
+) -> Result<bool, RepoError> {
+    if !workspace.exists() {
+        return Ok(true);
+    }
+    let current = collect_file_entries(workspace, "")?;
+    let by_path: std::collections::HashMap<&str, &FileEntry> = baseline
+        .iter()
+        .map(|e| (e.relative_path.as_str(), e))
+        .collect();
+    Ok(current
+        .iter()
+        .filter(|entry| !is_ignorable_sidecar(&entry.relative_path, entry.file_size))
+        .filter_map(|entry| {
+            by_path
+                .get(entry.relative_path.as_str())
+                .map(|b| (b, entry))
+        })
+        .all(|(base, entry)| mtime_ns(base).is_some() && mtime_ns(entry).is_some()))
+}
+
 pub fn workspace_changes(
     workspace: &Path,
     baseline: &[FileEntry],
@@ -1669,6 +1707,11 @@ pub fn workspace_changes(
                     }
                     match (mtime_ns(base), mtime_ns(entry)) {
                         (Some(a), Some(b)) => a != b,
+                        // Size matched and mtime could not be consulted, so this
+                        // file is "unchanged as far as we can tell" -- which is not
+                        // the same as unchanged. `workspace_changes_are_conclusive`
+                        // reports whether that happened, for callers that need the
+                        // difference.
                         _ => false,
                     }
                 }

@@ -558,16 +558,34 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
                 dimmed(&w.reason)
             )?;
         }
-        println_safe!(
-            "  {}",
-            dimmed(format!(
-                "{} working copies, {} \u{2014} listed for review, not collected: the \
+        // Split by `safe_to_remove` rather than asserting none of them are. This
+        // line said "not collected" unconditionally, which was true while the field
+        // could only be false and became a flat contradiction of the JSON once it
+        // could be true -- the per-entry reason printed just above already
+        // disagreed with it.
+        let safe_count = report
+            .reclaimable_workspaces
+            .iter()
+            .filter(|w| w.safe_to_remove)
+            .count();
+        let total = report.reclaimable_workspaces.len();
+        let summary = if safe_count == 0 {
+            format!(
+                "{total} working copies, {} \u{2014} listed for review, not collected: the \
                  branch each belonged to is gone, so nothing will restore them, and nothing \
                  here can tell whether one holds uncommitted work no commit records",
-                report.reclaimable_workspaces.len(),
                 fmt_bytes(report.reclaimable_workspace_bytes)
-            ))
-        )?;
+            )
+        } else {
+            format!(
+                "{total} working copies, {} \u{2014} {safe_count} match the commit they came \
+                 from in size and modification time and are collectable; the rest are listed \
+                 for review, because nothing here can tell whether one holds uncommitted work \
+                 no commit records",
+                fmt_bytes(report.reclaimable_workspace_bytes)
+            )
+        };
+        println_safe!("  {}", dimmed(summary))?;
     }
 
     if !report.dangling.is_empty() {
@@ -641,16 +659,27 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
             )
         )?;
     } else if report.dangling.is_empty() && report.unrecognised.is_empty() {
-        // Deliberately does not say "everything above is collectable": the
-        // working-copy section directly above says the opposite, and the two
-        // lines contradicting each other is worse than either alone.
-        if report.unreachable.is_empty() {
+        // Follows `safe_to_remove` rather than asserting what it must be. The
+        // comment that stood here said two contradicting lines are worse than
+        // either alone, which was right -- and then the field became derivable and
+        // these lines became the contradiction, claiming nothing is collected while
+        // the JSON for the same run said a working copy was safe to remove.
+        let any_safe = report
+            .reclaimable_workspaces
+            .iter()
+            .any(|w| w.safe_to_remove);
+        if report.reclaimable_workspaces.is_empty() {
+            println_safe!("repository is consistent; the objects above are collectable")?;
+        } else if report.unreachable.is_empty() && !any_safe {
             println_safe!(
                 "repository is consistent; the working copies above are unneeded but are \
                  listed for review rather than collected"
             )?;
-        } else if report.reclaimable_workspaces.is_empty() {
-            println_safe!("repository is consistent; the objects above are collectable")?;
+        } else if any_safe {
+            println_safe!(
+                "repository is consistent; the objects above are collectable, and the working \
+                 copies marked safe to remove -- the rest are listed for review"
+            )?;
         } else {
             println_safe!(
                 "repository is consistent; the objects above are collectable, the working \

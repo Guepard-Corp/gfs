@@ -124,8 +124,17 @@ pub struct Unrecognised {
 pub struct ReclaimableWorkspace {
     /// Whether removing this is safe.
     ///
-    /// Still `false`, and a field rather than a doc note because a JSON consumer
-    /// cannot read doc notes. The original reason has expired: `checkout` no
+    /// `true` only for a DETACHED working copy whose every file matches the commit
+    /// it came from in size and modification time. It is a stat comparison, not a
+    /// content one: nothing reads the bytes, so this is the evidence `rsync` and
+    /// `make` act on rather than proof. A collector must re-check under the
+    /// repository lock before unlinking.
+    ///
+    /// `false` whenever that cannot be established -- a branch workspace, whose
+    /// baseline is gone with its branch; a commit object that will not read; a
+    /// comparison that could not consult modification times, which for a database
+    /// means size alone and a database writes in fixed-width pages. The original
+    /// reason this was always `false` has expired: `checkout` no
     /// longer preserves an existing workspace -- it unconditionally removes and
     /// repopulates it -- and a dirty check does exist, refusing a checkout that
     /// would overwrite uncommitted work.
@@ -263,7 +272,7 @@ pub struct FsckReport {
     /// Working copies no branch or reachable commit needs, reported apart from
     /// `unreachable` because they are not graph objects.
     ///
-    /// **Reported, not yet collectable.** Checkout now always restores from the
+    /// **Reported; collectable only where `safe_to_remove` says so.** Checkout now always restores from the
     /// snapshot -- it removes the workspace and repopulates it, rather than
     /// preserving an existing one -- so a workspace *is* a cache for any branch
     /// that still exists, and the earlier reason for never touching these has

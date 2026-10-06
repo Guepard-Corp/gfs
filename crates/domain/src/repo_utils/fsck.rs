@@ -370,6 +370,29 @@ pub fn roots(
     // detached HEAD contributes a root the branches do not.
     let head_path = repo_path.join(GFS_DIR).join(HEAD_FILE);
     let head_raw = match std::fs::read_to_string(&head_path) {
+        // Empty is a hole for the same reason absence is, and it used to be
+        // neither. `init` writes `ref: refs/heads/<name>`, a detached checkout
+        // writes a hash, and a repository with no commit yet writes the
+        // `NO_COMMIT` sentinel -- so nothing in gfs ever writes an empty HEAD, and
+        // reading one means a write did not finish. `update_head_with_commit` uses
+        // a bare `fs::write`: `O_TRUNC` then `write_all`, with no temp-and-rename,
+        // so a process killed between those two calls -- or an `ENOSPC` on the
+        // write -- leaves exactly this.
+        //
+        // Treated as a legitimate "HEAD names nothing" it dropped the detached
+        // root silently: the guard below skips an empty string, so no root was
+        // pushed and no hole was recorded, and a commit whose only root was a
+        // detached HEAD was reported collectable under a clean walk. That is the
+        // hazard the comment on the `Err` arm describes, reached by a different
+        // door.
+        Ok(h) if h.trim().is_empty() => {
+            blind.at(
+                repo_path,
+                &head_path,
+                "is empty, so whether HEAD was detached cannot be known",
+            );
+            String::new()
+        }
         Ok(h) => h.trim().to_string(),
         // Every failure here is a hole, absence included. Elsewhere NotFound is a
         // real answer -- `refs/deleted` does not exist until a branch is soft-deleted
@@ -1565,8 +1588,14 @@ fn reclaimable_workspaces(
 
 /// Detached working copies, keyed by a 12-character commit prefix rather than a
 /// full hash, so liveness is a prefix match against the reachable set.
-/// Whether a detached workspace's content still matches the commit it was
-/// checked out from.
+/// Whether a detached workspace still matches the commit it was checked out from,
+/// **as far as a stat comparison can tell**.
+///
+/// This does NOT read file contents. `workspace_changes` compares size, then
+/// modification time, and only when both sides recorded one. So a `true` here
+/// means "same length and same mtime for every file", which is the same evidence
+/// `rsync` and `make` act on -- strong, but not proof. A caller acting on it to
+/// DELETE must treat it as advisory and re-check under a lock.
 ///
 /// `safe_to_remove` was hardcoded `false` because answering this was thought to
 /// need a baseline that is gone. For a DETACHED workspace it is not: the
@@ -1592,7 +1621,15 @@ fn detached_matches_its_commit(
         return None;
     }
     let changes = repo_layout::workspace_changes(&data, &baseline).ok()?;
-    Some(changes.is_empty())
+    if !changes.is_empty() {
+        return Some(false);
+    }
+    // An empty change list is only worth acting on if the comparison could see
+    // mtime for every file. Without it the comparison is size-only, and a database
+    // writes in fixed-width pages -- PostgreSQL 8 KiB, SQLite likewise -- so a
+    // whole table can be rewritten without any file changing length. Treating that
+    // as "matches" marked a diverged working copy safe to delete.
+    repo_layout::workspace_changes_are_conclusive(&data, &baseline).ok()
 }
 
 /// What a detached-workspace walk accumulates, grouped so the walk's inputs stay
@@ -1648,12 +1685,14 @@ fn collect_detached(
             safe_to_remove: matches == Some(true),
             path: format!("{WORKSPACES_DIR}/detached/{prefix}"),
             reason: match matches {
-                Some(true) => "no reachable commit starts with this hash, and its \
-                               content still matches that commit"
+                Some(true) => "no reachable commit starts with this hash, and every \
+                               file matches that commit in size and modification \
+                               time"
                     .to_string(),
-                Some(false) => "no reachable commit starts with this hash, and its \
-                                content has diverged from that commit -- it may hold \
-                                work no commit records"
+                Some(false) => "no reachable commit starts with this hash, and it \
+                                differs from that commit, or the comparison could \
+                                not consult modification times -- it may hold work \
+                                no commit records"
                     .to_string(),
                 None => "no reachable commit starts with this hash, and the commit it \
                          was checked out from could not be read to compare against"
@@ -2044,6 +2083,58 @@ mod tests {
             3,
             "did-not-run is not the same as found-garbage"
         );
+    }
+
+    /// All four HEAD states, because the two that were covered sat either side of
+    /// the one that was not.
+    ///
+    /// Absent was a hole and truncated was corruption; EMPTY was neither, and an
+    /// empty HEAD is what a bare `fs::write` leaves when the process dies between
+    /// `O_TRUNC` and `write_all`. The guard that skips an attached HEAD also skips
+    /// an empty string, so no root was pushed and no hole recorded -- a commit
+    /// whose only root was a detached HEAD was reported collectable under a clean
+    /// walk. The control matters as much as the rest: a well-formed HEAD must stay
+    /// exit 0, or this fix would condemn every repository.
+    #[test]
+    fn every_unusable_head_is_a_hole_and_a_usable_one_is_not() {
+        for (label, write_head) in [
+            ("absent", None),
+            ("empty", Some("")),
+            ("whitespace", Some("  \n ")),
+        ] {
+            let d = repo();
+            let h = write_commit(d.path(), "aa", "live", None, true);
+            set_branch(d.path(), "main", &h);
+            let head = d.path().join(GFS_DIR).join(HEAD_FILE);
+            match write_head {
+                None => fs::remove_file(&head).unwrap(),
+                Some(body) => fs::write(&head, body).unwrap(),
+            }
+
+            let r = check(d.path(), Duration::ZERO).unwrap();
+            assert!(
+                !r.reachability_complete,
+                "{label}: an unusable HEAD must leave the walk incomplete"
+            );
+            assert_eq!(
+                r.exit_code(),
+                3,
+                "{label}: it is a hole, not a verdict -- unreadable: {:?}",
+                r.unreadable
+            );
+            assert!(
+                r.unreachable.is_empty() && r.reclaimable_workspaces.is_empty(),
+                "{label}: nothing may be offered for collection from an incomplete walk"
+            );
+        }
+
+        // The control. Without it, returning 3 unconditionally would pass above.
+        let d = repo();
+        let h = write_commit(d.path(), "aa", "live", None, true);
+        set_branch(d.path(), "main", &h);
+        let r = check(d.path(), Duration::ZERO).unwrap();
+        assert_eq!(r.exit_code(), 0, "a well-formed HEAD is not a hole");
+        assert!(r.reachability_complete);
     }
 
     #[test]
@@ -2898,22 +2989,30 @@ mod tests {
         assert!(json.contains("\"safe_to_remove\":false"), "got {json}");
     }
 
-    /// A commit that records exactly one file, plus a detached workspace holding
-    /// that file with matching size. Returns the workspace's data directory.
+    /// A commit recording one file, plus a detached workspace holding it.
     ///
-    /// The file list matters: a commit without one cannot be compared against, so
-    /// `safe_to_remove` is correctly `false` and a fixture built on `write_commit`
-    /// tests the unrecoverable-baseline path instead of the matching one.
-    fn detached_workspace_matching(repo: &std::path::Path, seed: &str) -> std::path::PathBuf {
+    /// `with_mtime: false` reproduces a commit written before `mtime_ns` existed
+    /// (`file_attributes: None`), where the comparison degrades to size alone.
+    /// That is not a corner — it is every commit on disk from before the field
+    /// landed — and this fixture was built that way by accident, so these tests
+    /// were exercising the size-only path while claiming to check a content match.
+    fn detached_workspace_matching_with(
+        repo: &std::path::Path,
+        seed: &str,
+        with_mtime: bool,
+    ) -> std::path::PathBuf {
         let body = b"recorded";
-        let entries = vec![crate::model::commit::FileEntry {
-            relative_path: "db".to_string(),
-            file_size: body.len() as u64,
-            owner: None,
-            group: None,
-            permissions: None,
-            file_attributes: None,
-        }];
+        // Write the file, then read its real metadata: the baseline a commit holds
+        // is exactly what `collect_file_entries` saw on disk, mtime included.
+        let staging = repo.join(GFS_DIR).join(format!("staging-{seed}"));
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("db"), body).unwrap();
+        let mut entries = repo_layout::collect_file_entries(&staging, "").unwrap();
+        if !with_mtime {
+            for e in &mut entries {
+                e.file_attributes = None;
+            }
+        }
         let files_ref = repo_layout::write_files_object(repo, &entries).unwrap();
         let commit = write_commit_with_files(repo, seed, &files_ref);
         let dir = repo
@@ -2923,8 +3022,24 @@ mod tests {
             .join(&commit[..12])
             .join(WORKSPACE_DATA_DIR);
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("db"), body).unwrap();
+        fs::copy(staging.join("db"), dir.join("db")).unwrap();
+        // `fs::copy` preserves permissions but not mtime, and the two agreeing is
+        // the whole point of the comparison under test.
+        let want = fs::metadata(staging.join("db"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(dir.join("db"))
+            .unwrap()
+            .set_modified(want)
+            .unwrap();
         dir
+    }
+
+    fn detached_workspace_matching(repo: &std::path::Path, seed: &str) -> std::path::PathBuf {
+        detached_workspace_matching_with(repo, seed, true)
     }
 
     /// A detached workspace whose content still matches the commit it came from
@@ -2972,7 +3087,63 @@ mod tests {
             "it holds a file no commit records: {}",
             w.reason
         );
-        assert!(w.reason.contains("diverged"), "reason: {}", w.reason);
+        assert!(w.reason.contains("differs"), "reason: {}", w.reason);
+    }
+
+    /// The size-only path must never say safe, and this is the one that was being
+    /// tested all along without anyone noticing.
+    ///
+    /// A commit written before `mtime_ns` existed records no modification time, so
+    /// the comparison falls back to size. For a database that is close to useless:
+    /// PostgreSQL and SQLite write fixed-width pages, so a table can be rewritten
+    /// with every file the same length. The fixture here keeps the sizes identical
+    /// and changes the bytes, which is exactly that case.
+    #[test]
+    fn a_size_only_comparison_is_never_enough_to_call_a_workspace_safe() {
+        let d = repo();
+        let live = write_commit(d.path(), "aa", "on main", None, true);
+        set_branch(d.path(), "main", &live);
+        let dir = detached_workspace_matching_with(d.path(), "bb", false);
+
+        // Same length, different bytes: invisible to a size comparison.
+        let before = fs::read(dir.join("db")).unwrap();
+        fs::write(dir.join("db"), vec![b'X'; before.len()]).unwrap();
+        assert_eq!(
+            fs::metadata(dir.join("db")).unwrap().len() as usize,
+            before.len(),
+            "precondition: the rewrite must not change the length"
+        );
+
+        let r = check(d.path(), Duration::ZERO).unwrap();
+        let w = r
+            .reclaimable_workspaces
+            .iter()
+            .find(|w| w.path.contains("detached"))
+            .expect("the detached workspace must be reported");
+        assert!(
+            !w.safe_to_remove,
+            "a baseline with no mtime cannot prove a match: {}",
+            w.reason
+        );
+
+        // The control: the same fixture WITH mtime recorded, left untouched, is
+        // provable. Without this the assertion above would pass if the fixture
+        // simply stopped producing a reportable workspace.
+        let d2 = repo();
+        let live2 = write_commit(d2.path(), "aa", "on main", None, true);
+        set_branch(d2.path(), "main", &live2);
+        detached_workspace_matching_with(d2.path(), "bb", true);
+        let r2 = check(d2.path(), Duration::ZERO).unwrap();
+        let w2 = r2
+            .reclaimable_workspaces
+            .iter()
+            .find(|w| w.path.contains("detached"))
+            .expect("the control workspace must be reported");
+        assert!(
+            w2.safe_to_remove,
+            "with mtime on both sides and nothing changed, it is provable: {}",
+            w2.reason
+        );
     }
 
     /// And when the baseline cannot be recovered at all, the answer is `false`.
