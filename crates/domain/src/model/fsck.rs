@@ -262,12 +262,28 @@ pub struct FsckReport {
     /// truncation alone would move the value by up to a full second, swamping
     /// the thing being fixed.
     ///
-    /// Carried out of the domain so a persisted plan can record the epoch the
-    /// mark ran against. Stamping it at write time instead dates the plan AFTER
-    /// the walk, and a collector honouring that value would fail to exclude
-    /// anything created *during* the mark -- which is precisely the window in
-    /// which a commit writes its snapshot before the object referencing it.
+    /// This is the GRACE cutoff -- the mark's start minus the window -- and not
+    /// the mark epoch. It answers "how old must something be before this pass
+    /// considers it", which is not the question RFC 009 D5 asks. See
+    /// `mark_started_unix_millis` for that one; a collector that used this value
+    /// as a max-modification bound would be 24 hours early at the default window.
     pub cutoff_unix_millis: Option<u64>,
+
+    /// When the walk began, in milliseconds since the epoch.
+    ///
+    /// This is the value RFC 009 D5 needs: anything created after it is out of
+    /// scope for the sweep by construction, the way Nessie's
+    /// `--max-file-modification` defaults to the mark epoch. It is recorded
+    /// separately from `cutoff_unix_millis` because the two differ by the grace
+    /// window, and separately from the plan's directory name because that is
+    /// stamped at WRITE time, after the walk -- so everything created during the
+    /// mark is older than it and a collector using it would exclude nothing.
+    ///
+    /// Milliseconds rather than seconds for the same reason as the cutoff:
+    /// truncation to a second swamps the discrepancy this exists to make visible.
+    ///
+    /// `None` only if the system clock is before the Unix epoch.
+    pub mark_started_unix_millis: Option<u64>,
 
     /// Working copies no branch or reachable commit needs, reported apart from
     /// `unreachable` because they are not graph objects.
@@ -355,6 +371,7 @@ mod tests {
             referenced_bytes: 0,
             exclusive_bytes: None,
             cutoff_unix_millis: None,
+            mark_started_unix_millis: None,
             snapshots_checked: true,
             exclusive_is_partial: false,
             unreadable: Vec::new(),

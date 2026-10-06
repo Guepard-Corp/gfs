@@ -558,16 +558,16 @@ the same statement: the command did not run, so nothing here describes your
 repository. `--help` and `--version` exit `0`; they are requests, not errors.
 
 `3` is the one to handle first. It is not a statement about the repository — an
-unreadable object, a ref that would not resolve, or a Kubernetes backend whose
-cluster cannot be reached all produce it, and on a cluster-backed repository with
-no reachable cluster it is the ordinary answer. Treating it as `1` would read a
-check that never ran as a check that found some garbage.
+unreadable object, a `refs/heads` entry that could not be read or is absent, a
+Kubernetes backend whose cluster cannot be reached, and a usage error all produce
+it, and on a cluster-backed repository with no reachable cluster it is the
+ordinary answer. Treating it as `1` would read a check that never ran as a check
+that found some garbage.
 
-Note these codes are specific to `fsck` and deliberately differ from the
-project-wide CLI convention, where `1` means a usage error. A mistyped flag and a
-repository with collectable objects therefore both exit `1`; under `--json` they
-are distinguishable, since a findings run emits a top-level `fsck` object and a
-usage error emits `error`.
+A ref whose *value* is present but will not parse — empty, or not a hash — is
+`2`, not `3`. The distinction is deliberate: a file that could not be read is a
+hole, while a file that reads back as nonsense is corruption, and only the second
+is a statement about the repository.
 
 Reported sizes are what `du` would show for those trees, not space already free —
 on a copy-on-write filesystem a snapshot shares blocks with the tree it was

@@ -122,7 +122,13 @@ pub async fn run(
             // repository either, and gating on mere existence let the warning fire
             // beside "<path>/.gfs exists but is not a directory" -- two messages
             // for one problem, the first of them beside the point.
-            if repo_path.join(GFS_DIR).is_dir() {
+            // And not under `--json`. This is human prose on stderr, which no
+            // `RUST_LOG` or `NO_COLOR` setting suppresses because it is not a
+            // tracing event, so a caller merging the streams -- the shape most
+            // scripts and agent harnesses use -- stopped receiving parseable JSON
+            // on exactly this path. The report already carries the same fact in
+            // `snapshots_checked: false`, which is where a machine should read it.
+            if !json_output && repo_path.join(GFS_DIR).is_dir() {
                 eprintln!(
                     "{} could not read the repository config, so the storage backend is \
                      unknown; snapshots will not be verified",
@@ -181,7 +187,17 @@ pub async fn run(
                 println_safe!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
-                        "error": { "message": message, "details": format!("{e:#}") }
+                        // `exit_code` belongs here too. `refuse_plan` carries it and
+                        // this path did not, so the only structural difference
+                        // between "your flags were wrong" and "your repository is
+                        // damaged and I refused to plan" was whether the field
+                        // happened to be present -- and a consumer defaulting a
+                        // missing one to 0 read "not a GFS repository" as clean.
+                        "error": {
+                            "message": message,
+                            "details": format!("{e:#}"),
+                            "exit_code": EXIT_COULD_NOT_RUN,
+                        }
                     }))
                     .unwrap_or_else(|_| "{\"error\":{\"message\":\"serialization failed\"}}".into())
                 )?;
@@ -348,20 +364,28 @@ fn write_plan(repo_path: &std::path::Path, report: &FsckReport) -> Result<String
 
     let plan = json!({
         "mark_id": mark_id,
-        // Anything created after this instant is out of scope for the sweep by
-        // construction, the way Nessie's --max-file-modification defaults to
-        // the mark epoch.
-        // The epoch the MARK ran against, carried out of the walk -- not the
-        // clock at write time. RFC 009 D5 requires anything created after the
-        // mark began to be out of scope by construction, and a collector
-        // honouring a cutoff stamped after the walk would fail to exclude
-        // exactly what was created during it. Measured before this change:
-        // 52ms late on a 1-commit repository, 90ms with a large unreachable
-        // snapshot, and the gap tracks walk duration, so minutes on a large one.
-        // `to_rfc3339()` drops the milliseconds the field carries, which puts up
-        // to a second of slack back into the value and defeats the point: the
-        // discrepancy being fixed here was 52-90ms. Forced to millisecond
-        // precision.
+        // TWO instants, because a collector needs both and they are not the same.
+        //
+        // `mark_started` is when the walk began: RFC 009 D5's "anything created
+        // after the mark began is out of scope by construction", the way Nessie's
+        // --max-file-modification defaults to the mark epoch. `cutoff` is that
+        // instant minus the grace window, which is how old something must be
+        // before this pass considered it at all.
+        //
+        // Only `cutoff` used to be here, and a collector reading it as the mark
+        // epoch would be a whole grace window early -- 24 hours at the default.
+        // Conservative, so not dangerous, but D5 could not be implemented from the
+        // plan. `mark_id` is no substitute: it is the clock at WRITE time, after
+        // the walk, so everything created during the mark is older than it and a
+        // collector keying on it would exclude nothing.
+        //
+        // Both forced to millisecond precision. `to_rfc3339()` truncates to the
+        // second, which puts up to a second of slack back into a value whose whole
+        // purpose was to record a 52-90ms discrepancy.
+        "mark_started": report
+            .mark_started_unix_millis
+            .and_then(|ms| chrono::DateTime::from_timestamp_millis(ms as i64))
+            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
         "cutoff": report
             .cutoff_unix_millis
             .and_then(|ms| chrono::DateTime::from_timestamp_millis(ms as i64))

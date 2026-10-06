@@ -213,6 +213,31 @@ fn two_level(
                 junk.push(entry.path());
                 continue;
             }
+            // The same rule as the shard above, for the same reason. Without it a
+            // symlinked leaf is followed by `identify_object` and by the sizing
+            // walk: a file outside the repository is read and classified as one of
+            // its objects, a directory outside it is measured and attributed to its
+            // bytes, and both are written into a plan under a path that resolves
+            // back out. The guard existed one level up and not here.
+            match std::fs::symlink_metadata(entry.path()) {
+                Ok(m) if m.file_type().is_symlink() => {
+                    junk.push(entry.path());
+                    continue;
+                }
+                Ok(_) => {}
+                // Gone between listing and stat, as the shard treats it: gone is
+                // gone. Without this arm the race reported a hole instead, turning
+                // a concurrent write into "the check did not complete".
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    blind.at(
+                        repo_path,
+                        &entry.path(),
+                        format!("object could not be stat'd: {e}"),
+                    );
+                    continue;
+                }
+            }
             let hash = format!("{prefix_name}{rest}").to_ascii_lowercase();
             out.push((hash, entry.path()));
         }
@@ -267,6 +292,12 @@ pub fn roots(
         );
     }
     let mut named: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Refs this pass refused to follow. The second pass below re-reads every
+    // branch and does not repeat this validation, so without remembering them it
+    // resolved a refused ref's target as a root anyway -- undoing the refusal, and
+    // letting a link that may point anywhere decide what counts as live inside the
+    // repository.
+    let mut refused: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (name, tip) in repo_layout::list_branches(repo_path)? {
         named.insert(name.clone());
         // A ref is a file. A symlink where one should be sends the walk outside
@@ -282,6 +313,7 @@ pub fn roots(
                 kind: ObjectKind::Commit,
                 missing: "(symbolic link, not a ref)".to_string(),
             });
+            refused.insert(name);
             continue;
         }
         let tip = tip.trim();
@@ -353,7 +385,14 @@ pub fn roots(
     // 64. Running it always costs one `normalise_hash` per branch, and `out` is
     // sorted and deduped below, so a tip seen twice is still one root.
     if let Ok(again) = repo_layout::list_branches(repo_path) {
-        for (_name, tip) in again {
+        for (name, tip) in again {
+            // Still unconditional for every ordinary ref -- that is the point of
+            // this pass -- but not for one the first pass refused to follow.
+            // Re-resolving a symlinked ref here reinstated exactly the root the
+            // refusal was there to withhold.
+            if refused.contains(&name) {
+                continue;
+            }
             let tip = tip.trim();
             if tip == NO_COMMIT || tip.is_empty() {
                 continue;
@@ -589,15 +628,18 @@ fn soft_deleted_roots(
                             missing: brief(&body),
                         }),
                     },
-                    Err(_) => problems.push(Dangling {
-                        from_commit: path
-                            .strip_prefix(repo_path)
-                            .unwrap_or(&path)
-                            .to_string_lossy()
-                            .to_string(),
-                        kind: ObjectKind::Commit,
-                        missing: "(unreadable)".to_string(),
-                    }),
+                    // A read failure is a hole, not corruption. `Dangling` means
+                    // "a reachable commit names something that is missing", which
+                    // a collector must refuse to run against -- and a tombstone we
+                    // lack permission to read is not missing data, it is data we
+                    // could not look at. Reporting it as corruption produced
+                    // "repository is inconsistent" for a root-owned repository
+                    // inspected by a non-root operator, which is this module's own
+                    // canonical scenario and the exact false alarm `Blind` was
+                    // introduced to eliminate. The listing and stat failures in
+                    // this same function already route here; only the file read
+                    // did not.
+                    Err(e) => blind.at(repo_path, &path, format!("could not be read: {e}")),
                 }
             }
         }
@@ -1101,13 +1143,22 @@ pub fn check_with(
     let objects_dir = gfs_dir.join(OBJECTS_DIR);
     let snapshots_dir = gfs_dir.join(SNAPSHOTS_DIR);
 
-    // Taken before the walk, so anything written while this runs is newer than
-    // the cutoff by construction and cannot be collected on this pass.
+    // Two instants, and they are not the same thing. `mark_started` is when this
+    // walk began; `cutoff` is that instant minus the grace window, which is the
+    // age an object must exceed to be considered at all.
+    //
+    // Only the first can implement RFC 009 D5 -- "anything created after the mark
+    // began is out of scope by construction" -- and only the second decides what
+    // the grace window protects. The report used to carry just the cutoff, which a
+    // collector reading it as the mark epoch would use as a max-modification bound
+    // 24 hours too early at the default window: conservative, so not dangerous,
+    // but D5 cannot be built from it.
+    let mark_started = SystemTime::now();
     let cutoff = if grace.is_zero() {
         None
     } else {
         Some(
-            SystemTime::now()
+            mark_started
                 .checked_sub(grace)
                 .unwrap_or(SystemTime::UNIX_EPOCH),
         )
@@ -1427,6 +1478,10 @@ pub fn check_with(
                 .ok()
                 .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
         }),
+        mark_started_unix_millis: mark_started
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
         reclaimable_workspaces,
         reclaimable_workspace_bytes,
     })
@@ -1510,8 +1565,32 @@ fn reclaimable_workspaces(
     let mut protected = 0usize;
     let mut unreadable = Vec::new();
 
-    if !root.exists() {
-        return (out, total, protected, unreadable);
+    // The walk ROOT needs the same type check as everything beneath it, and did
+    // not have one. `exists()` and `read_dir` both follow a symlink, so pointing
+    // `.gfs/workspaces` at another volume -- a reasonable thing to do, since
+    // working copies are the largest thing a repository holds -- made the walk
+    // leave the repository and report an outside directory as a working copy
+    // "inside" it, under a relative path a collector would resolve straight back
+    // out through the link.
+    match std::fs::symlink_metadata(&root) {
+        Ok(m) if m.file_type().is_symlink() => {
+            unreadable.push(format!(
+                "{WORKSPACES_DIR} is a symlink, so what it points at was not walked"
+            ));
+            return (out, total, protected, unreadable);
+        }
+        Ok(m) if !m.is_dir() => {
+            unreadable.push(format!("{WORKSPACES_DIR} is not a directory"));
+            return (out, total, protected, unreadable);
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (out, total, protected, unreadable);
+        }
+        Err(e) => {
+            unreadable.push(format!("{WORKSPACES_DIR} could not be stat'd: {e}"));
+            return (out, total, protected, unreadable);
+        }
     }
 
     // Depth-first over real directories only. Symlinks are never followed: a
