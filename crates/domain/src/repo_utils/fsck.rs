@@ -240,9 +240,9 @@ fn is_incidental(name: &str) -> bool {
 /// detached HEAD points at a commit no branch names, and dropping it would
 /// report the commit you currently have checked out as garbage.
 ///
-/// Soft-deleted refs inside their retention window belong here too and are not
-/// yet available — `refs/deleted` arrives with the recoverable-`branch -d`
-/// work. When it lands, add the source here and nothing else changes.
+/// Soft-deleted refs are roots too, read from `refs/deleted/` by
+/// `soft_deleted_roots` below. Age is not consulted: see its own note for why
+/// over-retaining is the safe direction here.
 pub fn roots(
     repo_path: &Path,
     blind: &mut Blind,
@@ -470,9 +470,21 @@ fn between_ref_reads(_repo_path: &Path) {}
 /// treated as a root while its file exists. fsck's job is to avoid proposing
 /// the collection of anything that still has a recovery record on disk, and
 /// over-retaining is the safe direction; expiry is `branch -d`'s to enforce by
-/// removing the entry. This also means fsck needs no access to the retention
-/// setting, which does not exist on this branch, and cannot disagree with
-/// `branch -d` about the window.
+/// removing the entry.
+///
+/// The retention setting DOES exist -- `GfsConfig::deleted_branch_retention_days`,
+/// defaulting to 30 -- so this is a choice rather than an absence, and the choice
+/// has a visible cost: `gfs branch --deleted` will say a branch is no longer
+/// recoverable while its tombstone is still on disk and still rooting its data
+/// here, because `prune_expired_deleted_refs` runs only from inside
+/// `gfs branch -d`. The two disagree until the next delete happens.
+///
+/// Reading the setting instead would mean fsck deciding an entry is expired and
+/// offering its data for collection while the file that records it is still
+/// there -- a collector acting on that would delete data whose recovery record
+/// exists, which is the one thing this function is for. So the disagreement is
+/// resolved in favour of keeping the data, and the real fix belongs in expiry:
+/// whatever removes the entry should be what ends the protection.
 fn soft_deleted_roots(
     repo_path: &Path,
     problems: &mut Vec<Dangling>,
