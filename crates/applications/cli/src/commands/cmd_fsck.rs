@@ -40,11 +40,19 @@ pub async fn run(
     // window cannot produce a report at all -- let alone a `--plan` artefact
     // naming a snapshot a running commit is about to reference.
     if grace < MIN_GRACE && !disable_grace_period_check {
-        anyhow::bail!(
-            "a grace of {}s is below the {}s floor, so a commit still in flight              could be reported as garbage. Pass --disable-grace-period-check to              override it deliberately",
+        // `refuse_plan`, not `anyhow::bail!`. A bail is reported by the global
+        // handler, which exits 1 and emits an error object with no `exit_code`
+        // field -- so this refusal was indistinguishable from "the repository has
+        // collectable objects", and a consumer reading the JSON could not recover
+        // the status it should have had.
+        let message = format!(
+            "a grace of {}s is below the {}s floor, so a commit still in flight could be \
+             reported as garbage. Pass --disable-grace-period-check to override it \
+             deliberately",
             grace.as_secs(),
             MIN_GRACE.as_secs()
         );
+        return refuse_plan(json_output, &message, EXIT_COULD_NOT_RUN);
     }
 
     // On Kubernetes a snapshot is a VolumeSnapshot object, not a directory, so

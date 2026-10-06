@@ -493,8 +493,11 @@ fn a_grace_below_the_floor_is_refused_without_the_override() {
 
     for window in ["0", "1", "3599"] {
         let (code, stdout, stderr) = run_gfs(tmp.path(), &["fsck", "--grace", window]);
-        assert_ne!(
-            code, 0,
+        // Was `assert_ne!(code, 0)`, which passes for 1, 2 or 3 and so could not
+        // see that this refusal was exiting 1 -- the same code as "the repository
+        // has collectable objects". Pinned now.
+        assert_eq!(
+            code, 3,
             "a grace of {window}s must not be accepted: {stdout}"
         );
         assert!(

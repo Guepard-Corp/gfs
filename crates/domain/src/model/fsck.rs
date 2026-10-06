@@ -291,6 +291,14 @@ impl FsckReport {
     /// - `2` — corruption found, which takes priority over `1`
     /// - `3` — the check did not fully run, so it makes no claim either way
     ///
+    /// A workspace that is reported but NOT provably collectable does not reach
+    /// `1`. `1` means a collector has work to do; a listing a human should look
+    /// at is not that, and until `safe_to_remove` could be `true` this clause
+    /// fired on every reported workspace, so `1` meant "something was listed"
+    /// rather than "something can be removed". The listing stays in the report
+    /// either way -- what changes is only whether a script keyed on `1` wakes a
+    /// collector that would find nothing to do.
+    ///
     /// `3` outranks `1`. Both `0` and `1` are *statements about the
     /// repository* — one says it is clean, the other says exactly this much is
     /// garbage — and a run that could not see the snapshots is entitled to
@@ -304,7 +312,9 @@ impl FsckReport {
             2
         } else if !self.snapshots_checked || !self.unreadable.is_empty() {
             3
-        } else if !self.unreachable.is_empty() || !self.reclaimable_workspaces.is_empty() {
+        } else if !self.unreachable.is_empty()
+            || self.reclaimable_workspaces.iter().any(|w| w.safe_to_remove)
+        {
             1
         } else {
             0

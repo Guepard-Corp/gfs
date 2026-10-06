@@ -2219,8 +2219,47 @@ mod tests {
             "only the workspace with no branch is stale: {paths:?}"
         );
         assert!(r.reclaimable_workspace_bytes > 0);
-        // Waste, not corruption.
-        assert_eq!(r.exit_code(), 1);
+        // Waste, not corruption -- that distinction is the point of this
+        // assertion and it still holds.
+        assert_ne!(r.exit_code(), 2, "waste must never read as corruption");
+        // But waste that cannot be proved collectable is not `1` either. A
+        // BRANCH workspace has no recoverable baseline, so nothing here can be
+        // shown safe to remove, and `1` means a collector has work to do. The
+        // bytes above are still reported for a human to act on.
+        assert_eq!(
+            r.exit_code(),
+            0,
+            "reported but not provably collectable: {:?}",
+            r.reclaimable_workspaces
+                .iter()
+                .map(|w| (w.safe_to_remove, &w.reason))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The other direction, without which the change above is only half tested:
+    /// a workspace that IS provably collectable must still reach `1`.
+    #[test]
+    fn a_provably_collectable_workspace_still_reports_collectable_work() {
+        let d = repo();
+        let live = write_commit(d.path(), "aa", "on main", None, true);
+        set_branch(d.path(), "main", &live);
+        detached_workspace_matching(d.path(), "bb");
+
+        let r = check(d.path(), Duration::ZERO).unwrap();
+        assert!(
+            r.reclaimable_workspaces.iter().any(|w| w.safe_to_remove),
+            "fixture must produce something provably safe: {:?}",
+            r.reclaimable_workspaces
+                .iter()
+                .map(|w| (w.safe_to_remove, &w.reason))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            r.exit_code(),
+            1,
+            "something can be removed, so a collector has work"
+        );
     }
 
     /// A branch directory that merely contains nested branches is not stale.
