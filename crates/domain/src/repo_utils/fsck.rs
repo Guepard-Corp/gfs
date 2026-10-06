@@ -728,7 +728,7 @@ pub fn default_snapshot_source(repo_path: &Path) -> SnapshotSource<'static> {
         Ok(None) => SnapshotSource::Filesystem,
         Ok(Some(r)) => {
             let p = r.runtime_provider.trim().to_ascii_lowercase();
-            if p == "kubernetes" || p == "k8s" {
+            if crate::model::config::is_kubernetes_provider(&p) {
                 SnapshotSource::Unavailable
             } else {
                 SnapshotSource::Filesystem

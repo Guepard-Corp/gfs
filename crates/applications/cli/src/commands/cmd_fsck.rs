@@ -54,7 +54,20 @@ pub async fn run(
     // Scoped to this repository's own snapshot directory. The cluster namespace
     // is shared, so an unscoped listing hands fsck other deployments' snapshots,
     // which no local commit references and which therefore look collectable.
+    // Canonicalized, because the label this is matched against was. `commit`
+    // canonicalizes the repository before writing the snapshot's owner label
+    // (gfs_repository.rs:493 and :577), and the adapter matches with
+    // `starts_with`. A `--path` through a symlink -- or plain `--path .` --
+    // produced a prefix that matched nothing, so the Known map came back empty
+    // and EVERY commit read as dangling: exit 2, corruption invented out of a
+    // path spelling, on the one backend that holds production repositories.
+    //
+    // Falls back to the uncanonicalized path rather than failing: if the
+    // repository cannot be resolved the check has bigger problems, and the
+    // report already distinguishes "could not verify" from "verified clean".
     let owner_prefix = repo_path
+        .canonicalize()
+        .unwrap_or_else(|_| repo_path.clone())
         .join(GFS_DIR)
         .join(SNAPSHOTS_DIR)
         .to_string_lossy()
@@ -258,7 +271,7 @@ fn runtime_is_kubernetes(repo_path: &std::path::Path) -> Option<bool> {
     let config = gfs_domain::model::config::GfsConfig::load(repo_path).ok()?;
     Some(config.runtime.is_some_and(|r| {
         let p = r.runtime_provider.trim().to_ascii_lowercase();
-        p == "kubernetes" || p == "k8s"
+        gfs_domain::model::config::is_kubernetes_provider(&p)
     }))
 }
 
