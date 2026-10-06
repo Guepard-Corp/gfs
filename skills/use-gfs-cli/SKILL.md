@@ -82,6 +82,7 @@ gfs --color always log     # Force colors even when piped
 | `gfs fsck` | 0 | Repository consistent, nothing unreachable |
 | `gfs fsck` | 1 | Unreachable objects found (collectable) |
 | `gfs fsck` | 2 | Corruption found: something referenced is missing, or an object could not be identified |
+| `gfs fsck` | 3 | The check could NOT be completed — says nothing about the repository. Handle this before 1 or 2: an unreadable object, an unresolvable ref, or a Kubernetes backend with no reachable cluster all land here, and on a cluster-backed repository with no cluster it is the ordinary answer |
 
 Use exit codes for conditional logic:
 ```shell

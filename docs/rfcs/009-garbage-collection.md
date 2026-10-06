@@ -289,3 +289,77 @@ Content-addressing snapshots. It would give GFS dedup and make identical data
 free, and it is the strategic fix for the underlying cost — but it is a change to
 the snapshot identity model, not to collection, and it does not remove the need
 for any decision above.
+
+## Amendments
+
+Appended rather than edited in place: the original text stays as written, and
+these record where `main` has moved since. All measured on the implementation
+branch, 2026-10-06.
+
+### A1 — the measured problem statement no longer reproduces
+
+"The problem, measured" rests on three branches created, committed to and
+deleted leaving their objects unreachable. On current `main` that construction
+leaves **nothing** collectable, for two reasons that both arrived after this RFC
+was written:
+
+- `branch -d` is recoverable. It moves the ref into `refs/deleted/` rather than
+  unlinking it, and fsck roots every tombstone, so the commits stay live. They
+  become collectable only once expiry removes the entry — and expiry runs solely
+  from inside `branch -d`, so it is lazy (tracked separately).
+- `branch -d` also removes the branch's working copy, so no reclaimable
+  workspace is left either.
+
+The hazard the RFC describes is real; the reproduction in it is stale. A fresh
+measurement is needed before the cost figures are quoted again.
+
+### A2 — two further claims that `main` has falsified
+
+"Commits made at a detached HEAD, unreachable the moment they are created":
+`main` refuses to commit on a detached HEAD and leaves no orphan snapshot.
+
+"A standalone reclaim script exists on an unmerged branch":
+`scripts/gfs-reclaim-orphan-snapshots.py` is in `main`.
+
+### A3 — D4's floor and gate are implemented, with a named flag
+
+D4 asked for a floor enforced in argument parsing and for `--expire=now` to be
+reachable "only behind a flag whose name says what it disables". Implemented as
+`MIN_GRACE` of one hour and `--disable-grace-period-check`, rejected before the
+repository is read. Measured before the floor existed: at `--grace 0`, 19 of 19
+runs during a concurrent commit persisted a plan naming live in-flight data, and
+32 of 32 in an independent audit; at the default window, 0 of 28.
+
+D4's two NFS refinements — taking the cutoff from a probe file the filesystem
+stamped, and letting one recent mtime veto the whole pass — are **not**
+implemented.
+
+### A4 — D5's mark epoch is now what the plan records
+
+The persisted `cutoff` was stamped at write time, dating the plan after the walk;
+a collector honouring it would have failed to exclude anything created during the
+mark. It now carries the epoch the walk used, to millisecond precision. Measured
+after: the recorded epoch sits ~9ms after launch and stays flat as the walk
+lengthens, where before it tracked walk duration (52ms and 90ms).
+
+### A5 — the lock D5 and D6 depend on does not exist on the writers
+
+`RepoLock` is listed as a prerequisite for step 3. Note that `branch -d` and
+`branch --restore` take **no** lock — they are bare `fs::rename` — so `gc` cannot
+simply acquire it: those two commands have to start taking it first, which is a
+user-visible change since they currently never block.
+
+Consequently fsck narrows its own read race (reading the branch store twice) but
+cannot close the gap between mark and sweep, which is unbounded. `gc` must
+re-validate the marked set under the lock immediately before each unlink — D4
+already requires exactly that for mtime, and reachability needs the same.
+
+### A6 — D9's rule 1 was never load-bearing
+
+"`.gfs/WORKSPACE` is live, whatever else is true" was implemented as a raw string
+prefix test that matched nothing for the relative path `gfs init .` records, and
+mismatched a canonical recorded value when `--path` reached the repository
+through a symlink. Both are fixed. But reverting the fix changes no observable
+behaviour: a branch workspace is already protected by its live branch ref and a
+detached one by the reachable-commit prefix, so rule 1 is belt-and-braces behind
+rules 2 and 3 rather than the guarantee the RFC presents it as.

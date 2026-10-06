@@ -539,16 +539,45 @@ store it cannot identify. It removes nothing.
 ```bash
 gfs fsck
 gfs fsck --json
-gfs fsck --plan          # also record the marked set under .gfs/gc/<id>/
+gfs fsck --plan            # also record the marked set under .gfs/gc/<id>/
+gfs fsck --grace 7200      # seconds an entry must have existed to count as garbage
 ```
 
-Exit status is meaningful: `0` consistent, `1` unreachable objects found (a
-collector would have work to do), `2` corruption found. Reported sizes are what
-`du` would show for those trees, not space already free — on a copy-on-write
-filesystem a snapshot shares blocks with the tree it was cloned from.
+Exit status is meaningful:
 
-`--plan` is refused on an inconsistent repository, since a plan is the prelude
-to a deletion.
+| code | meaning |
+| ---- | ------- |
+| `0` | consistent, nothing to collect |
+| `1` | unreachable objects found — a collector would have work to do |
+| `2` | corruption found: something referenced is missing, or an entry could not be identified |
+| `3` | **the check could not be completed**, so the report says nothing about the repository |
+
+`3` is the one to handle first. It is not a statement about the repository — an
+unreadable object, a ref that would not resolve, or a Kubernetes backend whose
+cluster cannot be reached all produce it, and on a cluster-backed repository with
+no reachable cluster it is the ordinary answer. Treating it as `1` would read a
+check that never ran as a check that found some garbage.
+
+Note these codes are specific to `fsck` and deliberately differ from the
+project-wide CLI convention, where `1` means a usage error. A mistyped flag and a
+repository with collectable objects therefore both exit `1`; under `--json` they
+are distinguishable, since a findings run emits a top-level `fsck` object and a
+usage error emits `error`.
+
+Reported sizes are what `du` would show for those trees, not space already free —
+on a copy-on-write filesystem a snapshot shares blocks with the tree it was
+cloned from.
+
+`--grace` defaults to 86400 (24 hours): a commit writes its snapshot before the
+object that references it, so anything newer may belong to an operation still in
+flight. Values below the one-hour floor need `--disable-grace-period-check`,
+which is named for what it disables — without the window, an in-flight commit's
+snapshot can be reported as garbage, and `--plan` will persist that judgement.
+
+`--plan` is refused when a plan would be untrustworthy: on an inconsistent
+repository, when the snapshots could not be verified, and when the walk did not
+complete. In each case the refusal carries the repository's own exit code, and
+under `--json` it is reported as an `error` object rather than an empty stdout.
 
 ### `gfs commit`
 
