@@ -15,7 +15,21 @@ use crate::ports::compute::ComputeResources;
 /// the first two. A repository configured as `k3s` therefore had its snapshots
 /// looked for on the local filesystem, where a cluster-backed repository has
 /// none, and every commit read as dangling -- corruption invented out of a
-/// spelling. Adding a backend here now reaches every caller.
+/// spelling.
+///
+/// It is also what `commit`, `checkout`, `query` and `destroy` ask, and those
+/// four asked it as `eq_ignore_ascii_case("kubernetes")` -- accepting ONE
+/// spelling where every other site accepted three. A `k8s`-configured repository
+/// was therefore not Kubernetes to `checkout`, which would reach for filesystem
+/// operations on a cluster-backed repository, nor to `destroy`, which would leave
+/// its cluster objects behind. They call this now.
+///
+/// Every caller that asks this as a predicate now calls this. Three still
+/// dispatch on the same set as `match` arms -- `cmd_init`'s compute selection,
+/// `compute_support`, and `restore_is_not_filesystem_based` -- because a match
+/// arm selects a value rather than answering yes or no. They accept all three
+/// spellings already, so a fourth backend means editing those three by hand and
+/// nothing else.
 pub fn is_kubernetes_provider(provider: &str) -> bool {
     matches!(
         provider.trim().to_ascii_lowercase().as_str(),
