@@ -998,10 +998,18 @@ pub fn validate_branch_name(name: &str) -> Result<(), RepoError> {
     // only this. Adding the rule to one left the other accepting it, which is how
     // the collision survived its first fix. `a_reserved_name_is_refused_by_both`
     // pins the pair together.
-    if name == DETACHED_WORKSPACE_SEGMENT {
+    // Case-insensitive and first-segment, matching `branch_name::` -- see the long
+    // note there. `Detached` resolves to the same directory on a case-insensitive
+    // filesystem, and `detached/foo` lands inside the namespace.
+    if name
+        .split('/')
+        .next()
+        .is_some_and(|first| first.eq_ignore_ascii_case(DETACHED_WORKSPACE_SEGMENT))
+    {
         return Err(RepoError::invalid_layout(format!(
             "branch name '{name}' is reserved: it names the directory holding detached \
-             working copies, so a branch of that name would own the whole namespace"
+             working copies, so a branch starting with that segment would land inside or \
+             on that namespace"
         )));
     }
     Ok(())
