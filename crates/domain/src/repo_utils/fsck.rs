@@ -1416,13 +1416,45 @@ fn reclaimable_workspaces(
     cutoff: Option<SystemTime>,
     blind: &mut Blind,
 ) -> (Vec<ReclaimableWorkspace>, u64, usize, Vec<String>) {
-    let root = repo_path.join(GFS_DIR).join(WORKSPACES_DIR);
+    // Canonicalized once, so the walk root -- and therefore every path derived
+    // from it below -- is in the same spelling as the recorded workspace, which
+    // `checkout` writes canonicalized. Without this a `--path` that reaches the
+    // repository through a symlink walks symlink-spelled paths and compares them
+    // against a canonical recorded value, so `starts_with` fails on paths naming
+    // the same directory and the LIVE workspace is reported as unneeded.
+    let repo_real = repo_path
+        .canonicalize()
+        .unwrap_or_else(|_| repo_path.to_path_buf());
+    let root = repo_real.join(GFS_DIR).join(WORKSPACES_DIR);
     // The one file that says which workspace is live. Unreadable used to become
     // an empty path, matching nothing, so the checked-out workspace was reported
     // as unneeded — the single most valuable directory in the repository.
     let active_path = repo_path.join(GFS_DIR).join(WORKSPACE_FILE);
     let active = match std::fs::read_to_string(&active_path) {
-        Ok(s) => PathBuf::from(s.trim().to_string()),
+        // Resolved against the repository, and then canonicalized, because the
+        // comparisons below are `starts_with` against paths built from
+        // `repo_path`. Two spellings had to be reconciled:
+        //
+        //   `gfs init .` records a RELATIVE value (`./.gfs/workspaces/...`), so
+        //   the raw string matched nothing and the checked-out workspace -- the
+        //   single most valuable directory in the repository -- was reported as
+        //   unneeded. `Path::join` leaves an absolute argument untouched, so one
+        //   join handles both forms.
+        //
+        //   `checkout` records a CANONICALIZED absolute value, while `--path`
+        //   may reach the same repository through a symlink. Then the recorded
+        //   side is canonical and the walked side is not, and `starts_with`
+        //   fails on paths that name the same directory. Canonicalizing both
+        //   makes the comparison about directories rather than spellings.
+        //
+        // Note this deliberately does NOT call
+        // `repo_layout::get_active_workspace_data_dir`, which falls back to the
+        // workspace for the current HEAD when the file is absent. Here an absent
+        // file must yield a path that matches nothing, not a guess.
+        Ok(s) => {
+            let joined = repo_real.join(s.trim());
+            joined.canonicalize().unwrap_or(joined)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => PathBuf::new(),
         Err(e) => {
             blind.at(repo_path, &active_path, format!("could not be read: {e}"));
