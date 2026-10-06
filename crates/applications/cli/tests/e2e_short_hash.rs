@@ -1,3 +1,8 @@
+//! Each test here provisions its own Postgres container, so they are
+//! independent but not cheap: run concurrently they put six databases on the
+//! host at once and fail on contention rather than on anything they assert.
+//! `#[serial]` keeps them one at a time without making them share state.
+//!
 //! End-to-end tests for short hash support
 //!
 //! Runs CLI in-process via gfs_cli::run() for coverage capture.
@@ -13,6 +18,7 @@ use std::time::Duration;
 
 use common::cli_runner;
 use gfs_domain::repo_utils::repo_layout;
+use serial_test::serial;
 
 /// Read the container id from `.gfs/config.toml` (runtime.container_name). Returns None if no runtime config.
 fn get_container_id(repo_path: &Path) -> Option<String> {
@@ -78,6 +84,7 @@ fn gfs_init_with_database(path: &Path, provider: &str, version: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[serial]
 fn postgres_log_shows_short_hash_by_default() {
     let tmp = common::shared_tempdir::shared_tempdir().expect("create temp dir");
     let repo_path = tmp.path();
@@ -123,6 +130,7 @@ fn postgres_log_shows_short_hash_by_default() {
 }
 
 #[test]
+#[serial]
 fn postgres_log_shows_full_hash_with_flag() {
     let tmp = common::shared_tempdir::shared_tempdir().expect("create temp dir");
     let repo_path = tmp.path();
@@ -166,6 +174,7 @@ fn postgres_log_shows_full_hash_with_flag() {
 }
 
 #[test]
+#[serial]
 fn postgres_checkout_accepts_short_hash() {
     let tmp = common::shared_tempdir::shared_tempdir().expect("create temp dir");
     let repo_path = tmp.path();
@@ -205,6 +214,7 @@ fn postgres_checkout_accepts_short_hash() {
 }
 
 #[test]
+#[serial]
 fn postgres_short_hash_works_with_tilde_notation() {
     let tmp = common::shared_tempdir::shared_tempdir().expect("create temp dir");
     let repo_path = tmp.path();
@@ -250,6 +260,7 @@ fn postgres_short_hash_works_with_tilde_notation() {
 }
 
 #[test]
+#[serial]
 fn short_hash_error_on_not_found() {
     let tmp = common::shared_tempdir::shared_tempdir().expect("create temp dir");
     let repo_path = tmp.path();
@@ -262,6 +273,7 @@ fn short_hash_error_on_not_found() {
 }
 
 #[test]
+#[serial]
 fn postgres_short_hash_minimum_length() {
     let tmp = common::shared_tempdir::shared_tempdir().expect("create temp dir");
     let repo_path = tmp.path();
