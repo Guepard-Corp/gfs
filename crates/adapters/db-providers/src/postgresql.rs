@@ -287,6 +287,43 @@ impl PostgresqlProvider {
 }
 
 impl DatabaseProvider for PostgresqlProvider {
+    /// Files PostgreSQL writes for itself, observed by committing a repository,
+    /// stopping the database and reading what the dirty check reported.
+    ///
+    /// A clean shutdown writes `pg_stat/pgstat.stat` (accumulated statistics,
+    /// deleted again on the next start), rewrites the control file and the
+    /// replication-origin checkpoint, and touches each database's
+    /// `pg_internal.init` relation cache. None of it is user data, and all of it
+    /// is replaced by the snapshot a checkout restores.
+    fn engine_owned_paths(&self) -> &'static [&'static str] {
+        &[
+            // Enumerated by committing a repository, checking it out, and
+            // comparing all 971 workspace files against the snapshot with no
+            // user work done: zero differed in size, five differed in content
+            // (both pg_internal.init files, pg_control, the WAL segment and
+            // postmaster.pid) and two more differed only in mtime
+            // (pg_multixact/offsets/0000, pg_subtrans/0000).
+            "pg_stat/",
+            "pg_stat_tmp/",
+            "global/pg_control",
+            "pg_logical/",
+            "pg_internal.init",
+            "pg_multixact/",
+            "pg_subtrans/",
+            "pg_xact/",
+            "postmaster.pid",
+            "postmaster.opts",
+            // Safe only because the dirty check checkpoints first. A committed
+            // transaction that has not been written back to its heap file lives
+            // in the WAL alone -- verified: a single-row INSERT with no
+            // checkpoint reported `pg_wal/...` and nothing under `base/`, so
+            // ignoring the WAL without flushing first would discard that row on
+            // checkout. After a CHECKPOINT the same row appears as
+            // `base/5/16384`, where it is caught.
+            "pg_wal/",
+        ]
+    }
+
     fn name(&self) -> &str {
         NAME
     }
