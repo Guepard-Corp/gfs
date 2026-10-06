@@ -652,6 +652,12 @@ impl Compute for DockerCompute {
         // PGDATA redirect turns on how the mount root's ownership is presented.
         let is_podman = self.is_podman_engine().await;
         let root_owned_bind_root = self.has_root_owned_bind_root(is_podman).await;
+        // Only podman-machine needs PGDATA moved into a subdirectory. Colima does
+        // not: once the container is not pinned to an unprivileged uid, the image
+        // entrypoint chowns the mount root itself and initialises the database
+        // there, which keeps the workspace -- and therefore every snapshot taken
+        // from it -- the same shape on every runtime.
+        let needs_pgdata_redirect = is_podman;
         let has_bind = definition.host_data_dir.is_some();
         let container_data_dir = definition.data_dir.to_string_lossy().into_owned();
 
@@ -664,7 +670,7 @@ impl Compute for DockerCompute {
                 // chmod'd by the DB uid, so PGDATA must live in a container-
                 // created subdirectory. See `podman_pgdata_redirect`.
                 match pgdata_redirect(
-                    root_owned_bind_root,
+                    needs_pgdata_redirect,
                     has_bind,
                     &e.name,
                     value,
