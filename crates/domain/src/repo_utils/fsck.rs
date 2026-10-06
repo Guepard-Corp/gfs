@@ -1958,6 +1958,9 @@ mod tests {
     /// and following it walks the object store out of the repository -- naming
     /// paths under a directory that only *looks* like it is inside, and putting
     /// them in front of whatever consumes the report.
+    // Unix-only: builds a state with `symlink` or a mode, neither of which
+    // exists on Windows, where this file otherwise fails to compile at all.
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_shard_is_named_and_not_followed() {
         let d = repo();
@@ -1992,6 +1995,9 @@ mod tests {
     ///
     /// Root ignores mode bits, so this announces a skip rather than passing
     /// vacuously.
+    // Unix-only: builds a state with `symlink` or a mode, neither of which
+    // exists on Windows, where this file otherwise fails to compile at all.
+    #[cfg(unix)]
     #[test]
     fn shards_behind_a_dir_we_cannot_traverse_are_a_hole_not_corruption() {
         use std::os::unix::fs::PermissionsExt;
@@ -2030,6 +2036,9 @@ mod tests {
     /// Root ignores permission bits, so this cannot be written to pass under
     /// every uid. It announces the skip instead of passing vacuously — a green
     /// test that exercised nothing is worse than an absent one.
+    // Unix-only: builds a state with `symlink` or a mode, neither of which
+    // exists on Windows, where this file otherwise fails to compile at all.
+    #[cfg(unix)]
     #[test]
     fn an_object_that_stats_but_will_not_open_is_a_hole_not_corruption() {
         use std::os::unix::fs::PermissionsExt;
@@ -2810,6 +2819,9 @@ mod tests {
 
     /// `roots` reports a symlinked `refs/heads` entry; the soft-deleted path used
     /// to skip the identical input, unrooting a branch `--restore` still honours.
+    // Unix-only: builds a state with `symlink` or a mode, neither of which
+    // exists on Windows, where this file otherwise fails to compile at all.
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_tombstone_is_reported_not_skipped() {
         let d = repo();
