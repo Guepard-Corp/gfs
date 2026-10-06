@@ -34,7 +34,7 @@ use crate::model::fsck::{
 };
 use crate::model::layout::{
     BRANCH_WORKSPACE_SEGMENT, DELETED_REFS_DIR, GFS_DIR, HEAD_FILE, HEADS_DIR, OBJECTS_DIR,
-    REFS_DIR, SNAPSHOTS_DIR, WORKSPACE_FILE, WORKSPACES_DIR,
+    REFS_DIR, SNAPSHOTS_DIR, WORKSPACE_DATA_DIR, WORKSPACE_FILE, WORKSPACES_DIR,
 };
 use crate::repo_utils::repo_layout;
 
@@ -1512,13 +1512,16 @@ fn reclaimable_workspaces(
 
             if child_rel == "detached" {
                 collect_detached(
+                    repo_path,
                     &path,
                     &active,
                     reachable,
                     cutoff,
-                    &mut out,
-                    &mut total,
-                    &mut protected,
+                    &mut DetachedTally {
+                        out: &mut out,
+                        total: &mut total,
+                        protected: &mut protected,
+                    },
                 );
                 continue;
             }
@@ -1554,14 +1557,52 @@ fn reclaimable_workspaces(
 
 /// Detached working copies, keyed by a 12-character commit prefix rather than a
 /// full hash, so liveness is a prefix match against the reachable set.
+/// Whether a detached workspace's content still matches the commit it was
+/// checked out from.
+///
+/// `safe_to_remove` was hardcoded `false` because answering this was thought to
+/// need a baseline that is gone. For a DETACHED workspace it is not: the
+/// directory is named after its commit's hash prefix, and unreachable is not the
+/// same as absent -- a commit no ref reaches still has its object and file list
+/// on disk, which is exactly the case reported here.
+///
+/// `None` when the baseline cannot be recovered at all, which keeps the
+/// conservative answer for anything this cannot prove. `Some(false)` when the
+/// content has diverged, meaning the workspace holds something no commit
+/// records. `Some(true)` only when every file matches, so removing it loses
+/// nothing that is not already recorded in a commit.
+fn detached_matches_its_commit(
+    repo_path: &Path,
+    workspace_dir: &Path,
+    prefix: &str,
+) -> Option<bool> {
+    let full = repo_layout::rev_parse(repo_path, prefix).ok()?;
+    let commit = repo_layout::get_commit_from_hash(repo_path, &full).ok()?;
+    let baseline = repo_layout::get_file_entries_for_commit(repo_path, &commit).ok()??;
+    let data = workspace_dir.join(WORKSPACE_DATA_DIR);
+    if !data.is_dir() {
+        return None;
+    }
+    let changes = repo_layout::workspace_changes(&data, &baseline).ok()?;
+    Some(changes.is_empty())
+}
+
+/// What a detached-workspace walk accumulates, grouped so the walk's inputs stay
+/// legible next to its outputs rather than trailing off the end of an eight-long
+/// parameter list.
+struct DetachedTally<'a> {
+    out: &'a mut Vec<ReclaimableWorkspace>,
+    total: &'a mut u64,
+    protected: &'a mut usize,
+}
+
 fn collect_detached(
+    repo_path: &Path,
     dir: &Path,
     active: &Path,
     reachable: &HashSet<String>,
     cutoff: Option<SystemTime>,
-    out: &mut Vec<ReclaimableWorkspace>,
-    total: &mut u64,
-    protected: &mut usize,
+    tally: &mut DetachedTally<'_>,
 ) {
     let Ok(kids) = std::fs::read_dir(dir) else {
         return;
@@ -1585,15 +1626,31 @@ fn collect_detached(
             continue;
         }
         if newer_than(&path, cutoff) {
-            *protected += 1;
+            *tally.protected += 1;
             continue;
         }
         let bytes = repo_layout::directory_physical_size_bytes(&path).unwrap_or(0);
-        *total += bytes;
-        out.push(ReclaimableWorkspace {
-            safe_to_remove: false,
+        *tally.total += bytes;
+        let matches = detached_matches_its_commit(repo_path, &path, prefix);
+        tally.out.push(ReclaimableWorkspace {
+            // `true` only on proof, never on absence of evidence: the baseline
+            // was recoverable AND every file matches it, so nothing here is
+            // unrecorded. Unrecoverable baseline or diverged content both stay
+            // `false`.
+            safe_to_remove: matches == Some(true),
             path: format!("{WORKSPACES_DIR}/detached/{prefix}"),
-            reason: "no reachable commit starts with this hash".to_string(),
+            reason: match matches {
+                Some(true) => "no reachable commit starts with this hash, and its \
+                               content still matches that commit"
+                    .to_string(),
+                Some(false) => "no reachable commit starts with this hash, and its \
+                                content has diverged from that commit -- it may hold \
+                                work no commit records"
+                    .to_string(),
+                None => "no reachable commit starts with this hash, and the commit it \
+                         was checked out from could not be read to compare against"
+                    .to_string(),
+            },
             bytes,
             idle_days: idle_days(&path),
         });
@@ -2786,10 +2843,115 @@ mod tests {
         assert!(!r.reclaimable_workspaces.is_empty());
         assert!(
             r.reclaimable_workspaces.iter().all(|w| !w.safe_to_remove),
-            "checkout preserves an existing workspace, so none of these are safe"
+            "a BRANCH workspace has no recoverable baseline -- the branch and so its \
+             tip are gone -- so it cannot be proved safe. Detached workspaces can be; \
+             see the tests below"
         );
         let json = serde_json::to_string(&r.reclaimable_workspaces[0]).unwrap();
         assert!(json.contains("\"safe_to_remove\":false"), "got {json}");
+    }
+
+    /// A commit that records exactly one file, plus a detached workspace holding
+    /// that file with matching size. Returns the workspace's data directory.
+    ///
+    /// The file list matters: a commit without one cannot be compared against, so
+    /// `safe_to_remove` is correctly `false` and a fixture built on `write_commit`
+    /// tests the unrecoverable-baseline path instead of the matching one.
+    fn detached_workspace_matching(repo: &std::path::Path, seed: &str) -> std::path::PathBuf {
+        let body = b"recorded";
+        let entries = vec![crate::model::commit::FileEntry {
+            relative_path: "db".to_string(),
+            file_size: body.len() as u64,
+            owner: None,
+            group: None,
+            permissions: None,
+            file_attributes: None,
+        }];
+        let files_ref = repo_layout::write_files_object(repo, &entries).unwrap();
+        let commit = write_commit_with_files(repo, seed, &files_ref);
+        let dir = repo
+            .join(GFS_DIR)
+            .join(WORKSPACES_DIR)
+            .join("detached")
+            .join(&commit[..12])
+            .join(WORKSPACE_DATA_DIR);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("db"), body).unwrap();
+        dir
+    }
+
+    /// A detached workspace whose content still matches the commit it came from
+    /// can be proved safe: everything in it is already recorded in an object on
+    /// disk, so removing it loses nothing. Unreachable is not absent.
+    #[test]
+    fn a_detached_workspace_matching_its_commit_is_safe_to_remove() {
+        let d = repo();
+        let live = write_commit(d.path(), "aa", "on main", None, true);
+        set_branch(d.path(), "main", &live);
+        detached_workspace_matching(d.path(), "bb");
+
+        let r = check(d.path(), Duration::ZERO).unwrap();
+        let w = r
+            .reclaimable_workspaces
+            .iter()
+            .find(|w| w.path.contains("detached"))
+            .expect("the detached workspace must be reported");
+        assert!(
+            w.safe_to_remove,
+            "content matches the commit, so it is provably safe: {}",
+            w.reason
+        );
+    }
+
+    /// The same workspace holding a file no commit records must NOT be safe. This
+    /// is the one that proves the comparison is consulted rather than the
+    /// baseline merely being present.
+    #[test]
+    fn a_detached_workspace_that_has_diverged_is_not_safe_to_remove() {
+        let d = repo();
+        let live = write_commit(d.path(), "aa", "on main", None, true);
+        set_branch(d.path(), "main", &live);
+        let dir = detached_workspace_matching(d.path(), "bb");
+        fs::write(dir.join("scratch"), b"work no commit records").unwrap();
+
+        let r = check(d.path(), Duration::ZERO).unwrap();
+        let w = r
+            .reclaimable_workspaces
+            .iter()
+            .find(|w| w.path.contains("detached"))
+            .expect("the detached workspace must be reported");
+        assert!(
+            !w.safe_to_remove,
+            "it holds a file no commit records: {}",
+            w.reason
+        );
+        assert!(w.reason.contains("diverged"), "reason: {}", w.reason);
+    }
+
+    /// And when the baseline cannot be recovered at all, the answer is `false`.
+    /// `true` must require proof, never the absence of a reason to refuse.
+    #[test]
+    fn a_detached_workspace_whose_commit_cannot_be_read_is_not_safe_to_remove() {
+        let d = repo();
+        let live = write_commit(d.path(), "aa", "on main", None, true);
+        set_branch(d.path(), "main", &live);
+        // A prefix no commit object backs: nothing to compare against.
+        let dir = d
+            .path()
+            .join(GFS_DIR)
+            .join(WORKSPACES_DIR)
+            .join("detached")
+            .join("ffffffffffff")
+            .join(WORKSPACE_DATA_DIR);
+        fs::create_dir_all(&dir).unwrap();
+
+        let r = check(d.path(), Duration::ZERO).unwrap();
+        let w = r
+            .reclaimable_workspaces
+            .iter()
+            .find(|w| w.path.contains("ffffffffffff"))
+            .expect("the detached workspace must be reported");
+        assert!(!w.safe_to_remove, "no baseline, so no proof: {}", w.reason);
     }
 
     /// The cluster namespace is shared. Handing fsck a snapshot belonging to
