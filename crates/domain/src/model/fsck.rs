@@ -237,6 +237,21 @@ pub struct FsckReport {
     /// The grace period this run applied, in seconds.
     pub grace_seconds: u64,
 
+    /// The cutoff this walk actually used, in milliseconds since the Unix epoch,
+    /// or `None` when the window was zero and nothing was protected.
+    ///
+    /// Milliseconds rather than seconds on purpose: the defect this records was
+    /// a 52-90ms discrepancy, which a second-resolution field cannot express --
+    /// truncation alone would move the value by up to a full second, swamping
+    /// the thing being fixed.
+    ///
+    /// Carried out of the domain so a persisted plan can record the epoch the
+    /// mark ran against. Stamping it at write time instead dates the plan AFTER
+    /// the walk, and a collector honouring that value would fail to exclude
+    /// anything created *during* the mark -- which is precisely the window in
+    /// which a commit writes its snapshot before the object referencing it.
+    pub cutoff_unix_millis: Option<u64>,
+
     /// Working copies no branch or reachable commit needs, reported apart from
     /// `unreachable` because they are not graph objects.
     ///
@@ -308,6 +323,7 @@ mod tests {
             unrecognised: Vec::new(),
             referenced_bytes: 0,
             exclusive_bytes: None,
+            cutoff_unix_millis: None,
             snapshots_checked: true,
             exclusive_is_partial: false,
             unreadable: Vec::new(),

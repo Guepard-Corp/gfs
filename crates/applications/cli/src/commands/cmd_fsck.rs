@@ -279,7 +279,21 @@ fn write_plan(repo_path: &std::path::Path, report: &FsckReport) -> Result<String
         // Anything created after this instant is out of scope for the sweep by
         // construction, the way Nessie's --max-file-modification defaults to
         // the mark epoch.
-        "cutoff": chrono::Utc::now().to_rfc3339(),
+        // The epoch the MARK ran against, carried out of the walk -- not the
+        // clock at write time. RFC 009 D5 requires anything created after the
+        // mark began to be out of scope by construction, and a collector
+        // honouring a cutoff stamped after the walk would fail to exclude
+        // exactly what was created during it. Measured before this change:
+        // 52ms late on a 1-commit repository, 90ms with a large unreachable
+        // snapshot, and the gap tracks walk duration, so minutes on a large one.
+        // `to_rfc3339()` drops the milliseconds the field carries, which puts up
+        // to a second of slack back into the value and defeats the point: the
+        // discrepancy being fixed here was 52-90ms. Forced to millisecond
+        // precision.
+        "cutoff": report
+            .cutoff_unix_millis
+            .and_then(|ms| chrono::DateTime::from_timestamp_millis(ms as i64))
+            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
         "report": report,
     });
     let path = dir.join("plan.json");

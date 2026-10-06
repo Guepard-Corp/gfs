@@ -1379,6 +1379,11 @@ pub fn check_with(
         unreadable: blind.notes,
         protected_by_grace: protected,
         grace_seconds: grace.as_secs(),
+        cutoff_unix_millis: cutoff.and_then(|c| {
+            c.duration_since(SystemTime::UNIX_EPOCH)
+                .ok()
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        }),
         reclaimable_workspaces,
         reclaimable_workspace_bytes,
     })
