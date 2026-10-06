@@ -528,8 +528,9 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                 tracing::warn!(
                     error = %e,
                     "database is busy; proceeding with an UNFROZEN snapshot per \
-                     GFS_ALLOW_UNFROZEN_SNAPSHOT — it may capture a torn copy if the \
-                     other process writes during the snapshot"
+                     GFS_ALLOW_UNFROZEN_SNAPSHOT — this commit MAY BE SILENTLY LOSSY: \
+                     a torn copy restores and passes integrity checks without reporting \
+                     anything wrong"
                 );
                 Ok(None)
             }
@@ -538,7 +539,10 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                     "{e}. Refusing to snapshot a database that is being written: a copy \
                      taken mid-write can capture a torn file. Options: (1) stop the process \
                      writing the database and retry; or (2) set GFS_ALLOW_UNFROZEN_SNAPSHOT=1 \
-                     to proceed with a best-effort snapshot that may not be restorable"
+                     to proceed with a snapshot that MAY BE SILENTLY LOSSY — it can \
+                     restore, answer queries and pass the engine's own integrity checks \
+                     while having lost committed data, so a bad restore is \
+                     indistinguishable from a good one"
                 )),
             )),
             Err(e) => Err(CommitRepoError::Repository(RepositoryError::Internal(
@@ -633,8 +637,16 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                                      cgroup v2); (2) upgrade the host to cgroup v2 \
                                      and use a runtime that honors it; or (3) set \
                                      GFS_ALLOW_UNFROZEN_SNAPSHOT=1 to proceed with \
-                                     a best-effort snapshot that may require manual \
-                                     WAL replay on restore"
+                                     a snapshot that MAY BE SILENTLY LOSSY. Measured \
+                                     on PostgreSQL 17: such a restore starts normally, \
+                                     answers queries, and passes bt_index_parent_check \
+                                     and a full heap scan while having lost committed \
+                                     data — recovery stops at the first torn WAL record \
+                                     and treats it as the end of the log. With \
+                                     data_checksums off, which is the default on the \
+                                     stock images, torn pages past that point are never \
+                                     detected either. There is no check that \
+                                     distinguishes a good restore from a bad one"
                                 ),
                             )));
                         } else {
@@ -643,8 +655,10 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                                 instance = %instance_id,
                                 "container pause unavailable (cgroup v1 or rootless runtime); \
                                  proceeding with UNFROZEN snapshot per GFS_ALLOW_UNFROZEN_SNAPSHOT — \
-                                 snapshot is NOT crash-consistent and may contain torn pages and \
-                                 half-applied WAL; restore may require manual recovery"
+                                 this commit MAY BE SILENTLY LOSSY: the snapshot is not \
+                                 crash-consistent, and a restore of it starts, answers queries and \
+                                 passes the engine's integrity checks while having lost committed \
+                                 data, so nothing flags it as bad"
                             );
                         }
                         // No unpause guard: nothing was paused.
@@ -2129,6 +2143,17 @@ mod tests {
                 assert!(
                     msg.contains("GFS_ALLOW_UNFROZEN_SNAPSHOT=1"),
                     "refusal must mention the opt-in env var; got: {msg}"
+                );
+                assert!(
+                    msg.contains("SILENTLY LOSSY"),
+                    "refusal must say the override may lose data silently, not merely \
+                     that recovery might be needed: the measured failure is that the \
+                     restore looks healthy; got: {msg}"
+                );
+                assert!(
+                    msg.contains("distinguishes a good restore from a bad one"),
+                    "refusal must say the operator has no way to tell the two apart, \
+                     which is what makes it unacceptable rather than risky; got: {msg}"
                 );
                 assert!(
                     msg.contains("cgroup v2"),
