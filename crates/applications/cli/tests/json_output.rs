@@ -482,6 +482,57 @@ fn a_closed_reader_does_not_replace_the_exit_status() {
     }
 }
 
+/// The output layer is shared, so the closed-reader fix has to hold outside
+/// fsck too -- and measured on this branch it did not: `gfs log --json` with the
+/// reader gone exited 101, a panic, which is outside every exit code this CLI
+/// documents. `gfs log --json | head -1` is an ordinary thing to type.
+///
+/// This covers ONE non-fsck command. `status` (48 bare `println!`) and `branch`
+/// (19) still panic the same way; that sweep is tracked separately, and asks for it in
+/// one pass rather than piecemeal.
+#[test]
+fn a_closed_reader_does_not_panic_a_non_fsck_command() {
+    use std::process::{Command, Stdio};
+
+    let tmp = TempDir::new().unwrap();
+    assert_eq!(run_gfs(tmp.path(), &["init", "."]).0, 0, "init");
+    let data = tmp.path().join(".gfs/workspaces/main/0/data");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("f"), b"x").unwrap();
+    assert_eq!(run_gfs(tmp.path(), &["commit", "-m", "one"]).0, 0, "commit");
+
+    // The precondition: with a reader present this prints JSON and exits 0, so a
+    // 0 below means "survived the closed reader", not "had nothing to say".
+    let (code, stdout, _) = run_gfs(tmp.path(), &["log", "--json"]);
+    assert_eq!(code, 0, "precondition: log --json must succeed");
+    assert!(
+        stdout.contains("\"commits\""),
+        "precondition: it must actually write to stdout, got {stdout:?}"
+    );
+
+    let mut child = Command::new(gfs_bin())
+        .current_dir(tmp.path())
+        .args(["log", "--json"])
+        .env("RUST_LOG", "off")
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn gfs");
+    drop(child.stdout.take());
+    let status = child.wait().expect("wait");
+    assert_ne!(
+        status.code(),
+        Some(101),
+        "a closed reader must not panic: 101 is a crash, not a verdict"
+    );
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "and the real exit status must survive"
+    );
+}
+
 /// RFC 009 D4 requires a floor in argument parsing and zero only behind a flag
 /// that names what it disables. Without the floor a mistyped window silently
 /// reports an in-flight commit as garbage -- and with `--plan`, persists that
