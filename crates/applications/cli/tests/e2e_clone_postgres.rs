@@ -116,7 +116,7 @@ fn e2e_clone_postgres() {
         );
         return;
     }
-    let repo = TempDir::new().expect("temp repo");
+    let repo = common::shared_tempdir::shared_tempdir().expect("temp repo");
     let repo_path = repo.path().to_path_buf();
     let mut cleanup = Cleanup {
         gfs_container: None,

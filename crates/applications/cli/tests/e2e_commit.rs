@@ -15,7 +15,6 @@ use std::time::Duration;
 use common::cli_runner;
 use gfs_domain::model::commit::Commit;
 use gfs_domain::repo_utils::repo_layout;
-use tempfile::tempdir;
 
 /// Read the container id from `.gfs/config.toml` (runtime.container_name). Returns None if no runtime config.
 fn get_container_id(repo_path: &Path) -> Option<String> {
@@ -84,7 +83,7 @@ fn snapshot_dir(repo_path: &Path, snapshot_hash: &str) -> PathBuf {
 
 #[test]
 fn init_creates_workspace_file_pointing_to_initial_data_dir() {
-    let tmp = tempdir().expect("create temp dir");
+    let tmp = common::shared_tempdir::shared_tempdir().expect("create temp dir");
     let repo_path = tmp.path();
 
     assert!(cli_runner::gfs_init(repo_path), "gfs init should succeed");
@@ -105,7 +104,7 @@ fn init_creates_workspace_file_pointing_to_initial_data_dir() {
 
 #[test]
 fn commit_creates_snapshot_folder_with_copied_files() {
-    let tmp = tempdir().expect("create temp dir");
+    let tmp = common::shared_tempdir::shared_tempdir().expect("create temp dir");
     let repo_path = tmp.path();
 
     assert!(cli_runner::gfs_init(repo_path), "gfs init should succeed");
@@ -159,7 +158,7 @@ fn commit_creates_snapshot_folder_with_copied_files() {
 
 #[test]
 fn log_displays_commit_after_commit() {
-    let tmp = tempdir().expect("create temp dir");
+    let tmp = common::shared_tempdir::shared_tempdir().expect("create temp dir");
     let repo_path = tmp.path();
 
     assert!(cli_runner::gfs_init(repo_path), "gfs init should succeed");
@@ -210,7 +209,7 @@ fn log_displays_commit_after_commit() {
 
 #[test]
 fn log_respects_max_count() {
-    let tmp = tempdir().expect("create temp dir");
+    let tmp = common::shared_tempdir::shared_tempdir().expect("create temp dir");
     let repo_path = tmp.path();
 
     assert!(cli_runner::gfs_init(repo_path), "gfs init should succeed");
@@ -271,7 +270,7 @@ fn log_respects_max_count() {
 
 #[test]
 fn two_commits_produce_distinct_snapshot_folders_with_files() {
-    let tmp = tempdir().expect("create temp dir");
+    let tmp = common::shared_tempdir::shared_tempdir().expect("create temp dir");
     let repo_path = tmp.path();
 
     assert!(cli_runner::gfs_init(repo_path), "gfs init should succeed");
@@ -327,7 +326,7 @@ fn two_commits_produce_distinct_snapshot_folders_with_files() {
 
 #[test]
 fn commit_with_missing_mount_point_source_fails_gracefully() {
-    let tmp = tempdir().expect("create temp dir");
+    let tmp = common::shared_tempdir::shared_tempdir().expect("create temp dir");
     let repo_path = tmp.path();
 
     assert!(cli_runner::gfs_init(repo_path), "gfs init should succeed");
@@ -351,7 +350,7 @@ fn commit_with_missing_mount_point_source_fails_gracefully() {
 
 #[test]
 fn commit_with_real_postgres_database_snapshots_workspace() {
-    let tmp = tempdir().expect("create temp dir");
+    let tmp = common::shared_tempdir::shared_tempdir().expect("create temp dir");
     let repo_path = tmp.path();
 
     assert!(

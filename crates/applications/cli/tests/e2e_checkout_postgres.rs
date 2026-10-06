@@ -32,7 +32,7 @@ use tempfile::TempDir;
 
 /// Shared repo: temp dir kept alive for process lifetime.
 static SHARED: Lazy<(TempDir, PathBuf)> = Lazy::new(|| {
-    let t = TempDir::new().expect("create temp dir for shared repo");
+    let t = common::shared_tempdir::shared_tempdir().expect("create temp dir for shared repo");
     let p = t.path().to_path_buf();
     (t, p)
 });

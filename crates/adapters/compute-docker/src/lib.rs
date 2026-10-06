@@ -479,6 +479,67 @@ impl DockerCompute {
         }
     }
 
+    /// Confirm the container's data directory and its bind source are the same
+    /// directory, and fail loudly when they are not.
+    ///
+    /// A container VM shares only part of the host filesystem: colima shares
+    /// `$HOME`, not `/tmp` or the macOS per-user temp directory. A bind mount
+    /// whose source lies outside that set is not refused -- the path is created
+    /// inside the VM instead, so the database writes there, the host directory
+    /// stays empty, and nothing reports a problem. The container is healthy and
+    /// accepts connections; only the workspace gfs snapshots is empty.
+    ///
+    /// Divergence is read rather than predicted: if the container has written
+    /// files the host cannot see, the two are not the same directory. An empty
+    /// container directory proves nothing either way and is left alone.
+    async fn verify_bind_mount_is_shared(&self, id: &InstanceId) -> Result<()> {
+        let info = self
+            .docker
+            .inspect_container(&id.0, None)
+            .await
+            .map_err(|e| classify(&id.0, e))?;
+        let Some((source, destination)) = info
+            .mounts
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find_map(|m| match (m.source.as_deref(), m.destination.as_deref()) {
+                (Some(source), Some(destination)) if !source.is_empty() => {
+                    Some((source.to_owned(), destination.to_owned()))
+                }
+                _ => None,
+            })
+        else {
+            return Ok(());
+        };
+
+        let inside = self
+            .run_exec_command(id, &format!("ls -A {destination} | wc -l"), None)
+            .await
+            .ok()
+            .and_then(|out| out.stdout.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if inside == 0 {
+            return Ok(());
+        }
+
+        let on_host = std::fs::read_dir(&source)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        if on_host > 0 {
+            return Ok(());
+        }
+
+        Err(ComputeError::Internal(format!(
+            "the container wrote {inside} entries to '{destination}' but the host \
+directory it is mounted from is empty: '{source}' is not shared with the \
+container runtime's virtual machine, so the database's files never reach this \
+machine and a commit would capture nothing. Move the repository inside a shared \
+directory (the home directory is shared by default), or add this path to the \
+runtime's mounts."
+        )))
+    }
+
     async fn wait_for_ready_ports(&self, id: &InstanceId) {
         let Ok(info) = self.docker.inspect_container(&id.0, None).await else {
             return;
@@ -699,7 +760,9 @@ impl Compute for DockerCompute {
             )
             .await
             .map_err(|e| classify(&id.0, e))?;
-        self.wait_for_stable_start(id).await
+        let status = self.wait_for_stable_start(id).await?;
+        self.verify_bind_mount_is_shared(id).await?;
+        Ok(status)
     }
 
     #[instrument(skip(self))]
@@ -718,7 +781,9 @@ impl Compute for DockerCompute {
             .restart_container(&id.0, None)
             .await
             .map_err(|e| classify(&id.0, e))?;
-        self.wait_for_stable_start(id).await
+        let status = self.wait_for_stable_start(id).await?;
+        self.verify_bind_mount_is_shared(id).await?;
+        Ok(status)
     }
 
     #[instrument(skip(self))]

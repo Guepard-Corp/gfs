@@ -286,7 +286,7 @@ fn clone_registers_real_tables_and_reads_match_source() {
     if !gfs_image_present() || !host_alias_resolves() {
         return;
     }
-    let repo = TempDir::new().unwrap();
+    let repo = common::shared_tempdir::shared_tempdir().unwrap();
     let repo_path = repo.path().to_path_buf();
     let mut cl = Cleanup::new(repo);
     let remote = "gfs-e2e-rob-reg";
@@ -354,7 +354,7 @@ fn clone_range_and_temporal_hydration_elide() {
     if !gfs_image_present() || !host_alias_resolves() {
         return;
     }
-    let repo = TempDir::new().unwrap();
+    let repo = common::shared_tempdir::shared_tempdir().unwrap();
     let repo_path = repo.path().to_path_buf();
     let mut cl = Cleanup::new(repo);
     let remote = "gfs-e2e-rob-range";
@@ -435,7 +435,7 @@ fn clone_federates_join_matching_source() {
     if !gfs_image_present() || !host_alias_resolves() {
         return;
     }
-    let repo = TempDir::new().unwrap();
+    let repo = common::shared_tempdir::shared_tempdir().unwrap();
     let repo_path = repo.path().to_path_buf();
     let mut cl = Cleanup::new(repo);
     let remote = "gfs-e2e-rob-join";
@@ -461,7 +461,7 @@ fn clone_local_writes_leave_source_untouched() {
     if !gfs_image_present() || !host_alias_resolves() {
         return;
     }
-    let repo = TempDir::new().unwrap();
+    let repo = common::shared_tempdir::shared_tempdir().unwrap();
     let repo_path = repo.path().to_path_buf();
     let mut cl = Cleanup::new(repo);
     let remote = "gfs-e2e-rob-write";
@@ -545,7 +545,7 @@ fn clone_local_delete_not_resurrected_by_warm() {
     if !gfs_image_present() || !host_alias_resolves() {
         return;
     }
-    let repo = TempDir::new().unwrap();
+    let repo = common::shared_tempdir::shared_tempdir().unwrap();
     let repo_path = repo.path().to_path_buf();
     let mut cl = Cleanup::new(repo);
     let remote = "gfs-e2e-rob-tomb";

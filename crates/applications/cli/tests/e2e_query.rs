@@ -25,7 +25,6 @@ use std::time::Duration;
 
 use common::cli_runner;
 use gfs_domain::repo_utils::repo_layout;
-use tempfile::tempdir;
 
 fn get_container_id(repo_path: &Path) -> Option<String> {
     repo_layout::get_runtime_config(repo_path)
@@ -105,7 +104,7 @@ fn query_exit_code_reflects_sql_success_and_failure() {
         return;
     }
 
-    let tmp = tempdir().expect("create temp dir");
+    let tmp = common::shared_tempdir::shared_tempdir().expect("create temp dir");
     let repo_path = tmp.path();
     assert!(
         cli_runner::gfs_init_with_db(repo_path),

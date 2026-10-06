@@ -13,7 +13,6 @@ use std::time::Duration;
 
 use common::cli_runner;
 use gfs_domain::repo_utils::repo_layout;
-use tempfile::tempdir;
 
 /// Read the container id from `.gfs/config.toml` (runtime.container_name). Returns None if no runtime config.
 fn get_container_id(repo_path: &Path) -> Option<String> {
@@ -80,7 +79,7 @@ fn gfs_init_with_database(path: &Path, provider: &str, version: &str) -> bool {
 
 #[test]
 fn postgres_log_shows_short_hash_by_default() {
-    let tmp = tempdir().expect("create temp dir");
+    let tmp = common::shared_tempdir::shared_tempdir().expect("create temp dir");
     let repo_path = tmp.path();
 
     // Init with postgres
@@ -125,7 +124,7 @@ fn postgres_log_shows_short_hash_by_default() {
 
 #[test]
 fn postgres_log_shows_full_hash_with_flag() {
-    let tmp = tempdir().expect("create temp dir");
+    let tmp = common::shared_tempdir::shared_tempdir().expect("create temp dir");
     let repo_path = tmp.path();
 
     // Init with postgres
@@ -168,7 +167,7 @@ fn postgres_log_shows_full_hash_with_flag() {
 
 #[test]
 fn postgres_checkout_accepts_short_hash() {
-    let tmp = tempdir().expect("create temp dir");
+    let tmp = common::shared_tempdir::shared_tempdir().expect("create temp dir");
     let repo_path = tmp.path();
 
     // Init with postgres
@@ -207,7 +206,7 @@ fn postgres_checkout_accepts_short_hash() {
 
 #[test]
 fn postgres_short_hash_works_with_tilde_notation() {
-    let tmp = tempdir().expect("create temp dir");
+    let tmp = common::shared_tempdir::shared_tempdir().expect("create temp dir");
     let repo_path = tmp.path();
 
     // Init with postgres
@@ -252,7 +251,7 @@ fn postgres_short_hash_works_with_tilde_notation() {
 
 #[test]
 fn short_hash_error_on_not_found() {
-    let tmp = tempdir().expect("create temp dir");
+    let tmp = common::shared_tempdir::shared_tempdir().expect("create temp dir");
     let repo_path = tmp.path();
 
     assert!(cli_runner::gfs_init(repo_path), "gfs init should succeed");
@@ -264,7 +263,7 @@ fn short_hash_error_on_not_found() {
 
 #[test]
 fn postgres_short_hash_minimum_length() {
-    let tmp = tempdir().expect("create temp dir");
+    let tmp = common::shared_tempdir::shared_tempdir().expect("create temp dir");
     let repo_path = tmp.path();
 
     // Init with postgres

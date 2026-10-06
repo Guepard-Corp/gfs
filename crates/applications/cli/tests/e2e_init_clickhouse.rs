@@ -10,7 +10,6 @@ use gfs_domain::repo_utils::repo_layout::{
     get_environment_config, get_runtime_config, validate_repo_layout,
 };
 use serial_test::serial;
-use tempfile::tempdir;
 
 struct ContainerCleanupGuard(String);
 
@@ -24,7 +23,7 @@ impl Drop for ContainerCleanupGuard {
 #[test]
 #[serial]
 fn gfs_init_clickhouse_creates_valid_repo_layout_and_runtime_config() {
-    let temp_dir = tempdir().expect("create temp dir");
+    let temp_dir = common::shared_tempdir::shared_tempdir().expect("create temp dir");
     let work_dir = temp_dir.path().to_path_buf();
 
     let ok = cli_runner::gfs_init_with_provider(&work_dir, "clickhouse", "24.8.14.39");
