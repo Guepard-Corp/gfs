@@ -131,6 +131,36 @@ const POSTGRES_BIND_PGDATA_SUBDIR: &str = "pgdata";
 ///
 /// Returns `Some(new_pgdata)` when the redirect applies, else `None` (leave the
 /// value untouched). Non-`PGDATA` vars always return `None`.
+/// The user a container should run as, or `None` for the image default.
+///
+/// A bind root presented as root-owned (podman-machine, colima's `virtiofs`)
+/// cannot be written by an unprivileged host uid, so pinning the container to
+/// one makes the image's own initialisation fail before the database exists.
+/// Running as the image default lets the entrypoint create and chown the data
+/// directory as root and then drop privileges itself, which is what the
+/// Kubernetes path already relies on.
+///
+/// `root` is kept: it can always write the mount, and callers ask for it
+/// deliberately for repair tasks. Everything is kept when there is no bind
+/// mount, or when the mount root is chownable.
+fn container_user(
+    root_owned_bind_root: bool,
+    has_bind: bool,
+    requested: Option<&str>,
+) -> Option<String> {
+    let requested = requested?;
+    if !has_bind || !root_owned_bind_root || is_root_user(requested) {
+        return Some(requested.to_owned());
+    }
+    None
+}
+
+/// Whether a docker `--user` value names uid 0, in `uid`, `uid:gid` or `root` form.
+fn is_root_user(user: &str) -> bool {
+    let uid = user.split(':').next().unwrap_or(user).trim();
+    uid == "0" || uid.eq_ignore_ascii_case("root")
+}
+
 fn pgdata_redirect(
     root_owned_bind_root: bool,
     has_bind: bool,
@@ -627,7 +657,7 @@ impl Compute for DockerCompute {
                     .collect(),
             ),
             host_config: Some(host_config),
-            user: definition.user.clone(),
+            user: container_user(root_owned_bind_root, has_bind, definition.user.as_deref()),
             cmd: if definition.args.is_empty() {
                 None
             } else {
@@ -1098,6 +1128,9 @@ impl Compute for DockerCompute {
             .collect();
 
         // 4. Bind mounts for data exchange.
+        let task_root_owned_bind_root = self
+            .has_root_owned_bind_root(self.is_podman_engine().await)
+            .await;
         let mut binds = Vec::new();
         if let Some(ref host_data) = definition.host_data_dir {
             let host_path = host_path_for_docker_bind(&resolve_host_bind_path(host_data)?);
@@ -1126,8 +1159,14 @@ impl Compute for DockerCompute {
             host_config: Some(host_config),
             entrypoint: Some(vec!["sh".into(), "-c".into()]),
             cmd: Some(vec![command.to_string()]),
-            // Honour the user override from the definition (e.g. "0:0" for root-level repair tasks).
-            user: definition.user.clone(),
+            // Honour the user override from the definition (e.g. "0:0" for
+            // root-level repair tasks); an unprivileged uid is dropped where the
+            // bind root is root-owned, for the reason in `container_user`.
+            user: container_user(
+                task_root_owned_bind_root,
+                definition.host_data_dir.is_some(),
+                definition.user.as_deref(),
+            ),
             ..Default::default()
         };
 
@@ -1711,6 +1750,67 @@ mod tar_safety_tests {
     fn parent_dir_component_is_unsafe() {
         assert!(!tar_link_target_is_safe(Path::new("../escape")));
         assert!(!tar_link_target_is_safe(Path::new("a/../../b")));
+    }
+}
+
+#[cfg(test)]
+mod container_user_tests {
+    use super::{container_user, is_root_user};
+
+    const HOST_UID: Option<&str> = Some("501:20");
+
+    #[test]
+    fn an_unprivileged_uid_is_dropped_on_a_root_owned_bind_root() {
+        // Colima/podman-machine: the host uid cannot create the data directory,
+        // so the image default must run instead.
+        assert_eq!(container_user(true, true, HOST_UID), None);
+    }
+
+    #[test]
+    fn root_is_kept_on_a_root_owned_bind_root() {
+        // Repair tasks ask for root deliberately, and root can write the mount.
+        assert_eq!(
+            container_user(true, true, Some("0:0")),
+            Some("0:0".to_owned())
+        );
+        assert_eq!(
+            container_user(true, true, Some("root")),
+            Some("root".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_unprivileged_uid_is_kept_where_the_mount_root_is_chownable() {
+        // Docker Desktop and Linux: pinning the host uid is correct there, and
+        // is what keeps workspace files readable during a snapshot.
+        assert_eq!(
+            container_user(false, true, HOST_UID),
+            Some("501:20".to_owned())
+        );
+    }
+
+    #[test]
+    fn without_a_bind_mount_the_requested_user_stands() {
+        assert_eq!(
+            container_user(true, false, HOST_UID),
+            Some("501:20".to_owned())
+        );
+    }
+
+    #[test]
+    fn no_request_means_the_image_default() {
+        assert_eq!(container_user(true, true, None), None);
+        assert_eq!(container_user(false, false, None), None);
+    }
+
+    #[test]
+    fn root_is_recognised_in_each_form_it_is_written() {
+        assert!(is_root_user("0"));
+        assert!(is_root_user("0:0"));
+        assert!(is_root_user("root"));
+        assert!(!is_root_user("501"));
+        assert!(!is_root_user("501:20"));
+        assert!(!is_root_user("rootless"));
     }
 }
 
