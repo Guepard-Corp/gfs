@@ -17,7 +17,7 @@ use crate::model::config::{EnvironmentConfig, GfsConfig, RuntimeConfig, UserConf
 use crate::model::errors::RepoError;
 use crate::model::layout::{GFS_DIR, OBJECTS_DIR, SNAPSHOTS_DIR, WORKSPACES_DIR};
 use crate::ports::repository::{LogOptions, RemoteOptions, Repository, RepositoryError, Result};
-use crate::repo_utils::repo_layout;
+use crate::repo_utils::{durable_write, repo_layout};
 use crate::utils::hash::hash_commit;
 
 fn map_err(e: RepoError) -> RepositoryError {
@@ -558,7 +558,10 @@ impl Repository for GfsRepository {
         fs::create_dir_all(&object_dir).map_err(RepositoryError::Io)?;
         let json = serde_json::to_string_pretty(&commit)
             .map_err(|e| RepositoryError::Internal(e.to_string()))?;
-        fs::write(&object_path, json).map_err(RepositoryError::Io)?;
+        // Durable before the ref names it: the ref advance below is what makes
+        // this object reachable, so it must not be able to outlive it.
+        durable_write::write_durable(&object_path, json.as_bytes(), None)
+            .map_err(RepositoryError::Io)?;
 
         // 7. Advance the current branch ref to the new commit. HEAD is guaranteed
         // attached to a branch here (a detached HEAD is refused at the top of this
@@ -709,7 +712,7 @@ impl Repository for GfsRepository {
                 let _ = fs::remove_file(workspace_path.join("postmaster.opts"));
                 // Signal that a pre-start ownership repair is required for this workspace.
                 if let Some(marker) = repo_layout::repair_marker_path(&workspace_path) {
-                    let _ = fs::write(marker, b"");
+                    let _ = durable_write::write_durable(&marker, b"", None);
                 }
             } else if snapshot_hash.is_empty() || restore_is_not_filesystem_based(&repo) {
                 // Two legitimate cases: a commit that records no snapshot at
@@ -771,25 +774,21 @@ impl Repository for GfsRepository {
         if let Some(parent) = ref_path.parent() {
             fs::create_dir_all(parent).map_err(RepositoryError::Io)?;
         }
-        // `create_new`, not a predicate then a write: `exists()` is false both for
+        // No-clobber, not a predicate then a write: `exists()` is false both for
         // "no such ref" and for "could not stat it", so an unreadable ref read as a
         // free name and its tip was replaced. Losing a ref costs the branch *name* --
         // the commits stay findable via `find_commits_by_prefix`.
-        use std::io::Write;
-        let mut f = match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&ref_path)
-        {
-            Ok(f) => f,
+        //
+        // `create_durable` keeps that refusal (it fails with `AlreadyExists`) and
+        // adds what `create_new` + `write_all` lacked: the ref appears complete
+        // and synced in one step, so neither a reader nor a crash can see it empty.
+        match durable_write::create_durable(&ref_path, commit_hash.as_bytes()) {
+            Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(RepositoryError::BranchAlreadyExists(name.to_string()));
+                Err(RepositoryError::BranchAlreadyExists(name.to_string()))
             }
-            Err(e) => return Err(RepositoryError::Io(e)),
-        };
-        f.write_all(commit_hash.as_bytes())
-            .map_err(RepositoryError::Io)?;
-        Ok(())
+            Err(e) => Err(RepositoryError::Io(e)),
+        }
     }
 
     async fn log(&self, repo: &Path, options: LogOptions) -> Result<Vec<CommitWithRefs>> {
@@ -1666,5 +1665,35 @@ description = "test"
             still_active, initial_active,
             "active workspace must not change after commits"
         );
+    }
+
+    /// `create_branch` must still refuse an existing ref after moving to
+    /// `create_durable`, keep the original tip, and leave no temp behind.
+    #[tokio::test]
+    async fn create_branch_refuses_an_existing_ref_and_leaves_no_temp() {
+        let temp = setup_repo();
+        let repo = temp.path();
+        let repository = GfsRepository::new();
+        let heads = repo.join(GFS_DIR).join(REFS_DIR).join(HEADS_DIR);
+
+        let tip = "a".repeat(64);
+        repository
+            .create_branch(repo, "team/feat", &tip)
+            .await
+            .unwrap();
+        let err = repository
+            .create_branch(repo, "team/feat", &"b".repeat(64))
+            .await;
+        assert!(
+            matches!(err, Err(RepositoryError::BranchAlreadyExists(_))),
+            "{err:?}"
+        );
+        assert_eq!(fs::read_to_string(heads.join("team/feat")).unwrap(), tip);
+        let names: Vec<String> = fs::read_dir(heads.join("team"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["feat".to_string()]);
     }
 }
