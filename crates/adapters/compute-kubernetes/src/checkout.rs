@@ -8,7 +8,7 @@ use gfs_domain::ports::compute::{Compute, ComputeDefinition, EnvVar, InstanceId}
 use gfs_domain::ports::database_provider::{ContainerProvider, DatabaseProviderRegistry};
 use gfs_domain::ports::repository::Repository;
 use gfs_domain::ports::storage::{CloneOptions, SnapshotId, StoragePort, VolumeId};
-use gfs_storage_kubernetes::KubernetesStorage;
+use gfs_storage_kubernetes::{KubernetesStorage, volumesnapshot_name_for_hash};
 
 use crate::KubernetesCompute;
 
@@ -87,6 +87,117 @@ async fn adopt_credentials_for_restored_volume(
         .map_err(|e| K8sCheckoutReprovisionError::Compute(e.to_string()))
 }
 
+/// The cluster operations a restore performs before it can clone, behind a
+/// trait so their ORDER can be asserted with a recording fake and no cluster.
+///
+/// [`ClusterSteps`] is the only production implementation; it delegates to
+/// `KubernetesStorage` and `KubernetesCompute`. The seam exists because the
+/// order is the whole fix (see [`verify_snapshot_then_destroy_instance`]) and
+/// a fake is the only way to observe the order without a Kubernetes cluster.
+/// Errors carry the adapter's message so the caller chooses the variant.
+trait RestoreSteps {
+    /// Errors if the VolumeSnapshot is missing, never became ready, or is being
+    /// deleted. Must change nothing.
+    async fn wait_snapshot_ready(&self, vs_name: &str) -> Result<(), String>;
+
+    /// Deletes the StatefulSet and Service and ISSUES the delete of the data
+    /// PVC and of `legacy_pvcs`. Destructive: the live volume is gone once the
+    /// delete it issues completes, and the StorageClass reclaims on Delete.
+    async fn teardown_instance_keep_snapshots(
+        &self,
+        id: &InstanceId,
+        legacy_pvcs: &[String],
+    ) -> Result<(), String>;
+
+    /// Deletes a PVC and waits for it to drain. Destructive.
+    async fn delete_pvc(&self, pvc: &str) -> Result<(), String>;
+}
+
+/// The real adapters, borrowed for one restore.
+struct ClusterSteps<'a> {
+    storage: &'a KubernetesStorage,
+    compute: &'a KubernetesCompute,
+}
+
+impl RestoreSteps for ClusterSteps<'_> {
+    async fn wait_snapshot_ready(&self, vs_name: &str) -> Result<(), String> {
+        self.storage
+            .wait_snapshot_ready(vs_name)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn teardown_instance_keep_snapshots(
+        &self,
+        id: &InstanceId,
+        legacy_pvcs: &[String],
+    ) -> Result<(), String> {
+        self.compute
+            .teardown_instance_keep_snapshots(id, legacy_pvcs)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn delete_pvc(&self, pvc: &str) -> Result<(), String> {
+        self.storage
+            .delete_pvc(pvc)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Confirm the snapshot, THEN destroy. The order is the fix.
+///
+/// Everything after the first step is irreversible: the teardown issues the
+/// delete of the data PVC, and the StorageClass reclaim policy is Delete, so
+/// the volume is destroyed rather than released. This wait used to sit after
+/// the teardown and the PVC delete, so a snapshot that was missing or never
+/// became ready cost the user their StatefulSet and their PVC before anyone
+/// checked. Now an unusable snapshot is a refusal that changes nothing.
+async fn verify_snapshot_then_destroy_instance<S: RestoreSteps>(
+    steps: &S,
+    vs_name: &str,
+    instance_id: &InstanceId,
+    data_pvc: &str,
+    legacy_pvcs: &[String],
+) -> Result<(), K8sCheckoutReprovisionError> {
+    steps
+        .wait_snapshot_ready(vs_name)
+        .await
+        .map_err(K8sCheckoutReprovisionError::Storage)?;
+
+    // RESTORE teardown: must PRESERVE the VolumeSnapshots — we delete the data PVC
+    // below and then clone it back FROM `vs_name`. Using the destroy teardown
+    // (`remove_instance_with_pvcs`) here would reclaim that snapshot (SEV1 data loss).
+    steps
+        .teardown_instance_keep_snapshots(instance_id, legacy_pvcs)
+        .await
+        .map_err(K8sCheckoutReprovisionError::Compute)?;
+
+    // Past this point the instance is gone. A PVC that will not delete leaves the
+    // repository with no database and no way forward — every retry repeats the
+    // teardown and fails here again. Observed: a lingering
+    // `snapshot.storage.kubernetes.io/pvc-as-source-protection` finalizer, held
+    // while VolumeSnapshots reference the PVC as their source, wedged a
+    // repository permanently. So say what happened and how to get out of it,
+    // rather than reporting a bare "still exists".
+    if let Err(e) = steps.delete_pvc(data_pvc).await {
+        return Err(K8sCheckoutReprovisionError::Storage(format!(
+            "{e}\n  The instance has already been torn down, so this repository now has no \
+             database.\n  A PVC usually refuses to delete because a VolumeSnapshot still \
+             names it as source — check:\n    kubectl get pvc -n gfs {data_pvc} \
+             -o jsonpath='{{.metadata.finalizers}}'\n    kubectl get volumesnapshot -n gfs \
+             -o custom-columns=N:.metadata.name,READY:.status.readyToUse,\
+             SRC:.spec.source.persistentVolumeClaimName\n  Deleting the snapshots that name it \
+             releases the finalizer and the PVC drains."
+        )));
+    }
+    for legacy in legacy_pvcs {
+        let _ = steps.delete_pvc(legacy).await;
+    }
+    Ok(())
+}
+
 /// Restore the pinned instance's data volume from a commit's VolumeSnapshot, then start Postgres.
 pub async fn restore_database_volume_from_snapshot<R: DatabaseProviderRegistry>(
     storage: &KubernetesStorage,
@@ -109,7 +220,9 @@ pub async fn restore_database_volume_from_snapshot<R: DatabaseProviderRegistry>(
         })?;
 
     let data_pvc = stable_data_pvc(&stable_instance);
-    let vs_name = format!("gfs-snap-{}", &snapshot_hash[..32.min(snapshot_hash.len())]);
+    // Named by the function that created the snapshot at commit time, so the
+    // check below and the clone after it cannot disagree about which one.
+    let vs_name = volumesnapshot_name_for_hash(snapshot_hash);
 
     let legacy_pvcs: Vec<String> = cfg
         .mount_point
@@ -120,26 +233,15 @@ pub async fn restore_database_volume_from_snapshot<R: DatabaseProviderRegistry>(
         .collect();
 
     let instance_id = InstanceId(stable_instance.clone());
-    // RESTORE teardown: must PRESERVE the VolumeSnapshots — we delete the data PVC
-    // below and then clone it back FROM `vs_name`. Using the destroy teardown
-    // (`remove_instance_with_pvcs`) here would reclaim that snapshot (SEV1 data loss).
-    compute
-        .teardown_instance_keep_snapshots(&instance_id, &legacy_pvcs)
-        .await
-        .map_err(|e| K8sCheckoutReprovisionError::Compute(e.to_string()))?;
 
-    storage
-        .delete_pvc(&data_pvc)
-        .await
-        .map_err(|e| K8sCheckoutReprovisionError::Storage(e.to_string()))?;
-    for legacy in &legacy_pvcs {
-        let _ = storage.delete_pvc(legacy).await;
-    }
-
-    storage
-        .wait_snapshot_ready(&vs_name)
-        .await
-        .map_err(|e| K8sCheckoutReprovisionError::Storage(e.to_string()))?;
+    verify_snapshot_then_destroy_instance(
+        &ClusterSteps { storage, compute },
+        &vs_name,
+        &instance_id,
+        &data_pvc,
+        &legacy_pvcs,
+    )
+    .await?;
 
     adopt_credentials_for_restored_volume(storage, compute, &vs_name, &stable_instance).await?;
 
@@ -361,6 +463,7 @@ pub async fn reprovision_after_pvc_restore<R: DatabaseProviderRegistry>(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
@@ -647,5 +750,160 @@ mod tests {
         let def = checkout_definition(&StubProvider, &cfg, &creds(None, None));
 
         assert_eq!(def.args, StubProvider.definition().args);
+    }
+
+    /// Records every cluster operation in the order it is asked for, so the
+    /// ORDER of the restore's destructive steps can be asserted without a
+    /// cluster. The real adapters cannot be driven here — they need a kube
+    /// client — and the point under test is that nothing destructive reaches
+    /// them before the snapshot has been confirmed.
+    struct RecordingSteps {
+        snapshot_ready: bool,
+        pvc_deletes: bool,
+        calls: RefCell<Vec<String>>,
+    }
+
+    impl RecordingSteps {
+        fn new(snapshot_ready: bool) -> Self {
+            Self {
+                snapshot_ready,
+                pvc_deletes: true,
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn record(&self, call: String) {
+            self.calls.borrow_mut().push(call);
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl RestoreSteps for RecordingSteps {
+        async fn wait_snapshot_ready(&self, vs_name: &str) -> Result<(), String> {
+            self.record(format!("wait_snapshot_ready({vs_name})"));
+            if self.snapshot_ready {
+                Ok(())
+            } else {
+                Err(format!(
+                    "get volumesnapshot failed: \"{vs_name}\" not found"
+                ))
+            }
+        }
+
+        async fn teardown_instance_keep_snapshots(
+            &self,
+            id: &InstanceId,
+            _legacy_pvcs: &[String],
+        ) -> Result<(), String> {
+            self.record(format!("teardown_instance_keep_snapshots({})", id.0));
+            Ok(())
+        }
+
+        async fn delete_pvc(&self, pvc: &str) -> Result<(), String> {
+            self.record(format!("delete_pvc({pvc})"));
+            if self.pvc_deletes {
+                Ok(())
+            } else {
+                Err(format!("pvc '{pvc}' still exists after delete"))
+            }
+        }
+    }
+
+    const VS: &str = "gfs-snap-aade0f36aade0f36aade0f36aade0f36";
+
+    async fn run_prelude(steps: &RecordingSteps) -> Result<(), K8sCheckoutReprovisionError> {
+        verify_snapshot_then_destroy_instance(
+            steps,
+            VS,
+            &InstanceId("gfs-pg-1".into()),
+            "gfs-pg-1-data",
+            &["gfs-pg-legacy".to_string()],
+        )
+        .await
+    }
+
+    fn position(calls: &[String], prefix: &str) -> Option<usize> {
+        calls.iter().position(|c| c.starts_with(prefix))
+    }
+
+    #[tokio::test]
+    async fn the_snapshot_is_confirmed_before_anything_is_destroyed() {
+        // The order IS the fix. It used to be teardown -> delete PVC -> wait,
+        // so a snapshot that was missing or never became ready was discovered
+        // only after the live volume was gone — and the StorageClass reclaim
+        // policy is Delete, so gone meant destroyed, not released.
+        let steps = RecordingSteps::new(true);
+        run_prelude(&steps)
+            .await
+            .expect("a ready snapshot restores");
+        let calls = steps.calls();
+
+        let wait = position(&calls, "wait_snapshot_ready").expect("the snapshot was never checked");
+        let teardown = position(&calls, "teardown_instance_keep_snapshots")
+            .expect("the instance was never torn down");
+        let first_delete = position(&calls, "delete_pvc").expect("no PVC was deleted");
+        assert!(
+            wait < teardown,
+            "the snapshot was checked only AFTER the instance was torn down; calls were {calls:?}"
+        );
+        assert!(
+            wait < first_delete,
+            "the snapshot was checked only AFTER a PVC delete; calls were {calls:?}"
+        );
+        assert_eq!(
+            calls,
+            [
+                format!("wait_snapshot_ready({VS})"),
+                "teardown_instance_keep_snapshots(gfs-pg-1)".to_string(),
+                "delete_pvc(gfs-pg-1-data)".to_string(),
+                "delete_pvc(gfs-pg-legacy)".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unusable_snapshot_destroys_nothing() {
+        let steps = RecordingSteps::new(false);
+        let err = run_prelude(&steps)
+            .await
+            .expect_err("an unusable snapshot must abort the restore");
+        assert!(
+            matches!(err, K8sCheckoutReprovisionError::Storage(_)),
+            "{err}"
+        );
+        let calls = steps.calls();
+
+        assert!(
+            position(&calls, "teardown_instance_keep_snapshots").is_none(),
+            "the instance was torn down although the snapshot was unusable; calls were {calls:?}"
+        );
+        assert!(
+            position(&calls, "delete_pvc").is_none(),
+            "a PVC was deleted although the snapshot was unusable; calls were {calls:?}"
+        );
+        assert_eq!(calls, [format!("wait_snapshot_ready({VS})")]);
+    }
+
+    #[tokio::test]
+    async fn a_pvc_that_will_not_delete_says_the_instance_is_gone_and_how_to_free_it() {
+        // Past the teardown there is no database and every retry fails the
+        // same way, so the error must say so and point at the finalizer that
+        // usually holds the PVC, rather than report a bare "still exists".
+        let mut steps = RecordingSteps::new(true);
+        steps.pvc_deletes = false;
+        let err = run_prelude(&steps)
+            .await
+            .expect_err("a PVC that will not drain fails the restore");
+        let text = err.to_string();
+        for needed in [
+            "pvc 'gfs-pg-1-data' still exists after delete",
+            "already been torn down",
+            "kubectl get pvc -n gfs gfs-pg-1-data -o jsonpath='{.metadata.finalizers}'",
+        ] {
+            assert!(text.contains(needed), "error lacks {needed:?}: {text}");
+        }
     }
 }
