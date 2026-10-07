@@ -356,6 +356,11 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
             _ => None,
         };
 
+        // What the engine offers, if anything. `None` -- the ordinary case -- means the
+        // live data directory is safe to copy while the guard is held, which keeps the
+        // copy-on-write clone O(1).
+        let engine_copy = _local_guard.as_deref().and_then(|g| g.consistent_copy());
+
         let (schema_hash, snapshot_hash) = if db_live_during_snapshot {
             // Overlap: run both arms to completion, then apply the asymmetry.
             // `join!` (not `try_join!`) is required because schema extraction is
@@ -371,6 +376,7 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                     &environment,
                     mount_point,
                     db_live_during_snapshot,
+                    engine_copy,
                 ),
             );
             (schema_res, snapshot_res?)
@@ -387,6 +393,7 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                     &environment,
                     mount_point,
                     db_live_during_snapshot,
+                    engine_copy,
                 )
                 .await?;
             (schema_res, snapshot_hash)
@@ -562,6 +569,9 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
         environment: &Option<EnvironmentConfig>,
         mount_point: Option<String>,
         db_live_during_snapshot: bool,
+        // Set when the engine could not make the live files safe to copy and wrote a
+        // self-contained copy instead; see `SnapshotGuard::consistent_copy`.
+        consistent_copy: Option<&Path>,
     ) -> Result<String, CommitRepoError> {
         // 3. Prepare the database container for snapshotting (if present).
         let mut unpause_guard: Option<UnpauseGuard> = None;
@@ -677,7 +687,12 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
         //    explicit mount_point is configured we read .gfs/WORKSPACE which
         //    always points to the directory where the database is currently
         //    running — even after multiple commits have advanced HEAD.
-        let volume_id = if let Some(mp) = mount_point {
+        let volume_id = if let Some(copy) = consistent_copy {
+            // Snapshot the engine's copy rather than the live data directory. The
+            // engine only offers one when copying the live files would produce a
+            // snapshot that does not restore.
+            VolumeId(copy.to_string_lossy().into_owned())
+        } else if let Some(mp) = mount_point {
             VolumeId(mp)
         } else {
             let data_dir = self.repository.get_active_workspace_data_dir(path).await?;
