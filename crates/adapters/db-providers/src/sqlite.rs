@@ -1868,6 +1868,97 @@ mod tests {
     /// The checkpoint must not consume the lock budget. One open read
     /// transaction previously cost the full 10s per commit, because TRUNCATE
     /// waits for readers to drain and the timeout was raised before it ran.
+    /// A reader that blocks the checkpoint gets a rewritten copy, not a snapshot of
+    /// files that will not restore.
+    ///
+    /// This is the case the whole fallback exists for, and it is the one that was
+    /// silently broken: a `TRUNCATE` checkpoint waits for readers to drain, so an open
+    /// read transaction blocks it indefinitely. Measured directly, the pragma returns
+    /// `busy = 1` having applied only some of the frames, and raises no error — so the
+    /// old code could not tell that outcome from success and snapshotted a file set
+    /// whose log still held the rest.
+    ///
+    /// The assertions are about the SHAPE of what the caller is handed, because that is
+    /// what decides whether a restore works: a directory, holding a database file, with
+    /// no log beside it.
+    #[cfg(unix)]
+    #[test]
+    fn a_reader_blocking_the_checkpoint_yields_a_rewritten_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let params = seeded_db(dir.path());
+        let db = dir.path().join(DB_FILENAME);
+
+        // Open for the whole test. A clean close would checkpoint and remove the log by
+        // itself, which is the case this must not measure.
+        let writer = rusqlite::Connection::open(&db).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        for n in 0..200 {
+            writer
+                .execute("INSERT INTO author (name) VALUES (?1)", [&format!("a{n}")])
+                .unwrap();
+        }
+
+        // The blocker: a read transaction, held open. Routine for a connection pool.
+        let reader = rusqlite::Connection::open(&db).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        reader
+            .query_row("SELECT count(*) FROM author", [], |r| r.get::<_, i64>(0))
+            .unwrap();
+
+        let wal = dir.path().join(format!("{DB_FILENAME}-wal"));
+        assert!(
+            wal.metadata().map(|m| m.len()).unwrap_or(0) > 0,
+            "the fixture needs a non-empty log, or there is nothing to fold in"
+        );
+
+        let guard = LocalEngine::prepare_for_snapshot(&SqliteProvider::new(), &params)
+            .expect("a blocking reader must not fail the commit")
+            .expect("a written database has something to quiesce");
+
+        let copy = guard
+            .consistent_copy()
+            .expect("the log could not be folded in, so a rewritten copy is required");
+        assert_eq!(
+            copy.file_name().unwrap(),
+            CONSISTENT_COPY_DIR,
+            "the copy lives in the directory this provider names"
+        );
+        assert!(
+            !copy.starts_with(dir.path().join(DB_FILENAME)),
+            "the copy must not sit inside the data directory being snapshotted"
+        );
+
+        let copied_db = copy.join(DB_FILENAME);
+        assert!(copied_db.is_file(), "the copy holds the database file");
+        assert_eq!(
+            wal_bytes(&copied_db),
+            0,
+            "and no log beside it -- a snapshot carrying one does not restore"
+        );
+
+        // It is a database, and it is intact. Checking the copy, never the live file.
+        let restored = rusqlite::Connection::open(&copied_db).unwrap();
+        let integrity: String = restored
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            integrity, "ok",
+            "the rewritten copy must be a sound database"
+        );
+        let rows: i64 = restored
+            .query_row("SELECT count(*) FROM author", [], |r| r.get(0))
+            .unwrap();
+        assert!(rows >= 200, "and must hold the committed rows, got {rows}");
+
+        // Dropping the guard takes the copy with it.
+        let copy_path = copy.to_path_buf();
+        drop(guard);
+        assert!(
+            !copy_path.exists(),
+            "the rewritten copy lives only as long as the guard"
+        );
+    }
+
     #[test]
     fn an_open_reader_does_not_cost_the_whole_lock_budget() {
         let dir = tempfile::tempdir().unwrap();
