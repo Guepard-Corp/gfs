@@ -748,3 +748,69 @@ fn fsck_plan_writes_exactly_one_artefact() {
     assert!(v.get("cutoff").is_some(), "plan must carry its cutoff");
     assert!(v.get("report").is_some(), "plan must carry the marked set");
 }
+
+/// Runs gfs with raw argument bytes, and optionally a raw argv[0].
+#[cfg(unix)]
+fn run_gfs_raw(cwd: &Path, arg0: Option<&[u8]>, args: &[&[u8]]) -> (i32, String, String) {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::process::CommandExt;
+
+    let mut command = Command::new(gfs_bin());
+    if let Some(arg0) = arg0 {
+        command.arg0(OsStr::from_bytes(arg0));
+    }
+    let out = command
+        .current_dir(cwd)
+        .args(args.iter().map(|arg| OsStr::from_bytes(arg)))
+        .env("RUST_LOG", "off")
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("failed to run gfs");
+
+    let code = out.status.code().unwrap_or(1);
+    let stdout = String::from_utf8(out.stdout).expect("stdout must be utf-8");
+    let stderr = String::from_utf8(out.stderr).expect("stderr must be utf-8");
+    (code, stdout, stderr)
+}
+
+/// An argument that is not UTF-8 panicked inside `std::env::args()`: exit 101,
+/// the code of any crash, with the undecodable bytes echoed in the panic message.
+/// It is a usage error like any other value that will not parse, so it exits 3
+/// and names the position, and never repeats the bytes back.
+///
+/// Unix only: Windows arguments are UTF-16 and cannot carry these bytes.
+#[cfg(unix)]
+#[test]
+fn an_argument_that_is_not_utf8_is_a_usage_error_not_a_crash() {
+    let tmp = TempDir::new().unwrap();
+    assert_eq!(run_gfs(tmp.path(), &["init", "."]).0, 0, "init");
+
+    let (code, stdout, stderr) =
+        run_gfs_raw(tmp.path(), None, &[b"commit", b"-m", b"echomarker\xe9"]);
+    assert_eq!(code, 3, "a usage error, not a crash: {stderr}");
+    assert!(stdout.is_empty(), "nothing on stdout: {stdout}");
+    assert!(
+        stderr.contains("argument 3 is not valid UTF-8"),
+        "names the position: {stderr}"
+    );
+    assert!(!stderr.contains("panicked"), "no panic: {stderr}");
+    assert!(
+        !stderr.contains("echomarker"),
+        "the argument is not echoed: {stderr}"
+    );
+
+    let (code, stdout, stderr) = run_gfs_raw(tmp.path(), None, &[b"--json", b"log", b"\xff\xfe"]);
+    assert_eq!(code, 3, "the same code under --json: {stderr}");
+    let v = assert_stdout_json(&stdout);
+    let message = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("argument 3 is not valid UTF-8"),
+        "the JSON error names the position: {v}"
+    );
+
+    // The control: argv[0] is the path the binary was launched by, not user
+    // input, so a non-UTF-8 one must not turn every command into an error.
+    let (code, _, stderr) = run_gfs_raw(tmp.path(), Some(b"gfs\xff"), &[b"--version"]);
+    assert_eq!(code, 0, "argv[0] is not an argument: {stderr}");
+}
