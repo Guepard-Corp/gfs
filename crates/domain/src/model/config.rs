@@ -148,7 +148,7 @@ impl GfsConfig {
         let config_path = repo_path.join(GFS_DIR).join(CONFIG_FILE);
         let content =
             toml::to_string_pretty(self).map_err(|e| RepoError::InvalidConfig(e.to_string()))?;
-        std::fs::write(config_path, content)?;
+        crate::repo_utils::atomic_write::write_atomic(&config_path, &content, None)?;
         Ok(())
     }
 
@@ -257,11 +257,10 @@ impl RepoCredentials {
         let content =
             toml::to_string_pretty(self).map_err(|e| RepoError::InvalidConfig(e.to_string()))?;
         let path = Self::path(repo_path);
-        std::fs::write(&path, content)?;
-        // Re-pin on every write: a fresh write lands at the default umask
-        // (0644) and an overwrite does not reset an existing file's mode.
-        #[cfg(unix)]
-        Self::restrict_to_owner(&path)?;
+        // Owner-only on the TEMP file, not after the rename: a rename carries
+        // the temp file's mode, so fixing it afterwards leaves a window in which
+        // the credentials are world-readable.
+        crate::repo_utils::atomic_write::write_atomic(&path, &content, Some(0o600))?;
         Ok(())
     }
 
@@ -318,7 +317,7 @@ impl GlobalSettings {
         }
         let content =
             toml::to_string_pretty(self).map_err(|e| RepoError::InvalidConfig(e.to_string()))?;
-        std::fs::write(path, content)?;
+        crate::repo_utils::atomic_write::write_atomic(&path, &content, None)?;
         Ok(())
     }
 }
