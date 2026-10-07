@@ -1204,8 +1204,22 @@ fn newer_than(path: &Path, cutoff: Option<SystemTime>) -> bool {
     // so a newly created entry always carries a recent one. The later of the two
     // is used because either can be the meaningful one: mtime catches content
     // written after creation, ctime catches creation itself.
+    match (mtime, ctime_of(&meta)) {
+        (Some(m), Some(c)) => m.max(c) > cutoff,
+        (Some(t), None) | (None, Some(t)) => t > cutoff,
+        // Undatable: protected, which is the safe direction.
+        (None, None) => true,
+    }
+}
+
+/// The inode's own change time, where the platform has one.
+///
+/// Factored out of `newer_than` so the tree walk below applies the identical
+/// rule. Two clocks that are supposed to agree, computed in two places, is how
+/// they stop agreeing.
+fn ctime_of(meta: &std::fs::Metadata) -> Option<SystemTime> {
     #[cfg(unix)]
-    let ctime = {
+    {
         use std::os::unix::fs::MetadataExt;
         let secs = meta.ctime();
         if secs >= 0 {
@@ -1213,15 +1227,82 @@ fn newer_than(path: &Path, cutoff: Option<SystemTime>) -> bool {
         } else {
             None
         }
-    };
+    }
     #[cfg(not(unix))]
-    let ctime: Option<SystemTime> = None;
+    {
+        let _ = meta;
+        None
+    }
+}
 
-    match (mtime, ctime) {
-        (Some(m), Some(c)) => m.max(c) > cutoff,
-        (Some(t), None) | (None, Some(t)) => t > cutoff,
-        // Undatable: protected, which is the safe direction.
-        (None, None) => true,
+/// The most recent write anywhere under `path`, by the same two-clock rule
+/// `newer_than` applies to a single entry.
+///
+/// A directory's mtime moves when its *entries* change -- a file created,
+/// renamed or unlinked -- and not when the contents of a file inside it are
+/// rewritten. A database being written to in place therefore leaves every
+/// directory level untouched, which is why statting the workspace container said
+/// nothing about whether the workspace was in use.
+///
+/// Measured on a workspace whose database had just been appended to:
+///
+///   workspaces/orphan           mtime 19:07:27   (25s old)
+///   workspaces/orphan/0         mtime 19:07:27
+///   workspaces/orphan/0/data    mtime 19:07:27
+///   workspaces/orphan/0/data/app.db   mtime 19:07:52   (0s old)
+///
+/// All three directory levels carry the same timestamp while only the file
+/// differs -- so descending one level to `data/` would not have fixed this
+/// either. The newest entry in the whole tree is the only thing that answers
+/// "was this written recently".
+///
+/// `None` means some part of the tree could not be dated, and the caller must
+/// read that as protected rather than as old. Symlinks are measured but never
+/// followed: a link into someone else's directory must not decide whether this
+/// workspace is in use.
+fn newest_write_in_tree(path: &Path) -> Option<SystemTime> {
+    let mut newest: Option<SystemTime> = None;
+    let mut stack = vec![path.to_path_buf()];
+
+    while let Some(current) = stack.pop() {
+        // `symlink_metadata`, so a symlink is dated as a link rather than as
+        // whatever it points at.
+        let meta = std::fs::symlink_metadata(&current).ok()?;
+        let stamp = match (meta.modified().ok(), ctime_of(&meta)) {
+            (Some(m), Some(c)) => Some(m.max(c)),
+            (Some(t), None) | (None, Some(t)) => Some(t),
+            (None, None) => None,
+        }?;
+        newest = Some(match newest {
+            Some(seen) => seen.max(stamp),
+            None => stamp,
+        });
+
+        if meta.is_dir() {
+            for entry in std::fs::read_dir(&current).ok()? {
+                stack.push(entry.ok()?.path());
+            }
+        }
+    }
+    newest
+}
+
+/// Whether anything under `path` was written after `cutoff`.
+///
+/// The directory counterpart to `newer_than`. Both workspace call sites used
+/// `newer_than` on the container, so RFC 009 D9 -- "a workspace being written
+/// right now is not garbage" -- did not hold: measured, a workspace whose
+/// database was appended to moments earlier was reported collectable at
+/// `--grace 20`, and protected only at `--grace 600`, which is the container's
+/// own age showing through.
+fn newer_than_tree(path: &Path, cutoff: Option<SystemTime>) -> bool {
+    let Some(cutoff) = cutoff else {
+        return false;
+    };
+    match newest_write_in_tree(path) {
+        Some(newest) => newest > cutoff,
+        // Undatable: protected, matching `newer_than`.
+        None => true,
     }
 }
 
@@ -1768,7 +1849,7 @@ fn reclaimable_workspaces(
                 if active.starts_with(&path) || live_branches.contains(&child_rel) {
                     continue;
                 }
-                if newer_than(&path, cutoff) {
+                if newer_than_tree(&path, cutoff) {
                     protected += 1;
                     continue;
                 }
@@ -1876,7 +1957,7 @@ fn collect_detached(
         if reachable.iter().any(|c| c.starts_with(&prefix_lc)) {
             continue;
         }
-        if newer_than(&path, cutoff) {
+        if newer_than_tree(&path, cutoff) {
             *tally.protected += 1;
             continue;
         }
@@ -1915,9 +1996,11 @@ fn collect_detached(
 /// Last *write*, not last read: `relatime`/`noatime` make atime unreliable, and
 /// a verification pass would itself look like access.
 fn idle_days(path: &Path) -> u64 {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
+    // The whole tree, for the reason on `newest_write_in_tree`. Statting the
+    // container reported a working copy as idle for 2470 days -- 6.8 years --
+    // while a database wrote into it, because only the file's mtime moved. An
+    // idle policy built on that field would have reclaimed it.
+    newest_write_in_tree(path)
         .and_then(|t| SystemTime::now().duration_since(t).ok())
         .map(|d| d.as_secs() / 86_400)
         .unwrap_or(0)
@@ -3713,6 +3796,123 @@ mod tests {
         assert!(
             !after.is_clean(),
             "a repository holding an object that is not what its name says is not consistent"
+        );
+    }
+
+    /// A directory's own timestamps say nothing about whether the files under it
+    /// are being written.
+    ///
+    /// A directory's mtime moves when its ENTRIES change -- a file created,
+    /// renamed, unlinked -- not when the bytes of a file inside it are rewritten.
+    /// So a database written to in place leaves every directory level untouched,
+    /// and both workspace call sites used to stat the container.
+    ///
+    /// Measured end to end on one fixture, two binaries two seconds apart, with a
+    /// workspace whose database had just been appended to and `--grace 20`:
+    ///
+    ///   container 01:41:46   0/ 01:41:46   data/ 01:41:46   app.db 01:42:16
+    ///   stats the container:  protected=0  listed=1   <- RFC 009 D9 violated
+    ///   newest write in tree: protected=1  listed=0
+    ///
+    /// The three directory levels carrying the SAME timestamp is why descending
+    /// one level to `data/` would not have fixed it either.
+    ///
+    /// A future mtime is used here rather than an old one because `ctime` cannot
+    /// be back-dated: anything this test does to age a file leaves ctime at now,
+    /// and the rule takes the later of the two clocks, so an "old" fixture reads
+    /// as fresh and the test would pass without measuring anything.
+    #[test]
+    fn the_newest_write_in_a_tree_is_what_dates_it_not_the_container() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("workspace");
+        let data = root.join("0").join("data");
+        fs::create_dir_all(&data).unwrap();
+        let db = data.join("app.db");
+        fs::write(&db, b"seed").unwrap();
+
+        let container_stamp = {
+            let meta = fs::metadata(&root).unwrap();
+            let m = meta.modified().unwrap();
+            match ctime_of(&meta) {
+                Some(c) => m.max(c),
+                None => m,
+            }
+        };
+
+        // An hour ahead, so it cannot be confused with anything the filesystem
+        // set by itself during this test.
+        let ahead = SystemTime::now() + Duration::from_secs(3600);
+        fs::File::options()
+            .write(true)
+            .open(&db)
+            .unwrap()
+            .set_modified(ahead)
+            .unwrap();
+
+        let newest = newest_write_in_tree(&root).expect("every entry is readable");
+        assert!(
+            newest > container_stamp,
+            "the file inside must date the tree, not the container"
+        );
+        assert!(
+            newest >= ahead,
+            "the newest entry is the file, not an ancestor directory"
+        );
+
+        // The directories were NOT touched by rewriting the file, which is the
+        // whole mechanism. If this ever fails, the premise has changed.
+        for level in [&root, &root.join("0"), &data] {
+            let meta = fs::metadata(level).unwrap();
+            assert!(
+                meta.modified().unwrap() < ahead,
+                "{} must not have moved when the file was rewritten",
+                level.display()
+            );
+        }
+
+        // And the grace check follows the tree. A cutoff between the container's
+        // age and the file's puts them on opposite sides: statting the container
+        // would call this collectable while a write is in flight.
+        let cutoff = Some(SystemTime::now() + Duration::from_secs(1800));
+        assert!(
+            newer_than_tree(&root, cutoff),
+            "a tree holding a write newer than the cutoff is protected"
+        );
+        assert!(
+            !newer_than(&root, cutoff),
+            "the container alone is older than the cutoff -- this is the gap"
+        );
+    }
+
+    /// An undatable tree is protected, not reported as old.
+    ///
+    /// `newer_than` already answered "cannot be dated" with "protected", and the
+    /// tree walk has to agree: an unreadable entry anywhere under a workspace
+    /// means the walk cannot show the workspace is idle, and guessing idle is the
+    /// direction that deletes live data.
+    #[cfg(unix)]
+    #[test]
+    fn a_tree_with_an_unreadable_directory_is_protected_rather_than_dated() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("workspace");
+        let shut = root.join("0");
+        fs::create_dir_all(shut.join("data")).unwrap();
+        fs::write(shut.join("data").join("app.db"), b"x").unwrap();
+
+        fs::set_permissions(&shut, fs::Permissions::from_mode(0o000)).unwrap();
+        let dated = newest_write_in_tree(&root);
+        let protected = newer_than_tree(&root, Some(SystemTime::now()));
+        fs::set_permissions(&shut, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            dated.is_none(),
+            "a tree that cannot be fully read has no defensible date"
+        );
+        assert!(
+            protected,
+            "and an undatable tree is protected, matching newer_than"
         );
     }
 
