@@ -472,6 +472,15 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
                 "could not record the resource spec; rebuilds will not re-apply it"
             );
         }
+        // The discovery labels travel the same way and for the same reason:
+        // `gfs.role` and `gfs.remote` exist only in the caller's head at init,
+        // so if they are not written here a rebuild cannot recover them.
+        if let Err(e) = GfsConfig::record_compute_labels(repo_path, definition.labels.clone()) {
+            tracing::warn!(
+                error = %e,
+                "could not record the discovery labels; rebuilds will not re-apply them"
+            );
+        }
 
         let workspace_data_dir = self
             .repository
