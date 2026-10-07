@@ -312,15 +312,24 @@ passed (doctests 0 passed, 2 ignored); `cargo test -p gfs-cli --lib` 20 passed;
 
 ## 7. Not covered, by design or not yet
 
-- **Power loss** was not simulated (see section 2).
+- **Power loss of physical media** was not simulated. Section 9 approximates it
+  with a forced stop of the VM's hypervisor, which drops the guest's page cache but
+  not the host's; see the limits listed there. It establishes that, on ext4 in a VM,
+  a ref the fixed binary has written never names a commit object that is missing or
+  empty, and never falls behind a commit `gfs commit` reported as done. It does not
+  establish the same for a real disk with its own volatile cache, for other
+  filesystems, for macOS, or for any write outside the commit path.
 - **Directory creation** (`objects/<2>/`, nested `refs/heads/a/b/`) is not fsynced in
   its parent; a power cut can lose a freshly created shard directory. ext4's single
   journal makes this unlikely in practice; not verified.
 - **`branch -d` and `--restore`** move refs with `rename` and no directory fsync,
   unchanged here; they belong with the compare-and-swap ref work.
 - **Snapshot data** is not fsynced; a power cut can leave a snapshot whose ref and
-  commit object are durable but whose files are not. Out of scope; the 200 MB case
-  above suggests where that cost would land.
+  commit object are durable but whose files are not. Section 9 observed exactly that
+  on every forced stop, with both binaries: every snapshot taken in the seconds
+  before the stop held a 0-byte `db.sqlite`, and `gfs checkout` of a recovered commit
+  succeeded (rc=0) and handed back an empty database. Out of scope here; the 200 MB
+  case above suggests where the cost of fixing it would land.
 - `init`'s `config.toml` and `new` marker, `.gfs/commit.lock`, and every write outside
   `.gfs` are unchanged.
 - Windows: not built, not run.
@@ -345,8 +354,195 @@ the conflict text matches exactly, and the real merge brings 122 other commits o
 divergence, so check every replayed hunk. The scratch worktree and branch were
 removed; `feat/env-record-and-resolution` was `6d06306` before and after.
 
+## 9. Power-loss analogue: forced VM stop mid-commit
+
+Section 2 killed the process, which leaves the page cache intact. This section
+loses the page cache: a writer commits in a loop inside a VM, and the VM's
+hypervisor process is killed under it.
+
+### Setup
+
+- **VM**: a throwaway multipass instance created for this run and deleted after it
+  (`gfs-powerloss-20261007`, 2 vCPU, 2 GB, 8 GB disk), Ubuntu 24.04.5, kernel
+  6.8.0-142-generic aarch64, root filesystem ext4 (`rw,relatime,discard,
+  errors=remount-ro,commit=30`, ordered data mode). Hypervisor: multipass 1.16.3's
+  QEMU (`-accel hvf`), root disk a qcow2 image on `virtio-scsi` with no `cache=`
+  option, so QEMU's default writeback cache on the host; the guest sees
+  `write_cache = write back`. `sqlite3` 3.45.1 installed; nothing else.
+- **Binaries**: built for Linux arm64 from `git archive` of each commit, in the
+  `rust:1.93.1-bookworm` container, `cargo build -p gfs-cli --release`, rustc
+  1.93.1 (01f6ddf75 2026-02-11), whose `rustc/01f6ddf75` commit string is embedded
+  in both binaries.
+
+  | | baseline | fixed |
+  | --- | --- | --- |
+  | commit | `ee4197e` (`origin/main`) | `fb4eaa0` (`fix/atomic-writes`) |
+  | release binary sha256 | `19d16c10…8940ba` | `bfa36d42…f99825` |
+  | `GFS_FSYNC` string in the binary | 0 | 1 |
+
+  The two builds shared one target directory. The first build of `fb4eaa0` reported
+  `Finished` in 0.76 s and produced a byte-identical copy of the baseline binary
+  (same sha256, no `GFS_FSYNC` string): the extracted sources' mtimes were older than
+  the baseline's artefacts. The `fb4eaa0` sources were touched and rebuilt; the
+  binaries above are from that rebuild and differ as shown.
+- **Telemetry** off (`GFS_NO_TELEMETRY=1`) for every `gfs` call: with it on, one
+  `gfs commit` on the VM took over two minutes to exit after printing its result.
+
+### The cycle (8 per binary, alternating old/new)
+
+1. Fresh repository: `gfs init --database-provider sqlite --database-version 3`,
+   `create table t(id integer primary key, v integer)` with the `sqlite3` CLI,
+   `gfs commit -m c0`, then `sync`, so the starting state is on disk.
+2. A writer started detached in the VM (`nohup setsid`): `sqlite3 <db> "insert …
+   values ($i)"`, then `gfs commit -m c$i --path <repo>`, then append `i, time, rc,
+   the ref's content` to a log file on the VM, without any fsync. From the Mac,
+   `multipass exec … tail -F` of that log streamed every line out of the VM as it
+   was written (the "mirror"), which is the record of what the writer saw succeed.
+3. From the Mac: sleep a random 3–8 s (drawn: 3.1 to 7.26 s), write a canary file
+   in the VM without fsync, then `multipass stop --force`, then `multipass start`.
+4. With the same binary, before any other `gfs` command: the ref's bytes; a walk of
+   the chain from the ref (every commit object exists and parses as JSON, its
+   `parents` are 64-hex, its `files_ref` object exists and is non-empty; every
+   object reached; leftover `.*.tmp.*` names); then `gfs log -n 3`; then one insert
+   and `gfs commit -m after`; then `gfs log` in full and the chain walk again.
+
+**Calibration of the stop, both directions.** A plain `multipass stop` followed by
+`start` kept a file written without fsync and logged no ext4 journal recovery. A
+`multipass stop --force` lost a file written without fsync (gone), kept one written
+with `sync`, and the next boot logged `EXT4-fs (sda1): recovery complete`. In all 16
+cycles below the boot logged `recovery complete`, the canary came back as a **0-byte
+file** (its creation reached the journal, its data did not), and the writer's log
+on the VM came back **0 lines, 0 bytes**, while the mirror on the Mac held 97 to 792
+lines. The stop did discard the guest's page cache every time.
+
+### Result
+
+| cycle | sleep s | last success the writer saw | ref after restart | class | objects 0 bytes | `gfs log -n 3` | `commit -m after`, then `gfs log` |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| old-1 | 5.21 | c655 `f61a377` | c654 `046f422` | DANGLING-REF | 1,308 of 1,311 | rc=1 | rc=0, then rc=1 |
+| old-2 | 6.53 | c742 `896679b` | c742 `896679b` | DANGLING-REF | 1,484 | rc=1 | rc=0, then rc=1 |
+| old-3 | 6.72 | c745 `c93c172` | c744 `3ccd7d0` | DANGLING-REF | 1,488 | rc=1 | rc=0, then rc=1 |
+| old-4 | 7.26 | c792 `987ef32` | c792 `987ef32` | DANGLING-REF | 1,584 | rc=1 | rc=0, then rc=1 |
+| old-5 | 5.02 | c627 `1c636c5` | c626 `a20e744` | DANGLING-REF | 1,252 | rc=1 | rc=0, then rc=1 |
+| old-6 | 4.13 | c478 `df6cf03` | c478 `df6cf03` | DANGLING-REF | 956 | rc=1 | rc=0, then rc=1 |
+| old-7 | 3.27 | c97 `edce832` | c97 `edce832` | DANGLING-REF | 194 | rc=1 | rc=0, then rc=1 |
+| old-8 | 3.84 | c296 `27f2986` | c296 `27f2986` | DANGLING-REF | 592 | rc=1 | rc=0, then rc=1 |
+| new-1 | 4.07 | c262 `719437c` | c262 `719437c` | CONSISTENT | 0 | rc=0 | rc=0, then rc=0 |
+| new-2 | 5.03 | c280 `11d94dd` | c280 `11d94dd` | CONSISTENT | 0 | rc=0 | rc=0, then rc=0 |
+| new-3 | 5.48 | c262 `7d1eb6e` | c262 `7d1eb6e` | CONSISTENT | 0 | rc=0 | rc=0, then rc=0 |
+| new-4 | 5.62 | c334 `8c8e30d` | c334 `8c8e30d` | CONSISTENT | 0 | rc=0 | rc=0, then rc=0 |
+| new-5 | 7.05 | c415 `c772bb8` | c416 `f088ea9` | CONSISTENT | 0 | rc=0 | rc=0, then rc=0 |
+| new-6 | 3.10 | c133 `bf2b835` | c133 `bf2b835` | CONSISTENT | 0 | rc=0 | rc=0, then rc=0 |
+| new-7 | 5.50 | c341 `49724ad` | c341 `49724ad` | CONSISTENT | 0 | rc=0 | rc=0, then rc=0 |
+| new-8 | 3.87 | c222 `a239d58` | c222 `a239d58` | CONSISTENT | 0 | rc=0 | rc=0, then rc=0 |
+
+Counts: **baseline 8 of 8 DANGLING-REF**, 0 EMPTY-REF, 0 consistent. **Fixed 8 of 8
+CONSISTENT**, 0 STALE-BUT-CONSISTENT, 0 EMPTY-REF, 0 DANGLING-REF. No commit failed
+in the writer in any cycle. Because the baseline failed in all 8, the extra 8 cycles
+planned for a clean baseline were not run.
+
+**Baseline, what was left** (old-1; the others are the same shape). The ref
+survived as 64 valid hex bytes, but every object written after the `sync` was a
+**0-byte file**: 1,308 of 1,311 objects, the three non-empty ones being `c0`'s commit
+and files objects and the schema. The ref named c654, one commit behind c655, which
+the writer had seen succeed (and had read back from the ref); old-3 and old-5 were
+also one behind:
+
+```
+$ od -c .gfs/refs/heads/main | head -1
+0000000   0   4   6   f   4   2   2   d   e   0   3   c   d   6   0   d
+$ ls -l .gfs/objects/04/
+-rw-rw-r-- 1 ubuntu ubuntu 0 Oct  7 13:39 6f422de03cd60d34931c90ebc6fe5b15213a6402eeb14f3fe3147904233f8b
+$ gfs log -n 3
+error: repository error: internal error: Invalid config.toml: EOF while parsing a value at line 1 column 0
+rc=1
+$ gfs commit -m after
+✓ [main] dfaa919  after
+rc=0
+$ gfs log
+error: repository error: internal error: Invalid config.toml: EOF while parsing a value at line 1 column 0
+rc=1
+```
+
+`config.toml` itself was intact (126 bytes); the message is the existing label of
+the error raised for the 0-byte commit object, and it is misleading. As in section
+2, the next commit succeeds and makes things worse: it records the empty object as
+its parent, so `gfs log` keeps failing and the history from `c0` to the crash is
+unreachable from the branch.
+
+The likely mechanism, not separately verified: each `sqlite3` insert fsyncs the
+database, which forces an ext4 journal commit; that commit carries the metadata of
+every new object file (created, size not yet on disk under delayed allocation) and,
+through ext4's `auto_da_alloc` heuristic for files truncated and rewritten in place,
+the data of the ref, but not the delayed-allocation data of the new objects. On a
+system where nothing else syncs, the same baseline would more likely lose the whole
+window and come back stale.
+
+**Fixed, what was left** (new-1). The ref named c262, the last commit the writer
+had seen succeed; the chain walked back 263 commits to `c0` with every object
+present, parseable and non-empty; one leftover temp
+(`objects/14/<schema>/.schema.json.tmp.6012.0`); `gfs log -n 3` rc=0 showing c262,
+c261, c260; `gfs commit -m after` rc=0 with c262 as its parent; `gfs log` rc=0.
+
+- In 7 cycles the ref was the last commit the writer had logged as successful; in
+  new-5 it was **one past** it (c416): that commit's ref had reached the disk before
+  the stop and its log line had not reached the Mac. In no cycle was the ref behind
+  a commit reported as successful.
+- Leftover temps in 4 of 8 cycles (new-1, -2, -3, -8), each a single temp from the
+  commit in flight: two schema temps, two object temps. new-8 also had one
+  unreachable object, written for the in-flight commit whose ref never moved.
+  Every command run afterwards succeeded with them present.
+
+### What it found that the fix does not cover: snapshot data
+
+Both binaries lost the **database contents** of every commit made in the window.
+Each snapshot's `db.sqlite` is copied without fsync, and after the stop every
+snapshot taken after the `sync` held a 0-byte `db.sqlite` (old-1: 654 of 656
+snapshot directories; new-8: 223 of 225; the two non-empty ones in each are `c0` and
+the post-restart `after`). The live database survived (`sqlite3` fsyncs it: new-8's
+workspace held 224 rows, up to v=223). On the fixed binary the result is a durable
+history that names empty data:
+
+```
+$ gfs checkout a239d58b…   # new-8's recovered tip, c222
+✓ Switched to a239d58b301819d6bba43ba276c23b8f138530b300cb87619168c4654e937b9f (a239d58)
+rc=0
+$ ls -l .gfs/workspaces/detached/a239d58b3018/data
+-rwx------ 1 ubuntu ubuntu 0 Oct  7 13:44 db.sqlite
+$ sqlite3 …/db.sqlite "select count(*) from t;"
+Error: in prepare, no such table: t
+```
+
+This was a known gap (section 7); it is now an observed one. The fix makes the
+metadata trustworthy, which makes the missing data harder to notice: nothing in the
+repository reports it.
+
+### Limits
+
+- **A forced VM stop is not a power cut.** It discards the guest's page cache, but
+  QEMU ran with the host's writeback cache and the host kept running, so anything
+  QEMU had handed to the host survived whether or not the guest had asked for a
+  flush. A real disk can also lose its own volatile cache; this test cannot. Section
+  1's fsync ordering is still what the durability claim rests on; this shows the
+  claim holds when the page cache is lost, nothing stronger.
+- **One filesystem, one kernel, one hypervisor**: ext4 in ordered mode on Linux 6.8
+  under QEMU/HVF. Not run on XFS, btrfs, APFS or a bare-metal disk.
+- **Directory creation** (a new `objects/<2>/` shard) and **snapshot data** are
+  still not synced. The first never showed up here as a missing object or shard;
+  why was not investigated. The second showed up in every cycle (above).
+- **16 cycles, 3–8 s windows.** The crash point within a commit is random, not
+  aimed; section 2 aims it.
+- Only `commit` was exercised; `checkout`, `branch -d/--restore` and `init` were not
+  stopped mid-write.
+- The scripts are not committed; the cycle is described above in full.
+
 ## Cleanup
 
 The VM build directory `/home/ubuntu/gfs-atomic-writes/` (clone, both target
 directories, the toolchain and every test repository) was removed after these runs,
 and the tmpfs mounts were unmounted. Nothing else on the VM was touched.
+
+For section 9, the VM `gfs-powerloss-20261007` was created for the run and then
+deleted and purged; `multipass list` before and after showed `guepard-dev-cp`,
+`guepard-dev-dp` and `guepard-dev-monitoring` in the same state. The build directory
+on the Mac was removed, and the build container no longer exists.
