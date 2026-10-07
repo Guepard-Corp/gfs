@@ -17,7 +17,7 @@ tests/paths/
 
 ```bash
 cargo build --release                      # the tests run the real binary
-docker build -t gfs-postgres:16 crates/extensions/gfs   # and the real image
+docker build --build-arg PG_MAJOR=16 -t gfs-postgres:16 crates/extensions/gfs   # and the real image
 
 tests/paths/run-all.sh            # every implemented path
 tests/paths/run-all.sh B          # just the B family

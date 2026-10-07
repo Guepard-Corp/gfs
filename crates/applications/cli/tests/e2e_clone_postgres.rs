@@ -77,7 +77,7 @@ fn e2e_clone_postgres() {
         .unwrap_or(false);
     if !img_ok {
         eprintln!(
-            "SKIP: image gfs-postgres:16 absent — build: docker build -t gfs-postgres:16 crates/extensions/gfs"
+            "SKIP: image gfs-postgres:16 absent — build: docker build --build-arg PG_MAJOR=16 -t gfs-postgres:16 crates/extensions/gfs"
         );
         return;
     }
