@@ -4,6 +4,7 @@
 //! When the repo has a compute container, the use case stops it before checkout
 //! and starts (or recreates with the new workspace mount) after checkout.
 
+use crate::println_safe;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -156,30 +157,30 @@ pub async fn checkout(
     };
 
     if json_output {
-        println!(
+        println_safe!(
             "{}",
             json!({
                 "hash": commit_hash,
                 "branch": create_branch.as_deref().unwrap_or(&revision),
                 "new_branch": create_branch.is_some(),
             })
-        );
+        )?;
     } else {
         let short_hash = &commit_hash[..7.min(commit_hash.len())];
         if let Some(ref name) = create_branch {
-            println!(
+            println_safe!(
                 "{} Switched to new branch '{}' ({})",
                 green("✓"),
                 green(name.trim()),
                 dimmed(short_hash)
-            );
+            )?;
         } else {
-            println!(
+            println_safe!(
                 "{} Switched to {} ({})",
                 green("✓"),
                 cyan(revision.trim()),
                 dimmed(short_hash)
-            );
+            )?;
         }
     }
     Ok(())

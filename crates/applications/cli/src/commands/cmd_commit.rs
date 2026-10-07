@@ -1,3 +1,4 @@
+use crate::println_safe;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -115,23 +116,23 @@ async fn run(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if json_output {
-        println!(
+        println_safe!(
             "{}",
             json!({
                 "hash": commit_hash,
                 "branch": branch,
                 "message": message,
             })
-        );
+        )?;
     } else {
         let short = &commit_hash[..7.min(commit_hash.len())];
-        println!(
+        println_safe!(
             "{} [{}] {}  {}",
             green("✓"),
             cyan(&branch),
             dimmed(short),
             message
-        );
+        )?;
     }
     Ok(())
 }

@@ -814,3 +814,80 @@ fn an_argument_that_is_not_utf8_is_a_usage_error_not_a_crash() {
     let (code, _, stderr) = run_gfs_raw(tmp.path(), Some(b"gfs\xff"), &[b"--version"]);
     assert_eq!(code, 0, "argv[0] is not an argument: {stderr}");
 }
+
+/// Exit code of `args` when stdout's reader is gone before gfs writes.
+fn closed_reader_exit_code(cwd: &Path, args: &[&str]) -> Option<i32> {
+    use std::process::Stdio;
+
+    let mut child = Command::new(gfs_bin())
+        .current_dir(cwd)
+        .args(args)
+        .env("RUST_LOG", "off")
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn gfs");
+    drop(child.stdout.take());
+    child.wait().expect("wait").code()
+}
+
+/// Every command, not just fsck, keeps its verdict when the reader closes early.
+///
+/// A bare `println!` panics on BrokenPipe, so `gfs status | head -1` exited 101 --
+/// the code of a crash -- and `gfs schema diff | head` turned "breaking changes"
+/// (2) into that same 101. The sqlite provider needs no container runtime, so
+/// this runs anywhere.
+#[test]
+fn a_closed_reader_keeps_the_verdict_of_every_command() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path();
+    for args in [
+        vec![
+            "init",
+            ".",
+            "--database-provider",
+            "sqlite",
+            "--database-version",
+            "3",
+        ],
+        vec!["config", "user.name", "closed-reader"],
+        vec!["config", "user.email", "closed-reader@example.com"],
+        vec!["commit", "-m", "first"],
+    ] {
+        assert_eq!(run_gfs(repo, &args).0, 0, "setup: {args:?}");
+    }
+    let workspace = std::fs::read_to_string(repo.join(".gfs/WORKSPACE")).unwrap();
+    rusqlite::Connection::open(repo.join(workspace.trim()).join("db.sqlite"))
+        .unwrap()
+        .execute("CREATE TABLE added (id INTEGER PRIMARY KEY)", [])
+        .unwrap();
+    assert_eq!(
+        run_gfs(repo, &["commit", "-m", "second"]).0,
+        0,
+        "setup: commit"
+    );
+
+    for (args, verdict) in [
+        (vec!["status"], 0),
+        (vec!["status", "--json"], 0),
+        (vec!["branch"], 0),
+        (vec!["branch", "--json"], 0),
+        (vec!["providers"], 0),
+        (vec!["version"], 0),
+        // A non-zero verdict, so a closed reader cannot pass by exiting 0.
+        (vec!["schema", "diff", "HEAD~1", "HEAD"], 2),
+    ] {
+        let (open, stdout, _) = run_gfs(repo, &args);
+        assert_eq!(open, verdict, "precondition: {args:?} exits {verdict}");
+        assert!(
+            !stdout.is_empty(),
+            "precondition: {args:?} has output to lose"
+        );
+        assert_eq!(
+            closed_reader_exit_code(repo, &args),
+            Some(verdict),
+            "a closed reader must not change the verdict of {args:?}"
+        );
+    }
+}

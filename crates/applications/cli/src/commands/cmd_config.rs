@@ -6,6 +6,7 @@
 //!
 //! Resolution order for commits: CLI flag → local → global → git config.
 
+use crate::println_safe;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -270,7 +271,7 @@ fn get_global(key: &str) -> Result<()> {
             }
         }
         KEY_TELEMETRY_ENABLED => {
-            println!("{}", settings.telemetry);
+            println_safe!("{}", settings.telemetry)?;
         }
         _ => {
             anyhow::bail!(

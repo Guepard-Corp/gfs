@@ -5,6 +5,7 @@
 //! - `gfs branch <name> <start>` — create a new branch at a specific commit/branch
 //! - `gfs branch -d <name>` — delete a branch
 
+use crate::println_safe;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -72,13 +73,13 @@ fn list_branches(repo_path: &std::path::Path, json_output: bool) -> Result<()> {
     let branches = list_branch_tips(repo_path, false)?;
     if branches.is_empty() {
         if json_output {
-            println!(
+            println_safe!(
                 "{}",
                 serde_json::to_string_pretty(&json!({ "branches": [] }))?
-            );
+            )?;
             return Ok(());
         }
-        println!("  (no branches)");
+        println_safe!("  (no branches)")?;
         return Ok(());
     }
 
@@ -115,10 +116,10 @@ fn list_branches(repo_path: &std::path::Path, json_output: bool) -> Result<()> {
                 })
             })
             .collect();
-        println!(
+        println_safe!(
             "{}",
             serde_json::to_string_pretty(&json!({ "branches": out }))?
-        );
+        )?;
         return Ok(());
     }
 
@@ -135,15 +136,15 @@ fn list_branches(repo_path: &std::path::Path, json_output: bool) -> Result<()> {
         };
 
         if *name == current {
-            println!(
+            println_safe!(
                 "  {} {} {} {}",
                 gold("*"),
                 green(name),
                 dimmed(short_hash),
                 subject
-            );
+            )?;
         } else {
-            println!("    {} {} {}", cyan(name), dimmed(short_hash), subject);
+            println_safe!("    {} {} {}", cyan(name), dimmed(short_hash), subject)?;
         }
     }
 
@@ -201,7 +202,7 @@ async fn create_branch(
         let start_label = start_point.unwrap_or("HEAD");
 
         if json_output {
-            println!(
+            println_safe!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
                     "action": "create",
@@ -209,18 +210,18 @@ async fn create_branch(
                     "hash": commit_hash,
                     "start_point": start_label,
                 }))?
-            );
+            )?;
             return Ok(());
         }
 
         let short_hash = &commit_hash[..7.min(commit_hash.len())];
-        println!(
+        println_safe!(
             "{} Created branch '{}' at {} ({})",
             green("✓"),
             cyan(name),
             start_label,
             dimmed(short_hash)
-        );
+        )?;
     }
 
     Ok(())
@@ -298,7 +299,7 @@ fn delete_branch(repo_path: &std::path::Path, name: &str, json_output: bool) -> 
     }
 
     if json_output {
-        println!(
+        println_safe!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "action": "delete",
@@ -306,17 +307,17 @@ fn delete_branch(repo_path: &std::path::Path, name: &str, json_output: bool) -> 
                 "commit": deleted.commit_hash,
                 "recoverable": true,
             }))?
-        );
+        )?;
         return Ok(());
     }
 
-    println!("{} Deleted branch '{}'", green("✓"), name);
-    println!(
+    println_safe!("{} Deleted branch '{}'", green("✓"), name)?;
+    println_safe!(
         "  {}",
         dimmed(format!(
             "restore with: gfs branch --restore {name}  (restores committed work)"
         ))
-    );
+    )?;
     Ok(())
 }
 
@@ -389,25 +390,25 @@ fn list_deleted(repo_path: &std::path::Path, json_output: bool) -> Result<()> {
                 })
             })
             .collect();
-        println!(
+        println_safe!(
             "{}",
             serde_json::to_string_pretty(&json!({ "deleted": rows }))?
-        );
+        )?;
         return Ok(());
     }
 
     if entries.is_empty() {
-        println!("{}", dimmed("No deleted branches are recoverable."));
+        println_safe!("{}", dimmed("No deleted branches are recoverable."))?;
         return Ok(());
     }
 
-    println!(
+    println_safe!(
         "{}",
         dimmed(format!(
             "Recoverable for {} days after deletion:",
             deleted_retention_days(repo_path)
         ))
-    );
+    )?;
     // Entries are newest-first, so the first occurrence of a name is the one
     // `--restore` would pick. Repeated deletions of the same name are shown
     // rather than collapsed, but only one of them is actionable.
@@ -416,16 +417,16 @@ fn list_deleted(repo_path: &std::path::Path, json_output: bool) -> Result<()> {
         let short: String = d.commit_hash.chars().take(7).collect();
         let newest = !seen.contains(&d.name.as_str());
         seen.push(d.name.as_str());
-        println!(
+        println_safe!(
             "  {}  {}  {}{}",
             cyan(&d.name),
             gold(&short),
             dimmed(format_age(d.deleted_at_ms)),
             if newest { "" } else { " (older deletion)" }
-        );
+        )?;
     }
-    println!();
-    println!("{}", dimmed("restore with: gfs branch --restore <name>"));
+    println_safe!()?;
+    println_safe!("{}", dimmed("restore with: gfs branch --restore <name>"))?;
     Ok(())
 }
 
@@ -527,27 +528,27 @@ fn restore_branch(repo_path: &std::path::Path, name: &str, json_output: bool) ->
             .with_context(|| format!("failed to restore branch '{}'", name))?;
 
     if json_output {
-        println!(
+        println_safe!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "action": "restore",
                 "branch": restored.name,
                 "commit": restored.commit_hash,
             }))?
-        );
+        )?;
         return Ok(());
     }
 
     let short: String = restored.commit_hash.chars().take(7).collect();
-    println!(
+    println_safe!(
         "{} Restored branch '{}' at {}",
         green("\u{2713}"),
         restored.name,
         gold(&short)
-    );
-    println!(
+    )?;
+    println_safe!(
         "  {}",
         dimmed(format!("check it out with: gfs checkout {}", restored.name))
-    );
+    )?;
     Ok(())
 }

@@ -1,5 +1,6 @@
 //! `gfs status` — show repository and compute status.
 
+use crate::println_safe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -52,8 +53,8 @@ pub async fn run(path: Option<PathBuf>, output: String) -> Result<i32> {
     }
 
     match output.as_str() {
-        "json" => print_json(&status),
-        _ => print_table(&status, &repo_path, moments.as_ref()),
+        "json" => print_json(&status)?,
+        _ => print_table(&status, &repo_path, moments.as_ref())?,
     }
 
     // Exit code: 0 if no compute or compute is running, 1 otherwise.
@@ -122,70 +123,70 @@ async fn source_summary(repo_path: &Path) -> Option<SourceStatus> {
     Some(st)
 }
 
-fn print_source(s: &SourceStatus, moments: Option<&cmd_source::CloneMoments>) {
-    println!();
-    println!("{}", box_top(&bold("Source"), BOX_W));
+fn print_source(s: &SourceStatus, moments: Option<&cmd_source::CloneMoments>) -> Result<()> {
+    println_safe!()?;
+    println_safe!("{}", box_top(&bold("Source"), BOX_W))?;
 
     // #132: a frozen clone is a sealed snapshot; behind/diverged/checked no
     // longer mean anything (nothing is compared any more), so say what it IS.
     if s.frozen == Some(true) {
         let state = "frozen snapshot";
         let row = fmt_box_row_colored("State", &cyan(state), state, LABEL_W, BOX_W);
-        println!("{}", box_row(&row, BOX_W));
+        println_safe!("{}", box_row(&row, BOX_W))?;
         if let Some(at) = &s.frozen_at {
             let row = fmt_box_row("Frozen at", at, LABEL_W, BOX_W);
-            println!("{}", box_row(&row, BOX_W));
+            println_safe!("{}", box_row(&row, BOX_W))?;
         }
         let row = fmt_box_row("Tracked tables", &s.tracked.to_string(), LABEL_W, BOX_W);
-        println!("{}", box_row(&row, BOX_W));
+        println_safe!("{}", box_row(&row, BOX_W))?;
         if s.diverged > 0 {
             let d = s.diverged.to_string();
             let row = fmt_box_row_colored("Kept", &yellow(&d).to_string(), &d, LABEL_W, BOX_W);
-            println!("{}", box_row(&row, BOX_W));
+            println_safe!("{}", box_row(&row, BOX_W))?;
         }
-        println!("{}", box_bottom(BOX_W));
-        println!();
-        println!(
+        println_safe!("{}", box_bottom(BOX_W))?;
+        println_safe!()?;
+        println_safe!(
             "  {}",
             dimmed("a point-in-time snapshot; the source is never consulted")
-        );
+        )?;
         if s.diverged > 0 {
             // #131: when the watermarks can date them, say the sharper thing --
             // kept tables were not re-copied, so their source rows are older
             // than the freeze instant. Never reported as "torn": keeping your
             // writes is what makes this clone a branch.
             if moments.map(|m| m.diverged_stale).unwrap_or(0) > 0 {
-                println!(
+                println_safe!(
                     "  {}",
                     dimmed(
                         "kept tables preserve your local writes; their source rows predate the freeze"
                     )
-                );
+                )?;
             } else {
-                println!(
+                println_safe!(
                     "  {}",
                     dimmed("kept tables preserve your local writes (they are your branch)")
-                );
+                )?;
             }
         }
-        return;
+        return Ok(());
     }
 
     // Zeros here would read as "up to date"; nothing has been compared yet.
     if s.tracked == 0 {
         let msg = format!("{:<w$}", "(not checked yet)", w = BOX_W);
-        println!("  {} {} {}", BOX_V, dimmed(&msg), BOX_V);
-        println!("{}", box_bottom(BOX_W));
-        println!();
-        println!(
+        println_safe!("  {} {} {}", BOX_V, dimmed(&msg), BOX_V)?;
+        println_safe!("{}", box_bottom(BOX_W))?;
+        println_safe!()?;
+        println_safe!(
             "  {}",
             dimmed("`gfs fetch --check` to probe the source now")
-        );
-        return;
+        )?;
+        return Ok(());
     }
 
     let row = fmt_box_row("Tracked tables", &s.tracked.to_string(), LABEL_W, BOX_W);
-    println!("{}", box_row(&row, BOX_W));
+    println_safe!("{}", box_row(&row, BOX_W))?;
 
     // "behind" counts every table the source has changed; the diverged ones are a
     // subset of those, and are the only ones `gfs pull` cannot resolve on its own.
@@ -196,12 +197,12 @@ fn print_source(s: &SourceStatus, moments: Option<&cmd_source::CloneMoments>) {
         behind.clone()
     };
     let row = fmt_box_row_colored("Behind", &behind_colored, &behind, LABEL_W, BOX_W);
-    println!("{}", box_row(&row, BOX_W));
+    println_safe!("{}", box_row(&row, BOX_W))?;
 
     if s.diverged > 0 {
         let d = s.diverged.to_string();
         let row = fmt_box_row_colored("Diverged", &red(&d).to_string(), &d, LABEL_W, BOX_W);
-        println!("{}", box_row(&row, BOX_W));
+        println_safe!("{}", box_row(&row, BOX_W))?;
     }
 
     // #131: does this clone mix source moments? A copied-at-different-moments
@@ -212,36 +213,37 @@ fn print_source(s: &SourceStatus, moments: Option<&cmd_source::CloneMoments>) {
         if m.torn {
             let v = format!("spans \u{2265}{} (torn)", m.moment_count);
             let row = fmt_box_row_colored("Moments", &yellow(&v).to_string(), &v, LABEL_W, BOX_W);
-            println!("{}", box_row(&row, BOX_W));
+            println_safe!("{}", box_row(&row, BOX_W))?;
         } else if m.copied >= 2 && m.unmarked == 0 {
             let row = fmt_box_row("Moments", "single", LABEL_W, BOX_W);
-            println!("{}", box_row(&row, BOX_W));
+            println_safe!("{}", box_row(&row, BOX_W))?;
         } else if m.copied > 0 && m.unmarked > 0 {
             let row = fmt_box_row("Moments", "unknown", LABEL_W, BOX_W);
-            println!("{}", box_row(&row, BOX_W));
+            println_safe!("{}", box_row(&row, BOX_W))?;
         }
     }
 
     if !s.last_checked.is_empty() {
         let row = fmt_box_row("Checked", &s.last_checked, LABEL_W, BOX_W);
-        println!("{}", box_row(&row, BOX_W));
+        println_safe!("{}", box_row(&row, BOX_W))?;
     }
-    println!("{}", box_bottom(BOX_W));
+    println_safe!("{}", box_bottom(BOX_W))?;
 
     if s.behind > 0 {
-        println!();
-        println!(
+        println_safe!()?;
+        println_safe!(
             "  {}",
             dimmed("`gfs fetch` for detail, `gfs pull` to make these tables local again")
-        );
+        )?;
     }
     if torn {
-        println!();
-        println!(
+        println_safe!()?;
+        println_safe!(
             "  {}",
             dimmed("`gfs fetch` shows the span; `gfs freeze` makes this clone one moment again")
-        );
+        )?;
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -251,9 +253,13 @@ fn print_source(s: &SourceStatus, moments: Option<&cmd_source::CloneMoments>) {
 const LABEL_W: usize = 20;
 const BOX_W: usize = 40;
 
-fn print_table(s: &StatusResponse, repo_path: &Path, moments: Option<&cmd_source::CloneMoments>) {
+fn print_table(
+    s: &StatusResponse,
+    repo_path: &Path,
+    moments: Option<&cmd_source::CloneMoments>,
+) -> Result<()> {
     // Repository section
-    println!("{}", box_top(&bold("Repository"), BOX_W));
+    println_safe!("{}", box_top(&bold("Repository"), BOX_W))?;
 
     let branch_row = fmt_box_row_colored(
         "Branch",
@@ -262,20 +268,20 @@ fn print_table(s: &StatusResponse, repo_path: &Path, moments: Option<&cmd_source
         LABEL_W,
         BOX_W,
     );
-    println!("{}", box_row(&branch_row, BOX_W));
+    println_safe!("{}", box_row(&branch_row, BOX_W))?;
 
     // The same field the MCP `status` tool reports, from the same place. When
     // only MCP had it the two surfaces answered the same question differently.
     if let Some(ref head) = s.head_commit {
         let short = &head[..7.min(head.len())];
         let row = fmt_box_row_colored("HEAD", &dimmed(short), short, LABEL_W, BOX_W);
-        println!("{}", box_row(&row, BOX_W));
+        println_safe!("{}", box_row(&row, BOX_W))?;
     }
 
     if let Some(ref active) = s.active_workspace_data_dir {
         let rel = relativize_to_repo(repo_path, active);
         let row = fmt_box_row("Active workspace", &rel, LABEL_W, BOX_W);
-        println!("{}", box_row(&row, BOX_W));
+        println_safe!("{}", box_row(&row, BOX_W))?;
     }
     // `gfs status --help` promises a connection string. A container-backed
     // provider prints one in the Compute section below; an embedded one has no
@@ -284,11 +290,11 @@ fn print_table(s: &StatusResponse, repo_path: &Path, moments: Option<&cmd_source
         && let Some(ref conn) = s.connection_string
     {
         let row = fmt_box_row("Connection", conn, LABEL_W, BOX_W);
-        println!("{}", box_row(&row, BOX_W));
+        println_safe!("{}", box_row(&row, BOX_W))?;
     }
-    println!("{}", box_bottom(BOX_W));
+    println_safe!("{}", box_bottom(BOX_W))?;
 
-    println!();
+    println_safe!()?;
 
     if let Some(ref c) = s.compute {
         let status_dot = status_indicator_colored(&c.container_status);
@@ -298,17 +304,17 @@ fn print_table(s: &StatusResponse, repo_path: &Path, moments: Option<&cmd_source
             c.container_status
         );
 
-        println!("{}", box_top(&bold("Compute"), BOX_W));
+        println_safe!("{}", box_top(&bold("Compute"), BOX_W))?;
 
         let row = fmt_box_row("Provider", &c.provider, LABEL_W, BOX_W);
-        println!("{}", box_row(&row, BOX_W));
+        println_safe!("{}", box_row(&row, BOX_W))?;
 
         let row = fmt_box_row("Version", &c.version, LABEL_W, BOX_W);
-        println!("{}", box_row(&row, BOX_W));
+        println_safe!("{}", box_row(&row, BOX_W))?;
 
         let status_colored = format!("{} {}", status_dot, c.container_status);
         let row = fmt_box_row_colored("Status", &status_colored, &status_raw, LABEL_W, BOX_W);
-        println!("{}", box_row(&row, BOX_W));
+        println_safe!("{}", box_row(&row, BOX_W))?;
 
         let truncated = truncate_id(&c.container_id);
         let row = fmt_box_row_colored(
@@ -318,33 +324,34 @@ fn print_table(s: &StatusResponse, repo_path: &Path, moments: Option<&cmd_source
             LABEL_W,
             BOX_W,
         );
-        println!("{}", box_row(&row, BOX_W));
+        println_safe!("{}", box_row(&row, BOX_W))?;
 
         if let Some(ref bind) = c.data_bind_host_path {
             let rel = relativize_to_repo(repo_path, bind);
             let row = fmt_box_row("Container data dir", &rel, LABEL_W, BOX_W);
-            println!("{}", box_row(&row, BOX_W));
+            println_safe!("{}", box_row(&row, BOX_W))?;
         }
         if !c.connection_string.is_empty() {
             let row = fmt_box_row("Connection", &c.connection_string, LABEL_W, BOX_W);
-            println!("{}", box_row(&row, BOX_W));
+            println_safe!("{}", box_row(&row, BOX_W))?;
         }
-        println!("{}", box_bottom(BOX_W));
+        println_safe!("{}", box_bottom(BOX_W))?;
     } else {
-        println!("{}", box_top(&bold("Compute"), BOX_W));
+        println_safe!("{}", box_top(&bold("Compute"), BOX_W))?;
         let msg = format!("{:<w$}", "(no compute instance configured)", w = BOX_W);
-        println!("  {} {} {}", BOX_V, dimmed(&msg), BOX_V);
-        println!("{}", box_bottom(BOX_W));
+        println_safe!("  {} {} {}", BOX_V, dimmed(&msg), BOX_V)?;
+        println_safe!("{}", box_bottom(BOX_W))?;
     }
 
     if let Some(ref src) = s.source {
-        print_source(src, moments);
+        print_source(src, moments)?;
     }
 
     if let Some(ref warning) = s.bind_mismatch_warning {
-        println!();
-        println!("  {}  {}", yellow("⚠"), yellow(warning));
+        println_safe!()?;
+        println_safe!("  {}  {}", yellow("⚠"), yellow(warning))?;
     }
+    Ok(())
 }
 
 /// Single-character indicator for container status (for quick scanning).
@@ -380,7 +387,8 @@ fn truncate_id(id: &str) -> String {
     }
 }
 
-fn print_json(s: &StatusResponse) {
+fn print_json(s: &StatusResponse) -> Result<()> {
     let out = serde_json::to_string_pretty(s).expect("status serialization");
-    println!("{}", out);
+    println_safe!("{}", out)?;
+    Ok(())
 }

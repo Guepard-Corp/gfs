@@ -1223,7 +1223,7 @@ where
                 Ok(0)
             }
             TopLevel::Version => {
-                commands::cmd_version::run();
+                commands::cmd_version::run()?;
                 Ok(0)
             }
         }
@@ -1314,12 +1314,12 @@ async fn dispatch_storage(
                 .await
                 .map_err(anyhow::Error::from)?;
             if json_output {
-                println!(
+                println_safe!(
                     "{}",
                     serde_json::to_string_pretty(&json!({"status":"mounted"}))?
-                );
+                )?;
             } else {
-                println!("mounted");
+                println_safe!("mounted")?;
             }
         }
         StorageAction::Unmount { id } => {
@@ -1328,12 +1328,12 @@ async fn dispatch_storage(
                 .await
                 .map_err(anyhow::Error::from)?;
             if json_output {
-                println!(
+                println_safe!(
                     "{}",
                     serde_json::to_string_pretty(&json!({"status":"unmounted"}))?
-                );
+                )?;
             } else {
-                println!("unmounted");
+                println_safe!("unmounted")?;
             }
         }
         StorageAction::Snapshot { id, label } => {
@@ -1342,7 +1342,7 @@ async fn dispatch_storage(
                 .await
                 .map_err(anyhow::Error::from)?;
             if json_output {
-                println!(
+                println_safe!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
                         "snapshot": {
@@ -1352,13 +1352,13 @@ async fn dispatch_storage(
                             "label": snap.label,
                         }
                     }))?
-                );
+                )?;
             } else {
-                println!("snapshot id  : {}", snap.id);
-                println!("volume       : {}", snap.volume_id);
-                println!("created_at   : {}", snap.created_at);
+                println_safe!("snapshot id  : {}", snap.id)?;
+                println_safe!("volume       : {}", snap.volume_id)?;
+                println_safe!("created_at   : {}", snap.created_at)?;
                 if let Some(lbl) = &snap.label {
-                    println!("label        : {lbl}");
+                    println_safe!("label        : {lbl}")?;
                 }
             }
         }
@@ -1389,7 +1389,7 @@ async fn dispatch_storage(
                 .await
                 .map_err(anyhow::Error::from)?;
             if json_output {
-                println!(
+                println_safe!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
                         "quota": {
@@ -1399,12 +1399,12 @@ async fn dispatch_storage(
                             "free_bytes": quota.free_bytes,
                         }
                     }))?
-                );
+                )?;
             } else {
-                println!("volume      : {}", quota.volume_id);
-                println!("limit_bytes : {}", quota.limit_bytes);
-                println!("used_bytes  : {}", quota.used_bytes);
-                println!("free_bytes  : {}", quota.free_bytes);
+                println_safe!("volume      : {}", quota.volume_id)?;
+                println_safe!("limit_bytes : {}", quota.limit_bytes)?;
+                println_safe!("used_bytes  : {}", quota.used_bytes)?;
+                println_safe!("free_bytes  : {}", quota.free_bytes)?;
             }
         }
     }
@@ -1424,7 +1424,7 @@ fn print_volume_status(
     json_output: bool,
 ) -> Result<()> {
     if json_output {
-        println!(
+        println_safe!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "volume": {
@@ -1435,20 +1435,20 @@ fn print_volume_status(
                     "used_bytes": s.used_bytes,
                 }
             }))?
-        );
+        )?;
         Ok(())
     } else {
-        println!("id          : {}", s.id);
-        println!(
+        println_safe!("id          : {}", s.id)?;
+        println_safe!(
             "mount_point : {}",
             s.mount_point
                 .as_deref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "-".to_owned())
-        );
-        println!("status      : {:?}", s.status);
-        println!("size_bytes  : {}", s.size_bytes);
-        println!("used_bytes  : {}", s.used_bytes);
+        )?;
+        println_safe!("status      : {:?}", s.status)?;
+        println_safe!("size_bytes  : {}", s.size_bytes)?;
+        println_safe!("used_bytes  : {}", s.used_bytes)?;
         Ok(())
     }
 }

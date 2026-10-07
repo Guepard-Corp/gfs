@@ -1,5 +1,6 @@
 //! `gfs providers` — list database providers and their supported versions.
 
+use crate::println_safe;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -44,7 +45,7 @@ pub fn run(provider_name: Option<String>, json_output: bool) -> Result<()> {
 fn print_all_providers(registry: &impl DatabaseProviderRegistry) -> Result<()> {
     let names = registry.list();
     if names.is_empty() {
-        println!("  (no providers registered)");
+        println_safe!("  (no providers registered)")?;
         return Ok(());
     }
 
@@ -63,7 +64,7 @@ fn print_all_providers(registry: &impl DatabaseProviderRegistry) -> Result<()> {
         })
         .collect();
 
-    print_providers_table(&rows);
+    print_providers_table(&rows)?;
     Ok(())
 }
 
@@ -81,10 +82,10 @@ fn print_all_providers_json(registry: &impl DatabaseProviderRegistry) -> Result<
         })
         .collect();
 
-    println!(
+    println_safe!(
         "{}",
         serde_json::to_string_pretty(&json!({ "providers": providers }))?
-    );
+    )?;
     Ok(())
 }
 
@@ -96,13 +97,13 @@ fn print_provider_detail(registry: &impl DatabaseProviderRegistry, name: &str) -
     let versions = provider.supported_versions();
     let features = provider.supported_features();
 
-    println!("  {} {}", bold("Provider:"), cyan(name));
-    println!();
-    println!("  Supported versions: {}", versions.join(", "));
-    println!();
-    print_features_table(&features);
-    println!();
-    println!("  Images are pulled from Docker Hub by default.");
+    println_safe!("  {} {}", bold("Provider:"), cyan(name))?;
+    println_safe!()?;
+    println_safe!("  Supported versions: {}", versions.join(", "))?;
+    println_safe!()?;
+    print_features_table(&features)?;
+    println_safe!()?;
+    println_safe!("  Images are pulled from Docker Hub by default.")?;
     Ok(())
 }
 
@@ -123,7 +124,7 @@ fn print_provider_detail_json(registry: &impl DatabaseProviderRegistry, name: &s
             "images_source": "docker_hub",
         }
     });
-    println!("{}", serde_json::to_string_pretty(&out)?);
+    println_safe!("{}", serde_json::to_string_pretty(&out)?)?;
     Ok(())
 }
 
@@ -135,17 +136,17 @@ const COL_PROVIDER: usize = 20;
 const COL_VERSION: usize = 30;
 const COL_FEATURES: usize = 30;
 
-fn print_providers_table(rows: &[(String, String, String)]) {
+fn print_providers_table(rows: &[(String, String, String)]) -> Result<()> {
     let cols = [COL_PROVIDER, COL_VERSION, COL_FEATURES];
 
     // Top border: ┌──────┬──────┬──────┐
-    println!("{}", tbl_rule(&cols, TBL_TL, TBL_T_DOWN, TBL_TR));
+    println_safe!("{}", tbl_rule(&cols, TBL_TL, TBL_T_DOWN, TBL_TR))?;
 
     // Header row
     let h_provider = format!("{:<w$}", "database_provider", w = COL_PROVIDER);
     let h_version = format!("{:<w$}", "version", w = COL_VERSION);
     let h_features = format!("{:<w$}", "features", w = COL_FEATURES);
-    println!(
+    println_safe!(
         "  {} {} {} {} {} {} {}",
         TBL_V,
         bold(&h_provider),
@@ -154,17 +155,17 @@ fn print_providers_table(rows: &[(String, String, String)]) {
         TBL_V,
         bold(&h_features),
         TBL_V
-    );
+    )?;
 
     // Separator: ├──────┼──────┼──────┤
-    println!("{}", tbl_rule(&cols, TBL_T_RIGHT, TBL_CROSS, TBL_T_LEFT));
+    println_safe!("{}", tbl_rule(&cols, TBL_T_RIGHT, TBL_CROSS, TBL_T_LEFT))?;
 
     // Data rows
     for (name, versions, features) in rows {
         let p = format!("{:<w$}", name, w = COL_PROVIDER);
         let v = format!("{:<w$}", truncate(versions, COL_VERSION), w = COL_VERSION);
         let f = format!("{:<w$}", truncate(features, COL_FEATURES), w = COL_FEATURES);
-        println!(
+        println_safe!(
             "  {} {} {} {} {} {} {}",
             TBL_V,
             cyan(&p),
@@ -173,51 +174,53 @@ fn print_providers_table(rows: &[(String, String, String)]) {
             TBL_V,
             f,
             TBL_V
-        );
+        )?;
     }
 
     // Bottom border: └──────┴──────┴──────┘
-    println!("{}", tbl_rule(&cols, TBL_BL, TBL_T_UP, TBL_BR));
+    println_safe!("{}", tbl_rule(&cols, TBL_BL, TBL_T_UP, TBL_BR))?;
 
-    println!();
-    println!("  Images are pulled from Docker Hub by default.");
+    println_safe!()?;
+    println_safe!("  Images are pulled from Docker Hub by default.")?;
+    Ok(())
 }
 
 const COL_FEATURE: usize = 25;
 const COL_DESC: usize = 45;
 
-fn print_features_table(features: &[SupportedFeature]) {
+fn print_features_table(features: &[SupportedFeature]) -> Result<()> {
     let cols = [COL_FEATURE, COL_DESC];
 
-    println!("  {}", bold("Features"));
+    println_safe!("  {}", bold("Features"))?;
 
     // Top border
-    println!("{}", tbl_rule(&cols, TBL_TL, TBL_T_DOWN, TBL_TR));
+    println_safe!("{}", tbl_rule(&cols, TBL_TL, TBL_T_DOWN, TBL_TR))?;
 
     // Header
     let h_feat = format!("{:<w$}", "feature", w = COL_FEATURE);
     let h_desc = format!("{:<w$}", "description", w = COL_DESC);
-    println!(
+    println_safe!(
         "  {} {} {} {} {}",
         TBL_V,
         bold(&h_feat),
         TBL_V,
         bold(&h_desc),
         TBL_V
-    );
+    )?;
 
     // Separator
-    println!("{}", tbl_rule(&cols, TBL_T_RIGHT, TBL_CROSS, TBL_T_LEFT));
+    println_safe!("{}", tbl_rule(&cols, TBL_T_RIGHT, TBL_CROSS, TBL_T_LEFT))?;
 
     // Rows
     for f in features {
         let feat = format!("{:<w$}", f.id, w = COL_FEATURE);
         let desc = format!("{:<w$}", truncate(&f.description, COL_DESC), w = COL_DESC);
-        println!("  {} {} {} {} {}", TBL_V, feat, TBL_V, desc, TBL_V);
+        println_safe!("  {} {} {} {} {}", TBL_V, feat, TBL_V, desc, TBL_V)?;
     }
 
     // Bottom
-    println!("{}", tbl_rule(&cols, TBL_BL, TBL_T_UP, TBL_BR));
+    println_safe!("{}", tbl_rule(&cols, TBL_BL, TBL_T_UP, TBL_BR))?;
+    Ok(())
 }
 
 fn truncate(s: impl AsRef<str>, max_len: usize) -> String {
