@@ -29,8 +29,8 @@ use std::time::{Duration, SystemTime};
 use crate::model::commit::Commit;
 use crate::model::errors::RepoError;
 use crate::model::fsck::{
-    Dangling, FsckReport, ObjectKind, ReclaimableWorkspace, SnapshotFacts, Unreachable,
-    Unrecognised,
+    Dangling, FsckReport, Misaddressed, ObjectKind, ReclaimableWorkspace, SnapshotFacts,
+    Unreachable, Unrecognised,
 };
 use crate::model::layout::{
     BRANCH_WORKSPACE_SEGMENT, DELETED_REFS_DIR, GFS_DIR, HEAD_FILE, HEADS_DIR, OBJECTS_DIR,
@@ -848,6 +848,14 @@ struct Marks {
     /// corruption. It is only wrong when the commit's own file list says files
     /// should be there.
     snapshot_contents: Vec<(String, String, Option<String>)>,
+    /// Commits whose content does not hash to the address they were loaded from.
+    ///
+    /// Collected during the walk rather than after it, because a commit is
+    /// reached through a ref or a parent link and never appears in `expected` --
+    /// which holds what commits POINT AT. Verifying only `expected` therefore
+    /// checked every file list and left every commit, including each branch tip,
+    /// unverified. That was this check's first shape and it caught nothing.
+    misaddressed: Vec<Misaddressed>,
 }
 
 /// Walk from `roots`, marking everything reachable and collecting dangling
@@ -896,6 +904,24 @@ fn mark(
 
         marks.objects.insert(hash.clone());
         marks.commits += 1;
+
+        // The store is content-addressed, so the name IS the digest of the
+        // content and recomputing it is the one check that says these are the
+        // bytes that were written. Everything above validates shape only: this
+        // commit parsed, and its kind matched what referred to it. A valid
+        // commit's bytes copied onto a different commit's address satisfies both
+        // -- and takes that commit's parent links with it, so the history behind
+        // it stops being reachable and fsck offers it for collection.
+        if let Some(found) = commit_address(&commit)
+            && !hash.eq_ignore_ascii_case(&found)
+        {
+            marks.misaddressed.push(Misaddressed {
+                stored_at: hash.clone(),
+                hashes_to: found,
+                kind: ObjectKind::Commit,
+                bytes: object_size(&objects_dir.join(&hash[..2]).join(&hash[2..])),
+            });
+        }
 
         if snapshots.is_checked() {
             match normalise_hash(&commit.snapshot_hash) {
@@ -1050,6 +1076,88 @@ fn identify_object(path: &Path) -> Result<ObjectKind, Unidentified> {
     ))
 }
 
+/// What the content at `path` hashes to, when the address is a content hash.
+///
+/// `None` means there is nothing to compare against, and the caller must treat
+/// that as "not checkable" rather than "fine". Snapshots are the case: their
+/// address comes from `hash_snapshot(source_path, timestamp)`, which never reads
+/// the data, so a snapshot's name says when and where it was taken and nothing
+/// about what is in it. Verifying a snapshot's *contents* means hashing the data
+/// itself, which scales with database size rather than with history, and is the
+/// line this walk stays on the cheap side of.
+///
+/// Each arm reproduces the write path exactly, by calling the same function the
+/// writer called wherever one exists. That is deliberate: a second
+/// implementation of a digest drifts from the first, and a drifted verifier
+/// reports every object as damaged, which is worse than not checking at all.
+/// The address a commit's content should occupy.
+///
+/// A commit is NOT its stored bytes. `hash_commit` digests the JSON of a
+/// `NewCommit`; what lands on disk is a `Commit` -- the same eleven fields plus
+/// the hash itself and the derived counts. Hashing the file would therefore
+/// report every commit in every repository as damaged, which is how a verifier
+/// that drifts from its writer behaves. Measured on a fresh two-commit
+/// repository: both file lists' addresses equal sha256 of their raw bytes, and
+/// neither commit's does.
+///
+/// So this rebuilds the `NewCommit` and calls the same function the writer
+/// called. If a field is ever added to `NewCommit`, this stops compiling rather
+/// than silently hashing the wrong shape.
+fn commit_address(commit: &Commit) -> Option<String> {
+    let as_written = crate::model::commit::NewCommit {
+        message: commit.message.clone(),
+        timestamp: commit.timestamp,
+        author: commit.author.clone(),
+        author_email: commit.author_email.clone(),
+        author_date: commit.author_date,
+        committer: commit.committer.clone(),
+        committer_email: commit.committer_email.clone(),
+        committer_date: commit.committer_date,
+        snapshot_hash: commit.snapshot_hash.clone(),
+        parents: commit.parents.clone(),
+        schema_hash: commit.schema_hash.clone(),
+    };
+    crate::utils::hash::hash_commit(&as_written).ok()
+}
+
+fn content_address(path: &Path, kind: ObjectKind) -> Option<String> {
+    use sha2::{Digest, Sha256};
+
+    match kind {
+        // A file list IS its bincode bytes, so the file on disk is exactly what
+        // `hash_file_entries` digested. Measured on a fresh repository: both file
+        // lists' addresses equal sha256 of their raw bytes.
+        ObjectKind::FileList => {
+            let bytes = std::fs::read(path).ok()?;
+            Some(format!("{:x}", Sha256::digest(&bytes)))
+        }
+        // A commit is NOT its stored bytes. `hash_commit` digests the JSON of a
+        // `NewCommit`, while what lands on disk is a `Commit` — the same fields
+        // plus the hash itself and the derived counts. Hashing the file would
+        // therefore flag every commit in every repository, which is why this
+        // rebuilds the `NewCommit` and calls the production function rather than
+        // re-deriving the digest here.
+        ObjectKind::Commit => {
+            let bytes = std::fs::read(path).ok()?;
+            commit_address(&serde_json::from_slice(&bytes).ok()?)
+        }
+        // A schema object is a directory, and its name covers BOTH files with a
+        // separator between them — see `write_schema_object`, which documents why
+        // hashing `schema.json` alone let two commits share a directory and the
+        // second overwrite the first's DDL.
+        ObjectKind::Schema => {
+            let json = std::fs::read(path.join("schema.json")).ok()?;
+            let sql = std::fs::read(path.join("schema.sql")).ok()?;
+            let mut hasher = Sha256::new();
+            hasher.update(&json);
+            hasher.update(b"\0schema.sql\0");
+            hasher.update(&sql);
+            Some(format!("{:x}", hasher.finalize()))
+        }
+        ObjectKind::Snapshot => None,
+    }
+}
+
 /// Whether `path` was modified after `cutoff`, and so is protected.
 ///
 /// An unreadable mtime counts as protected: refusing to collect something that
@@ -1174,10 +1282,14 @@ pub fn check_with(
     // a wrong answer presented confidently is the failure mode a check exists
     // to prevent. Same reasoning as `snapshots_checked`.
     let reachability_complete = dangling.is_empty();
-    let marks = mark(repo_path, &roots, snapshots, &mut dangling, &mut blind);
+    let mut marks = mark(repo_path, &roots, snapshots, &mut dangling, &mut blind);
 
     let mut unreachable: Vec<Unreachable> = Vec::new();
     let mut unrecognised: Vec<Unrecognised> = Vec::new();
+    let mut misaddressed: Vec<Misaddressed> = Vec::new();
+    // The walk's own findings come first: those are the commits, which is where
+    // the branch tips are and therefore where tampering does the most damage.
+    misaddressed.append(&mut marks.misaddressed);
     let mut referenced_bytes: u64 = 0;
     let mut exclusive_bytes: u64 = 0;
     let mut protected: usize = 0;
@@ -1258,7 +1370,21 @@ pub fn check_with(
     // and stays out of scope.
     for (hash, path, expected) in &marks.expected {
         match identify_object(path) {
-            Ok(actual) if actual == *expected => {}
+            Ok(actual) if actual == *expected => {
+                // The kind matched. That says the bytes parse as the right SHAPE,
+                // not that they are the right bytes -- a valid commit copied onto
+                // another commit's address passes everything above this line.
+                if let Some(found) = content_address(path, actual)
+                    && !hash.eq_ignore_ascii_case(&found)
+                {
+                    misaddressed.push(Misaddressed {
+                        stored_at: hash.clone(),
+                        hashes_to: found,
+                        kind: actual,
+                        bytes: object_size(path),
+                    });
+                }
+            }
             Ok(actual) => unrecognised.push(Unrecognised {
                 hash: hash.clone(),
                 reason: format!(
@@ -1461,6 +1587,7 @@ pub fn check_with(
         unreachable,
         dangling,
         unrecognised,
+        misaddressed,
         referenced_bytes,
         exclusive_bytes: if matches!(snapshots, SnapshotSource::Known(_)) {
             Some(exclusive_bytes)
@@ -1843,10 +1970,9 @@ mod tests {
         parent: Option<&str>,
         snap: bool,
     ) -> String {
-        let hash = hash_of(seed);
         let snapshot_hash = hash_of(&format!("5{seed}"));
-        let commit = serde_json::json!({
-            "hash": hash,
+        let mut commit = serde_json::json!({
+            "hash": "",
             "message": message,
             "timestamp": "2026-01-01T00:00:00Z",
             "parents": parent.map(|p| vec![p.to_string()]).unwrap_or_default(),
@@ -1854,6 +1980,22 @@ mod tests {
             "author": "t", "author_date": "2026-01-01T00:00:00Z",
             "committer": "t", "committer_date": "2026-01-01T00:00:00Z",
         });
+        // The address is the digest of the content, not a hash of the seed.
+        //
+        // It used to be `hash_of(seed)`, which meant no fixture in this module was
+        // a valid content-addressed repository -- and that went unnoticed for as
+        // long as nothing checked. Adding the check turned 18 tests red at once,
+        // which is the fixture being wrong rather than the check: a repository
+        // whose objects do not hash to their own names is exactly what fsck is
+        // now supposed to refuse to call consistent.
+        //
+        // Seeds still produce distinct commits, through `snapshot_hash`, which is
+        // one of the eleven fields the digest covers.
+        let hash = {
+            let parsed: Commit = serde_json::from_value(commit.clone()).unwrap();
+            commit_address(&parsed).expect("fixture commit must be hashable")
+        };
+        commit["hash"] = serde_json::json!(hash);
         let objects = repo.join(GFS_DIR).join(OBJECTS_DIR);
         fs::create_dir_all(objects.join(&hash[..2])).unwrap();
         fs::write(
@@ -3513,12 +3655,72 @@ mod tests {
         );
     }
 
+    /// An object that does not hash to its own name is corruption, and the
+    /// history it displaced must not be offered to a collector.
+    ///
+    /// The store is content-addressed, so the name IS the digest. Before this,
+    /// fsck validated only shape -- does it parse as a commit, is it the kind it
+    /// was referenced as -- and a valid commit's bytes copied onto another
+    /// commit's address satisfied both checks and reported `repository is
+    /// consistent`, exit 0.
+    ///
+    /// The second half is the one that costs data. The overwritten object carried
+    /// a parent link, so copying a parentless commit over it detaches the real
+    /// history: the displaced commit, its snapshot and its file list all stop
+    /// being reachable and get listed as collectable. The tampering is what makes
+    /// live history look like garbage, which is why this asserts the exit code is
+    /// corruption rather than merely non-zero.
+    #[test]
+    fn an_object_that_does_not_hash_to_its_name_is_corruption_not_a_collectable() {
+        let d = repo();
+        let first = write_commit(d.path(), "aa", "first", None, true);
+        let second = write_commit(d.path(), "bb", "second", Some(&first), true);
+        set_branch(d.path(), "main", &second);
+
+        // Calibration: without the tampering this repository is clean, so the
+        // assertions below cannot be satisfied by a fixture that was broken anyway.
+        let before = check(d.path(), Duration::ZERO).unwrap();
+        assert!(before.is_clean(), "baseline must be clean, got {before:?}");
+        assert!(before.misaddressed.is_empty());
+
+        let object = |h: &str| {
+            d.path()
+                .join(GFS_DIR)
+                .join(OBJECTS_DIR)
+                .join(&h[..2])
+                .join(&h[2..])
+        };
+        fs::copy(object(&first), object(&second)).unwrap();
+
+        let after = check(d.path(), Duration::ZERO).unwrap();
+        assert_eq!(
+            after.misaddressed.len(),
+            1,
+            "the tampered object must be named: {after:?}"
+        );
+        assert_eq!(after.misaddressed[0].stored_at, second);
+        assert_eq!(
+            after.misaddressed[0].hashes_to, first,
+            "the report must say what the content actually is, not only that it is wrong"
+        );
+        assert_eq!(after.misaddressed[0].kind, ObjectKind::Commit);
+        assert_eq!(
+            after.exit_code(),
+            2,
+            "corruption, not 1 -- 1 is the code that wakes a collector, and what it \
+             would collect here is the real history: {after:?}"
+        );
+        assert!(
+            !after.is_clean(),
+            "a repository holding an object that is not what its name says is not consistent"
+        );
+    }
+
     /// Write a commit that references `files_ref`, so the object can be
     /// tampered with afterwards.
     fn write_commit_with_files(repo: &Path, seed: &str, files_ref: &str) -> String {
-        let hash = hash_of(seed);
-        let commit = serde_json::json!({
-            "hash": hash,
+        let mut commit = serde_json::json!({
+            "hash": "",
             "message": "has a file list",
             "timestamp": "2026-01-01T00:00:00Z",
             "parents": Vec::<String>::new(),
@@ -3527,6 +3729,12 @@ mod tests {
             "author": "t", "author_date": "2026-01-01T00:00:00Z",
             "committer": "t", "committer_date": "2026-01-01T00:00:00Z",
         });
+        // Self-addressing, for the reason given on `write_commit`.
+        let hash = {
+            let parsed: Commit = serde_json::from_value(commit.clone()).unwrap();
+            commit_address(&parsed).expect("fixture commit must be hashable")
+        };
+        commit["hash"] = serde_json::json!(hash);
         let objects = repo.join(GFS_DIR).join(OBJECTS_DIR);
         fs::create_dir_all(objects.join(&hash[..2])).unwrap();
         fs::write(

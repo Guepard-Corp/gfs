@@ -661,6 +661,33 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
         }
     }
 
+    if !report.misaddressed.is_empty() {
+        println_safe!("")?;
+        println_safe!("{}", red("objects that do not hash to their own address:"))?;
+        for m in &report.misaddressed {
+            println_safe!(
+                "  {} {}  stored here, but its content hashes to {}",
+                dimmed(m.kind.as_str()),
+                gold(short(&m.stored_at)),
+                gold(short(&m.hashes_to))
+            )?;
+        }
+        // Said here rather than left to the reader: the unreachable list above is
+        // not independent evidence when this fires. An overwritten object lost the
+        // references it carried, so whatever it used to point at stops being
+        // reachable and appears in that list -- which is how a tampered object
+        // turns into a recommendation to delete the history it displaced.
+        if !report.unreachable.is_empty() {
+            println_safe!(
+                "{}",
+                yellow(
+                    "  anything listed as unreachable above may be unreachable BECAUSE of \
+                     this - the overwritten object's references went with it"
+                )
+            )?;
+        }
+    }
+
     println_safe!("")?;
     if report.is_clean() {
         println_safe!("{} repository is consistent", green("\u{2713}"))?;
@@ -682,7 +709,10 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
                  repository is whole"
             )
         )?;
-    } else if report.dangling.is_empty() && report.unrecognised.is_empty() {
+    } else if report.dangling.is_empty()
+        && report.unrecognised.is_empty()
+        && report.misaddressed.is_empty()
+    {
         // Follows `safe_to_remove` rather than asserting what it must be. The
         // comment that stood here said two contradicting lines are worse than
         // either alone, which was right -- and then the field became derivable and

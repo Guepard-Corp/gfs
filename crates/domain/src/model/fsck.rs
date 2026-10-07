@@ -106,6 +106,33 @@ pub struct Unrecognised {
     pub bytes: u64,
 }
 
+/// An object whose bytes do not hash to the address they are stored at.
+///
+/// The object store is content-addressed: an object's name IS the digest of its
+/// content, so recomputing that digest is the one check that says the bytes are
+/// the bytes that were written. Without it fsck validated only *shape* —
+/// `identify_object` asks "does this parse as a commit", `marks.expected` asks
+/// "is it the kind it was referenced as" — and a valid commit's bytes copied
+/// onto a different commit's address satisfied both.
+///
+/// That is not a cosmetic miss. The overwritten object's own references go with
+/// it, so the history it pointed at stops being reachable and fsck offers it for
+/// collection: a tampered or bit-rotted object reads as consistent while the
+/// real commit, its snapshot and its file list are named collectable.
+///
+/// Reported as corruption, never as something to collect. The repository cannot
+/// say which side is wrong — the address or the content — and deleting on that
+/// basis would destroy whichever one was right.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Misaddressed {
+    /// The address the object occupies: `objects/<2>/<62>` joined back together.
+    pub stored_at: String,
+    /// What the content there actually hashes to.
+    pub hashes_to: String,
+    pub kind: ObjectKind,
+    pub bytes: u64,
+}
+
 /// A working copy on disk that nothing needs any more.
 ///
 /// Called *reclaimable* rather than *stale* because `stale` is taken twice in
@@ -177,6 +204,8 @@ pub struct FsckReport {
     pub unreachable: Vec<Unreachable>,
     pub dangling: Vec<Dangling>,
     pub unrecognised: Vec<Unrecognised>,
+    /// Objects whose content does not hash to their own address.
+    pub misaddressed: Vec<Misaddressed>,
 
     /// Bytes the unreachable entries *reference*, as `du` would report them.
     ///
@@ -333,7 +362,13 @@ impl FsckReport {
     /// with it down. The second answer was the dangerous one, and it was the
     /// default on the node that actually holds repositories.
     pub fn exit_code(&self) -> i32 {
-        if !self.dangling.is_empty() || !self.unrecognised.is_empty() {
+        // Misaddressed sits with the other corruption classes, not with
+        // unreachable: an object that does not hash to its name is damage, and
+        // the damage is precisely that it makes live history look collectable.
+        if !self.dangling.is_empty()
+            || !self.unrecognised.is_empty()
+            || !self.misaddressed.is_empty()
+        {
             2
         } else if !self.snapshots_checked || !self.unreadable.is_empty() {
             3
@@ -368,6 +403,7 @@ mod tests {
             unreachable: Vec::new(),
             dangling: Vec::new(),
             unrecognised: Vec::new(),
+            misaddressed: Vec::new(),
             referenced_bytes: 0,
             exclusive_bytes: None,
             cutoff_unix_millis: None,
