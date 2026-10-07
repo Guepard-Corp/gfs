@@ -6,7 +6,7 @@ use std::sync::Arc;
 use gfs_domain::ports::compute::{ComputeDefinition, EnvVar, PortMapping};
 use gfs_domain::ports::database_provider::{
     ConnectionParams, ContainerProvider, DataFormat, DatabaseProvider, DatabaseProviderArg,
-    DatabaseProviderRegistry, ExportSpec, ImportSpec, ProviderError, Result, SIGTERM,
+    DatabaseProviderRegistry, ExportSpec, ImportSpec, ProviderError, Result, RoleLogin, SIGTERM,
     SchemaExtractionSpec, SupportedFeature,
 };
 
@@ -554,14 +554,24 @@ fi"#,
         sql: &str,
         database: Option<&str>,
     ) -> std::result::Result<String, ProviderError> {
-        const DELIM: &str = "GFS_SQL_EOF";
-        let body = gfs_domain::utils::shell::sql_heredoc_body(DELIM, sql)?;
-        let db = match database.map(str::trim).filter(|s| !s.is_empty()) {
-            Some(name) => gfs_domain::utils::shell::shell_single_quote(name),
-            None => r#""${CLICKHOUSE_DB:-default}""#.to_string(),
-        };
+        let (body, db) = query_body_and_database(sql, database)?;
         Ok(format!(
             r#"clickhouse-client --host 127.0.0.1 --user "${{CLICKHOUSE_USER:-default}}" --password "${{CLICKHOUSE_PASSWORD:-clickhouse}}" --database {db} --query "{body}""#
+        ))
+    }
+
+    /// The administrative command with the user's own login in place of the
+    /// configured `CLICKHOUSE_USER`'s.
+    fn query_in_instance_command_as(
+        &self,
+        sql: &str,
+        database: Option<&str>,
+        login: &RoleLogin<'_>,
+    ) -> std::result::Result<String, ProviderError> {
+        let (username, password) = login.shell_quoted()?;
+        let (body, db) = query_body_and_database(sql, database)?;
+        Ok(format!(
+            r#"clickhouse-client --host 127.0.0.1 --user {username} --password {password} --database {db} --query "{body}""#
         ))
     }
 
@@ -676,9 +686,87 @@ pub fn register(registry: &impl DatabaseProviderRegistry) -> Result<()> {
     registry.register(Arc::new(ClickhouseProvider::new()))
 }
 
+/// The query body and database argument shared by the in-instance query
+/// commands: `database` when given, else the container's `CLICKHOUSE_DB`.
+fn query_body_and_database(
+    sql: &str,
+    database: Option<&str>,
+) -> std::result::Result<(String, String), ProviderError> {
+    const DELIM: &str = "GFS_SQL_EOF";
+    let body = gfs_domain::utils::shell::sql_heredoc_body(DELIM, sql)?;
+    let db = match database.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(name) => gfs_domain::utils::shell::shell_single_quote(name),
+        None => r#""${CLICKHOUSE_DB:-default}""#.to_string(),
+    };
+    Ok((body, db))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const OWNER: RoleLogin<'static> = RoleLogin {
+        username: "owner",
+        password: "s3cret",
+    };
+
+    #[test]
+    fn standalone_query_runs_as_the_administrative_user() {
+        let command = ClickhouseProvider::new()
+            .query_in_instance_command("select 1", None)
+            .expect("command");
+        for mark in [
+            r#"--user "${CLICKHOUSE_USER:-default}""#,
+            r#"--password "${CLICKHOUSE_PASSWORD:-"#,
+        ] {
+            assert!(command.contains(mark), "missing {mark}: {command}");
+        }
+    }
+
+    #[test]
+    fn query_as_a_role_logs_in_with_that_roles_own_login() {
+        let command = ClickhouseProvider::new()
+            .query_in_instance_command_as("select 1", None, &OWNER)
+            .expect("command");
+        assert!(
+            command.starts_with(
+                "clickhouse-client --host 127.0.0.1 --user 'owner' --password 's3cret' "
+            ),
+            "{command}"
+        );
+        for admin in ["CLICKHOUSE_USER", "CLICKHOUSE_PASSWORD"] {
+            assert!(
+                !command.contains(admin),
+                "never the admin ({admin}): {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_as_a_role_quotes_the_login_and_targets_the_given_database() {
+        let login = RoleLogin {
+            username: "o'wner",
+            password: "pa'ss",
+        };
+        let command = ClickhouseProvider::new()
+            .query_in_instance_command_as("select 1", Some("app"), &login)
+            .expect("command");
+        assert!(command.contains(r#"'o'\''wner'"#), "{command}");
+        assert!(command.contains(r#"'pa'\''ss'"#), "{command}");
+        assert!(command.contains("'app'"), "{command}");
+    }
+
+    #[test]
+    fn query_as_a_role_refuses_an_empty_role() {
+        let login = RoleLogin {
+            username: " ",
+            password: "x",
+        };
+        let error = ClickhouseProvider::new()
+            .query_in_instance_command_as("select 1", None, &login)
+            .expect_err("an empty role is refused");
+        assert!(matches!(error, ProviderError::InvalidParams(_)), "{error}");
+    }
 
     #[test]
     fn connection_string_uses_defaults() {

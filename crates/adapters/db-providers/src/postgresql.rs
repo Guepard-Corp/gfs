@@ -11,7 +11,7 @@ use gfs_domain::ports::compute::{ComputeDefinition, EnvVar, PortMapping};
 use gfs_domain::ports::database_provider::{
     CloneSpec, ConnectionParams, ContainerProvider, DataFormat, DatabaseProvider,
     DatabaseProviderArg, DatabaseProviderRegistry, ExportSpec, ImportSpec, ProviderError,
-    RemoteSource, Result, SIGTERM, SchemaExtractionSpec, SupportedFeature,
+    RemoteSource, Result, RoleLogin, SIGTERM, SchemaExtractionSpec, SupportedFeature,
 };
 
 const NAME: &str = "postgres";
@@ -240,6 +240,22 @@ fn conn_creds(params: &ConnectionParams) -> (&str, &str, &str) {
 /// embedded single quote (`'` -> `'\''`).
 fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The `-c` body and `-d` argument shared by the in-instance query commands.
+/// `database` targets an explicit database (`gfs query --database`), else the
+/// container's configured POSTGRES_DB.
+fn query_body_and_database(
+    sql: &str,
+    database: Option<&str>,
+) -> std::result::Result<(String, String), ProviderError> {
+    const DELIM: &str = "GFS_SQL_EOF";
+    let body = gfs_domain::utils::shell::sql_heredoc_body(DELIM, sql)?;
+    let db = match database.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(name) => gfs_domain::utils::shell::shell_single_quote(name),
+        None => r#""${POSTGRES_DB:-postgres}""#.to_string(),
+    };
+    Ok((body, db))
 }
 
 /// Build the ephemeral tool-sidecar `ComputeDefinition` shared by export,
@@ -1096,16 +1112,29 @@ impl ContainerProvider for PostgresqlProvider {
         sql: &str,
         database: Option<&str>,
     ) -> std::result::Result<String, ProviderError> {
-        const DELIM: &str = "GFS_SQL_EOF";
-        let body = gfs_domain::utils::shell::sql_heredoc_body(DELIM, sql)?;
-        // Target an explicit database when given (`gfs query --database`), else the
-        // container's configured POSTGRES_DB.
-        let db = match database.map(str::trim).filter(|s| !s.is_empty()) {
-            Some(name) => gfs_domain::utils::shell::shell_single_quote(name),
-            None => r#""${POSTGRES_DB:-postgres}""#.to_string(),
-        };
+        let (body, db) = query_body_and_database(sql, database)?;
         Ok(format!(
             r#"PGPASSWORD="${{POSTGRES_PASSWORD:-postgres}}" psql -h 127.0.0.1 -U "${{POSTGRES_USER:-postgres}}" -d {db} -v ON_ERROR_STOP=1 -c "{body}""#
+        ))
+    }
+
+    /// Authenticates the way [`DatabaseProvider::query_client_command`]'s
+    /// session does, with the role's own username and password, and connects
+    /// over loopback TCP inside the instance like the administrative command,
+    /// so it works whether pg_hba trusts loopback or requires a password.
+    /// It is a real login (session_user is the role): unlike `SET ROLE`, the
+    /// SQL cannot `RESET ROLE` back to the administrative user. `-w` turns a
+    /// rejected password into an error instead of a prompt.
+    fn query_in_instance_command_as(
+        &self,
+        sql: &str,
+        database: Option<&str>,
+        login: &RoleLogin<'_>,
+    ) -> std::result::Result<String, ProviderError> {
+        let (username, password) = login.shell_quoted()?;
+        let (body, db) = query_body_and_database(sql, database)?;
+        Ok(format!(
+            r#"PGPASSWORD={password} psql -w -h 127.0.0.1 -U {username} -d {db} -v ON_ERROR_STOP=1 -c "{body}""#
         ))
     }
 
@@ -1530,6 +1559,75 @@ fn build_clone_bootstrap_sql(remote: &RemoteSource) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standalone_query_runs_as_the_administrative_user() {
+        let command = PostgresqlProvider::new()
+            .query_in_instance_command("select 1", None)
+            .expect("command");
+        assert!(
+            command.contains(r#"-U "${POSTGRES_USER:-postgres}""#),
+            "{command}"
+        );
+        assert!(command.contains("PGPASSWORD="), "{command}");
+    }
+
+    const OWNER: RoleLogin<'static> = RoleLogin {
+        username: "owner",
+        password: "s3cret",
+    };
+
+    #[test]
+    fn query_as_a_role_logs_in_with_that_roles_password_over_loopback() {
+        let command = PostgresqlProvider::new()
+            .query_in_instance_command_as("select 1", None, &OWNER)
+            .expect("command");
+        assert!(
+            command.starts_with("PGPASSWORD='s3cret' psql -w -h 127.0.0.1 -U 'owner' "),
+            "{command}"
+        );
+        assert!(
+            !command.contains("POSTGRES_USER"),
+            "never the admin: {command}"
+        );
+        assert!(
+            !command.contains("POSTGRES_PASSWORD"),
+            "never the admin's password: {command}"
+        );
+        assert!(
+            command.contains(r#"-d "${POSTGRES_DB:-postgres}""#),
+            "{command}"
+        );
+    }
+
+    #[test]
+    fn query_as_a_role_quotes_the_login_and_targets_the_given_database() {
+        let login = RoleLogin {
+            username: "o'wner",
+            password: "pa'ss",
+        };
+        let command = PostgresqlProvider::new()
+            .query_in_instance_command_as("select 1", Some("app"), &login)
+            .expect("command");
+        assert!(command.contains(r#"-U 'o'\''wner' "#), "{command}");
+        assert!(
+            command.starts_with(r#"PGPASSWORD='pa'\''ss' "#),
+            "{command}"
+        );
+        assert!(command.contains("-d 'app' "), "{command}");
+    }
+
+    #[test]
+    fn query_as_a_role_refuses_an_empty_role() {
+        let login = RoleLogin {
+            username: "  ",
+            password: "x",
+        };
+        let error = PostgresqlProvider::new()
+            .query_in_instance_command_as("select 1", None, &login)
+            .expect_err("an empty role is refused");
+        assert!(matches!(error, ProviderError::InvalidParams(_)), "{error}");
+    }
 
     #[test]
     fn connection_string_uses_defaults() {

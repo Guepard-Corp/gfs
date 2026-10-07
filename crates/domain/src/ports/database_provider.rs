@@ -28,6 +28,45 @@ pub enum RegistryError {
     Internal(String),
 }
 
+/// A database role's own login, for running a query as that role.
+#[derive(Clone, Copy)]
+pub struct RoleLogin<'a> {
+    pub username: &'a str,
+    pub password: &'a str,
+}
+
+impl<'a> RoleLogin<'a> {
+    /// The username, trimmed; an empty one is refused.
+    pub fn validated_username(&self) -> std::result::Result<&'a str, ProviderError> {
+        let username = self.username.trim();
+        if username.is_empty() {
+            return Err(ProviderError::InvalidParams(
+                "a query run as a role needs a role name".into(),
+            ));
+        }
+        Ok(username)
+    }
+
+    /// The validated username and the password, each single-quoted for a
+    /// `sh -c` command line.
+    pub fn shell_quoted(&self) -> std::result::Result<(String, String), ProviderError> {
+        let username = self.validated_username()?;
+        Ok((
+            crate::utils::shell::shell_single_quote(username),
+            crate::utils::shell::shell_single_quote(self.password),
+        ))
+    }
+}
+
+impl std::fmt::Debug for RoleLogin<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RoleLogin")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
     #[error("missing required env var for connection string: '{0}'")]
@@ -668,6 +707,28 @@ pub trait ContainerProvider: Send + Sync {
         Err(ProviderError::UnsupportedFormat("query_in_instance".into()))
     }
 
+    /// Like [`Self::query_in_instance_command`], but logged in as `login`
+    /// rather than the instance's administrative user: a host that hands
+    /// people a least-privilege role runs their SQL as that role, so what it
+    /// creates belongs to them and it cannot use administrative privileges.
+    /// It authenticates the way a client session does, with the role's own
+    /// username and password, so it does not depend on how the instance's
+    /// host-based auth treats local connections.
+    ///
+    /// The default refuses. A provider must never satisfy this by running as
+    /// its administrative user, which is the thing the caller is avoiding.
+    fn query_in_instance_command_as(
+        &self,
+        sql: &str,
+        database: Option<&str>,
+        login: &RoleLogin<'_>,
+    ) -> std::result::Result<String, ProviderError> {
+        let _ = (sql, database, login);
+        Err(ProviderError::UnsupportedFormat(
+            "query_in_instance as a role".into(),
+        ))
+    }
+
     /// Compute definition used for provisioning (image, env, ports, data dir, etc.).
     fn definition(&self) -> ComputeDefinition;
 
@@ -1055,6 +1116,42 @@ mod tests {
         assert_eq!(params.get_env("USER"), Some("alice"));
         assert_eq!(params.get_env("PASSWORD"), Some("secret"));
         assert_eq!(params.get_env("MISSING"), None);
+    }
+
+    #[test]
+    fn a_provider_that_cannot_run_as_a_role_refuses_instead_of_using_its_admin() {
+        let provider = TestProvider {
+            name: "test".into(),
+        };
+        let login = RoleLogin {
+            username: "owner",
+            password: "s3cret",
+        };
+        let error = provider
+            .query_in_instance_command_as("select 1", None, &login)
+            .expect_err("the default refuses");
+        assert!(
+            matches!(error, ProviderError::UnsupportedFormat(_)),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_role_login_refuses_an_empty_username_and_keeps_its_password_out_of_debug() {
+        let empty = RoleLogin {
+            username: "  ",
+            password: "s3cret",
+        };
+        assert!(matches!(
+            empty.validated_username(),
+            Err(ProviderError::InvalidParams(_))
+        ));
+        let login = RoleLogin {
+            username: " owner ",
+            password: "s3cret",
+        };
+        assert_eq!(login.validated_username().unwrap(), "owner");
+        assert!(!format!("{login:?}").contains("s3cret"));
     }
 
     #[test]
