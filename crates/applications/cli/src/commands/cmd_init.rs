@@ -1,3 +1,4 @@
+use crate::println_safe;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -167,7 +168,7 @@ pub async fn init(
     }
 
     if json_output {
-        println!(
+        println_safe!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "path": target_path.display().to_string(),
@@ -176,21 +177,21 @@ pub async fn init(
                 "provider": provider_display,
                 "connection_string": connection_string,
             }))?
-        );
+        )?;
     } else {
-        println!(
+        println_safe!(
             "  {} Initialized GFS repository at {}",
             green("✓"),
             cyan(target_path.display().to_string())
-        );
-        println!();
-        println!("    {:<16} {}", dimmed("Branch"), cyan("main"));
-        println!("    {:<16} .gfs/config.toml", dimmed("Config"));
+        )?;
+        println_safe!()?;
+        println_safe!("    {:<16} {}", dimmed("Branch"), cyan("main"))?;
+        println_safe!("    {:<16} .gfs/config.toml", dimmed("Config"))?;
         if let Some(ref provider) = provider_display {
-            println!("    {:<16} {}", dimmed("Provider"), cyan(provider));
+            println_safe!("    {:<16} {}", dimmed("Provider"), cyan(provider))?;
         }
         if let Some(ref c) = connection_string {
-            println!("    {:<16} {}", dimmed("Connection"), cyan(c));
+            println_safe!("    {:<16} {}", dimmed("Connection"), cyan(c))?;
         }
     }
 
