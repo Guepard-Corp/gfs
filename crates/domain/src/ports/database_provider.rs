@@ -321,6 +321,27 @@ pub trait LocalEngine: Send + Sync {
 pub trait SnapshotGuard: Send {
     /// What is being held, for diagnostics (e.g. `"sqlite write lock"`).
     fn describe(&self) -> String;
+
+    /// A directory to snapshot *instead of* the live workspace, when the engine
+    /// could not make the live files safe to copy.
+    ///
+    /// `None`, the default, means the live data directory is safe to copy while
+    /// this guard is held — which is the normal case and the only one that keeps
+    /// a copy-on-write clone O(1).
+    ///
+    /// `Some(dir)` exists because for some engines "exclude writers, then copy the
+    /// files" is not a sufficient recipe. SQLite in WAL mode is the measured case:
+    /// a snapshot carrying a non-empty write-ahead log cannot be restored, and
+    /// folding that log in can be blocked indefinitely by an ordinary reader. When
+    /// that happens the engine writes a self-contained copy somewhere of its own
+    /// choosing and names it here, rather than letting a snapshot be taken that
+    /// will not restore.
+    ///
+    /// The directory holds exactly what a restored workspace needs, and lives only
+    /// as long as the guard.
+    fn consistent_copy(&self) -> Option<&std::path::Path> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
