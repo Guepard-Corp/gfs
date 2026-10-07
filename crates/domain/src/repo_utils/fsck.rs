@@ -3916,6 +3916,83 @@ mod tests {
         );
     }
 
+    /// A tombstone we lack permission to READ is a hole, not corruption.
+    ///
+    /// This test exists because the arm it covers had none. The sibling test,
+    /// `an_unreadable_deleted_ref_is_reported_rather_than_dropped`, is named for
+    /// this case but writes a READABLE file holding a bad value, so it exercises
+    /// the `normalise_hash` failure one arm above and never the read failure. An
+    /// auditor established that by putting a `panic!` in the read arm and watching
+    /// 61 tests pass -- a guard tested by nothing, which is the same as no guard.
+    ///
+    /// The distinction is the one `Blind` exists for. `Dangling` means "a reachable
+    /// commit names something that is missing", which makes a collector refuse to
+    /// run; a tombstone behind a permission error is not missing data, it is data
+    /// nobody could look at. Routing it to corruption produced "repository is
+    /// inconsistent" for a root-owned repository inspected by a non-root operator,
+    /// which is this module's canonical false alarm.
+    #[cfg(unix)]
+    #[test]
+    fn a_tombstone_that_cannot_be_read_is_a_hole_not_corruption() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let d = repo();
+        let live = write_commit(d.path(), "aa", "live", None, true);
+        set_branch(d.path(), "main", &live);
+
+        let tomb = d
+            .path()
+            .join(GFS_DIR)
+            .join(REFS_DIR)
+            .join(DELETED_REFS_DIR)
+            .join("1788452232388")
+            .join("feature");
+        fs::create_dir_all(tomb.parent().unwrap()).unwrap();
+        fs::write(&tomb, &live).unwrap();
+
+        // Calibration: readable, this tombstone is a legitimate root and the
+        // repository is clean. So the assertions below cannot be satisfied by a
+        // fixture that was already broken.
+        let readable = check(d.path(), Duration::ZERO).unwrap();
+        assert!(
+            readable.is_clean(),
+            "a readable tombstone naming a live commit is fine: {readable:?}"
+        );
+
+        fs::set_permissions(&tomb, fs::Permissions::from_mode(0o000)).unwrap();
+        let blinded = check(d.path(), Duration::ZERO);
+        fs::set_permissions(&tomb, fs::Permissions::from_mode(0o644)).unwrap();
+        let blinded = blinded.unwrap();
+
+        // Running as root defeats a mode-000 file, so a run that can still read it
+        // proves nothing and must not be scored as a pass.
+        if blinded.is_clean() {
+            eprintln!("skipping: the read succeeded anyway, which happens as root");
+            return;
+        }
+
+        assert!(
+            blinded
+                .unreadable
+                .iter()
+                .any(|u| u.hash.contains("feature") || u.reason.contains("could not be read")),
+            "the tombstone must be reported as a hole: {blinded:?}"
+        );
+        assert!(
+            !blinded
+                .dangling
+                .iter()
+                .any(|x| x.from_commit.contains("feature")),
+            "and NOT as dangling -- that is the false alarm this arm was changed to \
+             stop: {blinded:?}"
+        );
+        assert_eq!(
+            blinded.exit_code(),
+            3,
+            "could-not-run, not corruption: {blinded:?}"
+        );
+    }
+
     /// Write a commit that references `files_ref`, so the object can be
     /// tampered with afterwards.
     fn write_commit_with_files(repo: &Path, seed: &str, files_ref: &str) -> String {
