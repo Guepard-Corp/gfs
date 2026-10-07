@@ -864,7 +864,123 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
             return Err(e);
         }
 
+        self.refuse_a_snapshot_that_captured_nothing(
+            path,
+            &snapshot_dest,
+            runtime_config,
+            environment,
+        )
+        .await?;
+
         Ok(snapshot_hash)
+    }
+
+    /// Refuse a commit whose snapshot captured nothing while the database still
+    /// holds data.
+    ///
+    /// The case this exists for: the workspace directory is not actually shared
+    /// with the container. Docker still creates the bind mount, the database
+    /// starts and serves queries from its own view, and the host side stays empty
+    /// — so a snapshot taken from the host copies zero bytes and the commit
+    /// reports success. Measured on colima: the container saw 24 entries / 39M at
+    /// `/var/lib/postgresql/data` while the host workspace saw 0, and every
+    /// descendant of that commit came up as a freshly initdb-ed, empty database.
+    ///
+    /// Three facts have to agree before refusing, because each one alone is
+    /// ambiguous:
+    ///
+    /// 1. the snapshot captured nothing — and `None` from `captured_any_data`
+    ///    means the adapter could not say, which is not evidence of anything;
+    /// 2. the instance is running, so there is something to ask;
+    /// 3. the container's own data directory is NOT empty.
+    ///
+    /// Without (3) this would refuse a legitimately empty database — a repository
+    /// initialised and committed before any data was written is a normal thing to
+    /// do, and it also captures zero bytes. Any failure to establish (3) leaves
+    /// the commit alone: a guard that fires when it cannot see is worse than no
+    /// guard, because it blocks healthy repositories.
+    async fn refuse_a_snapshot_that_captured_nothing(
+        &self,
+        repo_path: &std::path::Path,
+        snapshot_dest: &std::path::Path,
+        runtime_config: &Option<RuntimeConfig>,
+        environment: &Option<EnvironmentConfig>,
+    ) -> Result<(), CommitRepoError> {
+        // (1) Did it capture nothing? `None` is "cannot tell" and stops here.
+        // This is the only unconditional cost the guard adds to a commit, and it
+        // stops at the first file it finds rather than measuring the tree.
+        match self.storage.captured_any_data(snapshot_dest).await {
+            Ok(Some(false)) => {}
+            _ => return Ok(()),
+        }
+
+        let Some(runtime) = runtime_config.as_ref() else {
+            return Ok(());
+        };
+        let instance = InstanceId(runtime.container_name.clone());
+
+        // (2) Is there a running instance to ask?
+        match self.compute.status(&instance).await {
+            Ok(status) if status.state == InstanceState::Running => {}
+            _ => return Ok(()),
+        }
+
+        // (3) Does the container hold data the host did not see? Asking the
+        // container is the only way to tell this apart from an empty database:
+        // the host side is empty in both cases.
+        // Derived the same way the snapshot path above derives it, so the probe
+        // asks about the directory the snapshot was actually meant to capture.
+        let Some(data_path) = environment
+            .as_ref()
+            .map(|e| e.database_provider.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .and_then(|name| self.registry.get(&name))
+            .and_then(|provider| {
+                // The owned String is taken inside the closure: the reference
+                // `require_container` hands back borrows `provider`, which drops here.
+                provider.require_container().ok().map(|container| {
+                    container
+                        .definition()
+                        .data_dir
+                        .to_string_lossy()
+                        .into_owned()
+                })
+            })
+        else {
+            return Ok(());
+        };
+
+        let probe = format!("ls -A {data_path} 2>/dev/null | head -1");
+        let container_has_data = match self.compute.exec(&instance, &probe, None).await {
+            Ok(out) => !out.stdout.trim().is_empty(),
+            // Cannot ask, so cannot distinguish. Stay silent.
+            Err(_) => return Ok(()),
+        };
+        if !container_has_data {
+            return Ok(());
+        }
+
+        let host_path = self
+            .compute
+            .get_instance_data_mount_host_path(&instance, &data_path)
+            .await
+            .ok()
+            .flatten()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| repo_path.display().to_string());
+
+        Err(CommitRepoError::Repository(RepositoryError::Internal(
+            format!(
+                "refusing this commit: the snapshot captured 0 bytes while the database \
+                 still holds data. The workspace is not visible inside the container, so \
+                 the host copied an empty directory: the container has files under \
+                 {data_path} and the host sees none at {host_path}. A commit recorded this \
+                 way restores as an empty database. Share the repository's path with the \
+                 container runtime and retry — on colima or Docker Desktop the repository \
+                 must sit under a shared prefix such as your home directory, not under \
+                 /private/tmp."
+            ),
+        )))
     }
 
     /// Extract and store schema for the current database state.
@@ -1142,6 +1258,9 @@ mod tests {
         /// Reported via `capabilities()`. `true` models an atomic-snapshot runtime
         /// (e.g. Kubernetes + ZFS `VolumeSnapshot`) that snapshots a live database.
         db_live_during_snapshot: bool,
+        /// What an `exec` probe of the container's data dir prints. `None` models a
+        /// runtime where `exec` is unavailable, which is the trait default.
+        exec_stdout: Option<String>,
     }
 
     impl Default for MockCompute {
@@ -1155,6 +1274,7 @@ mod tests {
                 stream_snapshot_calls: AtomicUsize::new(0),
                 pause_fails_with: None,
                 db_live_during_snapshot: false,
+                exec_stdout: None,
             }
         }
     }
@@ -1198,6 +1318,22 @@ mod tests {
                 exit_code: None,
             })
         }
+        async fn exec(
+            &self,
+            _id: &InstanceId,
+            _command: &str,
+            _user: Option<&str>,
+        ) -> crate::ports::compute::Result<crate::ports::compute::ExecOutput> {
+            match self.exec_stdout.as_ref() {
+                Some(out) => Ok(crate::ports::compute::ExecOutput {
+                    exit_code: 0,
+                    stdout: out.clone(),
+                    stderr: String::new(),
+                }),
+                None => Err(ComputeError::Internal("exec not supported".into())),
+            }
+        }
+
         async fn status(&self, id: &InstanceId) -> crate::ports::compute::Result<InstanceStatus> {
             Ok(InstanceStatus {
                 id: id.clone(),
@@ -1344,6 +1480,9 @@ mod tests {
         finalized: Mutex<Option<std::path::PathBuf>>,
         /// When set, `snapshot()` returns this error (e.g. permission denied).
         snapshot_fail: Mutex<Option<crate::ports::storage::StorageError>>,
+        /// What `captured_any_data` reports. `None` is the trait default,
+        /// "cannot tell"; `Some(false)` is a snapshot that captured nothing.
+        captured: Option<bool>,
     }
 
     impl MockStorage {
@@ -1354,6 +1493,7 @@ mod tests {
                 last_label: Mutex::new(None),
                 finalized: Mutex::new(None),
                 snapshot_fail: Mutex::new(None),
+                captured: None,
             }
         }
     }
@@ -1419,6 +1559,13 @@ mod tests {
                 free_bytes: 0,
             })
         }
+        async fn captured_any_data(
+            &self,
+            _dest: &std::path::Path,
+        ) -> crate::ports::storage::Result<Option<bool>> {
+            Ok(self.captured)
+        }
+
         async fn finalize_snapshot(
             &self,
             dest: &std::path::Path,
@@ -2089,6 +2236,121 @@ mod tests {
             )
             .await;
         assert!(matches!(result, Err(CommitRepoError::Storage(_))));
+    }
+
+    /// Builds the use case for the zero-byte guard: a running instance, a
+    /// repository whose snapshot captured `captured` bytes, and a container whose
+    /// data-dir probe prints `probe`.
+    fn zero_byte_case(
+        captured: Option<bool>,
+        probe: Option<&str>,
+    ) -> CommitRepoUseCase<MockRegistry> {
+        let compute = Arc::new(MockCompute {
+            state: InstanceState::Running,
+            db_live_during_snapshot: true,
+            exec_stdout: probe.map(str::to_string),
+            ..Default::default()
+        });
+        let repo = MockRepository {
+            commit_hash: "abc123".into(),
+            current_commit: "prev".into(),
+            mount_point: Some("/vol/main".into()),
+            runtime_config: Some(RuntimeConfig {
+                runtime_provider: "docker".into(),
+                runtime_version: "29".into(),
+                container_name: "gfs-postgres-test".into(),
+            }),
+            environment: Some(EnvironmentConfig {
+                database_provider: "mock-db".into(),
+                database_version: "17".into(),
+                database_port: None,
+                display_name: None,
+            }),
+            ..Default::default()
+        };
+        let mut storage = MockStorage::new("snap-abc");
+        storage.captured = captured;
+        CommitRepoUseCase::new(
+            Arc::new(repo),
+            compute,
+            Arc::new(storage),
+            Arc::new(MockRegistry),
+        )
+    }
+
+    /// The defect this guards. Measured on colima: the workspace was not visible
+    /// inside the container, the database served rows from its own view, the host
+    /// copied an empty directory, and the commit reported success — after which
+    /// every descendant came up as an empty database.
+    #[tokio::test]
+    async fn a_commit_that_captured_nothing_from_a_live_database_is_refused() {
+        let uc = zero_byte_case(Some(false), Some("PG_VERSION\n"));
+        let result = uc
+            .run(
+                existing_repo_path(),
+                "parent snapshot".into(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        let Err(e) = result else {
+            panic!("a snapshot of 0 bytes from a database holding data must not commit");
+        };
+        let msg = e.to_string();
+        assert!(
+            msg.contains("captured 0 bytes"),
+            "the refusal must say what it measured; got: {msg}"
+        );
+        assert!(
+            msg.contains("not visible inside the container"),
+            "the refusal must name the cause, not report a generic IO error; got: {msg}"
+        );
+    }
+
+    /// The case that makes the guard safe to have. A repository initialised and
+    /// committed before any data was written captures zero bytes too, and that is
+    /// a normal thing to do. Only the container's own view separates the two.
+    #[tokio::test]
+    async fn a_commit_of_a_genuinely_empty_database_is_allowed() {
+        let uc = zero_byte_case(Some(false), Some(""));
+        let result = uc
+            .run(
+                existing_repo_path(),
+                "empty but legitimate".into(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "an empty container means an empty database, which may be committed: {result:?}"
+        );
+    }
+
+    /// A measurement that could not be taken is not evidence. `captured_bytes`
+    /// answering `None` must leave the commit alone — a guard that fires when it
+    /// cannot see blocks healthy repositories.
+    #[tokio::test]
+    async fn a_snapshot_whose_size_cannot_be_measured_does_not_block_the_commit() {
+        let uc = zero_byte_case(None, Some("PG_VERSION\n"));
+        let result = uc
+            .run(
+                existing_repo_path(),
+                "unmeasurable".into(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        assert!(result.is_ok(), "cannot-tell must not refuse: {result:?}");
     }
 
     /// Rootless Podman on cgroup v1 returns a `PauseUnsupported` error from `pause()`.

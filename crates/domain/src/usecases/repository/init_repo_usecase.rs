@@ -56,6 +56,25 @@ pub struct DatabaseCredentials {
 ///
 /// `R` is generic over [`DatabaseProviderRegistry`] because that trait is not
 /// dyn-compatible (its `register` method uses `impl Into<String>`).
+/// What the host can see at a workspace path. `Unreadable` is deliberately not
+/// folded into `Empty`: a directory we cannot read says nothing about whether the
+/// container's writes reach it.
+enum HostSide {
+    HasEntries,
+    Empty,
+    Unreadable,
+}
+
+fn host_side(path: &std::path::Path) -> HostSide {
+    match std::fs::read_dir(path) {
+        Ok(mut entries) => match entries.next() {
+            Some(_) => HostSide::HasEntries,
+            None => HostSide::Empty,
+        },
+        Err(_) => HostSide::Unreadable,
+    }
+}
+
 pub struct InitRepositoryUseCase<R: DatabaseProviderRegistry> {
     repository: Arc<dyn Repository>,
     compute: Option<Arc<dyn Compute>>,
@@ -88,6 +107,122 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
             compute,
             registry,
         }
+    }
+
+    /// Refuse an initialised repository whose workspace the container cannot see.
+    ///
+    /// The database starts and serves queries from its own view of the bind
+    /// mount while the host side stays empty, so every later commit captures
+    /// nothing. The commit path refuses that, but by then the user has a
+    /// repository that can never commit and no idea why — this catches it at the
+    /// one moment the fix is still cheap.
+    ///
+    /// Gated on the container's data directory actually being bound to THIS
+    /// repository's workspace, which is what makes it safe on runtimes where the
+    /// host never holds the data at all. Measured: on Kubernetes the host
+    /// workspace is empty by design because the data lives in a PVC, and
+    /// `get_instance_data_mount_host_path` returns `None` there — so the check
+    /// does not run, rather than refusing every Kubernetes init.
+    ///
+    /// Every uncertainty leaves the repository alone. A check that fires when it
+    /// cannot see would block working setups, which is worse than the silence it
+    /// replaces.
+    async fn refuse_a_workspace_the_container_cannot_see(
+        &self,
+        repo_path: &std::path::Path,
+        compute: &std::sync::Arc<dyn Compute>,
+        id: &crate::ports::compute::InstanceId,
+        container: &dyn crate::ports::database_provider::ContainerProvider,
+        workspace_data_dir: &std::path::Path,
+    ) -> Result<(), ComputeError> {
+        let data_dir = container
+            .definition()
+            .data_dir
+            .to_string_lossy()
+            .into_owned();
+
+        // Is the container's data directory bound to this workspace? `None` means
+        // the runtime does not bind a host path at all (Kubernetes), so there is
+        // no host view to compare and nothing to conclude.
+        let bound = match compute
+            .get_instance_data_mount_host_path(id, &data_dir)
+            .await
+        {
+            Ok(Some(path)) => path,
+            _ => return Ok(()),
+        };
+        // Compare resolved paths. The repository hands back the workspace exactly
+        // as the caller expressed it, so `gfs init .` yields a RELATIVE
+        // `./.gfs/workspaces/...` while the runtime reports an absolute bind
+        // source — measured, and it made this check silently never match.
+        // Canonicalising also settles the macOS `/tmp` -> `/private/tmp` symlink,
+        // where the two spellings name one directory.
+        let (Ok(bound), Ok(workspace)) = (
+            std::fs::canonicalize(&bound),
+            std::fs::canonicalize(workspace_data_dir),
+        ) else {
+            // A path that will not resolve cannot be compared, so say nothing.
+            return Ok(());
+        };
+        if bound != workspace {
+            // Bound somewhere else entirely; that is a different problem and not
+            // one this check can speak to.
+            return Ok(());
+        }
+
+        // `start` returns before the database has finished writing its data
+        // directory, so a single look finds both sides empty and concludes
+        // nothing. Measured: immediately after init the container held 24 entries
+        // and the host held 0, yet a check taken at `start` saw 0 and 0.
+        //
+        // So watch both sides until they disagree. The host is checked first and
+        // a non-empty host ends it immediately, which is the healthy case — a
+        // shared mount shows the container's writes on the host as they happen,
+        // so this adds no waiting to a working setup. Only a host that stays
+        // empty while the container fills keeps the loop alive.
+        let probe = format!("ls -A {data_dir} 2>/dev/null | head -1");
+        let mut container_has_data = false;
+        for _ in 0..120 {
+            match host_side(workspace_data_dir) {
+                // The host can see the container's work: nothing to report.
+                HostSide::HasEntries | HostSide::Unreadable => return Ok(()),
+                HostSide::Empty => {}
+            }
+            match compute.exec(id, &probe, None).await {
+                Ok(out) if !out.stdout.trim().is_empty() => {
+                    container_has_data = true;
+                    break;
+                }
+                Ok(_) => {}
+                // Cannot ask, so cannot distinguish.
+                Err(_) => return Ok(()),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        // Neither side ever showed data: an empty database is not this defect.
+        if !container_has_data {
+            return Ok(());
+        }
+        // Re-read the host once more, so a write that landed during the last
+        // interval is not reported as invisible.
+        match host_side(workspace_data_dir) {
+            HostSide::HasEntries | HostSide::Unreadable => return Ok(()),
+            HostSide::Empty => {}
+        }
+
+        Err(ComputeError::Internal(format!(
+            "refusing to finish initialising this repository: the workspace is not \
+             visible inside the container. The container wrote its data directory at \
+             {data_dir} and the host sees nothing at {}. Every commit here would \
+             capture 0 bytes and restore as an empty database. Create the repository \
+             under a path your container runtime shares — on colima or Docker Desktop \
+             that means your home directory rather than somewhere like /private/tmp — \
+             and run `gfs init` again. Repository left at {} for you to remove.",
+            workspace.display(),
+            std::fs::canonicalize(repo_path)
+                .unwrap_or_else(|_| repo_path.to_path_buf())
+                .display()
+        )))
     }
 
     /// Initialise the repository and optionally provision a database.
@@ -350,7 +485,7 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
                 ))
             },
         )?;
-        definition.host_data_dir = Some(workspace_data_dir);
+        definition.host_data_dir = Some(workspace_data_dir.clone());
 
         #[cfg(unix)]
         {
@@ -395,6 +530,15 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         self.repository
             .update_runtime_config(repo_path, runtime)
             .await?;
+
+        self.refuse_a_workspace_the_container_cannot_see(
+            repo_path,
+            compute,
+            &id,
+            container,
+            &workspace_data_dir,
+        )
+        .await?;
 
         tracing::info!("Database deployed; instance id: {}", id);
         Ok(())
@@ -589,6 +733,12 @@ mod tests {
         /// Captures the labels of the last provisioned definition, so tests can
         /// assert that the use case threads them through to `provision`.
         provisioned_labels: std::sync::Mutex<Option<std::collections::BTreeMap<String, String>>>,
+        /// What `get_instance_data_mount_host_path` reports. `None` is the shape
+        /// Kubernetes has: no host path is bound at all.
+        bound_host_path: Option<PathBuf>,
+        /// What an `exec` probe of the container's data dir prints. `None` models a
+        /// runtime without `exec`, which is the trait default.
+        exec_stdout: Option<String>,
     }
 
     #[async_trait]
@@ -688,7 +838,23 @@ mod tests {
             _id: &InstanceId,
             _: &str,
         ) -> crate::ports::compute::Result<Option<PathBuf>> {
-            Ok(None)
+            Ok(self.bound_host_path.clone())
+        }
+
+        async fn exec(
+            &self,
+            _id: &InstanceId,
+            _command: &str,
+            _user: Option<&str>,
+        ) -> crate::ports::compute::Result<crate::ports::compute::ExecOutput> {
+            match self.exec_stdout.as_ref() {
+                Some(out) => Ok(crate::ports::compute::ExecOutput {
+                    exit_code: 0,
+                    stdout: out.clone(),
+                    stderr: String::new(),
+                }),
+                None => Err(ComputeError::Internal("exec not supported".into())),
+            }
         }
         async fn remove_instance(&self, _id: &InstanceId) -> crate::ports::compute::Result<()> {
             Ok(())
@@ -870,6 +1036,101 @@ mod tests {
 
     /// The whole point of an embedded provider: `init` succeeds with no compute
     /// runtime supplied at all, so a machine without Docker can still use it.
+    /// A repository whose workspace the container cannot see can never commit:
+    /// every snapshot copies an empty directory. Init is the only point where the
+    /// remedy is cheap, so it refuses there.
+    #[tokio::test]
+    async fn init_refuses_a_workspace_the_container_cannot_see() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace/data");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let repository = Arc::new(MockRepository {
+            data_dir: Some(workspace.clone()),
+            ..Default::default()
+        });
+        // Bound to THIS workspace, container reports data, host side empty — the
+        // three facts that together mean the two are not one directory.
+        // The runtime reports an ABSOLUTE bind source while the repository hands
+        // back the workspace as the caller expressed it. Production hits the
+        // relative form via `gfs init .`, and an equality check on the raw strings
+        // silently never matched — so the mock reports absolute here deliberately.
+        let compute: Arc<dyn Compute> = Arc::new(MockCompute {
+            bound_host_path: Some(std::fs::canonicalize(&workspace).unwrap()),
+            exec_stdout: Some("PG_VERSION\n".into()),
+            ..Default::default()
+        });
+
+        let usecase =
+            InitRepositoryUseCase::new(repository.clone(), Some(compute), Arc::new(MockRegistry));
+        let result = usecase
+            .run(
+                dir.path().to_path_buf(),
+                None,
+                Some("postgres".into()),
+                Some("17".into()),
+                None,
+                DatabaseCredentials::default(),
+                None,
+                None,
+                Default::default(),
+            )
+            .await;
+
+        let Err(e) = result else {
+            panic!("init must refuse a workspace the container cannot see");
+        };
+        let msg = e.to_string();
+        assert!(
+            msg.contains("not visible inside the container"),
+            "the refusal must name the cause; got: {msg}"
+        );
+        assert!(
+            msg.contains("capture 0 bytes"),
+            "it must say why that matters for commits; got: {msg}"
+        );
+    }
+
+    /// The shape Kubernetes has: no host path is bound at all, because the data
+    /// lives in a PVC and the host workspace is empty by design — measured on a
+    /// live cluster. Checking the host side there would refuse every init, so an
+    /// unbound data mount must leave init alone.
+    #[tokio::test]
+    async fn init_does_not_refuse_when_no_host_path_is_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace/data");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let repository = Arc::new(MockRepository {
+            data_dir: Some(workspace.clone()),
+            ..Default::default()
+        });
+        let compute: Arc<dyn Compute> = Arc::new(MockCompute {
+            bound_host_path: None,
+            exec_stdout: Some("PG_VERSION\n".into()),
+            ..Default::default()
+        });
+
+        let usecase =
+            InitRepositoryUseCase::new(repository.clone(), Some(compute), Arc::new(MockRegistry));
+        let result = usecase
+            .run(
+                dir.path().to_path_buf(),
+                None,
+                Some("postgres".into()),
+                Some("17".into()),
+                None,
+                DatabaseCredentials::default(),
+                None,
+                None,
+                Default::default(),
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "an unbound data mount says nothing about the host side: {result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn init_with_an_embedded_provider_needs_no_compute() {
         let dir = tempfile::tempdir().unwrap();
