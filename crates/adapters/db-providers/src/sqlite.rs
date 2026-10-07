@@ -1127,11 +1127,20 @@ impl LocalEngine for SqliteProvider {
             return Ok(None);
         }
 
-        // Compaction first, on its own short budget (see CHECKPOINT_TIMEOUT).
-        conn.busy_timeout(CHECKPOINT_TIMEOUT)
+        // Fold the log in, take the lock, then CHECK the log is actually gone.
+        //
+        // The check is the part that was missing. `wal_checkpoint` reports
+        // (busy, log_frames, checkpointed_frames) and this code used to discard that
+        // row, so a checkpoint that applied 204 of 694 frames and returned busy = 1 --
+        // raising no error at all, verified directly against a blocking reader -- was
+        // indistinguishable from one that succeeded. The commit then copied a file set
+        // whose log still held the rest.
+        conn.busy_timeout(CHECKPOINT_ATTEMPT_TIMEOUT)
             .map_err(|e| ProviderError::InvalidParams(format!("cannot set busy timeout: {e}")))?;
-        if let Err(e) = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE") {
-            tracing::debug!(error = %e, "wal checkpoint did not complete; snapshotting WAL as-is");
+        if let Err(e) = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            row.get::<_, i64>(0)
+        }) {
+            tracing::debug!(error = %e, "wal checkpoint attempt did not complete");
         }
 
         // The lock gets the full budget.
@@ -1141,7 +1150,80 @@ impl LocalEngine for SqliteProvider {
         conn.execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| classify_lock_failure(&path, e, self.lock_timeout))?;
 
-        Ok(Some(Box::new(SqliteSnapshotGuard { conn })))
+        // Checked UNDER the lock, not after the checkpoint. A writer is free to append
+        // new frames in the window between the two, which the previous comment here
+        // acknowledged and called harmless on the grounds that the lock "freezes both
+        // files together". It does freeze them -- and a frozen non-empty log is exactly
+        // the shape that does not restore. Nothing can append once the lock is held, so
+        // an empty log here stays empty for the duration of the copy.
+        if wal_bytes(&path) == 0 {
+            return Ok(Some(Box::new(SqliteSnapshotGuard {
+                conn,
+                consistent_copy: None,
+            })));
+        }
+
+        // The log could not be folded in, so the live files are not safe to copy. Write
+        // a self-contained copy instead and hand that to the caller.
+        //
+        // `VACUUM INTO` is SQLite's own answer to this: it produces one complete file
+        // with no log beside it, needs only a read transaction, and is NOT blocked by
+        // other readers -- measured at 0.02s against the same open read transaction
+        // that defeated the checkpoint. It costs a rewrite, O(size), which is why it is
+        // reached only here and not on the ordinary path.
+        //
+        // A SECOND connection, because VACUUM cannot run inside a transaction and this
+        // one is holding BEGIN IMMEDIATE. Keeping that lock held while the copy is made
+        // is deliberate: it stops new frames arriving midway.
+        let copy_dir = path
+            .parent()
+            .map(|p| p.join(CONSISTENT_COPY_DIR))
+            .ok_or_else(|| {
+                ProviderError::InvalidParams(format!(
+                    "database path '{}' has no parent directory",
+                    path.display()
+                ))
+            })?;
+        let file_name = path.file_name().ok_or_else(|| {
+            ProviderError::InvalidParams(format!(
+                "database path '{}' has no file name",
+                path.display()
+            ))
+        })?;
+
+        // Outside the data directory on purpose: the storage layer snapshots the data
+        // directory itself, so a copy placed inside it would be captured by the very
+        // snapshot it exists to replace.
+        std::fs::create_dir_all(&copy_dir).map_err(|e| {
+            ProviderError::InvalidParams(format!(
+                "cannot create '{}' for a consistent copy: {e}",
+                copy_dir.display()
+            ))
+        })?;
+
+        let destination = copy_dir.join(file_name);
+        let reader = Self::open(&path)?;
+        if let Err(e) = reader.execute("VACUUM INTO ?1", [destination.to_string_lossy().as_ref()]) {
+            // Classified, not blanket-reported as busy. A corrupt database fails here
+            // too, and reporting corruption as busy is what invites the caller to
+            // override and record it.
+            let _ = std::fs::remove_dir_all(&copy_dir);
+            return Err(classify_lock_failure(&path, e, self.lock_timeout));
+        }
+
+        tracing::warn!(
+            path = %path.display(),
+            copy = %destination.display(),
+            "the write-ahead log could not be folded in, so this snapshot is a rewritten \
+             copy rather than a clone: it is correct but costs time proportional to the \
+             database size. A reader holding a transaction open across commits is the \
+             usual cause"
+        );
+
+        Ok(Some(Box::new(SqliteSnapshotGuard {
+            conn,
+            consistent_copy: Some(copy_dir),
+        })))
     }
 
     /// Write a SQL dump that recreates the database when replayed.
@@ -1347,24 +1429,59 @@ fn brief(error: &rusqlite::Error) -> String {
 /// decide whether an unquiesced snapshot is acceptable.
 const LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How long to wait for the WAL checkpoint.
+/// How long one checkpoint attempt may block.
 ///
-/// Deliberately short, and separate from [`LOCK_TIMEOUT`]. A `TRUNCATE`
-/// checkpoint waits for readers to drain, so a single long-lived read
-/// transaction — routine for an ORM connection pool — would otherwise burn the
-/// entire lock budget before giving up, after which the write lock is taken
-/// instantly. The checkpoint is compaction, not correctness: failing it costs a
-/// larger WAL in the snapshot, nothing more.
-const CHECKPOINT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+/// Deliberately short, for the reason it always was: a `TRUNCATE` checkpoint waits
+/// for readers to drain, so a single long-lived read transaction — routine for an
+/// ORM connection pool — would otherwise burn the entire lock budget before giving
+/// up, after which the write lock is taken instantly.
+///
+/// What changed is what happens when it does not complete. The previous note here
+/// said the checkpoint "is compaction, not correctness: failing it costs a larger
+/// WAL in the snapshot, nothing more". That is measurably false — a snapshot holding
+/// a non-empty log does not restore — so an unfolded log now routes to a rewritten
+/// copy instead of being snapshotted as-is.
+const CHECKPOINT_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Directory holding a rewritten copy when the live files are not safe to snapshot.
+///
+/// A sibling of the data directory, never inside it: the storage layer snapshots the
+/// data directory, so a copy placed within it would be captured by the snapshot it
+/// exists to replace.
+const CONSISTENT_COPY_DIR: &str = ".gfs-consistent-copy";
+
+/// Size of the database's write-ahead log, or 0 when there is none.
+///
+/// Read from the filesystem rather than asked of SQLite, because it is checked while
+/// a write transaction is open and `wal_checkpoint` cannot run inside one.
+fn wal_bytes(db: &Path) -> u64 {
+    let mut name = db.as_os_str().to_os_string();
+    name.push("-wal");
+    std::fs::metadata(PathBuf::from(name))
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
 
 /// Holds SQLite's write lock open for the duration of a storage snapshot.
 struct SqliteSnapshotGuard {
     conn: rusqlite::Connection,
+    /// Set only when the log could not be folded in; see `prepare_for_snapshot`.
+    consistent_copy: Option<PathBuf>,
 }
 
 impl SnapshotGuard for SqliteSnapshotGuard {
     fn describe(&self) -> String {
-        "sqlite write lock (BEGIN IMMEDIATE) after WAL checkpoint".to_string()
+        match &self.consistent_copy {
+            None => "sqlite write lock (BEGIN IMMEDIATE), log folded in".to_string(),
+            Some(dir) => format!(
+                "sqlite write lock (BEGIN IMMEDIATE) over a rewritten copy at {}",
+                dir.display()
+            ),
+        }
+    }
+
+    fn consistent_copy(&self) -> Option<&Path> {
+        self.consistent_copy.as_deref()
     }
 }
 
@@ -1376,6 +1493,16 @@ impl Drop for SqliteSnapshotGuard {
         // lock regardless.
         if let Err(e) = self.conn.execute_batch("ROLLBACK") {
             tracing::debug!(error = %e, "releasing sqlite write lock");
+        }
+        // The rewritten copy lives only as long as the guard. Removed by the exact
+        // path this provider constructed, and only when its final component is the
+        // name this provider chose -- a directory tree is being deleted, so the target
+        // is checked rather than assumed.
+        if let Some(dir) = self.consistent_copy.take()
+            && dir.file_name().is_some_and(|n| n == CONSISTENT_COPY_DIR)
+            && let Err(e) = std::fs::remove_dir_all(&dir)
+        {
+            tracing::debug!(error = %e, path = %dir.display(), "removing the rewritten copy");
         }
     }
 }
