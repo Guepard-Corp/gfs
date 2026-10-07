@@ -143,17 +143,6 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
             _ => Vec::new(),
         };
 
-        // Flush before comparing, so that work the engine has committed but not
-        // yet written back to its data files is on disk where the comparison can
-        // see it. Without this, ignoring the write-ahead log would discard a
-        // committed row that exists only there; with it, the same row appears
-        // under the data directory and is caught.
-        //
-        // Best effort by design: a stopped database has already flushed on
-        // shutdown, and a database that cannot be reached is one whose files are
-        // not moving either. Failing the checkout because a checkpoint did not
-        // run would trade a rare missed write for a common refusal.
-        self.flush_before_comparing(path).await;
         let changed = repo_layout::workspace_changes(&workspace, &baseline, &engine_owned)
             .map_err(|e| CheckoutRepoError::Repository(RepositoryError::Internal(e.to_string())))?;
         if changed.is_empty() {
@@ -251,6 +240,23 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
         // Held first so the dirty-workspace check below reads a repo that no
         // concurrent commit can be mutating; the guard drops on any early
         // return, releasing the lock.
+        // Flush once, before the comparison below, so that work the engine has
+        // committed but not yet written back to its data files is on disk where
+        // the comparison can see it. The write-ahead log is on the ignore list,
+        // so a comparison made without flushing would miss a committed row that
+        // lives only there.
+        //
+        // Once, and not from inside the comparison, because a checkpoint writes
+        // the control file and catalog pages itself: a second one reports its own
+        // writes as the user's. That is how a workspace found clean came back
+        // dirty a moment later.
+        //
+        // Best effort: a stopped database has already flushed on shutdown, and
+        // one that cannot be reached is not writing either.
+        if !self.force && create_branch.is_none() {
+            self.flush_before_comparing(&path).await;
+        }
+
         let _repo_lock = RepoLock::acquire_waiting(&path, LOCK_WAIT).map_err(|e| match e {
             // "another operation", not "a commit": a second checkout holds this
             // same lock, so the blocker is not always a commit.
