@@ -59,9 +59,8 @@ pub fn is_temp_name(name: &str) -> bool {
     name.starts_with('.')
 }
 
-/// The temp path for `path`: same directory, dotted, unique per process and
-/// per call.
-fn temp_path(path: &Path) -> std::io::Result<(PathBuf, &Path)> {
+/// `path`'s directory and file name, or an error naming what is missing.
+fn split(path: &Path) -> std::io::Result<(&Path, &std::ffi::OsStr)> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -74,22 +73,35 @@ fn temp_path(path: &Path) -> std::io::Result<(PathBuf, &Path)> {
             format!("{} has no file name", path.display()),
         )
     })?;
+    Ok((parent, name))
+}
+
+/// The next temp name for `name` in `parent`: same directory, dotted, unique
+/// per process and per call.
+fn temp_name(parent: &Path, name: &std::ffi::OsStr) -> PathBuf {
     let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp = parent.join(format!(
+    parent.join(format!(
         ".{}.tmp.{}.{}",
         name.to_string_lossy(),
         std::process::id(),
         n
-    ));
-    Ok((tmp, parent))
+    ))
 }
 
-/// Create the temp file, set its mode, write `bytes`, and sync it.
-fn write_temp(tmp: &Path, bytes: &[u8], mode: Option<u32>, sync: bool) -> std::io::Result<()> {
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(tmp)?;
+/// The temp path for `path` (see [`temp_name`]).
+#[cfg(test)]
+fn temp_path(path: &Path) -> std::io::Result<(PathBuf, &Path)> {
+    let (parent, name) = split(path)?;
+    Ok((temp_name(parent, name), parent))
+}
+
+/// How many temp names to try before giving up. A name is taken only by a
+/// leftover of a crashed process that had the same pid, or by a writer in
+/// another pid namespace (two containers sharing the repository volume).
+const TEMP_ATTEMPTS: usize = 16;
+
+/// Set the mode, write `bytes`, and sync: everything after the create.
+fn fill(file: &mut File, bytes: &[u8], mode: Option<u32>, sync: bool) -> std::io::Result<()> {
     #[cfg(unix)]
     if let Some(mode) = mode {
         use std::os::unix::fs::PermissionsExt;
@@ -102,6 +114,42 @@ fn write_temp(tmp: &Path, bytes: &[u8], mode: Option<u32>, sync: bool) -> std::i
         file.sync_all()?;
     }
     Ok(())
+}
+
+/// Create a fresh temp from the names `next` yields, fill it, and return it.
+///
+/// A name that already exists is skipped, never reused and never removed: it
+/// belongs to someone else, and deleting it could pull a file out from under a
+/// writer that is about to rename it. Only a temp this call created is removed
+/// on failure.
+fn create_temp(
+    bytes: &[u8],
+    mode: Option<u32>,
+    sync: bool,
+    mut next: impl FnMut() -> PathBuf,
+) -> std::io::Result<PathBuf> {
+    for _ in 0..TEMP_ATTEMPTS {
+        let tmp = next();
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        if let Err(e) = fill(&mut file, bytes, mode, sync) {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        return Ok(tmp);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("no free temp name after {TEMP_ATTEMPTS} attempts"),
+    ))
 }
 
 /// Sync a directory so a rename or link inside it survives a crash.
@@ -148,11 +196,8 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
 /// window in which the file has the default mode.
 pub fn write_durable(path: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::Result<()> {
     let sync = fsync_enabled();
-    let (tmp, parent) = temp_path(path)?;
-    if let Err(e) = write_temp(&tmp, bytes, mode, sync) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
+    let (parent, name) = split(path)?;
+    let tmp = create_temp(bytes, mode, sync, || temp_name(parent, name))?;
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
@@ -175,11 +220,8 @@ pub fn write_durable(path: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::R
 /// still no-clobber and durable, without the atomicity for readers.
 pub fn create_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let sync = fsync_enabled();
-    let (tmp, parent) = temp_path(path)?;
-    if let Err(e) = write_temp(&tmp, bytes, None, sync) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
+    let (parent, name) = split(path)?;
+    let tmp = create_temp(bytes, None, sync, || temp_name(parent, name))?;
     let linked = std::fs::hard_link(&tmp, path);
     let _ = std::fs::remove_file(&tmp);
     match linked {
@@ -271,6 +313,23 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&p).unwrap(), b"first");
         assert_eq!(entries(dir.path()), vec!["feature".to_string()]);
+    }
+
+    /// A temp name that is already taken (a crashed process's leftover with a
+    /// reused pid, or a writer in another pid namespace) is skipped and left
+    /// exactly as it was. Removing it on the way out, as the first version
+    /// did, deletes a file this process never created.
+    #[test]
+    fn a_taken_temp_name_is_skipped_and_never_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let taken = dir.path().join(".main.tmp.1.0");
+        std::fs::write(&taken, b"someone else's").unwrap();
+        let fresh = dir.path().join(".main.tmp.1.1");
+        let mut names = vec![fresh.clone(), taken.clone()];
+        let tmp = create_temp(b"mine", None, false, || names.pop().unwrap()).unwrap();
+        assert_eq!(tmp, fresh);
+        assert_eq!(std::fs::read(&taken).unwrap(), b"someone else's");
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"mine");
     }
 
     #[test]
