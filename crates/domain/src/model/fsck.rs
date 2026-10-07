@@ -149,13 +149,26 @@ pub struct Misaddressed {
 /// removes them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReclaimableWorkspace {
-    /// Whether removing this is safe.
+    /// Whether this working copy still matches the commit it came from.
+    ///
+    /// Named for the evidence, not for a conclusion. It was called
+    /// `safe_to_remove`, and that name was the problem: a stat comparison is not a
+    /// safety proof, and a script reading `safe_to_remove: true` out of the JSON
+    /// will delete without reading the doc comment that says otherwise. Renamed
+    /// while `fsck` is still unshipped -- there are no consumers of the field yet,
+    /// so this costs nothing now and would be a broken contract later.
     ///
     /// `true` only for a DETACHED working copy whose every file matches the commit
     /// it came from in size and modification time. It is a stat comparison, not a
     /// content one: nothing reads the bytes, so this is the evidence `rsync` and
-    /// `make` act on rather than proof. A collector must re-check under the
-    /// repository lock before unlinking.
+    /// `make` act on rather than proof. Two files of equal length whose contents
+    /// differ, written within the same mtime granularity, compare equal here --
+    /// and a database writes fixed-width pages, which is exactly that shape.
+    ///
+    /// So the decision to unlink is the collector's, not this field's, and the
+    /// collector must re-check under the repository lock. Closing the gap for real
+    /// needs a content digest, which `FileEntry` has no field for; that is a schema
+    /// change and is tracked separately.
     ///
     /// `false` whenever that cannot be established -- a branch workspace, whose
     /// baseline is gone with its branch; a commit object that will not read; a
@@ -174,7 +187,7 @@ pub struct ReclaimableWorkspace {
     /// that question is answered cheaply, `true` here would risk deleting a
     /// developer's uncommitted work in the one category that is usually the
     /// largest thing in a repository.
-    pub safe_to_remove: bool,
+    pub matches_its_commit: bool,
     /// Path relative to `.gfs/`, e.g. `workspaces/feature/0`.
     pub path: String,
     /// Why nothing needs it.
@@ -317,7 +330,7 @@ pub struct FsckReport {
     /// Working copies no branch or reachable commit needs, reported apart from
     /// `unreachable` because they are not graph objects.
     ///
-    /// **Reported; collectable only where `safe_to_remove` says so.** Checkout now always restores from the
+    /// **Reported; collectable only where `matches_its_commit` says so.** Checkout now always restores from the
     /// snapshot -- it removes the workspace and repopulates it, rather than
     /// preserving an existing one -- so a workspace *is* a cache for any branch
     /// that still exists, and the earlier reason for never touching these has
@@ -347,7 +360,7 @@ impl FsckReport {
     ///
     /// A workspace that is reported but NOT provably collectable does not reach
     /// `1`. `1` means a collector has work to do; a listing a human should look
-    /// at is not that, and until `safe_to_remove` could be `true` this clause
+    /// at is not that, and until `matches_its_commit` could be `true` this clause
     /// fired on every reported workspace, so `1` meant "something was listed"
     /// rather than "something can be removed". The listing stays in the report
     /// either way -- what changes is only whether a script keyed on `1` wakes a
@@ -373,7 +386,10 @@ impl FsckReport {
         } else if !self.snapshots_checked || !self.unreadable.is_empty() {
             3
         } else if !self.unreachable.is_empty()
-            || self.reclaimable_workspaces.iter().any(|w| w.safe_to_remove)
+            || self
+                .reclaimable_workspaces
+                .iter()
+                .any(|w| w.matches_its_commit)
         {
             1
         } else {

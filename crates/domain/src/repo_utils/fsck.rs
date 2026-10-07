@@ -1856,7 +1856,7 @@ fn reclaimable_workspaces(
                 let bytes = repo_layout::directory_physical_size_bytes(&path).unwrap_or(0);
                 total += bytes;
                 out.push(ReclaimableWorkspace {
-                    safe_to_remove: false,
+                    matches_its_commit: false,
                     path: format!("{WORKSPACES_DIR}/{child_rel}"),
                     reason: "no branch of this name exists".to_string(),
                     bytes,
@@ -1884,7 +1884,7 @@ fn reclaimable_workspaces(
 /// `rsync` and `make` act on -- strong, but not proof. A caller acting on it to
 /// DELETE must treat it as advisory and re-check under a lock.
 ///
-/// `safe_to_remove` was hardcoded `false` because answering this was thought to
+/// `matches_its_commit` was hardcoded `false` because answering this was thought to
 /// need a baseline that is gone. For a DETACHED workspace it is not: the
 /// directory is named after its commit's hash prefix, and unreachable is not the
 /// same as absent -- a commit no ref reaches still has its object and file list
@@ -1969,7 +1969,7 @@ fn collect_detached(
             // was recoverable AND every file matches it, so nothing here is
             // unrecorded. Unrecoverable baseline or diverged content both stay
             // `false`.
-            safe_to_remove: matches == Some(true),
+            matches_its_commit: matches == Some(true),
             path: format!("{WORKSPACES_DIR}/detached/{prefix}"),
             reason: match matches {
                 Some(true) => "no reachable commit starts with this hash, and every \
@@ -2644,7 +2644,7 @@ mod tests {
             "reported but not provably collectable: {:?}",
             r.reclaimable_workspaces
                 .iter()
-                .map(|w| (w.safe_to_remove, &w.reason))
+                .map(|w| (w.matches_its_commit, &w.reason))
                 .collect::<Vec<_>>()
         );
     }
@@ -2660,11 +2660,13 @@ mod tests {
 
         let r = check(d.path(), Duration::ZERO).unwrap();
         assert!(
-            r.reclaimable_workspaces.iter().any(|w| w.safe_to_remove),
+            r.reclaimable_workspaces
+                .iter()
+                .any(|w| w.matches_its_commit),
             "fixture must produce something provably safe: {:?}",
             r.reclaimable_workspaces
                 .iter()
-                .map(|w| (w.safe_to_remove, &w.reason))
+                .map(|w| (w.matches_its_commit, &w.reason))
                 .collect::<Vec<_>>()
         );
         assert_eq!(
@@ -3279,7 +3281,7 @@ mod tests {
     /// A JSON consumer cannot read a doc comment, so the caveat that these are
     /// unsafe to remove has to be a field. It was previously only in prose.
     #[test]
-    fn a_reported_working_copy_is_marked_unsafe_to_remove() {
+    fn a_reported_working_copy_is_not_marked_as_matching() {
         let d = repo();
         let h = write_commit(d.path(), "aa", "live", None, true);
         set_branch(d.path(), "main", &h);
@@ -3296,13 +3298,15 @@ mod tests {
         let r = check(d.path(), Duration::ZERO).unwrap();
         assert!(!r.reclaimable_workspaces.is_empty());
         assert!(
-            r.reclaimable_workspaces.iter().all(|w| !w.safe_to_remove),
+            r.reclaimable_workspaces
+                .iter()
+                .all(|w| !w.matches_its_commit),
             "a BRANCH workspace has no recoverable baseline -- the branch and so its \
              tip are gone -- so it cannot be proved safe. Detached workspaces can be; \
              see the tests below"
         );
         let json = serde_json::to_string(&r.reclaimable_workspaces[0]).unwrap();
-        assert!(json.contains("\"safe_to_remove\":false"), "got {json}");
+        assert!(json.contains("\"matches_its_commit\":false"), "got {json}");
     }
 
     /// A commit recording one file, plus a detached workspace holding it.
@@ -3362,7 +3366,7 @@ mod tests {
     /// can be proved safe: everything in it is already recorded in an object on
     /// disk, so removing it loses nothing. Unreachable is not absent.
     #[test]
-    fn a_detached_workspace_matching_its_commit_is_safe_to_remove() {
+    fn a_detached_workspace_matching_its_commit_is_reported_as_matching() {
         let d = repo();
         let live = write_commit(d.path(), "aa", "on main", None, true);
         set_branch(d.path(), "main", &live);
@@ -3375,7 +3379,7 @@ mod tests {
             .find(|w| w.path.contains("detached"))
             .expect("the detached workspace must be reported");
         assert!(
-            w.safe_to_remove,
+            w.matches_its_commit,
             "content matches the commit, so it is provably safe: {}",
             w.reason
         );
@@ -3385,7 +3389,7 @@ mod tests {
     /// is the one that proves the comparison is consulted rather than the
     /// baseline merely being present.
     #[test]
-    fn a_detached_workspace_that_has_diverged_is_not_safe_to_remove() {
+    fn a_detached_workspace_that_has_diverged_is_not_reported_as_matching() {
         let d = repo();
         let live = write_commit(d.path(), "aa", "on main", None, true);
         set_branch(d.path(), "main", &live);
@@ -3399,7 +3403,7 @@ mod tests {
             .find(|w| w.path.contains("detached"))
             .expect("the detached workspace must be reported");
         assert!(
-            !w.safe_to_remove,
+            !w.matches_its_commit,
             "it holds a file no commit records: {}",
             w.reason
         );
@@ -3437,7 +3441,7 @@ mod tests {
             .find(|w| w.path.contains("detached"))
             .expect("the detached workspace must be reported");
         assert!(
-            !w.safe_to_remove,
+            !w.matches_its_commit,
             "a baseline with no mtime cannot prove a match: {}",
             w.reason
         );
@@ -3456,7 +3460,7 @@ mod tests {
             .find(|w| w.path.contains("detached"))
             .expect("the control workspace must be reported");
         assert!(
-            w2.safe_to_remove,
+            w2.matches_its_commit,
             "with mtime on both sides and nothing changed, it is provable: {}",
             w2.reason
         );
@@ -3465,7 +3469,7 @@ mod tests {
     /// And when the baseline cannot be recovered at all, the answer is `false`.
     /// `true` must require proof, never the absence of a reason to refuse.
     #[test]
-    fn a_detached_workspace_whose_commit_cannot_be_read_is_not_safe_to_remove() {
+    fn a_detached_workspace_whose_commit_cannot_be_read_is_not_reported_as_matching() {
         let d = repo();
         let live = write_commit(d.path(), "aa", "on main", None, true);
         set_branch(d.path(), "main", &live);
@@ -3485,7 +3489,11 @@ mod tests {
             .iter()
             .find(|w| w.path.contains("ffffffffffff"))
             .expect("the detached workspace must be reported");
-        assert!(!w.safe_to_remove, "no baseline, so no proof: {}", w.reason);
+        assert!(
+            !w.matches_its_commit,
+            "no baseline, so no proof: {}",
+            w.reason
+        );
     }
 
     /// The cluster namespace is shared. Handing fsck a snapshot belonging to

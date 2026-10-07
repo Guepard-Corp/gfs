@@ -582,7 +582,7 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
                 dimmed(&w.reason)
             )?;
         }
-        // Split by `safe_to_remove` rather than asserting none of them are. This
+        // Split by `matches_its_commit` rather than asserting none of them are. This
         // line said "not collected" unconditionally, which was true while the field
         // could only be false and became a flat contradiction of the JSON once it
         // could be true -- the per-entry reason printed just above already
@@ -590,7 +590,7 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
         let safe_count = report
             .reclaimable_workspaces
             .iter()
-            .filter(|w| w.safe_to_remove)
+            .filter(|w| w.matches_its_commit)
             .count();
         let total = report.reclaimable_workspaces.len();
         let summary = if safe_count == 0 {
@@ -713,15 +713,15 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
         && report.unrecognised.is_empty()
         && report.misaddressed.is_empty()
     {
-        // Follows `safe_to_remove` rather than asserting what it must be. The
+        // Follows `matches_its_commit` rather than asserting what it must be. The
         // comment that stood here said two contradicting lines are worse than
         // either alone, which was right -- and then the field became derivable and
         // these lines became the contradiction, claiming nothing is collected while
-        // the JSON for the same run said a working copy was safe to remove.
+        // the JSON for the same run said a working copy matched its commit.
         let any_safe = report
             .reclaimable_workspaces
             .iter()
-            .any(|w| w.safe_to_remove);
+            .any(|w| w.matches_its_commit);
         if report.reclaimable_workspaces.is_empty() {
             println_safe!("repository is consistent; the objects above are collectable")?;
         } else if report.unreachable.is_empty() && !any_safe {
@@ -732,7 +732,8 @@ fn render_text(report: &FsckReport, plan_id: Option<&str>) -> std::io::Result<()
         } else if any_safe {
             println_safe!(
                 "repository is consistent; the objects above are collectable, and the working \
-                 copies marked safe to remove -- the rest are listed for review"
+                 copies that still match the commit they came from -- the rest are \
+                 listed for review"
             )?;
         } else {
             println_safe!(
