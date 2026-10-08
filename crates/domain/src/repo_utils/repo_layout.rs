@@ -6,6 +6,7 @@ use crate::model::layout::{
     HEAD_FILE, HEADS_DIR, MAIN_BRANCH, MIN_SHORT_HASH_LEN, OBJECTS_DIR, REFS_DIR,
     SHORT_COMMIT_ID_LEN, SNAPSHOTS_DIR, WORKSPACE_DATA_DIR, WORKSPACE_FILE, WORKSPACES_DIR,
 };
+use crate::repo_utils::durable_write::{is_temp_name, write_durable};
 use anyhow::Result;
 use std::collections::HashSet;
 use std::fs;
@@ -103,11 +104,12 @@ pub fn init_repo_layout(working_dir: &Path, mount_point: Option<String>) -> Resu
     fs::create_dir_all(&snapshots_dir).map_err(RepoError::from)?;
 
     let head_content = format!("ref: {}/{}/{}", REFS_DIR, HEADS_DIR, MAIN_BRANCH);
-    fs::write(gfs_dir.join(HEAD_FILE), head_content).map_err(RepoError::from)?;
+    write_durable(&gfs_dir.join(HEAD_FILE), head_content.as_bytes(), None)
+        .map_err(RepoError::from)?;
 
     // Create initial main branch reference (0 = no commits yet)
     let main_ref_path = refs_dir.join(MAIN_BRANCH);
-    fs::write(&main_ref_path, BRANCH_WORKSPACE_SEGMENT) // Initial commit hash "0"
+    write_durable(&main_ref_path, BRANCH_WORKSPACE_SEGMENT.as_bytes(), None) // Initial commit hash "0"
         .map_err(RepoError::from)?;
 
     // Record the active workspace data directory.
@@ -117,9 +119,10 @@ pub fn init_repo_layout(working_dir: &Path, mount_point: Option<String>) -> Resu
     // have accumulated since init.  It is updated by checkout / branch
     // operations; commit intentionally leaves it unchanged.
     let workspace_file = gfs_dir.join(WORKSPACE_FILE);
-    fs::write(
+    write_durable(
         &workspace_file,
-        workspace_data_dir.to_string_lossy().as_ref(),
+        workspace_data_dir.to_string_lossy().as_bytes(),
+        None,
     )
     .map_err(RepoError::from)?;
 
@@ -204,7 +207,7 @@ pub fn set_active_workspace_data_dir(
     path: &std::path::Path,
 ) -> Result<(), RepoError> {
     let workspace_file = repo_path.join(GFS_DIR).join(WORKSPACE_FILE);
-    fs::write(&workspace_file, path.to_string_lossy().as_ref()).map_err(RepoError::from)
+    write_durable(&workspace_file, path.to_string_lossy().as_bytes(), None).map_err(RepoError::from)
 }
 
 pub fn get_current_branch(path: &Path) -> Result<String, RepoError> {
@@ -679,7 +682,7 @@ pub fn write_files_object(repo_path: &Path, entries: &[FileEntry]) -> Result<Str
     let (dir_part, file_part) = hash.split_at(2);
     let object_dir = repo_path.join(GFS_DIR).join(OBJECTS_DIR).join(dir_part);
     fs::create_dir_all(&object_dir).map_err(RepoError::from)?;
-    fs::write(object_dir.join(file_part), &bytes).map_err(RepoError::from)?;
+    write_durable(&object_dir.join(file_part), &bytes, None).map_err(RepoError::from)?;
     Ok(hash)
 }
 
@@ -759,8 +762,14 @@ pub fn write_schema_object(
     fs::create_dir_all(&schema_dir).map_err(RepoError::from)?;
 
     // 4. Write both files
-    fs::write(schema_dir.join("schema.json"), schema_json).map_err(RepoError::from)?;
-    fs::write(schema_dir.join("schema.sql"), schema_sql).map_err(RepoError::from)?;
+    write_durable(
+        &schema_dir.join("schema.json"),
+        schema_json.as_bytes(),
+        None,
+    )
+    .map_err(RepoError::from)?;
+    write_durable(&schema_dir.join("schema.sql"), schema_sql.as_bytes(), None)
+        .map_err(RepoError::from)?;
 
     Ok(hash)
 }
@@ -890,6 +899,12 @@ pub fn is_commit(repo_path: &Path, commit_hash: &str) -> bool {
     if !commit_hash.is_char_boundary(2) {
         return false;
     }
+    // Only hex names are objects. Anything else under `objects/<2>/` is a
+    // leftover temp from an interrupted write (`.<62 hex>.tmp.<pid>.<n>`) and
+    // must not answer "yes, that commit exists".
+    if !commit_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
     let objects_dir = repo_path.join(GFS_DIR).join(OBJECTS_DIR);
     let (dir_part, file_part) = commit_hash.split_at(2);
     let object_path = objects_dir.join(dir_part).join(file_part);
@@ -900,9 +915,10 @@ pub fn update_head_with_branch(repo_path: &Path, branch_name: &str) -> Result<()
     tracing::trace!("Updating HEAD to branch '{}'", branch_name);
 
     let head_path = repo_path.join(GFS_DIR).join(HEAD_FILE);
-    fs::write(
+    write_durable(
         &head_path,
-        format!("ref: {}/{}/{}", REFS_DIR, HEADS_DIR, branch_name),
+        format!("ref: {}/{}/{}", REFS_DIR, HEADS_DIR, branch_name).as_bytes(),
+        None,
     )
     .map_err(RepoError::from)?;
 
@@ -913,7 +929,7 @@ pub fn update_head_with_commit(repo_path: &Path, commit_hash: &str) -> Result<()
     tracing::trace!("Updating HEAD to commit '{}'", commit_hash);
 
     let head_path = repo_path.join(GFS_DIR).join(HEAD_FILE);
-    fs::write(&head_path, commit_hash).map_err(RepoError::from)?;
+    write_durable(&head_path, commit_hash.as_bytes(), None).map_err(RepoError::from)?;
 
     Ok(())
 }
@@ -922,6 +938,11 @@ pub fn update_head_with_commit(repo_path: &Path, commit_hash: &str) -> Result<()
 ///
 /// Writes `refs/heads/<branch_name>` with the given commit hash. This is the
 /// operation performed after a new commit is recorded to advance the branch tip.
+///
+/// Durable and atomic ([`write_durable`]): a reader sees the old tip or the new
+/// one, never an empty or partial ref, and a crash at any point leaves one of
+/// the two on disk. A truncating write here was the one place a crash could
+/// lose a branch's whole history pointer.
 pub fn update_branch_ref(
     repo_path: &Path,
     branch_name: &str,
@@ -933,7 +954,7 @@ pub fn update_branch_ref(
         .join(REFS_DIR)
         .join(HEADS_DIR)
         .join(branch_name);
-    fs::write(&ref_path, commit_hash).map_err(RepoError::from)?;
+    write_durable(&ref_path, commit_hash.as_bytes(), None).map_err(RepoError::from)?;
     Ok(())
 }
 
@@ -1383,8 +1404,12 @@ fn find_commits_by_prefix(repo_path: &Path, prefix: &str) -> Result<Vec<String>,
         let dir_name = entry.file_name();
         let dir_name_str = dir_name.to_string_lossy();
 
-        // Skip directories that don't match prefix
-        if !dir_name_str.starts_with(dir_prefix) {
+        // Skip directories that don't match prefix, and anything that is not a
+        // two-hex shard directory.
+        if dir_name_str.len() != 2
+            || !dir_name_str.chars().all(|c| c.is_ascii_hexdigit())
+            || !dir_name_str.starts_with(dir_prefix)
+        {
             continue;
         }
 
@@ -1400,6 +1425,15 @@ fn find_commits_by_prefix(repo_path: &Path, prefix: &str) -> Result<Vec<String>,
             let file_entry = file_entry.map_err(RepoError::from)?;
             let file_name = file_entry.file_name();
             let file_name_str = file_name.to_string_lossy();
+
+            // Only a hex name is an object. A crash can leave a temp from an
+            // interrupted write next to the objects (`.<62 hex>.tmp.<pid>.<n>`);
+            // it is not a commit, and counting it would turn a unique short hash
+            // into an ambiguous one. (Hex, not exactly 62: test fixtures in this
+            // module use other lengths, and the dot is what marks a temp.)
+            if !file_name_str.chars().all(|c| c.is_ascii_hexdigit()) {
+                continue;
+            }
 
             // Check if file matches prefix
             if file_name_str.starts_with(file_prefix) {
@@ -1426,6 +1460,11 @@ fn collect_branch_refs(dir: &Path, prefix: &str) -> Result<Vec<(String, String)>
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| RepoError::invalid_layout("invalid ref name".to_string()))?;
+        // A dotted entry is a temp left by an interrupted ref write, never a
+        // branch (`validate_branch_name` refuses a segment starting with '.').
+        if is_temp_name(name) {
+            continue;
+        }
         let branch_name = if prefix.is_empty() {
             name.to_string()
         } else {
@@ -3364,6 +3403,189 @@ name = "test-repo"
     fn repair_marker_path_bare_component_returns_none() {
         let marker = repair_marker_path(std::path::Path::new("data"));
         assert_eq!(marker, None);
+    }
+
+    // -------------------------------------------------------------------------
+    // Interrupted writes: torn refs and leftover temps
+    // -------------------------------------------------------------------------
+
+    /// The defect `write_durable` exists for, at the ref: a writer advances
+    /// `refs/heads/main` in a loop while a reader reads it in a loop, and every
+    /// read must be a complete 64-hex tip. A truncating write is observable as
+    /// an empty or short ref, which `gfs log` cannot resolve.
+    #[test]
+    fn a_concurrent_reader_never_sees_a_torn_branch_ref() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let temp_dir = TempDir::new().unwrap();
+        let repo = Arc::new(temp_dir.path().join("repo"));
+        init_repo_layout(&repo, None).unwrap();
+        update_branch_ref(&repo, MAIN_BRANCH, &format!("{:064x}", 0)).unwrap();
+        let ref_path = repo
+            .join(GFS_DIR)
+            .join(REFS_DIR)
+            .join(HEADS_DIR)
+            .join(MAIN_BRANCH);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (repo, stop) = (repo.clone(), stop.clone());
+            std::thread::spawn(move || {
+                for i in 1..=400u64 {
+                    update_branch_ref(&repo, MAIN_BRANCH, &format!("{i:064x}")).unwrap();
+                }
+                stop.store(true, Ordering::SeqCst);
+            })
+        };
+
+        let mut reads = 0usize;
+        let mut torn: Option<String> = None;
+        while !stop.load(Ordering::SeqCst) {
+            if let Ok(seen) = fs::read_to_string(&ref_path) {
+                reads += 1;
+                if !(seen.len() == 64 && seen.chars().all(|c| c.is_ascii_hexdigit())) {
+                    torn = Some(seen);
+                    break;
+                }
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        writer.join().unwrap();
+        assert!(
+            torn.is_none(),
+            "read a torn branch ref after {reads} reads: {:?}",
+            torn.unwrap_or_default()
+        );
+        assert!(reads > 0, "the reader never observed the ref");
+    }
+
+    /// A crash mid-write leaves `.main.tmp.<pid>.<n>`. It is not a branch.
+    #[test]
+    fn list_branches_ignores_a_leftover_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        create_valid_repo_layout(repo).unwrap();
+        let tip = "a".repeat(64);
+        write_branch(repo, MAIN_BRANCH, &tip);
+        write_branch(repo, "team/alpha", &tip);
+        write_branch(repo, ".foo.tmp.123", &tip);
+        write_branch(repo, "team/.alpha.tmp.123.0", "");
+
+        let mut names: Vec<String> = list_branches(repo)
+            .unwrap()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![MAIN_BRANCH.to_string(), "team/alpha".to_string()]
+        );
+    }
+
+    /// `gfs log` decorates commits with the refs pointing at them; a leftover
+    /// temp holding the same tip must not appear as one.
+    #[test]
+    fn get_refs_pointing_to_ignores_a_leftover_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        create_valid_repo_layout(repo).unwrap();
+        let tip = "c".repeat(64);
+        write_branch(repo, MAIN_BRANCH, &tip);
+        write_branch(repo, ".main.tmp.123.0", &tip);
+
+        let refs = get_refs_pointing_to(repo, &tip).unwrap();
+        assert!(
+            refs.iter().all(|r| !r.contains(".tmp.")),
+            "a temp was reported as a ref: {refs:?}"
+        );
+        assert!(refs.contains(&MAIN_BRANCH.to_string()), "{refs:?}");
+    }
+
+    /// Deleted refs live under `refs/deleted/<ms>/`; a temp inside one is not a
+    /// recoverable branch, and a dotted directory beside them is not a deletion.
+    #[test]
+    fn list_deleted_branch_refs_ignores_a_leftover_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        create_valid_repo_layout(repo).unwrap();
+        write_branch(repo, "feature", &"a".repeat(64));
+        soft_delete_branch_ref(repo, "feature").unwrap();
+
+        let base = deleted_refs_dir(repo);
+        let stamp = fs::read_dir(&base).unwrap().next().unwrap().unwrap().path();
+        fs::write(stamp.join(".foo.tmp.123"), "a".repeat(64)).unwrap();
+        fs::create_dir_all(base.join(".1700000000000.tmp.1")).unwrap();
+        fs::write(base.join(".1700000000000.tmp.1").join("x"), "a".repeat(64)).unwrap();
+
+        let listed = list_deleted_branch_refs(repo).unwrap();
+        let names: Vec<&str> = listed.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["feature"]);
+    }
+
+    /// Only 62-hex names under a 2-hex shard are objects. Plants a dotted temp
+    /// and an undotted one (the shape `write_atomic`'s `with_extension` would
+    /// give an object name); neither may turn a unique prefix ambiguous.
+    #[test]
+    fn find_commits_by_prefix_ignores_a_leftover_temp() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_dir = temp_dir.path().join("repo");
+        init_repo_layout(&repo_dir, None).unwrap();
+        let hash = "a1b2c3d4e5f60000000000000000000000000000000000000000000000000000";
+        create_test_commit_with_hash(&repo_dir, hash, None);
+
+        let shard = repo_dir.join(GFS_DIR).join(OBJECTS_DIR).join("a1");
+        fs::write(shard.join(".foo.tmp.123"), "{}").unwrap();
+        fs::write(shard.join(format!(".{}.tmp.123.0", &hash[2..])), "{}").unwrap();
+        fs::write(shard.join(format!("{}.tmp.123", &hash[2..])), "{}").unwrap();
+
+        assert_eq!(
+            find_commits_by_prefix(&repo_dir, "a1b2").unwrap(),
+            vec![hash.to_string()]
+        );
+        assert_eq!(rev_parse(&repo_dir, "a1b2c3").unwrap(), hash);
+    }
+
+    /// `is_commit` is `pub`; a leftover temp's name must not answer "exists".
+    #[test]
+    fn is_commit_ignores_a_leftover_temp() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_dir = temp_dir.path().join("repo");
+        init_repo_layout(&repo_dir, None).unwrap();
+        let shard = repo_dir.join(GFS_DIR).join(OBJECTS_DIR).join("ab");
+        fs::create_dir_all(&shard).unwrap();
+        fs::write(shard.join(".foo.tmp.123"), "{}").unwrap();
+
+        assert!(!is_commit(&repo_dir, "ab.foo.tmp.123"));
+    }
+
+    /// The routed writes leave nothing behind on the success path.
+    #[test]
+    fn routed_writes_leave_no_temp_behind() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_dir = temp_dir.path().join("repo");
+        init_repo_layout(&repo_dir, None).unwrap();
+        update_branch_ref(&repo_dir, MAIN_BRANCH, &"d".repeat(64)).unwrap();
+        update_head_with_commit(&repo_dir, &"d".repeat(64)).unwrap();
+        update_head_with_branch(&repo_dir, MAIN_BRANCH).unwrap();
+        set_active_workspace_data_dir(&repo_dir, Path::new("/x")).unwrap();
+        write_files_object(&repo_dir, &[]).unwrap();
+
+        fn strays(d: &Path, out: &mut Vec<PathBuf>) {
+            for e in fs::read_dir(d).unwrap().flatten() {
+                let p = e.path();
+                if e.file_name().to_string_lossy().contains(".tmp.") {
+                    out.push(p.clone());
+                }
+                if p.is_dir() {
+                    strays(&p, out);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        strays(&repo_dir.join(GFS_DIR), &mut found);
+        assert!(found.is_empty(), "temp files left behind: {found:?}");
     }
 }
 

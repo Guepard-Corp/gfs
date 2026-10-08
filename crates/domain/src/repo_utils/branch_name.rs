@@ -78,6 +78,13 @@ pub fn validate_branch_name(name: &str) -> Result<(), RepoError> {
             );
         }
     }
+    // A dotted segment is reserved for the temp files of interrupted ref writes
+    // (`.<name>.tmp.<pid>.<n>`), which every listing skips. A branch named that
+    // way would be created and then never listed. Git refuses it for the same
+    // reason (`check-ref-format`: no component may begin with '.').
+    if name.split('/').any(|segment| segment.starts_with('.')) {
+        return invalid("a path segment starts with '.', which is reserved");
+    }
     Ok(())
 }
 
@@ -165,5 +172,16 @@ mod tests {
             validate_branch_name(name)
                 .unwrap_or_else(|e| panic!("'{name}' should be allowed, got: {e}"));
         }
+    }
+
+    /// Dotted segments are reserved for the temps of interrupted ref writes,
+    /// which every listing skips; a branch named that way would vanish.
+    #[test]
+    fn a_segment_starting_with_a_dot_is_refused() {
+        for name in [".hidden", "team/.alpha", ".main.tmp.123.0"] {
+            assert!(rejected(name).contains("reserved"), "{name}");
+        }
+        assert!(validate_branch_name("v1.2").is_ok());
+        assert!(validate_branch_name("team/a.b").is_ok());
     }
 }

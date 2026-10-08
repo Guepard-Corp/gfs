@@ -32,6 +32,11 @@ fn collect_refs(dir: &Path, prefix: &str) -> Result<Vec<(String, String)>> {
             .and_then(|n| n.to_str())
             .unwrap_or("")
             .to_string();
+        // A dotted entry is a temp left by an interrupted ref write, never a
+        // branch: the branch-name rules refuse a segment starting with '.'.
+        if gfs_domain::repo_utils::durable_write::is_temp_name(&name) {
+            continue;
+        }
         let branch_name = if prefix.is_empty() {
             name
         } else {
@@ -130,5 +135,20 @@ mod tests {
             relativize_to_repo(tmp.path(), "/some/other/path"),
             "/some/other/path"
         );
+    }
+
+    /// A crash mid-write leaves a dotted temp in refs/heads. `gfs branch` and
+    /// `gfs log` list through here and must not show it as a branch.
+    #[test]
+    fn list_branch_tips_ignores_a_leftover_temp() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        let a = "a".repeat(64);
+        write_ref(root, "main", &a);
+        write_ref(root, ".main.tmp.123.0", "");
+        write_ref(root, "team/.alpha.tmp.9.1", &a);
+
+        let tips = list_branch_tips(root, false).unwrap();
+        assert_eq!(tips, vec![("main".to_string(), a)]);
     }
 }

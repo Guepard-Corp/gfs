@@ -823,12 +823,12 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                     let canonical_ws = self.repository.get_active_workspace_data_dir(path).await;
                     if let Ok(ws) = canonical_ws {
                         if let Some(m) = repo_layout::repair_marker_path(&ws) {
-                            let _ = std::fs::write(&m, b"");
+                            let _ = crate::repo_utils::durable_write::write_durable(&m, b"", None);
                         }
                     } else if let Some(m) = repo_layout::repair_marker_path(
                         std::path::Path::new(volume_id.0.as_str()),
                     ) {
-                        let _ = std::fs::write(&m, b"");
+                        let _ = crate::repo_utils::durable_write::write_durable(&m, b"", None);
                     }
 
                     Ok(())
