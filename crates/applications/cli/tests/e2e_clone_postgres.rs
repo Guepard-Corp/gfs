@@ -66,9 +66,44 @@ fn psql_gfs(container: &str, query: &str) -> String {
         .trim()
         .to_string()
 }
+/// True if a container can resolve `host.docker.internal`, which these suites
+/// need so the gfs container reaches a source database on the host.
+///
+/// The adapter requests the alias explicitly, so this normally holds on any
+/// engine. It is probed rather than assumed because the failure mode without
+/// it is a `pg_dump: could not translate host name` deep inside a clone, which
+/// reads as a product defect rather than a missing capability.
+fn host_alias_resolves() -> bool {
+    let ok = runtime_command()
+        .args([
+            "run",
+            "--rm",
+            "--add-host=host.docker.internal:host-gateway",
+            "alpine",
+            "getent",
+            "hosts",
+            "host.docker.internal",
+        ])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!(
+            "SKIP: containers cannot resolve host.docker.internal on this engine; \
+             these suites need the gfs container to reach a source DB on the host"
+        );
+    }
+    ok
+}
 
 #[test]
 fn e2e_clone_postgres() {
+    // Equally a capability, not a defect: without the host alias the clone
+    // cannot reach the source database on the host.
+    if !host_alias_resolves() {
+        return;
+    }
+
     // The planner-hook clone needs the gfs extension image; skip (don't fail) if absent.
     let img_ok = runtime_command()
         .args(["image", "inspect", "gfs-postgres:16"])
@@ -81,7 +116,7 @@ fn e2e_clone_postgres() {
         );
         return;
     }
-    let repo = TempDir::new().expect("temp repo");
+    let repo = common::shared_tempdir::shared_tempdir().expect("temp repo");
     let repo_path = repo.path().to_path_buf();
     let mut cleanup = Cleanup {
         gfs_container: None,

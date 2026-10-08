@@ -566,7 +566,28 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
         // 3. Prepare the database container for snapshotting (if present).
         let mut unpause_guard: Option<UnpauseGuard> = None;
         let mut paused_instance_id: Option<InstanceId> = None;
-        if let (Some(runtime), Some(env)) = (runtime_config, environment) {
+
+        // A stopped database needs no quiescing: a clean shutdown has already
+        // flushed and closed everything, which is the state CHECKPOINT and pause
+        // exist to reach. Asking it to checkpoint fails with "instance is not
+        // running", and refusing the commit for that reason left both commands
+        // that could move the repository forward refusing at once -- checkout
+        // because the shutdown's own writes to pg_control read as uncommitted
+        // work, commit because the database is down -- leaving --force, which
+        // discards work, as the only way out.
+        let instance_is_running = match runtime_config {
+            Some(runtime) => matches!(
+                self
+                    .compute
+                    .status(&InstanceId(runtime.container_name.clone()))
+                    .await,
+                Ok(status) if status.state == InstanceState::Running
+            ),
+            None => false,
+        };
+        if let (Some(runtime), Some(env)) = (runtime_config, environment)
+            && instance_is_running
+        {
             let instance_id = InstanceId(runtime.container_name.clone());
 
             let provider = self.registry.get(&env.database_provider).ok_or_else(|| {

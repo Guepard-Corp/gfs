@@ -4,11 +4,10 @@ mod common;
 
 use common::cli_runner;
 use gfs_domain::repo_utils::repo_layout;
-use tempfile::tempdir;
 
 #[test]
 fn postgres_schema_diff_agentic_format_default() {
-    let tmp = tempdir().unwrap();
+    let tmp = common::shared_tempdir::shared_tempdir().unwrap();
     let repo_path = tmp.path();
 
     // Initialize repo with PostgreSQL
@@ -103,7 +102,7 @@ fn postgres_schema_diff_agentic_format_default() {
 
 #[test]
 fn postgres_schema_diff_pretty_format() {
-    let tmp = tempdir().unwrap();
+    let tmp = common::shared_tempdir::shared_tempdir().unwrap();
     let repo_path = tmp.path();
 
     // Initialize repo with PostgreSQL
@@ -193,7 +192,7 @@ fn postgres_schema_diff_pretty_format() {
 
 #[test]
 fn postgres_schema_diff_no_changes_exit_code() {
-    let tmp = tempdir().unwrap();
+    let tmp = common::shared_tempdir::shared_tempdir().unwrap();
     let repo_path = tmp.path();
 
     // Initialize repo
@@ -253,7 +252,7 @@ fn postgres_schema_diff_no_changes_exit_code() {
 
 #[test]
 fn postgres_schema_diff_no_color_flag() {
-    let tmp = tempdir().unwrap();
+    let tmp = common::shared_tempdir::shared_tempdir().unwrap();
     let repo_path = tmp.path();
 
     // Initialize and setup
@@ -336,7 +335,7 @@ fn postgres_schema_diff_no_color_flag() {
 
 #[test]
 fn postgres_schema_diff_json_format() {
-    let tmp = tempdir().unwrap();
+    let tmp = common::shared_tempdir::shared_tempdir().unwrap();
     let repo_path = tmp.path();
 
     // Initialize repo with PostgreSQL
@@ -466,7 +465,7 @@ fn postgres_schema_diff_json_format() {
 
 #[test]
 fn postgres_schema_diff_json_no_changes() {
-    let tmp = tempdir().unwrap();
+    let tmp = common::shared_tempdir::shared_tempdir().unwrap();
     let repo_path = tmp.path();
 
     // Initialize repo
@@ -536,7 +535,7 @@ fn postgres_schema_diff_json_no_changes() {
 
 #[test]
 fn postgres_schema_diff_json_pretty_mutually_exclusive() {
-    let tmp = tempdir().unwrap();
+    let tmp = common::shared_tempdir::shared_tempdir().unwrap();
     let repo_path = tmp.path();
 
     // Initialize repo

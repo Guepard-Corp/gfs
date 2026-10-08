@@ -12,9 +12,12 @@ use thiserror::Error;
 
 use crate::model::config::RuntimeConfig;
 use crate::ports::compute::{
-    Compute, ComputeCapabilities, ComputeDefinition, ComputeError, InstanceId, RuntimeDescriptor,
+    Compute, ComputeCapabilities, ComputeDefinition, ComputeError, InstanceId, InstanceState,
+    RuntimeDescriptor,
 };
-use crate::ports::database_provider::{DatabaseProviderRegistry, ProviderError, SnapshotGuard};
+use crate::ports::database_provider::{
+    ConnectionParams, DatabaseProviderRegistry, ProviderError, SnapshotGuard,
+};
 use crate::ports::repository::{Repository, RepositoryError};
 use crate::repo_utils::repo_layout;
 use crate::repo_utils::repo_lock::{LockError, RepoLock};
@@ -129,7 +132,18 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
         let Ok(Some(baseline)) = repo_layout::get_file_entries_for_commit(path, &commit) else {
             return Ok(None);
         };
-        let changed = repo_layout::workspace_changes(&workspace, &baseline)
+        // The provider says which files it maintains for itself; an unknown or
+        // absent one yields nothing, which keeps the conservative behaviour.
+        let engine_owned: Vec<&str> = match repo_layout::get_environment_config(path) {
+            Ok(Some(env)) => self
+                .registry
+                .get(&env.database_provider)
+                .map(|provider| provider.engine_owned_paths().to_vec())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+
+        let changed = repo_layout::workspace_changes(&workspace, &baseline, &engine_owned)
             .map_err(|e| CheckoutRepoError::Repository(RepositoryError::Internal(e.to_string())))?;
         if changed.is_empty() {
             return Ok(None);
@@ -144,6 +158,56 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
         } else {
             shown.join(", ")
         }))
+    }
+
+    /// Ask the engine to write its committed work to disk, ignoring failure.
+    ///
+    /// See the call site for why this precedes the dirty comparison and why it
+    /// does not fail the checkout.
+    async fn flush_before_comparing(&self, path: &Path) {
+        let Ok(Some(environment)) = repo_layout::get_environment_config(path) else {
+            return;
+        };
+        let Ok(Some(runtime)) = repo_layout::get_runtime_config(path) else {
+            return;
+        };
+        let Some(provider) = self.registry.get(&environment.database_provider) else {
+            return;
+        };
+        let Ok(container) = provider.require_container() else {
+            return;
+        };
+        let instance_id = InstanceId(runtime.container_name.clone());
+        if !matches!(
+            self.compute.status(&instance_id).await,
+            Ok(status) if status.state == InstanceState::Running
+        ) {
+            return;
+        }
+        let Ok(conn_info) = self
+            .compute
+            .get_connection_info(&instance_id, container.default_port())
+            .await
+        else {
+            return;
+        };
+        let params = ConnectionParams {
+            host: conn_info.host,
+            port: conn_info.port,
+            env: conn_info.env,
+        };
+        if let Ok(commands) = container.prepare_for_snapshot(&params)
+            && let Err(e) = self
+                .compute
+                .prepare_for_snapshot(&instance_id, &commands)
+                .await
+        {
+            tracing::debug!(
+                error = %e,
+                "could not flush the database before comparing the workspace; \
+                 comparing it as it stands"
+            );
+        }
     }
 
     /// Check out `revision` (branch name or full 64-char commit hash) at `path`.
@@ -176,6 +240,23 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
         // Held first so the dirty-workspace check below reads a repo that no
         // concurrent commit can be mutating; the guard drops on any early
         // return, releasing the lock.
+        // Flush once, before the comparison below, so that work the engine has
+        // committed but not yet written back to its data files is on disk where
+        // the comparison can see it. The write-ahead log is on the ignore list,
+        // so a comparison made without flushing would miss a committed row that
+        // lives only there.
+        //
+        // Once, and not from inside the comparison, because a checkpoint writes
+        // the control file and catalog pages itself: a second one reports its own
+        // writes as the user's. That is how a workspace found clean came back
+        // dirty a moment later.
+        //
+        // Best effort: a stopped database has already flushed on shutdown, and
+        // one that cannot be reached is not writing either.
+        if !self.force && create_branch.is_none() {
+            self.flush_before_comparing(&path).await;
+        }
+
         let _repo_lock = RepoLock::acquire_waiting(&path, LOCK_WAIT).map_err(|e| match e {
             // "another operation", not "a commit": a second checkout holds this
             // same lock, so the blocker is not always a commit.

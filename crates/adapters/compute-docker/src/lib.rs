@@ -88,9 +88,23 @@ fn resolve_host_bind_path(path: &Path) -> Result<std::path::PathBuf> {
     Ok(absolute.canonicalize().unwrap_or(absolute))
 }
 
-/// Subdirectory of the bind-mounted data dir used as PGDATA under Podman.
+/// Host alias every container gets, mapped to the Docker host.
 ///
-/// On `podman-machine` (macOS), the host data dir reaches the container through
+/// Docker Desktop provides `host.docker.internal` implicitly. colima and
+/// podman-machine do not -- inside a colima container no host alias resolves at
+/// all, only the gateway address -- so anything reaching back to a service on
+/// the host fails there with `could not translate host name`. A clone seeded
+/// from a host-local source is exactly that case.
+///
+/// `host-gateway` is resolved by the daemon to whatever the host is on that
+/// engine, so requesting it explicitly costs nothing where the alias already
+/// exists and supplies it where it does not.
+const HOST_ALIAS: &str = "host.docker.internal:host-gateway";
+
+/// Subdirectory of the bind-mounted data dir used as PGDATA when the bind-mount
+/// root is presented to the container as root-owned.
+///
+/// On `podman-machine` and on colima (macOS), the host data dir reaches the container through
 /// a virtiofs bind mount whose *mount point* is presented to the container as
 /// root-owned (`0:0`) and cannot be `chmod`'d by the unprivileged uid the
 /// database runs as. `initdb` (and the stock postgres entrypoint) require PGDATA
@@ -102,26 +116,59 @@ fn resolve_host_bind_path(path: &Path) -> Result<std::path::PathBuf> {
 /// this subdirectory. The host still snapshots/restores the whole bind-mounted
 /// dir (now containing `<subdir>/`), so the copy-on-write commit model is
 /// unchanged — the data simply lives one directory deeper on both sides.
-const POSTGRES_PODMAN_PGDATA_SUBDIR: &str = "pgdata";
+const POSTGRES_BIND_PGDATA_SUBDIR: &str = "pgdata";
 
 /// Compute the effective PGDATA value for a single env var, redirecting it into
-/// [`POSTGRES_PODMAN_PGDATA_SUBDIR`] only when all of the following hold:
+/// [`POSTGRES_BIND_PGDATA_SUBDIR`] only when all of the following hold:
 ///
-/// * the engine is Podman,
+/// * the bind-mount root is presented to the container as root-owned
+///   (`root_owned_bind_root`) -- true for podman-machine and colima, both of
+///   which reach the host over virtiofs; false for Docker Desktop, whose file
+///   sharing presents the mount as the requesting container's uid,
 /// * the container has a host bind mount (`has_bind`),
 /// * the var is `PGDATA`, and
 /// * `PGDATA` currently points exactly at the bind-mount root (`data_dir`).
 ///
 /// Returns `Some(new_pgdata)` when the redirect applies, else `None` (leave the
-/// value untouched). Docker and non-`PGDATA` vars always return `None`.
-fn podman_pgdata_redirect(
-    is_podman: bool,
+/// value untouched). Non-`PGDATA` vars always return `None`.
+/// The user a container should run as, or `None` for the image default.
+///
+/// A bind root presented as root-owned (podman-machine, colima's `virtiofs`)
+/// cannot be written by an unprivileged host uid, so pinning the container to
+/// one makes the image's own initialisation fail before the database exists.
+/// Running as the image default lets the entrypoint create and chown the data
+/// directory as root and then drop privileges itself, which is what the
+/// Kubernetes path already relies on.
+///
+/// `root` is kept: it can always write the mount, and callers ask for it
+/// deliberately for repair tasks. Everything is kept when there is no bind
+/// mount, or when the mount root is chownable.
+fn container_user(
+    root_owned_bind_root: bool,
+    has_bind: bool,
+    requested: Option<&str>,
+) -> Option<String> {
+    let requested = requested?;
+    if !has_bind || !root_owned_bind_root || is_root_user(requested) {
+        return Some(requested.to_owned());
+    }
+    None
+}
+
+/// Whether a docker `--user` value names uid 0, in `uid`, `uid:gid` or `root` form.
+fn is_root_user(user: &str) -> bool {
+    let uid = user.split(':').next().unwrap_or(user).trim();
+    uid == "0" || uid.eq_ignore_ascii_case("root")
+}
+
+fn pgdata_redirect(
+    root_owned_bind_root: bool,
     has_bind: bool,
     name: &str,
     value: &str,
     container_data_dir: &str,
 ) -> Option<String> {
-    if is_podman
+    if root_owned_bind_root
         && has_bind
         && name == "PGDATA"
         && !value.is_empty()
@@ -130,7 +177,7 @@ fn podman_pgdata_redirect(
         Some(format!(
             "{}/{}",
             value.trim_end_matches('/'),
-            POSTGRES_PODMAN_PGDATA_SUBDIR
+            POSTGRES_BIND_PGDATA_SUBDIR
         ))
     } else {
         None
@@ -315,6 +362,34 @@ impl DockerCompute {
         }
     }
 
+    /// Whether this engine presents a host bind mount to the container as
+    /// root-owned, so the database's unprivileged uid cannot `chmod` the mount
+    /// root.
+    ///
+    /// True for podman-machine and for colima: both reach the macOS host over
+    /// virtiofs, which maps host-owned files to `0:0` inside the guest. Docker
+    /// Desktop's file sharing presents the mount as the requesting container's
+    /// uid, so it needs no redirect and gets none.
+    ///
+    /// Detected rather than configured, because the symptom -- `initdb: could
+    /// not change permissions of directory ... Operation not permitted` --
+    /// names neither the engine nor the cause.
+    async fn has_root_owned_bind_root(&self, is_podman: bool) -> bool {
+        is_podman || self.is_colima_engine().await
+    }
+
+    /// Colima identifies itself by the VM's name in `docker info`; its version
+    /// string is a stock Docker one, so the Podman check cannot see it.
+    async fn is_colima_engine(&self) -> bool {
+        let Ok(info) = self.docker.info().await else {
+            return false;
+        };
+        info.name
+            .as_deref()
+            .map(|n| n.eq_ignore_ascii_case("colima"))
+            .unwrap_or(false)
+    }
+
     async fn is_podman_engine(&self) -> bool {
         let Ok(version) = self.docker.version().await else {
             return false;
@@ -402,6 +477,67 @@ impl DockerCompute {
                 Ok(last)
             }
         }
+    }
+
+    /// Confirm the container's data directory and its bind source are the same
+    /// directory, and fail loudly when they are not.
+    ///
+    /// A container VM shares only part of the host filesystem: colima shares
+    /// `$HOME`, not `/tmp` or the macOS per-user temp directory. A bind mount
+    /// whose source lies outside that set is not refused -- the path is created
+    /// inside the VM instead, so the database writes there, the host directory
+    /// stays empty, and nothing reports a problem. The container is healthy and
+    /// accepts connections; only the workspace gfs snapshots is empty.
+    ///
+    /// Divergence is read rather than predicted: if the container has written
+    /// files the host cannot see, the two are not the same directory. An empty
+    /// container directory proves nothing either way and is left alone.
+    async fn verify_bind_mount_is_shared(&self, id: &InstanceId) -> Result<()> {
+        let info = self
+            .docker
+            .inspect_container(&id.0, None)
+            .await
+            .map_err(|e| classify(&id.0, e))?;
+        let Some((source, destination)) = info
+            .mounts
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find_map(|m| match (m.source.as_deref(), m.destination.as_deref()) {
+                (Some(source), Some(destination)) if !source.is_empty() => {
+                    Some((source.to_owned(), destination.to_owned()))
+                }
+                _ => None,
+            })
+        else {
+            return Ok(());
+        };
+
+        let inside = self
+            .run_exec_command(id, &format!("ls -A {destination} | wc -l"), None)
+            .await
+            .ok()
+            .and_then(|out| out.stdout.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if inside == 0 {
+            return Ok(());
+        }
+
+        let on_host = std::fs::read_dir(&source)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        if on_host > 0 {
+            return Ok(());
+        }
+
+        Err(ComputeError::Internal(format!(
+            "the container wrote {inside} entries to '{destination}' but the host \
+directory it is mounted from is empty: '{source}' is not shared with the \
+container runtime's virtual machine, so the database's files never reach this \
+machine and a commit would capture nothing. Move the repository inside a shared \
+directory (the home directory is shared by default), or add this path to the \
+runtime's mounts."
+        )))
     }
 
     async fn wait_for_ready_ports(&self, id: &InstanceId) {
@@ -512,7 +648,16 @@ impl Compute for DockerCompute {
         );
         // Detect Podman once: it drives both the PGDATA redirect below and the
         // bind-mount options. Docker paths are entirely unaffected.
+        // Two different questions: podman needs its own bind syntax, while the
+        // PGDATA redirect turns on how the mount root's ownership is presented.
         let is_podman = self.is_podman_engine().await;
+        let root_owned_bind_root = self.has_root_owned_bind_root(is_podman).await;
+        // Only podman-machine needs PGDATA moved into a subdirectory. Colima does
+        // not: once the container is not pinned to an unprivileged uid, the image
+        // entrypoint chowns the mount root itself and initialises the database
+        // there, which keeps the workspace -- and therefore every snapshot taken
+        // from it -- the same shape on every runtime.
+        let needs_pgdata_redirect = is_podman;
         let has_bind = definition.host_data_dir.is_some();
         let container_data_dir = definition.data_dir.to_string_lossy().into_owned();
 
@@ -524,8 +669,8 @@ impl Compute for DockerCompute {
                 // On podman-machine (macOS) the bind-mount root cannot be
                 // chmod'd by the DB uid, so PGDATA must live in a container-
                 // created subdirectory. See `podman_pgdata_redirect`.
-                match podman_pgdata_redirect(
-                    is_podman,
+                match pgdata_redirect(
+                    needs_pgdata_redirect,
                     has_bind,
                     &e.name,
                     value,
@@ -564,6 +709,7 @@ impl Compute for DockerCompute {
         let host_config = bollard::service::HostConfig {
             binds: if binds.is_empty() { None } else { Some(binds) },
             port_bindings: Some(port_bindings),
+            extra_hosts: Some(vec![HOST_ALIAS.to_string()]),
             ..Default::default()
         };
 
@@ -578,7 +724,7 @@ impl Compute for DockerCompute {
                     .collect(),
             ),
             host_config: Some(host_config),
-            user: definition.user.clone(),
+            user: container_user(root_owned_bind_root, has_bind, definition.user.as_deref()),
             cmd: if definition.args.is_empty() {
                 None
             } else {
@@ -620,7 +766,9 @@ impl Compute for DockerCompute {
             )
             .await
             .map_err(|e| classify(&id.0, e))?;
-        self.wait_for_stable_start(id).await
+        let status = self.wait_for_stable_start(id).await?;
+        self.verify_bind_mount_is_shared(id).await?;
+        Ok(status)
     }
 
     #[instrument(skip(self))]
@@ -639,7 +787,9 @@ impl Compute for DockerCompute {
             .restart_container(&id.0, None)
             .await
             .map_err(|e| classify(&id.0, e))?;
-        self.wait_for_stable_start(id).await
+        let status = self.wait_for_stable_start(id).await?;
+        self.verify_bind_mount_is_shared(id).await?;
+        Ok(status)
     }
 
     #[instrument(skip(self))]
@@ -1049,6 +1199,9 @@ impl Compute for DockerCompute {
             .collect();
 
         // 4. Bind mounts for data exchange.
+        let task_root_owned_bind_root = self
+            .has_root_owned_bind_root(self.is_podman_engine().await)
+            .await;
         let mut binds = Vec::new();
         if let Some(ref host_data) = definition.host_data_dir {
             let host_path = host_path_for_docker_bind(&resolve_host_bind_path(host_data)?);
@@ -1058,6 +1211,7 @@ impl Compute for DockerCompute {
 
         let host_config = bollard::service::HostConfig {
             binds: if binds.is_empty() { None } else { Some(binds) },
+            extra_hosts: Some(vec![HOST_ALIAS.to_string()]),
             ..Default::default()
         };
 
@@ -1076,8 +1230,14 @@ impl Compute for DockerCompute {
             host_config: Some(host_config),
             entrypoint: Some(vec!["sh".into(), "-c".into()]),
             cmd: Some(vec![command.to_string()]),
-            // Honour the user override from the definition (e.g. "0:0" for root-level repair tasks).
-            user: definition.user.clone(),
+            // Honour the user override from the definition (e.g. "0:0" for
+            // root-level repair tasks); an unprivileged uid is dropped where the
+            // bind root is root-owned, for the reason in `container_user`.
+            user: container_user(
+                task_root_owned_bind_root,
+                definition.host_data_dir.is_some(),
+                definition.user.as_deref(),
+            ),
             ..Default::default()
         };
 
@@ -1665,34 +1825,119 @@ mod tar_safety_tests {
 }
 
 #[cfg(test)]
-mod podman_pgdata_tests {
-    use super::{POSTGRES_PODMAN_PGDATA_SUBDIR, podman_pgdata_redirect};
+mod container_user_tests {
+    use super::{container_user, is_root_user};
+
+    const HOST_UID: Option<&str> = Some("501:20");
+
+    #[test]
+    fn an_unprivileged_uid_is_dropped_on_a_root_owned_bind_root() {
+        // Colima/podman-machine: the host uid cannot create the data directory,
+        // so the image default must run instead.
+        assert_eq!(container_user(true, true, HOST_UID), None);
+    }
+
+    #[test]
+    fn root_is_kept_on_a_root_owned_bind_root() {
+        // Repair tasks ask for root deliberately, and root can write the mount.
+        assert_eq!(
+            container_user(true, true, Some("0:0")),
+            Some("0:0".to_owned())
+        );
+        assert_eq!(
+            container_user(true, true, Some("root")),
+            Some("root".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_unprivileged_uid_is_kept_where_the_mount_root_is_chownable() {
+        // Docker Desktop and Linux: pinning the host uid is correct there, and
+        // is what keeps workspace files readable during a snapshot.
+        assert_eq!(
+            container_user(false, true, HOST_UID),
+            Some("501:20".to_owned())
+        );
+    }
+
+    #[test]
+    fn without_a_bind_mount_the_requested_user_stands() {
+        assert_eq!(
+            container_user(true, false, HOST_UID),
+            Some("501:20".to_owned())
+        );
+    }
+
+    #[test]
+    fn no_request_means_the_image_default() {
+        assert_eq!(container_user(true, true, None), None);
+        assert_eq!(container_user(false, false, None), None);
+    }
+
+    #[test]
+    fn root_is_recognised_in_each_form_it_is_written() {
+        assert!(is_root_user("0"));
+        assert!(is_root_user("0:0"));
+        assert!(is_root_user("root"));
+        assert!(!is_root_user("501"));
+        assert!(!is_root_user("501:20"));
+        assert!(!is_root_user("rootless"));
+    }
+}
+
+#[cfg(test)]
+mod pgdata_redirect_tests {
+    use super::{POSTGRES_BIND_PGDATA_SUBDIR, pgdata_redirect};
 
     const DATA_DIR: &str = "/var/lib/postgresql/data";
 
     #[test]
     fn redirects_pgdata_on_podman_with_bind() {
-        let got = podman_pgdata_redirect(true, true, "PGDATA", DATA_DIR, DATA_DIR);
+        let got = pgdata_redirect(true, true, "PGDATA", DATA_DIR, DATA_DIR);
         assert_eq!(
             got,
-            Some(format!("{DATA_DIR}/{POSTGRES_PODMAN_PGDATA_SUBDIR}"))
+            Some(format!("{DATA_DIR}/{POSTGRES_BIND_PGDATA_SUBDIR}"))
         );
     }
 
     #[test]
     fn trailing_slash_on_pgdata_is_normalized() {
-        let got =
-            podman_pgdata_redirect(true, true, "PGDATA", "/var/lib/postgresql/data/", DATA_DIR);
+        let got = pgdata_redirect(true, true, "PGDATA", "/var/lib/postgresql/data/", DATA_DIR);
         assert_eq!(
             got,
-            Some(format!("{DATA_DIR}/{POSTGRES_PODMAN_PGDATA_SUBDIR}"))
+            Some(format!("{DATA_DIR}/{POSTGRES_BIND_PGDATA_SUBDIR}"))
         );
     }
 
+    /// Docker Desktop presents the mount as the requesting container's uid, so
+    /// the database can chmod the mount root itself and needs no redirect.
     #[test]
-    fn no_redirect_on_docker() {
+    fn no_redirect_when_the_mount_root_is_chownable() {
         assert_eq!(
-            podman_pgdata_redirect(false, true, "PGDATA", DATA_DIR, DATA_DIR),
+            pgdata_redirect(false, true, "PGDATA", DATA_DIR, DATA_DIR),
+            None
+        );
+    }
+
+    /// colima reaches the host over virtiofs exactly as podman-machine does, so
+    /// it needs the same redirect. Before this was recognised, `gfs init
+    /// --database-provider postgres` failed on colima with `initdb: could not
+    /// change permissions of directory ... Operation not permitted`.
+    #[test]
+    fn redirects_pgdata_on_colima_with_bind() {
+        let got = pgdata_redirect(true, true, "PGDATA", DATA_DIR, DATA_DIR);
+        assert_eq!(
+            got,
+            Some(format!("{DATA_DIR}/{POSTGRES_BIND_PGDATA_SUBDIR}"))
+        );
+    }
+
+    /// Without a host bind there is no virtiofs mount root to be blocked by,
+    /// so the redirect must not fire even on an affected engine.
+    #[test]
+    fn no_redirect_without_a_bind_even_on_an_affected_engine() {
+        assert_eq!(
+            pgdata_redirect(true, false, "PGDATA", DATA_DIR, DATA_DIR),
             None
         );
     }
@@ -1700,7 +1945,7 @@ mod podman_pgdata_tests {
     #[test]
     fn no_redirect_without_bind_mount() {
         assert_eq!(
-            podman_pgdata_redirect(true, false, "PGDATA", DATA_DIR, DATA_DIR),
+            pgdata_redirect(true, false, "PGDATA", DATA_DIR, DATA_DIR),
             None
         );
     }
@@ -1708,7 +1953,7 @@ mod podman_pgdata_tests {
     #[test]
     fn no_redirect_for_non_pgdata_var() {
         assert_eq!(
-            podman_pgdata_redirect(true, true, "POSTGRES_PASSWORD", "secret", DATA_DIR),
+            pgdata_redirect(true, true, "POSTGRES_PASSWORD", "secret", DATA_DIR),
             None
         );
     }
@@ -1717,17 +1962,14 @@ mod podman_pgdata_tests {
     fn no_redirect_when_pgdata_is_not_mount_root() {
         // Already a custom sub-path: leave it alone rather than double-nesting.
         assert_eq!(
-            podman_pgdata_redirect(true, true, "PGDATA", "/some/other/dir", DATA_DIR),
+            pgdata_redirect(true, true, "PGDATA", "/some/other/dir", DATA_DIR),
             None
         );
     }
 
     #[test]
     fn no_redirect_for_empty_value() {
-        assert_eq!(
-            podman_pgdata_redirect(true, true, "PGDATA", "", DATA_DIR),
-            None
-        );
+        assert_eq!(pgdata_redirect(true, true, "PGDATA", "", DATA_DIR), None);
     }
 }
 

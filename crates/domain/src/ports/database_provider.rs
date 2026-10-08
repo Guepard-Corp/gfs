@@ -344,6 +344,23 @@ pub trait DatabaseProvider: Send + Sync {
     /// Derived from [`DatabaseProvider::local_engine`] rather than declared
     /// separately, so a provider cannot claim to need no compute while offering
     /// no way to run without it. Do not override.
+    /// Paths inside the data directory that the engine maintains for itself,
+    /// relative to that directory.
+    ///
+    /// These are not user data: the engine writes them on its own schedule --
+    /// notably while shutting down -- and regenerates or replaces them on the
+    /// next start. A workspace whose only differences are here holds no work a
+    /// checkout could destroy, so the dirty check ignores them. Everything else
+    /// is treated as the user's until proven otherwise, which is the safe
+    /// direction: a needless refusal is an inconvenience, and a missed one loses
+    /// data.
+    ///
+    /// Empty by default, so a provider that has not been audited keeps the
+    /// conservative behaviour.
+    fn engine_owned_paths(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     fn requires_compute(&self) -> bool {
         self.container().is_some()
     }
