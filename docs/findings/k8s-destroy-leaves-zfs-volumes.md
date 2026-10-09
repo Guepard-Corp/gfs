@@ -126,6 +126,17 @@ cluster, `gfs storage reclaim` prints "No OpenEBS ZFS volume is waiting to be
 deleted." (exit 0), `--json` prints an empty list, and `--yes`, with or without
 `--volume`, reclaims nothing (exit 0).
 
+**Through the node daemon.** The stack's `guepard-node` rebuilt from the exact
+source of the running one with only this change added (only the two gfs
+Kubernetes crates recompiled). A database created through the console, three
+volume generations built in the daemon's repository with the stack's `gfs`
+CLI (50 MiB file, 4 commits, `checkout -b`, 50 MiB, commit, `checkout main`;
+restore checked), then deleted through the console (`DELETE /api/databases/:id`,
+which asks the control plane for `destroy: true`). The daemon logged "deleted
+ZFS volumes the driver left behind" for one of the three volumes; 30 s later
+none of the three `ZFSVolume` records or datasets was left, and the repository
+directory was gone.
+
 **Docker.** Destroy on Docker does not go through this code. On the control
 node's Docker, the PR head and the final binary each ran `init`, a row, a
 commit, `checkout -b`, a row, a commit, `checkout main` (refused for
@@ -140,10 +151,9 @@ kubeconfig fails with "kubernetes client unavailable" (exit 1).
 
 - The race itself is inferred from the driver source and its logs, not
   provoked deterministically; the unfixed binary leaked in 3 of 4 runs here.
-- The node daemon's destroy was not run. It calls the same
-  `remove_instance_with_pvcs(&instance, &[])` as the CLI. The daemon binary
-  deployed on this stack contains that function's existing log strings but not
-  the fix's, so its destroys can still strand volumes until it is rebuilt.
+- The node daemon was not run with the unfixed code on the flow below, so its
+  path is calibrated by the CLI runs and by the fix's own log line, not by a
+  daemon leak observed side by side.
 - A recorded OpenEBS volume on a cluster without the `ZFSVolume` CRD cannot
   occur (the volume comes from that driver); the 404 handling for it is read
   from the code.
