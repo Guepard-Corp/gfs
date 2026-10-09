@@ -245,77 +245,14 @@ impl KubernetesStorage {
             return Ok(report);
         }
         let zv_res = zfs_volume_resource();
-        let zv_all: Api<DynamicObject> = Api::all_with(self.client.clone(), &zv_res);
-        let snaps_all: Api<DynamicObject> =
-            Api::all_with(self.client.clone(), &zfs_snapshot_resource());
-        let pvs: Api<PersistentVolume> = Api::all(self.client.clone());
-
         let started = tokio::time::Instant::now();
         let mut pending: BTreeSet<String> = volumes.clone();
         loop {
             let mut still: BTreeMap<String, &'static str> = BTreeMap::new();
             for volume in &pending {
-                // The driver's namespace is chosen per install, so find the
-                // record by name across all of them.
-                let found = match zv_all
-                    .list(&ListParams::default().fields(&format!("metadata.name={volume}")))
-                    .await
-                {
-                    Ok(list) => list.items.into_iter().next(),
+                let Some((state, found)) = self.assess_openebs_volume(volume).await? else {
                     // No ZFSVolume CRD: this cluster does not run the driver.
-                    Err(e) if not_found(&e) => return Ok(report),
-                    Err(e) => {
-                        return Err(StorageError::Internal(format!(
-                            "list zfsvolumes for '{volume}' failed: {e}"
-                        )));
-                    }
-                };
-                let (pv, snapshots) = if found.is_some() {
-                    let pv = match pvs.get(volume).await {
-                        Ok(pv) => Some(pv),
-                        Err(e) if not_found(&e) => None,
-                        Err(e) => {
-                            return Err(StorageError::Internal(format!(
-                                "get pv '{volume}' failed: {e}"
-                            )));
-                        }
-                    };
-                    let snapshots = snaps_all
-                        .list(
-                            &ListParams::default()
-                                .labels(&format!("{SNAPSHOT_VOLUME_LABEL}={volume}")),
-                        )
-                        .await
-                        .map_err(|e| {
-                            StorageError::Internal(format!(
-                                "list zfssnapshots for '{volume}' failed: {e}"
-                            ))
-                        })?
-                        .items
-                        .len();
-                    (pv, snapshots)
-                } else {
-                    (None, 0)
-                };
-                let state = VolumeState {
-                    exists: found.is_some(),
-                    deleting: found
-                        .as_ref()
-                        .is_some_and(|z| z.metadata.deletion_timestamp.is_some()),
-                    marked: found.as_ref().is_some_and(|z| {
-                        z.metadata
-                            .annotations
-                            .as_ref()
-                            .and_then(|a| a.get(MARKED_FOR_DELETION))
-                            .is_some_and(|v| v == "true")
-                    }),
-                    has_pv: pv.is_some(),
-                    pv_retained: pv
-                        .as_ref()
-                        .and_then(|p| p.spec.as_ref())
-                        .and_then(|s| s.persistent_volume_reclaim_policy.as_deref())
-                        == Some("Retain"),
-                    snapshots,
+                    return Ok(report);
                 };
                 match verdict(&state) {
                     Verdict::Gone => {}
@@ -355,6 +292,134 @@ impl KubernetesStorage {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
+
+    /// The state of one OpenEBS ZFS volume and its `ZFSVolume` record, or
+    /// `None` when the cluster has no `ZFSVolume` CRD (no OpenEBS ZFS driver).
+    async fn assess_openebs_volume(
+        &self,
+        volume: &str,
+    ) -> std::result::Result<Option<(VolumeState, Option<DynamicObject>)>, StorageError> {
+        let zv_all: Api<DynamicObject> = Api::all_with(self.client.clone(), &zfs_volume_resource());
+        // The driver's namespace is chosen per install, so find the record by
+        // name across all of them.
+        let found = match zv_all
+            .list(&ListParams::default().fields(&format!("metadata.name={volume}")))
+            .await
+        {
+            Ok(list) => list.items.into_iter().next(),
+            Err(e) if not_found(&e) => return Ok(None),
+            Err(e) => {
+                return Err(StorageError::Internal(format!(
+                    "list zfsvolumes for '{volume}' failed: {e}"
+                )));
+            }
+        };
+        let (pv, snapshots) = if found.is_some() {
+            let pvs: Api<PersistentVolume> = Api::all(self.client.clone());
+            let pv = match pvs.get(volume).await {
+                Ok(pv) => Some(pv),
+                Err(e) if not_found(&e) => None,
+                Err(e) => {
+                    return Err(StorageError::Internal(format!(
+                        "get pv '{volume}' failed: {e}"
+                    )));
+                }
+            };
+            let snaps_all: Api<DynamicObject> =
+                Api::all_with(self.client.clone(), &zfs_snapshot_resource());
+            let snapshots = snaps_all
+                .list(&ListParams::default().labels(&format!("{SNAPSHOT_VOLUME_LABEL}={volume}")))
+                .await
+                .map_err(|e| {
+                    StorageError::Internal(format!("list zfssnapshots for '{volume}' failed: {e}"))
+                })?
+                .items
+                .len();
+            (pv, snapshots)
+        } else {
+            (None, 0)
+        };
+        let state = VolumeState {
+            exists: found.is_some(),
+            deleting: found
+                .as_ref()
+                .is_some_and(|z| z.metadata.deletion_timestamp.is_some()),
+            marked: found.as_ref().is_some_and(is_marked),
+            has_pv: pv.is_some(),
+            pv_retained: pv
+                .as_ref()
+                .and_then(|p| p.spec.as_ref())
+                .and_then(|s| s.persistent_volume_reclaim_policy.as_deref())
+                == Some("Retain"),
+            snapshots,
+        };
+        Ok(Some((state, found)))
+    }
+
+    /// Every OpenEBS ZFS volume in the cluster that the driver was asked to
+    /// delete and has not: the candidates for
+    /// [`Self::finish_deferred_openebs_deletes`] when nothing narrower is
+    /// known, e.g. volumes stranded by a destroy that ran before this fix. A
+    /// cluster without the driver has none.
+    pub async fn marked_openebs_volumes(
+        &self,
+    ) -> std::result::Result<BTreeSet<String>, StorageError> {
+        let zv_all: Api<DynamicObject> = Api::all_with(self.client.clone(), &zfs_volume_resource());
+        let list = match zv_all.list(&ListParams::default()).await {
+            Ok(list) => list,
+            Err(e) if not_found(&e) => return Ok(BTreeSet::new()),
+            Err(e) => {
+                return Err(StorageError::Internal(format!(
+                    "list zfsvolumes failed: {e}"
+                )));
+            }
+        };
+        Ok(list
+            .items
+            .into_iter()
+            .filter(is_marked)
+            .filter_map(|z| z.metadata.name)
+            .collect())
+    }
+
+    /// What [`Self::finish_deferred_openebs_deletes`] would do with each of
+    /// `volumes` right now, without changing anything, plus the bytes each
+    /// dataset holds when the pool is local to this host.
+    pub async fn assess_openebs_volumes(
+        &self,
+        volumes: &BTreeSet<String>,
+    ) -> std::result::Result<Vec<VolumeAssessment>, StorageError> {
+        let mut out = Vec::new();
+        for volume in volumes {
+            let Some((state, _)) = self.assess_openebs_volume(volume).await? else {
+                break;
+            };
+            out.push(VolumeAssessment {
+                volume: volume.clone(),
+                verdict: verdict(&state),
+                used_bytes: crate::zfs_dataset_usage(volume).await.map(|(_, used)| used),
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// One volume's verdict, as reported by
+/// [`KubernetesStorage::assess_openebs_volumes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeAssessment {
+    pub volume: String,
+    pub verdict: Verdict,
+    /// Bytes the dataset uses, when its pool is on this host.
+    pub used_bytes: Option<u64>,
+}
+
+fn is_marked(z: &DynamicObject) -> bool {
+    z.metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(MARKED_FOR_DELETION))
+        .is_some_and(|v| v == "true")
 }
 
 #[cfg(test)]
@@ -454,5 +519,26 @@ mod tests {
             openebs_volume_of_snapshot(Some(OPENEBS_ZFS_DRIVER), Some("pvc-1@")),
             None
         );
+    }
+
+    fn zfs_volume(annotations: &[(&str, &str)]) -> DynamicObject {
+        let mut z = DynamicObject::new("pvc-1", &zfs_volume_resource());
+        if !annotations.is_empty() {
+            z.metadata.annotations = Some(
+                annotations
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            );
+        }
+        z
+    }
+
+    #[test]
+    fn only_a_volume_annotated_marked_true_is_a_reclaim_candidate() {
+        assert!(is_marked(&zfs_volume(&[(MARKED_FOR_DELETION, "true")])));
+        assert!(!is_marked(&zfs_volume(&[(MARKED_FOR_DELETION, "false")])));
+        assert!(!is_marked(&zfs_volume(&[("openebs.io/other", "true")])));
+        assert!(!is_marked(&zfs_volume(&[])));
     }
 }
