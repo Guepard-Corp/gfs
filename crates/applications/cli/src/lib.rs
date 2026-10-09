@@ -563,6 +563,32 @@ enum TopLevel {
         path: Option<PathBuf>,
     },
 
+    /// Check repository integrity: report unreachable and dangling objects
+    Fsck {
+        /// Record the marked set under .gfs/gc/<id>/ for a later `gfs gc`
+        #[arg(long)]
+        plan: bool,
+
+        /// Seconds an entry must have existed before it can be called garbage
+        /// (default 86400). A commit writes its snapshot before the object that
+        /// references it, so anything recent may belong to a running operation.
+        /// Values below the one-hour floor need
+        /// `--disable-grace-period-check`.
+        #[arg(long, value_name = "SECONDS")]
+        grace: Option<u64>,
+
+        /// Allow a grace below the one-hour floor, including zero. Named for what
+        /// it disables on purpose: without the grace period a commit still in
+        /// flight can be reported as garbage, and a plan written from such a run
+        /// records live data for a later collector to act on.
+        #[arg(long)]
+        disable_grace_period_check: bool,
+
+        /// Path to the GFS repository root (default: current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+
     /// Export data from the running database instance to a file
     Export {
         /// Path to the GFS repository root (default: current directory)
@@ -783,6 +809,7 @@ fn command_name(cmd: &TopLevel) -> &'static str {
         TopLevel::Checkout { .. } => "checkout",
         TopLevel::Destroy { .. } => "destroy",
         TopLevel::Branch { .. } => "branch",
+        TopLevel::Fsck { .. } => "fsck",
         TopLevel::Export { .. } => "export",
         TopLevel::Import { .. } => "import",
         TopLevel::Providers { .. } => "providers",
@@ -1021,6 +1048,15 @@ where
                 .await?;
                 Ok(0)
             }
+            TopLevel::Fsck {
+                plan,
+                grace,
+                disable_grace_period_check,
+                path,
+            } => {
+                commands::cmd_fsck::run(path, plan, grace, disable_grace_period_check, json_output)
+                    .await
+            }
             TopLevel::Status { path, output } => {
                 let output = resolve_output_format(output, json_output);
                 let exit_code = commands::cmd_status::run(path, output).await?;
@@ -1187,7 +1223,7 @@ where
                 Ok(0)
             }
             TopLevel::Version => {
-                commands::cmd_version::run();
+                commands::cmd_version::run()?;
                 Ok(0)
             }
         }
@@ -1278,12 +1314,12 @@ async fn dispatch_storage(
                 .await
                 .map_err(anyhow::Error::from)?;
             if json_output {
-                println!(
+                println_safe!(
                     "{}",
                     serde_json::to_string_pretty(&json!({"status":"mounted"}))?
-                );
+                )?;
             } else {
-                println!("mounted");
+                println_safe!("mounted")?;
             }
         }
         StorageAction::Unmount { id } => {
@@ -1292,12 +1328,12 @@ async fn dispatch_storage(
                 .await
                 .map_err(anyhow::Error::from)?;
             if json_output {
-                println!(
+                println_safe!(
                     "{}",
                     serde_json::to_string_pretty(&json!({"status":"unmounted"}))?
-                );
+                )?;
             } else {
-                println!("unmounted");
+                println_safe!("unmounted")?;
             }
         }
         StorageAction::Snapshot { id, label } => {
@@ -1306,7 +1342,7 @@ async fn dispatch_storage(
                 .await
                 .map_err(anyhow::Error::from)?;
             if json_output {
-                println!(
+                println_safe!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
                         "snapshot": {
@@ -1316,13 +1352,13 @@ async fn dispatch_storage(
                             "label": snap.label,
                         }
                     }))?
-                );
+                )?;
             } else {
-                println!("snapshot id  : {}", snap.id);
-                println!("volume       : {}", snap.volume_id);
-                println!("created_at   : {}", snap.created_at);
+                println_safe!("snapshot id  : {}", snap.id)?;
+                println_safe!("volume       : {}", snap.volume_id)?;
+                println_safe!("created_at   : {}", snap.created_at)?;
                 if let Some(lbl) = &snap.label {
-                    println!("label        : {lbl}");
+                    println_safe!("label        : {lbl}")?;
                 }
             }
         }
@@ -1353,7 +1389,7 @@ async fn dispatch_storage(
                 .await
                 .map_err(anyhow::Error::from)?;
             if json_output {
-                println!(
+                println_safe!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
                         "quota": {
@@ -1363,12 +1399,12 @@ async fn dispatch_storage(
                             "free_bytes": quota.free_bytes,
                         }
                     }))?
-                );
+                )?;
             } else {
-                println!("volume      : {}", quota.volume_id);
-                println!("limit_bytes : {}", quota.limit_bytes);
-                println!("used_bytes  : {}", quota.used_bytes);
-                println!("free_bytes  : {}", quota.free_bytes);
+                println_safe!("volume      : {}", quota.volume_id)?;
+                println_safe!("limit_bytes : {}", quota.limit_bytes)?;
+                println_safe!("used_bytes  : {}", quota.used_bytes)?;
+                println_safe!("free_bytes  : {}", quota.free_bytes)?;
             }
         }
     }
@@ -1388,7 +1424,7 @@ fn print_volume_status(
     json_output: bool,
 ) -> Result<()> {
     if json_output {
-        println!(
+        println_safe!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "volume": {
@@ -1399,20 +1435,20 @@ fn print_volume_status(
                     "used_bytes": s.used_bytes,
                 }
             }))?
-        );
+        )?;
         Ok(())
     } else {
-        println!("id          : {}", s.id);
-        println!(
+        println_safe!("id          : {}", s.id)?;
+        println_safe!(
             "mount_point : {}",
             s.mount_point
                 .as_deref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "-".to_owned())
-        );
-        println!("status      : {:?}", s.status);
-        println!("size_bytes  : {}", s.size_bytes);
-        println!("used_bytes  : {}", s.used_bytes);
+        )?;
+        println_safe!("status      : {:?}", s.status)?;
+        println_safe!("size_bytes  : {}", s.size_bytes)?;
+        println_safe!("used_bytes  : {}", s.used_bytes)?;
         Ok(())
     }
 }

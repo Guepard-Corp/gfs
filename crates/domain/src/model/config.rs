@@ -7,6 +7,36 @@ use crate::model::errors::RepoError;
 use crate::model::layout::{CONFIG_FILE, GFS_DIR};
 use crate::ports::compute::ComputeResources;
 
+/// Whether a runtime provider string names a Kubernetes-family backend.
+///
+/// One place, because the spelling set had drifted: `cmd_init`, `cmd_clone`,
+/// `compute_support`, the MCP tool surface and `restore_is_not_filesystem_based`
+/// all accepted `kubernetes | k8s | k3s`, while both fsck sites accepted only
+/// the first two. A repository configured as `k3s` therefore had its snapshots
+/// looked for on the local filesystem, where a cluster-backed repository has
+/// none, and every commit read as dangling -- corruption invented out of a
+/// spelling.
+///
+/// It is also what `commit`, `checkout`, `query` and `destroy` ask, and those
+/// four asked it as `eq_ignore_ascii_case("kubernetes")` -- accepting ONE
+/// spelling where every other site accepted three. A `k8s`-configured repository
+/// was therefore not Kubernetes to `checkout`, which would reach for filesystem
+/// operations on a cluster-backed repository, nor to `destroy`, which would leave
+/// its cluster objects behind. They call this now.
+///
+/// Every caller that asks this as a predicate now calls this. Three still
+/// dispatch on the same set as `match` arms -- `cmd_init`'s compute selection,
+/// `compute_support`, and `restore_is_not_filesystem_based` -- because a match
+/// arm selects a value rather than answering yes or no. They accept all three
+/// spellings already, so a fourth backend means editing those three by hand and
+/// nothing else.
+pub fn is_kubernetes_provider(provider: &str) -> bool {
+    matches!(
+        provider.trim().to_ascii_lowercase().as_str(),
+        "kubernetes" | "k8s" | "k3s"
+    )
+}
+
 /// Returns the user's home directory ($HOME on Unix, %USERPROFILE% on Windows).
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
@@ -809,5 +839,35 @@ mod tests {
 
         assert!(config.compute_resources().is_none());
         assert_eq!(config.compute_params().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod provider_tests {
+    use super::is_kubernetes_provider;
+
+    /// The set that had drifted. `k3s` is the one both fsck sites were missing,
+    /// and its absence made a cluster-backed repository look corrupt.
+    #[test]
+    fn every_spelling_the_rest_of_the_cli_accepts_is_accepted_here() {
+        for p in ["kubernetes", "k8s", "k3s", "KUBERNETES", " k3s ", "K8s"] {
+            assert!(is_kubernetes_provider(p), "{p:?} should be Kubernetes");
+        }
+    }
+
+    #[test]
+    fn a_filesystem_runtime_is_not_mistaken_for_a_cluster() {
+        for p in [
+            "",
+            "docker",
+            "apfs",
+            "zfs",
+            "btrfs",
+            "kube",
+            "k3",
+            "kubernetes2",
+        ] {
+            assert!(!is_kubernetes_provider(p), "{p:?} should not be Kubernetes");
+        }
     }
 }

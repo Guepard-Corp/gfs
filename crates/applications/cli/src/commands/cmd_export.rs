@@ -1,5 +1,6 @@
 //! `gfs export` — export data from the running database instance.
 
+use crate::println_safe;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -49,19 +50,19 @@ pub async fn run(
     let output = use_case.run(&repo_path, output_dir, &format).await?;
 
     if json_output {
-        println!(
+        println_safe!(
             "{}",
             json!({
                 "file_path": output.file_path.display().to_string(),
                 "format": format,
             })
-        );
+        )?;
     } else {
-        println!(
+        println_safe!(
             "{} Exported to {}",
             green("✓"),
             cyan(output.file_path.display().to_string())
-        );
+        )?;
     }
     if !output.stderr.is_empty() {
         eprintln!("{}", output.stderr.trim_end());

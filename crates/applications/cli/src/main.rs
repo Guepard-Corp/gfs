@@ -2,6 +2,8 @@
 //!
 //! Thin wrapper around the library. See `gfs_cli::run()` for programmatic use.
 
+use std::ffi::OsString;
+
 use gfs_cli::output::red;
 use serde_json::json;
 
@@ -19,6 +21,34 @@ fn wants_json(args: &[String]) -> bool {
         }
     }
     false
+}
+
+/// The arguments as UTF-8, or the position of the first one that is not.
+///
+/// `std::env::args()` panics on such an argument, which exited 101 -- the code
+/// of any crash -- with a message that echoed the undecodable bytes back. The
+/// position is counted from 1 for the first argument after `gfs`.
+///
+/// argv[0] is exempt: it is the path the binary was launched by, not something
+/// the user typed, and clap only uses it for display.
+fn utf8_args(raw: Vec<OsString>) -> Result<Vec<String>, usize> {
+    raw.into_iter()
+        .enumerate()
+        .map(|(position, arg)| match arg.into_string() {
+            Ok(arg) => Ok(arg),
+            Err(arg) if position == 0 => Ok(arg.to_string_lossy().into_owned()),
+            Err(_) => Err(position),
+        })
+        .collect()
+}
+
+/// A usage error, so it takes the same exit code and rendering as a value clap
+/// could not parse. It names the position only: the bytes are not echoed.
+fn non_utf8_argument(position: usize) -> clap::Error {
+    clap::Error::raw(
+        clap::error::ErrorKind::InvalidUtf8,
+        format!("argument {position} is not valid UTF-8\n"),
+    )
 }
 
 #[tokio::main]
@@ -43,14 +73,27 @@ async fn main() {
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .init();
 
-    let args: Vec<String> = std::env::args().collect();
-    let wants_json = wants_json(&args);
+    let raw: Vec<OsString> = std::env::args_os().collect();
+    // Lossy is safe here: a replacement character can never produce "--json".
+    let lossy: Vec<String> = raw
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let wants_json = wants_json(&lossy);
 
-    match gfs_cli::run(args).await {
+    let result = match utf8_args(raw) {
+        Ok(args) => gfs_cli::run(args).await,
+        Err(position) => Err(non_utf8_argument(position).into()),
+    };
+
+    match result {
         Ok(exit_code) => std::process::exit(exit_code),
         Err(err) => {
             if wants_json {
-                println!(
+                // Discarded on purpose: the process exits with this error's own
+                // code just below, and a failed write has nowhere else to go. A
+                // bare println! here panicked into 101 on a closed reader.
+                let _ = gfs_cli::println_safe!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
                         "error": {
@@ -82,7 +125,24 @@ async fn main() {
             } else {
                 eprintln!("{} {err}", red("error:"));
             }
-            std::process::exit(1);
+            // A usage error exits 3, not 1.
+            //
+            // 1 is a statement that the command RAN and found something: fsck
+            // documents it as "unreachable objects found -- a collector would have
+            // work to do". A mistyped flag used to land on that same code, so
+            // `gfs fsck --typo` was indistinguishable from a repository with
+            // collectable garbage, and a script branching on 1 to run a collector
+            // would be triggered by a typo.
+            //
+            // 3 already means "the command could not be completed, so this says
+            // nothing about the repository", which is exactly what a rejected
+            // argument list is. `--help` and `--version` never reach here: `run()`
+            // returns Ok(0) for DisplayHelp and DisplayVersion before this point.
+            //
+            // Only parse failures move. Every other error keeps 1, so this does not
+            // silently redefine the code for the errors that did run.
+            let usage_error = err.downcast_ref::<clap::Error>().is_some();
+            std::process::exit(if usage_error { 3 } else { 1 });
         }
     }
 }
