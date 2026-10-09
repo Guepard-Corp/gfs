@@ -123,6 +123,17 @@ pub struct ComputeConfig {
     /// inherits the clone semantics the repository already defines.
     #[serde(default)]
     pub resources: Option<ComputeResources>,
+
+    /// The discovery labels this database was stamped with at init.
+    ///
+    /// Recorded for the same reason as `resources`: a checkout rebuilds the
+    /// container from the provider's bare definition, so anything applied only
+    /// at first provision is lost on the first branch switch. Most of these
+    /// could be recomputed, but two cannot — `gfs.role` distinguishes a clone
+    /// from a source, and `gfs.remote` names where a clone came from. Both are
+    /// known only to the caller that created the repository.
+    #[serde(default)]
+    pub labels: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -210,6 +221,14 @@ impl GfsConfig {
         self.compute.as_ref().and_then(|c| c.resources)
     }
 
+    /// The discovery labels recorded for this repository, empty when none were.
+    pub fn compute_labels(&self) -> std::collections::BTreeMap<String, String> {
+        self.compute
+            .as_ref()
+            .map(|c| c.labels.clone())
+            .unwrap_or_default()
+    }
+
     /// Record the resource spec for this repository so every later rebuild can
     /// re-apply it.
     ///
@@ -228,6 +247,21 @@ impl GfsConfig {
             .compute
             .get_or_insert_with(ComputeConfig::default)
             .resources = resources;
+        config.save(repo_path)
+    }
+
+    /// Record the discovery labels this repository was stamped with, so a
+    /// rebuild can re-apply them. Without this the checkout re-application has
+    /// nothing to read and the labels are still lost on the first branch switch.
+    pub fn record_compute_labels(
+        repo_path: &Path,
+        labels: std::collections::BTreeMap<String, String>,
+    ) -> Result<(), RepoError> {
+        let mut config = Self::load(repo_path)?;
+        config
+            .compute
+            .get_or_insert_with(ComputeConfig::default)
+            .labels = labels;
         config.save(repo_path)
     }
 }
@@ -462,6 +496,7 @@ mod tests {
             compute: Some(ComputeConfig {
                 params,
                 resources: None,
+                labels: Default::default(),
             }),
             deleted_branch_retention_days: None,
         };
@@ -638,6 +673,78 @@ mod tests {
         );
     }
     #[test]
+    fn recorded_discovery_labels_survive_a_reload() {
+        // The checkout re-application reads this back. If the write side is
+        // missing the read side is inert, so the round trip is the test.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(GFS_DIR)).unwrap();
+        GfsConfig {
+            mount_point: None,
+            version: String::new(),
+            description: String::new(),
+            user: None,
+            environment: None,
+            runtime: None,
+            storage: None,
+            compute: None,
+            deleted_branch_retention_days: None,
+        }
+        .save(dir.path())
+        .unwrap();
+
+        let labels = std::collections::BTreeMap::from([
+            ("gfs.managed".to_string(), "true".to_string()),
+            ("gfs.role".to_string(), "clone".to_string()),
+            ("gfs.remote".to_string(), "src.example:5432".to_string()),
+        ]);
+        GfsConfig::record_compute_labels(dir.path(), labels.clone()).unwrap();
+
+        let reloaded = GfsConfig::load(dir.path()).unwrap();
+        assert_eq!(reloaded.compute_labels(), labels);
+    }
+
+    #[test]
+    fn recording_labels_leaves_the_resource_spec_alone() {
+        // The two live in the same table; writing one must not drop the other.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(GFS_DIR)).unwrap();
+        GfsConfig {
+            mount_point: None,
+            version: String::new(),
+            description: String::new(),
+            user: None,
+            environment: None,
+            runtime: None,
+            storage: None,
+            compute: None,
+            deleted_branch_retention_days: None,
+        }
+        .save(dir.path())
+        .unwrap();
+
+        let spec = ComputeResources {
+            cpu_millicores: 625,
+            memory_mb: 2048,
+        };
+        GfsConfig::record_compute_resources(dir.path(), Some(spec)).unwrap();
+        GfsConfig::record_compute_labels(
+            dir.path(),
+            std::collections::BTreeMap::from([("gfs.role".to_string(), "source".to_string())]),
+        )
+        .unwrap();
+
+        let reloaded = GfsConfig::load(dir.path()).unwrap();
+        assert_eq!(reloaded.compute_resources(), Some(spec));
+        assert_eq!(
+            reloaded
+                .compute_labels()
+                .get("gfs.role")
+                .map(String::as_str),
+            Some("source")
+        );
+    }
+
+    #[test]
     fn a_recorded_resource_spec_survives_a_reload() {
         // The repository holds the authoritative copy, so a rebuild
         // re-reads rather than re-derives.
@@ -691,6 +798,7 @@ mod tests {
             compute: Some(ComputeConfig {
                 params,
                 resources: None,
+                labels: Default::default(),
             }),
             deleted_branch_retention_days: None,
         }

@@ -99,6 +99,41 @@ impl<R: DatabaseProviderRegistry> StatusRepoUseCase<R> {
             .ok()
             .filter(|id| id != "0");
 
+        // A property of the storage, probed once per status call. Costs tens of
+        // microseconds; see utils::reflink for why it is a probe and not a
+        // filesystem-name check.
+        let storage = active_workspace_data_dir.as_deref().and_then(|ws| {
+            let snapshots = path.join(crate::model::layout::GFS_DIR).join("snapshots");
+            match crate::utils::reflink::check(std::path::Path::new(ws), &snapshots) {
+                crate::utils::reflink::Outcome::Clones => {
+                    Some(crate::model::status::StorageStatus {
+                        copy_on_write: true,
+                        reason: None,
+                        detail: None,
+                    })
+                }
+                crate::utils::reflink::Outcome::FullCopy(r) => {
+                    Some(crate::model::status::StorageStatus {
+                        copy_on_write: false,
+                        reason: Some(
+                            match r {
+                                crate::utils::reflink::NoReflink::Unsupported => {
+                                    "filesystem cannot clone extents"
+                                }
+                                crate::utils::reflink::NoReflink::CrossDevice => {
+                                    "snapshots are on a different filesystem"
+                                }
+                            }
+                            .to_string(),
+                        ),
+                        detail: Some(r.explain().to_string()),
+                    })
+                }
+                // Unknown stays absent rather than guessing.
+                crate::utils::reflink::Outcome::Unknown => None,
+            }
+        });
+
         Ok(StatusResponse {
             current_branch,
             compute,
@@ -109,6 +144,7 @@ impl<R: DatabaseProviderRegistry> StatusRepoUseCase<R> {
             // Populated by the CLI: the drift SQL is a psql-level concern that
             // lives beside `gfs fetch`/`gfs pull`, not in the domain.
             source: None,
+            storage,
         })
     }
 }

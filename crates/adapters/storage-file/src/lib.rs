@@ -178,7 +178,9 @@ fn attrib_error(path: &Path, out: &std::process::Output) -> StorageError {
 ///
 /// * **macOS** – `cp -cRp` triggers clonefile(2) COW on APFS.
 /// * **Linux** – `cp --reflink=auto -a` uses Btrfs/XFS COW when available,
-///   and falls back to a regular deep copy on other filesystems.
+///   and falls back to a regular deep copy on other filesystems. That fallback
+///   is silent — exit 0, empty stderr — so the capability is probed first and
+///   the degradation reported. See [`gfs_domain::utils::reflink`].
 /// * **Windows** – `robocopy /E /COPY:DAT` (not `/COPYALL`, which needs audit privileges).
 async fn copy_dir(src: &str, dst: &str) -> Result<()> {
     let dst_path = Path::new(dst);
@@ -186,6 +188,10 @@ async fn copy_dir(src: &str, dst: &str) -> Result<()> {
         tokio::fs::create_dir_all(parent)
             .await
             .map_err(StorageError::Io)?;
+
+        // `--reflink=auto` degrades to a full byte copy in silence. Say so.
+        #[cfg(target_os = "linux")]
+        gfs_domain::utils::reflink::warn_if_full_copy(Path::new(src), parent);
     }
 
     // Windows: strip the `\\?\` extended-length-path prefix that
@@ -516,6 +522,40 @@ impl StoragePort for FileStorage {
     async fn finalize_snapshot(&self, dest: &Path) -> Result<()> {
         make_read_only(dest).await
     }
+
+    /// Stop at the first regular file: the question is whether anything was
+    /// captured, so one file answers it and a tree walk is wasted work on every
+    /// commit.
+    ///
+    /// A missing destination is `None` rather than `Some(false)`: "not there" and
+    /// "there and empty" are different facts, and only the second says anything
+    /// about what the snapshot captured.
+    async fn captured_any_data(&self, dest: &Path) -> Result<Option<bool>> {
+        if !dest.exists() {
+            return Ok(None);
+        }
+        let mut stack = vec![dest.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                // A directory we cannot read leaves the answer unknown rather
+                // than "empty", which would refuse a commit on no evidence.
+                Err(_) => return Ok(None),
+            };
+            for entry in entries.flatten() {
+                let Ok(meta) = entry.metadata() else {
+                    return Ok(None);
+                };
+                if meta.is_file() {
+                    return Ok(Some(true));
+                }
+                if meta.is_dir() {
+                    stack.push(entry.path());
+                }
+            }
+        }
+        Ok(Some(false))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -806,6 +846,60 @@ fn drive_letter(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The guard refuses a commit when this reports `Some(false)`, so the three
+    /// answers have to be exactly right: something captured, nothing captured,
+    /// and `None` when the question could not be answered at all.
+    #[tokio::test]
+    async fn captured_any_data_finds_a_nested_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("snap");
+        // The file is deliberately NOT at the top level: a check that only looked
+        // one level down would read a real snapshot as empty.
+        std::fs::create_dir_all(dest.join("base/1")).expect("mkdir");
+        std::fs::write(dest.join("base/1/1234"), vec![0u8; 8192]).expect("write");
+
+        assert_eq!(
+            FileStorage::new()
+                .captured_any_data(&dest)
+                .await
+                .expect("probe"),
+            Some(true)
+        );
+    }
+
+    /// Directories alone are not data. A snapshot that created the tree and copied
+    /// no file is exactly the failure this exists to catch.
+    #[tokio::test]
+    async fn a_destination_holding_only_directories_captured_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("snap");
+        std::fs::create_dir_all(dest.join("base/1")).expect("mkdir");
+
+        assert_eq!(
+            FileStorage::new()
+                .captured_any_data(&dest)
+                .await
+                .expect("probe"),
+            Some(false)
+        );
+    }
+
+    /// A destination that is not there says nothing about what a snapshot
+    /// captured, so it must be `None` and not `Some(false)` — answering "nothing"
+    /// here would refuse a commit on no evidence.
+    #[tokio::test]
+    async fn a_missing_destination_is_unknown_not_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        assert_eq!(
+            FileStorage::new()
+                .captured_any_data(&dir.path().join("never-created"))
+                .await
+                .expect("probe"),
+            None
+        );
+    }
     use super::*;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};

@@ -1,7 +1,8 @@
 //! End-to-end tests for `gfs checkout` with a real Postgres container.
 //!
-//! These tests share a single repo and run sequentially (via serial_test).
-//! **Must be run with `--test-threads=1`** so they execute in order and share state.
+//! These steps share a single repo and must run in order, so they are driven
+//! from one test (`postgres_checkout_lifecycle`) rather than left to the
+//! harness. No special invocation is needed.
 //! Tests never start or stop the compute container; they only validate that repo state,
 //! workspace paths, and compute status are as expected (running/stopped). One-off Postgres
 //! is only used on cold data dirs (e.g. snapshots) and we do not remove postmaster.pid/opts.
@@ -32,7 +33,7 @@ use tempfile::TempDir;
 
 /// Shared repo: temp dir kept alive for process lifetime.
 static SHARED: Lazy<(TempDir, PathBuf)> = Lazy::new(|| {
-    let t = TempDir::new().expect("create temp dir for shared repo");
+    let t = common::shared_tempdir::shared_tempdir().expect("create temp dir for shared repo");
     let p = t.path().to_path_buf();
     (t, p)
 });
@@ -371,8 +372,64 @@ fn count_commits_from_main(repo_path: &Path) -> usize {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// The numbered steps below share one repository and only make sense in order:
+/// step 02 commits what 03 checks out, 05 branches from what 04 restored.
+///
+/// They used to be seven `#[test]` functions. `#[serial]` stopped them running at
+/// the same time but not out of order, so under `cargo test` they passed or failed
+/// depending on the order the harness happened to pick, and only
+/// `--test-threads=1` made them deterministic -- a requirement a plain
+/// `cargo test` does not honour. Running them from one test makes the order part
+/// of the code rather than part of the invocation.
 #[test]
 #[serial]
+fn postgres_checkout_lifecycle() {
+    let steps: &[(&str, fn())] = &[
+        (
+            "01 init, config, commit, log",
+            postgres_test_01_init_config_validate_commit_log,
+        ),
+        (
+            "02 pgbench, commit, compute status",
+            postgres_test_02_pgbench_commit_compute_status,
+        ),
+        (
+            "03 checkout previous: no pgbench",
+            postgres_test_03_checkout_previous_no_pgbench,
+        ),
+        (
+            "04 checkout head: pgbench present",
+            postgres_test_04_checkout_head_has_pgbench,
+        ),
+        (
+            "05 branch from main keeps pgbench",
+            postgres_test_05_checkout_b_new_branch_has_pgbench,
+        ),
+        (
+            "06 checkout back to main",
+            postgres_test_06_checkout_back_to_main,
+        ),
+    ];
+
+    let mut failure = None;
+    for (name, step) in steps {
+        eprintln!("--- {name}");
+        // Catch here so the container is removed even when a step fails; the
+        // panic is re-raised afterwards so the test still reports as failed.
+        if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(step)) {
+            eprintln!("--- {name} FAILED");
+            failure = Some(panic);
+            break;
+        }
+    }
+
+    postgres_test_99_cleanup_main_container();
+
+    if let Some(panic) = failure {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 fn postgres_test_01_init_config_validate_commit_log() {
     install_panic_cleanup_hook();
     let repo_path = shared_repo_path();
@@ -431,8 +488,6 @@ fn postgres_test_01_init_config_validate_commit_log() {
     }
 }
 
-#[test]
-#[serial]
 fn postgres_test_02_pgbench_commit_compute_status() {
     let repo_path = shared_repo_path();
     let container_id = get_container_id(repo_path).expect("container should exist from test_01");
@@ -484,8 +539,6 @@ fn postgres_test_02_pgbench_commit_compute_status() {
     }
 }
 
-#[test]
-#[serial]
 fn postgres_test_03_checkout_previous_no_pgbench() {
     let repo_path = shared_repo_path();
     let hash1 = get_first_commit_hash(repo_path);
@@ -528,8 +581,6 @@ fn postgres_test_03_checkout_previous_no_pgbench() {
     );
 }
 
-#[test]
-#[serial]
 fn postgres_test_04_checkout_head_has_pgbench() {
     let repo_path = shared_repo_path();
 
@@ -582,8 +633,6 @@ fn postgres_test_04_checkout_head_has_pgbench() {
     }
 }
 
-#[test]
-#[serial]
 fn postgres_test_05_checkout_b_new_branch_has_pgbench() {
     let repo_path = shared_repo_path();
     // We are on main at tip (with pgbench). Create a new branch from current HEAD.
@@ -637,8 +686,6 @@ fn postgres_test_05_checkout_b_new_branch_has_pgbench() {
     }
 }
 
-#[test]
-#[serial]
 fn postgres_test_06_checkout_back_to_main() {
     let repo_path = shared_repo_path();
 
@@ -689,8 +736,6 @@ fn postgres_test_06_checkout_back_to_main() {
 
 /// Final test: stop and remove the main container so no test-provisioned containers remain.
 /// Must run last (use `--test-threads=1`). One-off containers are removed by their guard on drop.
-#[test]
-#[serial]
 fn postgres_test_99_cleanup_main_container() {
     cleanup_main_container(shared_repo_path());
 }

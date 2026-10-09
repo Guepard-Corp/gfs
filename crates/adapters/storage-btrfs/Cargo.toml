@@ -13,3 +13,6 @@ chrono = { workspace = true }
 gfs-domain = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

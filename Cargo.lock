@@ -1507,6 +1507,7 @@ dependencies = [
  "async-trait",
  "bincode",
  "chrono",
+ "libc",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1566,6 +1567,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "gfs-domain",
+ "tempfile",
  "tokio",
  "tracing",
 ]

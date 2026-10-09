@@ -43,6 +43,11 @@ pub(crate) fn classify_with_mount_path(
             // Check for mount-related errors
             if msg.contains("invalid mount config")
                 || msg.contains("mount denied")
+                // Docker Desktop writes "Mounts denied:" -- plural. "mount denied"
+                // is not a substring of it, so without this line the macOS case,
+                // which is the common one, fell through to a bare Internal error.
+                || msg.contains("mounts denied")
+                || msg.contains("not shared from the host")
                 || msg.contains("cannot mount")
                 || msg.contains("invalid volume specification")
                 || msg.contains("invalid mode")
@@ -127,11 +132,18 @@ fn extract_path_from_error(message: &str) -> Option<PathBuf> {
         ("\"", "\""),
     ];
 
+    // Matched case-insensitively: Docker Desktop capitalises ("The path ...")
+    // while the daemon's own messages do not, and a lowercase-only search
+    // silently yields "unknown" for the Desktop wording.
+    let haystack = message.to_ascii_lowercase();
     for (start, end) in patterns {
-        if let Some(start_idx) = message.find(start) {
+        if let Some(start_idx) = haystack.find(start) {
             let path_start = start_idx + start.len();
+            // Slice the ORIGINAL, not the lowercased copy: a path is
+            // case-sensitive and /Users/Foo must not come back as /users/foo.
+            // ASCII-lowercasing preserves byte offsets, so the indices align.
             let remaining = &message[path_start..];
-            if let Some(end_idx) = remaining.find(end) {
+            if let Some(end_idx) = remaining.to_ascii_lowercase().find(end) {
                 let path_str = &remaining[..end_idx];
                 if !path_str.is_empty() && (path_str.starts_with('/') || path_str.contains(':')) {
                     return Some(PathBuf::from(path_str));
@@ -338,6 +350,51 @@ mod tests {
                 assert!(suggestion.contains("Solutions:"));
             }
             _ => panic!("Expected DockerMountFailed, got {:?}", err),
+        }
+    }
+
+    /// Docker Desktop's own wording, verbatim. The other tests in this module
+    /// use invented strings that happen to match the condition list, so a
+    /// condition list that never fires in practice still passed all of them.
+    #[test]
+    fn classify_mount_error_docker_desktop_macos_wording() {
+        let err = classify(
+            "c1",
+            docker_err(
+                500,
+                "Mounts denied: \nThe path /tmp/gfs-export is not shared from the host \
+                 and is not known to Docker.\nYou can configure shared paths from \
+                 Docker -> Preferences... -> Resources -> File Sharing.",
+            ),
+        );
+        match err {
+            ComputeError::DockerMountFailed {
+                path, suggestion, ..
+            } => {
+                assert_eq!(path, PathBuf::from("/tmp/gfs-export"));
+                assert!(suggestion.contains("Solutions:"));
+            }
+            other => panic!("Expected DockerMountFailed, got {:?}", other),
+        }
+    }
+
+    /// The marker is matched case-insensitively, but the path is sliced from
+    /// the original: /Users/MAC must not come back as /users/mac, or the
+    /// suggestion tells the reader to share a directory that does not exist.
+    #[test]
+    fn an_extracted_path_keeps_its_original_case() {
+        let err = classify(
+            "c1",
+            docker_err(
+                500,
+                "Mounts denied: The path /Users/MAC/Desktop/GFS is not shared from the host.",
+            ),
+        );
+        match err {
+            ComputeError::DockerMountFailed { path, .. } => {
+                assert_eq!(path, PathBuf::from("/Users/MAC/Desktop/GFS"));
+            }
+            other => panic!("Expected DockerMountFailed, got {:?}", other),
         }
     }
 

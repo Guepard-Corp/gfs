@@ -1907,7 +1907,12 @@ fn detached_matches_its_commit(
     if !data.is_dir() {
         return None;
     }
-    let changes = repo_layout::workspace_changes(&data, &baseline).ok()?;
+    // No engine-owned paths are skipped here, unlike checkout. Checkout may ignore
+    // the database's own bookkeeping -- the WAL among it -- only because it flushes
+    // first; fsck flushes nothing, and a committed row can live in the WAL alone.
+    // Skipping it would let this mark a workspace safe to delete while it holds
+    // the only copy of that row.
+    let changes = repo_layout::workspace_changes(&data, &baseline, &[]).ok()?;
     if !changes.is_empty() {
         return Some(false);
     }
