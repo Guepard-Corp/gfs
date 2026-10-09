@@ -19,7 +19,7 @@ async fn runtime_compute() -> Result<Arc<dyn Compute>, CmdError> {
     let k8s = std::env::var("GFS_RUNTIME_PROVIDER")
         .map(|v| {
             let v = v.to_ascii_lowercase();
-            v == "kubernetes" || v == "k8s" || v == "k3s"
+            gfs_domain::model::config::is_kubernetes_provider(&v)
         })
         .unwrap_or(false);
     if k8s {

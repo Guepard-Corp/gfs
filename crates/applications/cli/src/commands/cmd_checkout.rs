@@ -55,7 +55,7 @@ pub async fn checkout(
     let is_k8s = GfsConfig::load(&repo_path)
         .ok()
         .and_then(|c| c.runtime.map(|r| r.runtime_provider))
-        .map(|p| p.trim().eq_ignore_ascii_case("kubernetes"))
+        .map(|p| gfs_domain::model::config::is_kubernetes_provider(&p))
         .unwrap_or(false);
 
     let commit_hash = if is_k8s {
