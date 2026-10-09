@@ -354,19 +354,19 @@ fn print_table(
     if let Some(ref storage) = s.storage
         && !storage.copy_on_write
     {
-        println!();
+        println_safe!()?;
         if let Some(ref detail) = storage.detail {
-            println!(
+            println_safe!(
                 "  {} snapshots are full copies: {}",
                 yellow("!"),
                 dimmed(detail)
-            );
+            )?;
         } else if let Some(ref reason) = storage.reason {
-            println!(
+            println_safe!(
                 "  {} snapshots are full copies: {}",
                 yellow("!"),
                 dimmed(reason)
-            );
+            )?;
         }
     }
 
