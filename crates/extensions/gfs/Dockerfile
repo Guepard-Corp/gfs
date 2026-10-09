@@ -57,3 +57,8 @@ COPY --from=build /usr/share/postgresql/${PG_MAJOR}/extension/gfs.control \
 COPY --from=build /usr/lib/postgresql/${PG_MAJOR}/lib/gfs.so /usr/lib/postgresql/${PG_MAJOR}/lib/
 RUN test -f /usr/share/postgresql/${PG_MAJOR}/extension/gfs.control \
  && test -f /usr/lib/postgresql/${PG_MAJOR}/lib/gfs.so
+
+# TLS offered on every start (self-signed unless a cert is mounted); see the script.
+COPY gfs-tls-entrypoint.sh /usr/local/bin/gfs-tls-entrypoint.sh
+ENTRYPOINT ["gfs-tls-entrypoint.sh"]
+CMD ["postgres"]
