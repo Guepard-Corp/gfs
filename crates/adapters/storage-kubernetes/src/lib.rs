@@ -25,6 +25,9 @@ use serde_json::json;
 use gfs_domain::model::fsck::SnapshotFacts;
 use std::time::SystemTime;
 
+mod openebs_zfs;
+pub use openebs_zfs::ReclaimReport;
+
 const DEFAULT_NAMESPACE: &str = "gfs";
 const DEFAULT_PVC_SIZE_GI: &str = "1";
 
