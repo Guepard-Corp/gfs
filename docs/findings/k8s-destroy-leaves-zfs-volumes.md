@@ -4,13 +4,13 @@
 deletes the StatefulSet, the data PVC and every VolumeSnapshot of that PVC. Is
 the ZFS dataset holding the data gone afterwards?
 
-**Answer: not reliably, before this fix.** In 3 of 4 runs of the unfixed
+**Answer: not reliably, before this fix.** In 4 of 6 runs of the unfixed
 binary, one of the repository's volumes stayed on the node after destroy: no
 PVC, no PV, no snapshots, but the `ZFSVolume` record was `Ready`, annotated
 `openebs.io/marked-for-deletion: "true"`, and its dataset still held the
-database's files (89.8 MB in each of the two measured runs). Nothing deletes
-such a volume later. With the fix, 0 of 3 runs left anything; in one of them
-the fix completed a delete the driver had dropped.
+database's files (89.8 MB each time). Nothing deletes such a volume later.
+With the fix, 0 of 5 runs left anything; in two of them the fix completed a
+delete the driver had dropped.
 
 Measured on 2026-10-09 on a two-node k3s stack. Everything below was run by me.
 
@@ -70,7 +70,7 @@ are logged as warnings and do not fail the destroy.
 | Cluster | k3s v1.34.6+k3s1, two nodes; ZFS pool on the worker |
 | Storage | StorageClass `openebs-zfs-gfs` (zfs.csi.openebs.io, reclaim Delete), VolumeSnapshotClass with deletion policy Delete, `openebs/zfs-driver:2.11.1` |
 | Unfixed binary | PR head `71e712a`, sha256 `2e381960ccc4…` |
-| Fixed binary | `71e712a` + this change, sha256 `ec00d40040bd…` |
+| Fixed binary | `71e712a` + this change: sha256 `ec00d40040bd…` (first version), `acade3aaf187…` (shared with `storage reclaim`), `11860dd3809b…` (final, every source identical to the branch head) |
 | Compiler | `cargo build --release -p gfs-cli`, rustc 1.93.1 (`01f6ddf75`), aarch64 Linux, same target dir |
 | Where gfs ran | on the worker node, as root, with the node's kubeconfig |
 
@@ -94,6 +94,17 @@ lookup goes through the run's own instance id, PVC and snapshots.
 | fixed-a | fixed | 3 | ok | 5 s | 0 | yes, 1 volume |
 | fixed-b | fixed | 3 | ok | 2 s | 0 | no |
 | fixed-c | fixed | 3 | ok | 4 s | 0 | no |
+| fixed2-a | fixed (`acade3aa`) | 3 | ok | — | 0 | yes, 1 volume |
+| fixed3-a | fixed (final) | 3 | ok | 4 s | 0 | no |
+| orphan-a | unfixed | 3 | ok | 0 s | 0 | — |
+| orphan-b | unfixed | 3 | ok | 1 s | **1 `ZFSVolume`, dataset 89.8 MB, 0 snapshots, marked** | — |
+| orphan-c | unfixed | 3 | ok | 0 s | 0 | — |
+| orphan-d | unfixed | 3 | ok | 0 s | **1 `ZFSVolume`, dataset 89.8 MB, 0 snapshots, marked** | — |
+
+The `orphan` runs stranded volumes on purpose, to reclaim them (below). If
+the fix did nothing, five clean runs in a row at the unfixed leak rate (4 of 6)
+would happen about 0.4% of the time; the two runs where the fix acted are the
+direct evidence.
 
 Two further unfixed runs: one with the same sequence but no data files left
 nothing behind; one with gfs 0.4.0 (4 commits, `checkout -b`, a commit,
@@ -102,14 +113,41 @@ nothing behind; one with gfs 0.4.0 (4 commits, `checkout -b`, a commit,
 A run on the cluster's `local-path` StorageClass (not OpenEBS) with the fixed
 binary: `init`, `destroy -y` exit 0 in 1 s, no ZFS log lines, nothing left.
 
+**A cluster without OpenEBS.** A kind cluster (Kubernetes v1.37, `local-path`,
+no CRDs at all: neither `ZFSVolume` nor `VolumeSnapshot`), gfs built on macOS
+at the PR head and at this branch. `init` then `destroy -y`: exit 0 with both,
+no StatefulSet, PVC, Service, Secret or PV left. Both log the existing warning
+that snapshot cleanup could not list VolumeSnapshots. The first build of this
+change also logged "could not list the ZFS volumes", because it treated the
+missing CRD as an error rather than as no snapshots; that is fixed, and the
+re-run with the fixed build logs only the existing warning. On the same
+cluster, `gfs storage reclaim` prints "No OpenEBS ZFS volume is waiting to be
+deleted." (exit 0), `--json` prints an empty list, and `--yes`, with or without
+`--volume`, reclaims nothing (exit 0).
+
+**Docker.** Destroy on Docker does not go through this code. On the control
+node's Docker, the PR head and the final binary each ran `init`, a row, a
+commit, `checkout -b`, a row, a commit, `checkout main` (refused for
+uncommitted files both times, then `--force`), and `destroy -y`: the same exit
+code at every step, `main` holds row 1 only, and the repository's container
+count goes from 1 to 0. `gfs storage status`, `quota` and `clone` on an APFS
+directory give the same output with both binaries (`quota`'s used bytes differ
+by the 4 KiB the disk changed between the calls). `gfs storage reclaim` with no
+kubeconfig fails with "kubernetes client unavailable" (exit 1).
+
 ## Not verified
 
 - The race itself is inferred from the driver source and its logs, not
   provoked deterministically; the unfixed binary leaked in 3 of 4 runs here.
-- A cluster where the `ZFSVolume` CRD is absent was not run; that path is read
+- The node daemon's destroy was not run. It calls the same
+  `remove_instance_with_pvcs(&instance, &[])` as the CLI. The daemon binary
+  deployed on this stack contains that function's existing log strings but not
+  the fix's, so its destroys can still strand volumes until it is rebuilt.
+- A recorded OpenEBS volume on a cluster without the `ZFSVolume` CRD cannot
+  occur (the volume comes from that driver); the 404 handling for it is read
   from the code.
-- A clone chain that needs more than one pass was not observed; the volumes in
-  these runs were released in one pass.
+- A clone chain needing more than one pass was not observed in a gfs destroy;
+  it was observed with `gfs storage reclaim` (below).
 - The 120 s bound was never reached. A volume still held at the deadline is
   logged and left, as before.
 
@@ -149,6 +187,12 @@ Run on this stack:
   `blocked`; with `--yes` it deleted B, and the node agent then finished A in
   the same run (28 s, exit 0). Both records, both datasets and every snapshot
   were gone; no other volume was touched.
+- Two volumes stranded by the unfixed gfs destroy (`orphan-b`, `orphan-d`
+  above, 89.8 MB each): `gfs storage reclaim --volume <it>` listed it
+  `reclaim` and changed nothing (`ZFSVolume` count 26 and 23, before and
+  after); `--yes` reclaimed it in 1 s, exit 0. It was the only `ZFSVolume`
+  that disappeared, none appeared, and its dataset was gone. The second run
+  used the final binary.
 - Before the command existed, deleting the records of the three volumes these
   runs had stranded by hand (`kubectl -n <ns> delete zfsvolume <name>`)
   removed their datasets (240 MB, 89.8 MB, 89.8 MB).
