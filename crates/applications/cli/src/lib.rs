@@ -754,10 +754,11 @@ enum StorageAction {
     },
     /// Delete the OpenEBS ZFS volumes the driver was asked to delete and never
     /// did (marked for deletion, no PV, no snapshot left), so the data of
-    /// databases destroyed earlier leaves the node. Lists them unless --yes.
+    /// databases destroyed earlier leaves the node. Lists them, then asks
+    /// before deleting when run at a terminal; elsewhere only --yes deletes.
     Reclaim {
-        /// Delete them; without this flag nothing is changed
-        #[arg(long)]
+        /// Delete them without asking
+        #[arg(short = 'y', long)]
         yes: bool,
         /// Seconds to keep waiting for volumes that are still held, e.g. a
         /// parent whose snapshot a stranded clone keeps alive
