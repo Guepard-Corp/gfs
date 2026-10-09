@@ -182,14 +182,22 @@ pub fn local_connection_params(
 /// Return the path recorded in `.gfs/WORKSPACE` — the directory where the
 /// database is currently running.
 ///
+/// Resolved against `repo_path`, never against the process working directory.
+/// `gfs init .` records a relative value (`./.gfs/workspaces/...`) while
+/// `checkout` records an absolute one, so a caller that did not happen to be
+/// standing in the repository root used to get a path that does not exist —
+/// `gfs commit --path <repo>` failed in the storage adapter with
+/// `cp -cRp './.gfs/workspaces/main/0/data' ... No such file or directory`.
+/// `Path::join` returns the argument unchanged when it is absolute, so this is
+/// correct for both forms.
+///
 /// Falls back to the workspace for the current HEAD commit when the
 /// `WORKSPACE` file does not exist (e.g. repos created before this feature).
 pub fn get_active_workspace_data_dir(repo_path: &Path) -> Result<std::path::PathBuf, RepoError> {
     let workspace_file = repo_path.join(GFS_DIR).join(WORKSPACE_FILE);
     if workspace_file.exists() {
         let raw = fs::read_to_string(&workspace_file).map_err(RepoError::from)?;
-        let path = std::path::PathBuf::from(raw.trim());
-        return Ok(path);
+        return Ok(repo_path.join(raw.trim()));
     }
     // Legacy fallback: derive from current HEAD.
     get_workspace_data_dir_for_head(repo_path)
@@ -2341,6 +2349,50 @@ name = "test-repo"
             "physical (blocks) should be >= logical"
         );
         Ok(())
+    }
+
+    /// `gfs init .` records a relative WORKSPACE, so resolving it against the
+    /// process working directory rather than the repository made `gfs commit
+    /// --path <repo>` fail in the storage adapter from any other directory.
+    #[test]
+    fn a_relative_workspace_resolves_against_the_repository_not_the_cwd() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_dir = temp_dir.path().join("repo");
+        let relative = format!("./{GFS_DIR}/{WORKSPACES_DIR}/{MAIN_BRANCH}/0/{WORKSPACE_DATA_DIR}");
+        fs::create_dir_all(repo_dir.join(GFS_DIR)).unwrap();
+        fs::write(repo_dir.join(GFS_DIR).join(WORKSPACE_FILE), &relative).unwrap();
+
+        let resolved = get_active_workspace_data_dir(&repo_dir).unwrap();
+
+        assert!(
+            resolved.starts_with(&repo_dir),
+            "expected a path under {}, got {}",
+            repo_dir.display(),
+            resolved.display()
+        );
+        assert_eq!(resolved, repo_dir.join(&relative));
+    }
+
+    /// An absolute WORKSPACE, which is what `checkout` writes, must survive the
+    /// join unchanged.
+    #[test]
+    fn an_absolute_workspace_is_returned_as_recorded() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_dir = temp_dir.path().join("repo");
+        let absolute = repo_dir
+            .join(GFS_DIR)
+            .join(WORKSPACES_DIR)
+            .join("other")
+            .join("0")
+            .join(WORKSPACE_DATA_DIR);
+        fs::create_dir_all(repo_dir.join(GFS_DIR)).unwrap();
+        fs::write(
+            repo_dir.join(GFS_DIR).join(WORKSPACE_FILE),
+            absolute.to_string_lossy().as_ref(),
+        )
+        .unwrap();
+
+        assert_eq!(get_active_workspace_data_dir(&repo_dir).unwrap(), absolute);
     }
 
     #[test]
