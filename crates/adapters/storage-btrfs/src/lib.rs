@@ -789,10 +789,97 @@ impl StoragePort for BtrfsStorage {
             Err(unsupported())
         }
     }
+
+    /// Stop at the first regular file: the question is whether anything was
+    /// captured, so one file answers it and a tree walk is wasted work on every
+    /// commit.
+    ///
+    /// btrfs needs this as much as the copying adapters do, which was measured
+    /// rather than assumed. A `btrfs subvolume snapshot` is taken OF the
+    /// workspace subvolume, so the snapshot holds exactly what the workspace
+    /// held: with an empty workspace the snapshot is an empty subvolume and the
+    /// commit still succeeds. Verified on a real btrfs filesystem — workspace 0
+    /// entries, `commit rc=0`, snapshot a subvolume with 0 entries.
+    ///
+    /// A missing destination is `None` rather than `Some(false)`: "not there" and
+    /// "there and empty" are different facts, and only the second says anything
+    /// about what the snapshot captured.
+    async fn captured_any_data(&self, dest: &Path) -> Result<Option<bool>> {
+        if !dest.exists() {
+            return Ok(None);
+        }
+        let mut stack = vec![dest.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(_) => return Ok(None),
+            };
+            for entry in entries.flatten() {
+                let Ok(meta) = entry.metadata() else {
+                    return Ok(None);
+                };
+                if meta.is_file() {
+                    return Ok(Some(true));
+                }
+                if meta.is_dir() {
+                    stack.push(entry.path());
+                }
+            }
+        }
+        Ok(Some(false))
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    /// Measured on a real btrfs filesystem: a `btrfs subvolume snapshot` is taken
+    /// OF the workspace subvolume, so an empty workspace yields an empty snapshot
+    /// subvolume and the commit still succeeds. btrfs therefore needs this probe
+    /// exactly as much as the copying adapters do.
+    #[tokio::test]
+    async fn captured_any_data_finds_a_nested_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("snap");
+        std::fs::create_dir_all(dest.join("base/1")).expect("mkdir");
+        std::fs::write(dest.join("base/1/1234"), vec![0u8; 8192]).expect("write");
+
+        assert_eq!(
+            BtrfsStorage::new()
+                .captured_any_data(&dest)
+                .await
+                .expect("probe"),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_destination_holding_only_directories_captured_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("snap");
+        std::fs::create_dir_all(dest.join("base/1")).expect("mkdir");
+
+        assert_eq!(
+            BtrfsStorage::new()
+                .captured_any_data(&dest)
+                .await
+                .expect("probe"),
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_destination_is_unknown_not_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        assert_eq!(
+            BtrfsStorage::new()
+                .captured_any_data(&dir.path().join("never-created"))
+                .await
+                .expect("probe"),
+            None
+        );
+    }
+
     use super::*;
 
     #[test]

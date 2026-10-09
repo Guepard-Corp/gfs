@@ -234,11 +234,25 @@ fn apply_storage_settings(
     }
 }
 
+/// Explain that a `[storage]` key had no effect here.
+///
+/// These settings are read only by the btrfs adapter, so they do nothing on any
+/// other filesystem. The earlier wording said reflink "is only supported on
+/// btrfs", which is not true of reflink — APFS always clones, and XFS created
+/// with `reflink=1` or ZFS with block cloning enabled clone too (all measured).
+/// What is btrfs-only is this *setting*. The old wording told users that
+/// copy-on-write was unavailable when it was, and said nothing when it really
+/// was not; `gfs commit` now reports the latter directly.
 fn unsupported_storage_message(key: &str) -> &'static str {
     if key == KEY_STORAGE_COMPRESSION {
-        "Warning: compression is only supported on btrfs. Your filesystem is not btrfs."
+        "Warning: the compression setting applies only to btrfs, and this repository is \
+         not on btrfs. It will have no effect here."
     } else {
-        "Warning: reflink is only supported on btrfs. Your filesystem is not btrfs."
+        "Warning: the reflink setting applies only to btrfs, and this repository is not \
+         on btrfs. It will have no effect here. Copy-on-write may still be in use: APFS \
+         always clones, and XFS (created with reflink=1) or ZFS (with block cloning \
+         enabled) clone when available. `gfs commit` warns when a snapshot will be a \
+         full copy instead."
     }
 }
 

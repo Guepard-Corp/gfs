@@ -190,6 +190,36 @@ fn gfs_image_present() -> bool {
     ok
 }
 
+/// True if a container can resolve `host.docker.internal`, which these suites
+/// need so the gfs container reaches a source database on the host.
+///
+/// The adapter requests the alias explicitly, so this normally holds on any
+/// engine. It is probed rather than assumed because the failure mode without
+/// it is a `pg_dump: could not translate host name` deep inside a clone, which
+/// reads as a product defect rather than a missing capability.
+fn host_alias_resolves() -> bool {
+    let ok = runtime_command()
+        .args([
+            "run",
+            "--rm",
+            "--add-host=host.docker.internal:host-gateway",
+            "alpine",
+            "getent",
+            "hosts",
+            "host.docker.internal",
+        ])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!(
+            "SKIP: containers cannot resolve host.docker.internal on this engine; \
+             these suites need the gfs container to reach a source DB on the host"
+        );
+    }
+    ok
+}
+
 fn run_clone(url: &str, repo: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_gfs"))
         .args([
@@ -253,10 +283,10 @@ fn setup(cl: &mut Cleanup, remote: &str, repo: &Path) -> String {
 #[test]
 #[serial]
 fn clone_registers_real_tables_and_reads_match_source() {
-    if !gfs_image_present() {
+    if !gfs_image_present() || !host_alias_resolves() {
         return;
     }
-    let repo = TempDir::new().unwrap();
+    let repo = common::shared_tempdir::shared_tempdir().unwrap();
     let repo_path = repo.path().to_path_buf();
     let mut cl = Cleanup::new(repo);
     let remote = "gfs-e2e-rob-reg";
@@ -321,10 +351,10 @@ fn clone_registers_real_tables_and_reads_match_source() {
 #[test]
 #[serial]
 fn clone_range_and_temporal_hydration_elide() {
-    if !gfs_image_present() {
+    if !gfs_image_present() || !host_alias_resolves() {
         return;
     }
-    let repo = TempDir::new().unwrap();
+    let repo = common::shared_tempdir::shared_tempdir().unwrap();
     let repo_path = repo.path().to_path_buf();
     let mut cl = Cleanup::new(repo);
     let remote = "gfs-e2e-rob-range";
@@ -402,10 +432,10 @@ fn clone_range_and_temporal_hydration_elide() {
 #[test]
 #[serial]
 fn clone_federates_join_matching_source() {
-    if !gfs_image_present() {
+    if !gfs_image_present() || !host_alias_resolves() {
         return;
     }
-    let repo = TempDir::new().unwrap();
+    let repo = common::shared_tempdir::shared_tempdir().unwrap();
     let repo_path = repo.path().to_path_buf();
     let mut cl = Cleanup::new(repo);
     let remote = "gfs-e2e-rob-join";
@@ -428,10 +458,10 @@ fn clone_federates_join_matching_source() {
 #[test]
 #[serial]
 fn clone_local_writes_leave_source_untouched() {
-    if !gfs_image_present() {
+    if !gfs_image_present() || !host_alias_resolves() {
         return;
     }
-    let repo = TempDir::new().unwrap();
+    let repo = common::shared_tempdir::shared_tempdir().unwrap();
     let repo_path = repo.path().to_path_buf();
     let mut cl = Cleanup::new(repo);
     let remote = "gfs-e2e-rob-write";
@@ -512,10 +542,10 @@ fn clone_local_writes_leave_source_untouched() {
 #[test]
 #[serial]
 fn clone_local_delete_not_resurrected_by_warm() {
-    if !gfs_image_present() {
+    if !gfs_image_present() || !host_alias_resolves() {
         return;
     }
-    let repo = TempDir::new().unwrap();
+    let repo = common::shared_tempdir::shared_tempdir().unwrap();
     let repo_path = repo.path().to_path_buf();
     let mut cl = Cleanup::new(repo);
     let remote = "gfs-e2e-rob-tomb";

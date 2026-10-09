@@ -49,6 +49,30 @@ pub struct StatusResponse {
     /// omitted from JSON in that case so non-clone output is unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<SourceStatus>,
+
+    /// Whether snapshots on this repository share extents or duplicate bytes.
+    ///
+    /// A property of the storage the repository sits on, not an event, which is
+    /// why it belongs here rather than only in a log line a `--json` consumer
+    /// never sees. Omitted when the capability could not be determined, so
+    /// output is unchanged wherever the answer is unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage: Option<StorageStatus>,
+}
+
+/// Storage section of the status response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageStatus {
+    /// `true` when a snapshot will share extents with its source.
+    pub copy_on_write: bool,
+
+    /// Why copy-on-write is unavailable. `None` when it is available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+
+    /// What to do about it, when there is something to do.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// Compute section of the status response.
@@ -132,6 +156,7 @@ mod tests {
             active_workspace_data_dir: None,
             bind_mismatch_warning: None,
             source: None,
+            storage: None,
         };
         let json = serde_json::to_string(&s).expect("serialize");
         assert!(!json.contains("source"), "unexpected source key in {json}");
@@ -159,6 +184,7 @@ mod tests {
             connection_string: None,
             active_workspace_data_dir: None,
             bind_mismatch_warning: None,
+            storage: None,
             source: Some(SourceStatus {
                 tracked: 3,
                 behind: 2,
@@ -210,5 +236,79 @@ mod tests {
         let back: SourceStatus = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.frozen, Some(true));
         assert_eq!(back.frozen_at.as_deref(), Some("2026-08-31 12:00:00"));
+    }
+
+    /// A repository whose storage capability could not be determined must
+    /// serialize exactly as it did before this field existed: no `storage` key
+    /// at all, not `"storage": null`.
+    #[test]
+    fn storage_omitted_when_unknown() {
+        let s = StatusResponse {
+            current_branch: "main".into(),
+            compute: None,
+            active_workspace_data_dir: None,
+            bind_mismatch_warning: None,
+            source: None,
+            head_commit: None,
+            connection_string: None,
+            storage: None,
+        };
+        let json = serde_json::to_string(&s).expect("serialize");
+        assert!(
+            !json.contains("storage"),
+            "unexpected storage key in {json}"
+        );
+        let back: StatusResponse = serde_json::from_str(&json).expect("deserialize");
+        assert!(back.storage.is_none());
+    }
+
+    /// When copy-on-write is available the entry says so and carries no reason
+    /// or remedy, so a consumer never has to parse prose to learn the answer.
+    #[test]
+    fn storage_reports_capability_without_prose_when_available() {
+        let s = StatusResponse {
+            current_branch: "main".into(),
+            compute: None,
+            active_workspace_data_dir: None,
+            bind_mismatch_warning: None,
+            source: None,
+            head_commit: None,
+            connection_string: None,
+            storage: Some(StorageStatus {
+                copy_on_write: true,
+                reason: None,
+                detail: None,
+            }),
+        };
+        let json = serde_json::to_string(&s).expect("serialize");
+        assert!(json.contains("\"copy_on_write\":true"));
+        assert!(!json.contains("reason"));
+        assert!(!json.contains("detail"));
+    }
+
+    #[test]
+    fn storage_round_trips_with_a_reason() {
+        let s = StatusResponse {
+            current_branch: "main".into(),
+            compute: None,
+            active_workspace_data_dir: None,
+            bind_mismatch_warning: None,
+            source: None,
+            head_commit: None,
+            connection_string: None,
+            storage: Some(StorageStatus {
+                copy_on_write: false,
+                reason: Some("filesystem cannot clone extents".into()),
+                detail: Some("needs btrfs, XFS reflink=1, or ZFS block cloning".into()),
+            }),
+        };
+        let json = serde_json::to_string(&s).expect("serialize");
+        let back: StatusResponse = serde_json::from_str(&json).expect("deserialize");
+        let st = back.storage.expect("storage present");
+        assert!(!st.copy_on_write);
+        assert_eq!(
+            st.reason.as_deref(),
+            Some("filesystem cannot clone extents")
+        );
     }
 }

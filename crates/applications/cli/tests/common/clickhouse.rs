@@ -10,7 +10,6 @@ use std::time::Duration;
 use super::cli_runner;
 use super::container_runtime;
 use gfs_domain::repo_utils::repo_layout;
-use tempfile::TempDir;
 
 const TEST_VERSION: &str = "24.8.14.39";
 const TEST_USER: &str = "default";
@@ -52,7 +51,7 @@ pub fn with_fresh_repo<F>(f: F)
 where
     F: FnOnce(&Path),
 {
-    let temp = TempDir::new().expect("create temp dir for repo");
+    let temp = crate::common::shared_tempdir::shared_tempdir().expect("create temp dir for repo");
     let repo_path = temp.path();
 
     assert!(

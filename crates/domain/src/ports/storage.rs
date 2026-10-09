@@ -160,6 +160,29 @@ pub trait StoragePort: Send + Sync {
     /// apply the platform-appropriate mechanism (e.g. `chmod -R a-w` on Unix,
     /// `attrib +R /S /D` on Windows).
     async fn finalize_snapshot(&self, dest: &Path) -> Result<()>;
+
+    /// Whether a finished snapshot destination captured any data at all, or
+    /// `None` when this adapter cannot say.
+    ///
+    /// Deliberately a yes/no and not a byte total. The only question asked of it
+    /// is "did this capture nothing?", and answering that needs one regular file,
+    /// not a sum over the tree — a total would stat every file in the data
+    /// directory on the hot path of every commit, which for a real database is
+    /// tens of thousands of `stat` calls to learn something the first file
+    /// settles.
+    ///
+    /// `Snapshot::size_bytes` cannot answer it either: `storage-apfs`,
+    /// `storage-file` and `storage-kubernetes` all hardcode it to `0` on the
+    /// snapshot path, so a caller treating it as a byte count would read every
+    /// snapshot as empty and refuse every commit.
+    ///
+    /// `None` means *cannot tell* and callers must stay silent on it, the same
+    /// discipline the reflink probe uses: a measurement that failed says nothing
+    /// about the thing being measured, and guessing from it is how a guard starts
+    /// firing on healthy repositories.
+    async fn captured_any_data(&self, _dest: &Path) -> Result<Option<bool>> {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
