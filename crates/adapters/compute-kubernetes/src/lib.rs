@@ -1535,6 +1535,26 @@ impl KubernetesCompute {
         Ok(InstanceId(instance))
     }
 
+    /// Whether the instance's StatefulSet exists, whatever its replica count.
+    ///
+    /// [`Compute::status`] reads the instance's pod, so a database scaled to zero
+    /// (StatefulSet kept, no pod: what a pause leaves) and one whose StatefulSet is
+    /// gone (a checkout that tore it down and never rebuilt it) both read
+    /// [`InstanceState::Unknown`]. Only the first can be started again with
+    /// [`Compute::start`], which patches the StatefulSet's replicas; the second
+    /// answers `statefulsets.apps ... not found`. This tells them apart.
+    ///
+    /// # Errors
+    /// [`ComputeError::Internal`] when the StatefulSet cannot be read. That is not
+    /// an answer either way, and callers must not read it as "absent".
+    pub async fn runtime_exists(&self, id: &InstanceId) -> Result<bool> {
+        self.api_statefulsets()
+            .get_opt(&id.0)
+            .await
+            .map(|statefulset| statefulset.is_some())
+            .map_err(|e| ComputeError::Internal(format!("k8s statefulset get failed: {e}")))
+    }
+
     /// PVC names for an instance: the stable `{id}-data` plus any de-duplicated
     /// non-empty extras.
     fn pvc_names(id: &InstanceId, extra_pvcs: &[String]) -> Vec<String> {
