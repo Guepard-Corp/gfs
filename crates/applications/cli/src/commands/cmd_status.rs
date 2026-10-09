@@ -341,6 +341,29 @@ fn print_table(s: &StatusResponse, repo_path: &Path, moments: Option<&cmd_source
         print_source(src, moments);
     }
 
+    // Only surfaced when it is actionable. A filesystem that clones is the
+    // expected case and saying so on every status would be noise; a filesystem
+    // that does not is a standing cost the user has no other way to discover.
+    // `--json` carries the capability either way, for consumers that want it.
+    if let Some(ref storage) = s.storage
+        && !storage.copy_on_write
+    {
+        println!();
+        if let Some(ref detail) = storage.detail {
+            println!(
+                "  {} snapshots are full copies: {}",
+                yellow("!"),
+                dimmed(detail)
+            );
+        } else if let Some(ref reason) = storage.reason {
+            println!(
+                "  {} snapshots are full copies: {}",
+                yellow("!"),
+                dimmed(reason)
+            );
+        }
+    }
+
     if let Some(ref warning) = s.bind_mismatch_warning {
         println!();
         println!("  {}  {}", yellow("⚠"), yellow(warning));

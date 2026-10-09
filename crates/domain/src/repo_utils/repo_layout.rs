@@ -1639,6 +1639,24 @@ fn is_ignorable_sidecar(path: &str, size: u64) -> bool {
     path.ends_with("-shm") || (path.ends_with("-wal") && size == 0)
 }
 
+/// Whether `path` is one the engine maintains for itself.
+///
+/// A pattern matches as an exact relative path, as a directory when it ends in
+/// `/`, or as a bare file name when it contains no `/` -- the last because a
+/// name like `pg_internal.init` appears once per database under a directory
+/// named after an id that is not known in advance.
+fn is_engine_owned(path: &str, patterns: &[&str]) -> bool {
+    patterns.iter().any(|pattern| {
+        if let Some(dir) = pattern.strip_suffix('/') {
+            path == dir || path.starts_with(&format!("{dir}/"))
+        } else if pattern.contains('/') {
+            path == *pattern
+        } else {
+            path.rsplit('/').next() == Some(*pattern)
+        }
+    })
+}
+
 /// Whether a `workspace_changes` comparison could consult mtime for every file
 /// it found in both places.
 ///
@@ -1680,6 +1698,7 @@ pub fn workspace_changes_are_conclusive(
 pub fn workspace_changes(
     workspace: &Path,
     baseline: &[FileEntry],
+    engine_owned: &[&str],
 ) -> Result<Vec<String>, RepoError> {
     if !workspace.exists() {
         return Ok(Vec::new());
@@ -1693,7 +1712,9 @@ pub fn workspace_changes(
     let mut changed: Vec<String> = current
         .iter()
         .filter(|entry| {
-            if is_ignorable_sidecar(&entry.relative_path, entry.file_size) {
+            if is_ignorable_sidecar(&entry.relative_path, entry.file_size)
+                || is_engine_owned(&entry.relative_path, engine_owned)
+            {
                 return false;
             }
             match by_path.get(entry.relative_path.as_str()) {
@@ -1804,11 +1825,11 @@ mod tests {
         let baseline = collect_file_entries(ws, "").unwrap();
 
         // Untouched.
-        assert!(workspace_changes(ws, &baseline).unwrap().is_empty());
+        assert!(workspace_changes(ws, &baseline, &[]).unwrap().is_empty());
 
         // A write that changes the size.
         fs::write(ws.join("db"), "aaaaaaaa").unwrap();
-        assert_eq!(workspace_changes(ws, &baseline).unwrap(), vec!["db"]);
+        assert_eq!(workspace_changes(ws, &baseline, &[]).unwrap(), vec!["db"]);
 
         // A new file, and `db` rewritten back to its original SIZE.
         //
@@ -1822,7 +1843,10 @@ mod tests {
         // so a one-row INSERT is a size-identical write.
         fs::write(ws.join("db"), "aaaa").unwrap();
         fs::write(ws.join("new"), "x").unwrap();
-        assert_eq!(workspace_changes(ws, &baseline).unwrap(), vec!["db", "new"]);
+        assert_eq!(
+            workspace_changes(ws, &baseline, &[]).unwrap(),
+            vec!["db", "new"]
+        );
     }
 
     /// A commit written before `mtime_ns` existed must still give a usable
@@ -1849,13 +1873,13 @@ mod tests {
         // documented limit of an old baseline -- not an error, not everything.
         fs::write(ws.join("db"), "bbbb").unwrap();
         assert!(
-            workspace_changes(ws, &baseline).unwrap().is_empty(),
+            workspace_changes(ws, &baseline, &[]).unwrap().is_empty(),
             "an old baseline degrades to the size comparison, it does not fail"
         );
 
         // A size change is still caught, so the old guarantee is intact.
         fs::write(ws.join("db"), "bbbbbbbb").unwrap();
-        assert_eq!(workspace_changes(ws, &baseline).unwrap(), vec!["db"]);
+        assert_eq!(workspace_changes(ws, &baseline, &[]).unwrap(), vec!["db"]);
     }
 
     /// Sidecars APPEARING must not read as uncommitted work.
@@ -1879,14 +1903,14 @@ mod tests {
         fs::write(ws.join("app.db-shm"), "").unwrap();
         fs::write(ws.join("app.db-wal"), "").unwrap();
         assert!(
-            workspace_changes(ws, &baseline).unwrap().is_empty(),
+            workspace_changes(ws, &baseline, &[]).unwrap().is_empty(),
             "a plain read must not report uncommitted work"
         );
 
         // A -wal with frames in it is real work and must be reported.
         fs::write(ws.join("app.db-wal"), "committed frames").unwrap();
         assert_eq!(
-            workspace_changes(ws, &baseline).unwrap(),
+            workspace_changes(ws, &baseline, &[]).unwrap(),
             vec!["app.db-wal"],
             "a populated -wal holds data a restore would destroy"
         );
@@ -1909,7 +1933,7 @@ mod tests {
         fs::remove_file(ws.join("db-wal")).unwrap();
         fs::remove_file(ws.join("db-shm")).unwrap();
         assert!(
-            workspace_changes(ws, &baseline).unwrap().is_empty(),
+            workspace_changes(ws, &baseline, &[]).unwrap().is_empty(),
             "closing the database is not uncommitted work"
         );
     }
@@ -1926,7 +1950,7 @@ mod tests {
         fs::write(&file, "aaaa").unwrap();
         let mut baseline = collect_file_entries(ws, "").unwrap();
         baseline[0].permissions = Some("0400".to_string());
-        assert!(workspace_changes(ws, &baseline).unwrap().is_empty());
+        assert!(workspace_changes(ws, &baseline, &[]).unwrap().is_empty());
     }
 
     /// A workspace that is not there yet has nothing to lose.
@@ -1934,7 +1958,7 @@ mod tests {
     fn workspace_changes_on_a_missing_workspace_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         assert!(
-            workspace_changes(&dir.path().join("gone"), &[])
+            workspace_changes(&dir.path().join("gone"), &[], &[])
                 .unwrap()
                 .is_empty()
         );
@@ -3425,5 +3449,59 @@ name = "test-repo"
     fn repair_marker_path_bare_component_returns_none() {
         let marker = repair_marker_path(std::path::Path::new("data"));
         assert_eq!(marker, None);
+    }
+}
+
+#[cfg(test)]
+mod engine_owned_tests {
+    use super::is_engine_owned;
+
+    const POSTGRES: &[&str] = &[
+        "pg_stat/",
+        "global/pg_control",
+        "pg_logical/replorigin_checkpoint",
+        "pg_internal.init",
+    ];
+
+    #[test]
+    fn a_directory_pattern_covers_the_directory_and_its_contents() {
+        assert!(is_engine_owned("pg_stat", POSTGRES));
+        assert!(is_engine_owned("pg_stat/pgstat.stat", POSTGRES));
+        assert!(is_engine_owned("pg_stat/nested/other.stat", POSTGRES));
+    }
+
+    #[test]
+    fn an_exact_pattern_matches_only_that_path() {
+        assert!(is_engine_owned("global/pg_control", POSTGRES));
+        assert!(!is_engine_owned("pg_control", POSTGRES));
+        assert!(!is_engine_owned("base/1/global/pg_control", POSTGRES));
+    }
+
+    #[test]
+    fn a_bare_name_matches_the_file_in_any_directory() {
+        // Each database has its own, under a directory named after an id that is
+        // not known in advance.
+        assert!(is_engine_owned("base/5/pg_internal.init", POSTGRES));
+        assert!(is_engine_owned("base/16384/pg_internal.init", POSTGRES));
+        assert!(is_engine_owned("pg_internal.init", POSTGRES));
+    }
+
+    #[test]
+    fn user_data_is_never_matched() {
+        assert!(!is_engine_owned("base/5/16401", POSTGRES));
+        assert!(!is_engine_owned("postgresql.conf", POSTGRES));
+        assert!(!is_engine_owned(
+            "pg_wal/000000010000000000000001",
+            POSTGRES
+        ));
+        // A name that merely contains a pattern is not that pattern.
+        assert!(!is_engine_owned("base/5/pg_internal.init.bak", POSTGRES));
+        assert!(!is_engine_owned("pg_statistic", POSTGRES));
+    }
+
+    #[test]
+    fn a_provider_declaring_nothing_keeps_every_path() {
+        assert!(!is_engine_owned("pg_stat/pgstat.stat", &[]));
+        assert!(!is_engine_owned("global/pg_control", &[]));
     }
 }

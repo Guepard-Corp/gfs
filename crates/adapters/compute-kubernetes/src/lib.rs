@@ -89,6 +89,74 @@ fn instance_expose_port() -> Option<i32> {
 }
 
 /// Kubernetes NodePort must be in 30000–32767; hostPort on the pod may use any assigned port.
+/// Pin a recorded NodePort onto the published mapping, and only that one.
+///
+/// A repository records ONE `database_port` — the endpoint its connection
+/// string advertises — so it can only pin one mapping. Writing it onto every
+/// mapping gave a multi-port provider the same NodePort twice, and the API
+/// server rejects the whole Service: `spec.ports[1].nodePort: Invalid value:
+/// 32306: provided port is already allocated`. Only clickhouse has two ports
+/// (9000 native, 8123 HTTP), and only a repository that has a recorded port
+/// reaches this, which is why a first deploy succeeded and a later branch
+/// switch did not.
+///
+/// The published mapping is the first by convention: a provider lists its
+/// `default_port()` first. Later mappings keep whatever they already carry.
+fn pin_published_node_port(ports: &mut [PortMapping], node_port: Option<u16>) {
+    let Some(port) = node_port.filter(|p| is_valid_k8s_node_port(i32::from(*p))) else {
+        return;
+    };
+    if let Some(published) = ports.first_mut() {
+        published.host_port = Some(port);
+    }
+}
+
+/// The Service's published ports for a definition's port mappings.
+///
+/// `GFS_INSTANCE_NODE_PORT` names ONE port — the instance's published endpoint —
+/// so it may pin at most one entry. Applying it to every mapping gave a
+/// multi-port provider the same NodePort twice in one Service, and the API
+/// server rejects the whole object: `spec.ports[1].nodePort: Invalid value:
+/// 31151: provided port is already allocated`. Only clickhouse has two ports
+/// (9000 native, 8123 HTTP), so only clickhouse could hit it, and only on a path
+/// that sets the env var — which is why a deploy succeeded and a checkout did
+/// not.
+///
+/// The first mapping is the published one by convention: a provider lists its
+/// `default_port()` first. Later mappings keep an explicit `host_port` when they
+/// carry one, and otherwise let Kubernetes allocate, which is what the deploy
+/// path already did.
+///
+/// A free function so it is testable without a live `Client`.
+fn service_ports_for(ports: &[PortMapping]) -> Vec<ServicePort> {
+    ports
+        .iter()
+        .enumerate()
+        .map(|(idx, p)| {
+            let mut sp = ServicePort {
+                port: i32::from(p.compute_port),
+                target_port: Some(
+                    k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(i32::from(
+                        p.compute_port,
+                    )),
+                ),
+                name: Some(format!("p{}", p.compute_port)),
+                ..Default::default()
+            };
+            if k8s_expose_nodeport() {
+                sp.node_port = if idx == 0 {
+                    service_node_port_from_mapping(p)
+                } else {
+                    p.host_port
+                        .map(i32::from)
+                        .filter(|n| is_valid_k8s_node_port(*n))
+                };
+            }
+            sp
+        })
+        .collect()
+}
+
 fn is_valid_k8s_node_port(port: i32) -> bool {
     (30000..=32767).contains(&port)
 }
@@ -1011,25 +1079,7 @@ impl KubernetesCompute {
     fn service_manifest(&self, instance: &str, ports: &[PortMapping]) -> Service {
         let labels = labels_for(instance);
         let svc_name = Self::svc_name(instance);
-        let service_ports: Vec<ServicePort> = ports
-            .iter()
-            .map(|p| {
-                let mut sp = ServicePort {
-                    port: i32::from(p.compute_port),
-                    target_port: Some(
-                        k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(i32::from(
-                            p.compute_port,
-                        )),
-                    ),
-                    name: Some(format!("p{}", p.compute_port)),
-                    ..Default::default()
-                };
-                if k8s_expose_nodeport() {
-                    sp.node_port = service_node_port_from_mapping(p);
-                }
-                sp
-            })
-            .collect();
+        let service_ports = service_ports_for(ports);
 
         Service {
             metadata: ObjectMeta {
@@ -1460,11 +1510,7 @@ impl KubernetesCompute {
         node_port: Option<u16>,
     ) -> Result<InstanceId> {
         let mut ports = definition.ports.clone();
-        if let Some(port) = node_port.filter(|p| is_valid_k8s_node_port(i32::from(*p))) {
-            for mapping in &mut ports {
-                mapping.host_port = Some(port);
-            }
-        }
+        pin_published_node_port(&mut ports, node_port);
         let mut def = definition.clone();
         def.ports = ports;
         self.provision_with_instance(&def, instance_name).await
@@ -2472,6 +2518,78 @@ mod tests {
             host_port: Some(31000),
         };
         assert_eq!(host_port_from_mapping(&m), Some(31000));
+    }
+
+    /// A repository records one `database_port`, so it may pin one mapping.
+    /// Writing it onto every mapping gave clickhouse (9000 native, 8123 HTTP)
+    /// the same NodePort twice and the API server rejected the Service, which
+    /// took a database offline on every branch switch.
+    #[test]
+    fn a_recorded_port_pins_the_published_mapping_only() {
+        let mut ports = vec![
+            PortMapping {
+                compute_port: 9000,
+                host_port: None,
+            },
+            PortMapping {
+                compute_port: 8123,
+                host_port: None,
+            },
+        ];
+
+        pin_published_node_port(&mut ports, Some(32306));
+
+        assert_eq!(ports[0].host_port, Some(32306), "the published port pins");
+        assert_eq!(
+            ports[1].host_port, None,
+            "the second port must not inherit the published NodePort"
+        );
+    }
+
+    /// `GFS_INSTANCE_NODE_PORT` names one published endpoint, so it must pin at
+    /// most one Service port. Applying it to every mapping gave clickhouse — the
+    /// only provider with two (9000 native, 8123 HTTP) — the same NodePort twice,
+    /// and the API server rejects the object entirely:
+    /// `spec.ports[1].nodePort: Invalid value: 31151: provided port is already
+    /// allocated`. A single-port provider cannot reproduce it, so this case is
+    /// written with two.
+    #[test]
+    fn a_two_port_service_never_pins_the_same_nodeport_twice() {
+        // SAFETY: read synchronously below, in a single-threaded test.
+        unsafe {
+            std::env::set_var("GFS_INSTANCE_NODE_PORT", "31151");
+            std::env::set_var("GFS_K8S_EXPOSE_NODEPORT", "1");
+        }
+        let ports = service_ports_for(&[
+            PortMapping {
+                compute_port: 9000,
+                host_port: None,
+            },
+            PortMapping {
+                compute_port: 8123,
+                host_port: None,
+            },
+        ]);
+        unsafe {
+            std::env::remove_var("GFS_INSTANCE_NODE_PORT");
+            std::env::remove_var("GFS_K8S_EXPOSE_NODEPORT");
+        }
+
+        assert_eq!(ports.len(), 2, "both container ports are published");
+        assert_eq!(
+            ports[0].node_port,
+            Some(31151),
+            "the first mapping takes the instance's published NodePort"
+        );
+        assert_eq!(
+            ports[1].node_port, None,
+            "the second must be left for Kubernetes to allocate, not pinned to the same value"
+        );
+        let pinned: Vec<i32> = ports.iter().filter_map(|p| p.node_port).collect();
+        let mut uniq = pinned.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(pinned.len(), uniq.len(), "no NodePort appears twice");
     }
 
     #[test]
