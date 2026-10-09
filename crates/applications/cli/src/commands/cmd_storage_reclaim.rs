@@ -3,6 +3,7 @@
 //! the node. A destroy finishes this for its own volumes; this command covers
 //! volumes stranded by a destroy that ran before it could.
 
+use std::io::{IsTerminal, Write};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -25,6 +26,15 @@ fn mib(bytes: Option<u64>) -> String {
     )
 }
 
+/// Ask on the terminal whether to delete; anything but y/yes is a no.
+fn confirm(question: &str) -> bool {
+    eprint!("{question} [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    let _ = std::io::stdin().read_line(&mut answer);
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
 pub async fn run(yes: bool, wait_secs: u64, only: Vec<String>, json_output: bool) -> Result<()> {
     let storage = KubernetesStorage::new(None).await?;
     let mut marked = storage.marked_openebs_volumes().await?;
@@ -34,6 +44,11 @@ pub async fn run(yes: bool, wait_secs: u64, only: Vec<String>, json_output: bool
         marked.retain(|v| only.contains(v));
     }
     let before = storage.assess_openebs_volumes(&marked).await?;
+
+    // At a terminal the listing ends in a question; in a script or a pipe,
+    // or with --json, it stays a listing and only --yes deletes.
+    let interactive =
+        !json_output && std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
 
     if !yes {
         if json_output {
@@ -66,10 +81,22 @@ pub async fn run(yes: bool, wait_secs: u64, only: Vec<String>, json_output: bool
             .iter()
             .filter(|a| a.verdict == Verdict::Reclaim)
             .count();
-        println!(
-            "\n{n} volume(s) can be reclaimed now. Nothing was changed; pass --yes to delete them."
-        );
-        return Ok(());
+        let held = before
+            .iter()
+            .filter(|a| matches!(a.verdict, Verdict::Wait(_)))
+            .count();
+        println!("\n{n} volume(s) can be reclaimed now.");
+        let question = if held == 0 {
+            format!("Delete these {n} volume(s) and their data?")
+        } else {
+            format!(
+                "Delete these {n} volume(s) and their data, and wait up to {wait_secs} s for the {held} blocked one(s)?"
+            )
+        };
+        if !interactive || n + held == 0 || !confirm(&question) {
+            println!("Nothing was changed; pass --yes to delete them.");
+            return Ok(());
+        }
     }
 
     let report = storage

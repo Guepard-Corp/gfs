@@ -4,7 +4,7 @@
 deletes the StatefulSet, the data PVC and every VolumeSnapshot of that PVC. Is
 the ZFS dataset holding the data gone afterwards?
 
-**Answer: not reliably, before this fix.** In 4 of 6 runs of the unfixed
+**Answer: not reliably, before this fix.** In 5 of 7 runs of the unfixed
 binary, one of the repository's volumes stayed on the node after destroy: no
 PVC, no PV, no snapshots, but the `ZFSVolume` record was `Ready`, annotated
 `openebs.io/marked-for-deletion: "true"`, and its dataset still held the
@@ -100,10 +100,11 @@ lookup goes through the run's own instance id, PVC and snapshots.
 | orphan-b | unfixed | 3 | ok | 1 s | **1 `ZFSVolume`, dataset 89.8 MB, 0 snapshots, marked** | — |
 | orphan-c | unfixed | 3 | ok | 0 s | 0 | — |
 | orphan-d | unfixed | 3 | ok | 0 s | **1 `ZFSVolume`, dataset 89.8 MB, 0 snapshots, marked** | — |
+| prompt-a | unfixed | 3 | ok | — | **1 `ZFSVolume`, dataset 89.8 MB, 0 snapshots, marked** | — |
 
-The `orphan` runs stranded volumes on purpose, to reclaim them (below). If
-the fix did nothing, five clean runs in a row at the unfixed leak rate (4 of 6)
-would happen about 0.4% of the time; the two runs where the fix acted are the
+The `orphan` and `prompt` runs stranded volumes on purpose, to reclaim them
+(below). If the fix did nothing, five clean runs in a row at the unfixed leak
+rate (5 of 7) would happen about 0.2% of the time; the two runs where the fix acted are the
 direct evidence.
 
 Two further unfixed runs: one with the same sequence but no data files left
@@ -158,15 +159,18 @@ destroy that ran before the fix — or by anything else that deletes several
 snapshots of one volume at once — is reclaimed with:
 
 ```sh
-gfs storage reclaim                    # lists them; changes nothing
-gfs storage reclaim --yes              # reclaims them
+gfs storage reclaim                    # lists them; at a terminal, asks before deleting
+gfs storage reclaim --yes              # reclaims them without asking
 gfs storage reclaim --yes --volume <pv-name> [--volume ...]   # only these
 ```
 
 It runs where the Kubernetes runtime runs (`KUBECONFIG`), considers only
 `ZFSVolume`s the driver marked for deletion, and applies the same rule as
 destroy: reclaim when there is no PV and no `ZFSSnapshot` left; report the rest
-as `blocked` or `keep` with the reason. With `--yes` it keeps passing over the
+as `blocked` or `keep` with the reason. Without `--yes`, at a terminal it ends
+the list with a y/N question and deletes only on `y`; with `--json`, or when
+stdin or stderr is not a terminal (a script, a pipe), it only lists. Once
+deleting, it keeps passing over the
 set for up to `--wait-secs` (default 120), so a parent whose snapshot a
 stranded clone keeps alive goes in the same run, once the clone is gone. The
 `used` column comes from `zfs list` and is only filled in on the node that
@@ -193,6 +197,11 @@ Run on this stack:
   after); `--yes` reclaimed it in 1 s, exit 0. It was the only `ZFSVolume`
   that disappeared, none appeared, and its dataset was gone. The second run
   used the final binary.
+- The question, on a third volume the unfixed destroy stranded (89.8 MB), all
+  with `--volume <it>`: `y` piped in without `--yes` (not a terminal), only the
+  list; at a terminal (`script`), `n` and an empty answer changed nothing, and
+  `--json` printed the list without asking; `y` reclaimed it, record and
+  dataset gone.
 - Before the command existed, deleting the records of the three volumes these
   runs had stranded by hand (`kubectl -n <ns> delete zfsvolume <name>`)
   removed their datasets (240 MB, 89.8 MB, 89.8 MB).
