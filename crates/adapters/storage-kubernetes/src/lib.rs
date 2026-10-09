@@ -22,6 +22,9 @@ use kube::api::{Api, DeleteParams, DynamicObject, ListParams, Patch, PatchParams
 use kube::core::{ApiResource, GroupVersionKind};
 use serde_json::json;
 
+mod openebs_zfs;
+pub use openebs_zfs::{ReclaimReport, Verdict, VolumeAssessment};
+
 const DEFAULT_NAMESPACE: &str = "gfs";
 const DEFAULT_PVC_SIZE_GI: &str = "1";
 
@@ -113,7 +116,13 @@ fn snapshot_hash_from_label(label: Option<&str>) -> Option<String> {
     }
 }
 
-fn volumesnapshot_name_for_hash(hash: &str) -> String {
+/// The VolumeSnapshot a commit's snapshot hash is stored under.
+///
+/// Public so the restore side — `gfs-compute-kubernetes`'s checkout and the
+/// CLI's pre-flight check — names the snapshot with the function that created
+/// it. A checkout that confirmed one spelling and restored from another would
+/// pass its own check and then destroy the live volume.
+pub fn volumesnapshot_name_for_hash(hash: &str) -> String {
     // DNS label <= 63. Keep stable + deterministic.
     // Use first 32 chars to keep name short but collision-resistant.
     format!("gfs-snap-{}", &hash[..32.min(hash.len())])
@@ -291,6 +300,24 @@ impl KubernetesStorage {
                 .get(name)
                 .await
                 .map_err(|e| StorageError::Internal(format!("get volumesnapshot failed: {e}")))?;
+            // A snapshot being DELETED is not usable, however ready it looks.
+            //
+            // A VolumeSnapshot whose content is bound carries
+            // `volumesnapshot-bound-protection`, so deleting it does not remove
+            // it: it sits Terminating, still answering `get`, still reporting
+            // readyToUse: true. Cloning from one produces a PVC whose dataSource
+            // can never resolve — it stays Pending, the pod never schedules, and
+            // the only thing that eventually complains is a compute readiness
+            // timeout blaming the INSTANCE. Nothing in that path mentions the
+            // snapshot. Reproduced exactly that way on the k3s stack, which is
+            // why "does it exist" was never the right question.
+            if vs.metadata.deletion_timestamp.is_some() {
+                return Err(StorageError::Internal(format!(
+                    "volumesnapshot '{name}' is being deleted, so it cannot be restored from; \
+                     a snapshot whose content is bound stays visible while it terminates, and \
+                     cloning from it would create a volume that never binds"
+                )));
+            }
             let status = vs.data.get("status");
             let ready = status
                 .and_then(|s| s.get("readyToUse"))
@@ -518,5 +545,24 @@ impl StoragePort for KubernetesStorage {
     async fn finalize_snapshot(&self, _dest: &Path) -> Result<()> {
         // Not applicable to CSI snapshots.
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::volumesnapshot_name_for_hash;
+
+    #[test]
+    fn volumesnapshot_name_is_the_first_32_hex_of_the_hash() {
+        // Both the commit path (which creates the snapshot) and the checkout
+        // path (which restores from it) now call this one function; this pins
+        // the spelling they share.
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            volumesnapshot_name_for_hash(hash),
+            "gfs-snap-0123456789abcdef0123456789abcdef"
+        );
+        // Shorter than 32 characters takes everything rather than panicking.
+        assert_eq!(volumesnapshot_name_for_hash("abc"), "gfs-snap-abc");
     }
 }

@@ -75,7 +75,7 @@ pub async fn checkout(
         })?;
 
         // Validate refs before stopping compute — bad input must not leave the DB offline.
-        let checkout_rev = if let Some(ref branch_name) = create_branch {
+        let (checkout_rev, target_commit) = if let Some(ref branch_name) = create_branch {
             let branch_name = branch_name.trim();
             // Same rule as `gfs branch`: this path creates the ref too, and an
             // unchecked name here would escape just as readily.
@@ -93,22 +93,60 @@ pub async fn checkout(
             if tip == "0" {
                 anyhow::bail!("cannot create branch: start revision has no commits");
             }
-            repository
-                .create_branch(&repo_path, branch_name, &tip)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            branch_name.to_string()
+            (branch_name.to_string(), tip)
         } else {
             if revision.trim().is_empty() {
                 anyhow::bail!("revision required or use -b <branch_name>");
             }
             let target = revision.trim();
-            repository
+            let target_commit = repository
                 .rev_parse(&repo_path, target)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            target.to_string()
+            (target.to_string(), target_commit)
         };
+
+        let storage = gfs_storage_kubernetes::KubernetesStorage::new(None).await?;
+
+        // The restore below clones the data volume from the VolumeSnapshot the
+        // target commit recorded. Confirm that snapshot is usable BEFORE anything
+        // changes — before a `-b` ref is created, before the database is stopped,
+        // and before `repository.checkout` rewrites HEAD and WORKSPACE — so a
+        // commit the cluster cannot restore is refused with the repository exactly
+        // as it was. The restore repeats the check before its own teardown, which
+        // is what keeps the volume safe; this earlier one keeps HEAD off an
+        // unrestorable commit, which that one cannot do because HEAD has already
+        // moved by the time it runs.
+        //
+        // "0" is a branch with no commits: there is no snapshot to confirm, and
+        // `repository.checkout` refuses it below, as it always has.
+        if target_commit != "0" {
+            let commit = gfs_domain::repo_utils::repo_layout::get_commit_from_hash(
+                &repo_path,
+                &target_commit,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            // Named by the function that created the snapshot at commit time.
+            let vs_name =
+                gfs_storage_kubernetes::volumesnapshot_name_for_hash(&commit.snapshot_hash);
+            storage.wait_snapshot_ready(&vs_name).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "cannot checkout '{checkout_rev}': the VolumeSnapshot '{vs_name}' recorded \
+                     by commit {} is not restorable ({e}). Nothing was changed: HEAD was not \
+                     moved and the database is still running on its current volume",
+                    &target_commit[..7.min(target_commit.len())]
+                )
+            })?;
+        }
+
+        // Only now create the ref: a refused checkout leaves nothing behind, not
+        // even a branch pointing at the commit it refused.
+        if create_branch.is_some() {
+            repository
+                .create_branch(&repo_path, &checkout_rev, &target_commit)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
 
         if let Ok(cfg) = GfsConfig::load(&repo_path)
             && let Some(rt) = cfg.runtime
@@ -130,7 +168,6 @@ pub async fn checkout(
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
         let snapshot_hash = commit.snapshot_hash;
 
-        let storage = gfs_storage_kubernetes::KubernetesStorage::new(None).await?;
         let k8s_compute = KubernetesCompute::new(None)
             .await
             .map_err(|e| anyhow::anyhow!("kubernetes compute: {e}"))?;
