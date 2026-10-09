@@ -179,11 +179,21 @@ impl KubernetesStorage {
             }
         }
 
-        let snapshots = self
+        // A cluster without the VolumeSnapshot CRD has no snapshots, so the
+        // bound volume is the only one.
+        let snapshots = match self
             .api_volume_snapshots()
             .list(&ListParams::default())
             .await
-            .map_err(|e| StorageError::Internal(format!("list volumesnapshots failed: {e}")))?;
+        {
+            Ok(list) => list,
+            Err(e) if not_found(&e) => return Ok(volumes),
+            Err(e) => {
+                return Err(StorageError::Internal(format!(
+                    "list volumesnapshots failed: {e}"
+                )));
+            }
+        };
         let contents = self.api_volume_snapshot_contents();
         for vs in snapshots {
             let src = vs
