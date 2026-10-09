@@ -23,7 +23,7 @@ use kube::core::{ApiResource, GroupVersionKind};
 use serde_json::json;
 
 mod openebs_zfs;
-pub use openebs_zfs::ReclaimReport;
+pub use openebs_zfs::{ReclaimReport, Verdict, VolumeAssessment};
 
 const DEFAULT_NAMESPACE: &str = "gfs";
 const DEFAULT_PVC_SIZE_GI: &str = "1";

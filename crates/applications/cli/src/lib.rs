@@ -651,7 +651,7 @@ enum TopLevel {
         output: Option<String>,
     },
 
-    /// Storage operations (mount, unmount, snapshot, clone, status, quota)
+    /// Storage operations (mount, unmount, snapshot, clone, status, quota, reclaim)
     Storage {
         #[command(subcommand)]
         action: StorageAction,
@@ -751,6 +751,22 @@ enum StorageAction {
     Quota {
         #[arg(long)]
         id: String,
+    },
+    /// Delete the OpenEBS ZFS volumes the driver was asked to delete and never
+    /// did (marked for deletion, no PV, no snapshot left), so the data of
+    /// databases destroyed earlier leaves the node. Lists them unless --yes.
+    Reclaim {
+        /// Delete them; without this flag nothing is changed
+        #[arg(long)]
+        yes: bool,
+        /// Seconds to keep waiting for volumes that are still held, e.g. a
+        /// parent whose snapshot a stranded clone keeps alive
+        #[arg(long, default_value_t = 120)]
+        wait_secs: u64,
+        /// Only consider these volumes (repeatable); default: every volume
+        /// the driver was asked to delete
+        #[arg(long = "volume")]
+        volumes: Vec<String>,
     },
 }
 
@@ -1227,6 +1243,17 @@ where
 // ---------------------------------------------------------------------------
 
 async fn run_storage(action: StorageAction, json_output: bool) -> Result<()> {
+    // Reclaim works on the cluster's OpenEBS ZFS volumes, not on a local path,
+    // so it does not go through the host's storage adapter.
+    if let StorageAction::Reclaim {
+        yes,
+        wait_secs,
+        volumes,
+    } = action
+    {
+        return commands::cmd_storage_reclaim::run(yes, wait_secs, volumes, json_output).await;
+    }
+
     #[cfg(target_os = "macos")]
     {
         use gfs_storage_apfs::ApfsStorage;
@@ -1263,6 +1290,7 @@ fn storage_action_path(action: &StorageAction) -> &std::path::Path {
         | StorageAction::Status { id }
         | StorageAction::Quota { id } => std::path::Path::new(id),
         StorageAction::Clone { source, .. } => std::path::Path::new(source),
+        StorageAction::Reclaim { .. } => std::path::Path::new("."),
     }
 }
 
@@ -1370,6 +1398,9 @@ async fn dispatch_storage(
                 println!("used_bytes  : {}", quota.used_bytes);
                 println!("free_bytes  : {}", quota.free_bytes);
             }
+        }
+        StorageAction::Reclaim { .. } => {
+            anyhow::bail!("`storage reclaim` is handled before the storage adapter is chosen")
         }
     }
     Ok(())
