@@ -115,34 +115,45 @@ binary: `init`, `destroy -y` exit 0 in 1 s, no ZFS log lines, nothing left.
 
 ## Volumes orphaned before the fix
 
-The fix only covers databases destroyed by a fixed binary. A volume stranded
-earlier is a `ZFSVolume` that is marked for deletion, has no PV and has no
-`ZFSSnapshot`. Listing them:
+A destroy finishes the deletes for its own volumes. A volume stranded by a
+destroy that ran before the fix — or by anything else that deletes several
+snapshots of one volume at once — is reclaimed with:
 
 ```sh
-for zv in $(kubectl get zfsvolumes -A \
-    -o jsonpath='{range .items[?(@.metadata.annotations.openebs\.io/marked-for-deletion=="true")]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}'); do
-  ns=${zv%/*}; v=${zv#*/}
-  kubectl get pv "$v" >/dev/null 2>&1 && continue
-  [ "$(kubectl get zfssnapshots -A -l openebs.io/persistent-volume="$v" -o name | wc -l)" -eq 0 ] || continue
-  echo "$ns $v"
-done
+gfs storage reclaim                    # lists them; changes nothing
+gfs storage reclaim --yes              # reclaims them
+gfs storage reclaim --yes --volume <pv-name> [--volume ...]   # only these
 ```
 
-Each line names a volume the driver was asked to delete and would have deleted
-itself. Review the list, then delete the record; the node agent destroys the
-dataset:
+It runs where the Kubernetes runtime runs (`KUBECONFIG`), considers only
+`ZFSVolume`s the driver marked for deletion, and applies the same rule as
+destroy: reclaim when there is no PV and no `ZFSSnapshot` left; report the rest
+as `blocked` or `keep` with the reason. With `--yes` it keeps passing over the
+set for up to `--wait-secs` (default 120), so a parent whose snapshot a
+stranded clone keeps alive goes in the same run, once the clone is gone. The
+`used` column comes from `zfs list` and is only filled in on the node that
+holds the pool.
 
-```sh
-kubectl -n <ns> delete zfsvolume <volume>
-```
+Run on this stack:
 
-Run on this stack, the listing named 22 of its 23 volumes: it skipped the one
-that still had a snapshot and named that snapshot's stranded clone. Deleting
-the records of the three volumes these runs had stranded removed their
-datasets (240 MB, 89.8 MB, 89.8 MB) within the `kubectl delete --wait`.
-
-A volume with a `ZFSSnapshot` left is not on the list. If that snapshot is the
-origin of another stranded volume (`zfs list -o name,origin`), reclaiming the
-clone first lets the node agent finish the snapshot, and the parent appears on
-the next listing.
+- The dry run listed the 20 marked volumes: 19 `reclaim`, and 1 `blocked`
+  (`the node agent is already destroying it`) — a parent the driver has been
+  trying to delete since 2026-10-05, held by the snapshot its stranded clone
+  (one of the 19) was cloned from. The volume count was 20 before and after.
+- A chain built for the test with `kubectl` alone — volume A with two
+  snapshots, volume B cloned from A's second snapshot with two of its own, both
+  PVCs deleted, then all four snapshots deleted in one call — reproduced both
+  shapes without gfs: B marked with no snapshot and no PV, its 20 MiB still on
+  disk; A with a deletion timestamp and one snapshot the driver could not
+  destroy. `gfs storage reclaim --volume A --volume B` listed B `reclaim` and A
+  `blocked`; with `--yes` it deleted B, and the node agent then finished A in
+  the same run (28 s, exit 0). Both records, both datasets and every snapshot
+  were gone; no other volume was touched.
+- Before the command existed, deleting the records of the three volumes these
+  runs had stranded by hand (`kubectl -n <ns> delete zfsvolume <name>`)
+  removed their datasets (240 MB, 89.8 MB, 89.8 MB).
+- During the session, two volumes of other databases on the same stack, whose
+  destroys did not run through these binaries, ended up marked for deletion
+  with no PV (created 18:19 and 19:35). Which client destroyed them was not
+  checked; the node daemon's destroy goes through the same
+  `remove_instance_with_pvcs`.
