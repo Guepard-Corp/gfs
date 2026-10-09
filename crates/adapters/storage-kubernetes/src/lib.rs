@@ -22,6 +22,9 @@ use kube::api::{Api, DeleteParams, DynamicObject, ListParams, Patch, PatchParams
 use kube::core::{ApiResource, GroupVersionKind};
 use serde_json::json;
 
+mod openebs_zfs;
+pub use openebs_zfs::ReclaimReport;
+
 const DEFAULT_NAMESPACE: &str = "gfs";
 const DEFAULT_PVC_SIZE_GI: &str = "1";
 

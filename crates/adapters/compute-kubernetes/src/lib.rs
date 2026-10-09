@@ -34,6 +34,10 @@ use serde_json::json;
 
 const DEFAULT_NAMESPACE: &str = "gfs";
 const DEFAULT_PVC_SIZE_GI: &str = "1";
+/// How long a destroy waits for the OpenEBS ZFS driver to let go of a
+/// database's volumes. Normally a few seconds: its snapshots drain, then the
+/// volumes go. A volume still held at the deadline is logged and left.
+const ZFS_RECLAIM_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
 fn k8s_storage_class() -> Option<String> {
     std::env::var("GFS_K8S_STORAGE_CLASS")
@@ -1587,6 +1591,24 @@ impl KubernetesCompute {
         id: &InstanceId,
         extra_pvcs: &[String],
     ) -> Result<()> {
+        let storage = gfs_storage_kubernetes::KubernetesStorage::new(Some(self.namespace.clone()))
+            .await
+            .ok();
+
+        // Which OpenEBS ZFS volumes hold this database's data has to be read
+        // now: once the PVCs and snapshots are deleted nothing links them.
+        let mut zfs_volumes = std::collections::BTreeSet::new();
+        if let Some(ref storage) = storage {
+            for name in Self::pvc_names(id, extra_pvcs) {
+                match storage.openebs_volumes_for_pvc(name.as_str()).await {
+                    Ok(v) => zfs_volumes.extend(v),
+                    Err(e) => tracing::warn!(
+                        "remove_instance_with_pvcs: could not list the ZFS volumes behind '{name}': {e}"
+                    ),
+                }
+            }
+        }
+
         self.teardown_instance_keep_snapshots(id, extra_pvcs)
             .await?;
 
@@ -1597,9 +1619,6 @@ impl KubernetesCompute {
             .delete(&credentials_secret_name(&id.0), &DeleteParams::default())
             .await;
 
-        let storage = gfs_storage_kubernetes::KubernetesStorage::new(Some(self.namespace.clone()))
-            .await
-            .ok();
         for name in Self::pvc_names(id, extra_pvcs) {
             if let Some(ref storage) = storage
                 && let Err(e) = storage.delete_snapshots_for_pvc(name.as_str()).await
@@ -1607,6 +1626,35 @@ impl KubernetesCompute {
                 tracing::warn!(
                     "remove_instance_with_pvcs: snapshot cleanup for '{name}' failed: {e}"
                 );
+            }
+        }
+
+        // Deleting a PV whose dataset still has snapshots only marks the
+        // OpenEBS ZFS volume; the driver is meant to delete it with the last
+        // snapshot but misses when several go at once, which is what the loop
+        // above does. Without this the dataset, and the data, outlive the
+        // destroy on the node.
+        if let Some(ref storage) = storage {
+            match storage
+                .finish_deferred_openebs_deletes(&zfs_volumes, ZFS_RECLAIM_DEADLINE)
+                .await
+            {
+                Ok(report) => {
+                    if !report.reclaimed.is_empty() {
+                        tracing::info!(
+                            "remove_instance_with_pvcs: deleted ZFS volumes the driver left behind: {:?}",
+                            report.reclaimed
+                        );
+                    }
+                    for (volume, why) in report.pending.iter().chain(report.left.iter()) {
+                        tracing::warn!(
+                            "remove_instance_with_pvcs: ZFS volume '{volume}' is still on the node: {why}"
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    "remove_instance_with_pvcs: could not finish deleting the ZFS volumes {zfs_volumes:?}: {e}"
+                ),
             }
         }
         Ok(())
