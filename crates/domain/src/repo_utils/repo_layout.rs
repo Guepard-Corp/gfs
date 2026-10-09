@@ -382,12 +382,26 @@ pub fn directory_logical_size_bytes(dir: &Path) -> Result<u64, RepoError> {
     Ok(total)
 }
 
-/// Physical (on-disk) size of a directory tree in bytes.
+/// Bytes this directory tree *references*, as `du -s` would report them.
 ///
-/// On Unix this is the sum of allocated 512-byte blocks per file (equivalent to `du -s`).
-/// On APFS, COW snapshots share blocks with the source, so volume usage does not increase
-/// by this amount until the copy diverges; this value is still useful for reporting
-/// "disk usage of this tree" as tools like `du` would show.
+/// On Unix this is the sum of allocated 512-byte blocks per file. **It is not
+/// the space that removing the tree would free**, and the two differ by however
+/// much the tree shares with something else.
+///
+/// Every filesystem GFS runs on shares blocks. On APFS a snapshot is a
+/// `clonefile` of the workspace; on ZFS — which is what the Kubernetes backend
+/// sits on — a snapshot shares by construction. Measured: a 20 MB file cloned
+/// with `cp -c` reports `st_blocks = 39064` on *both* copies, so this function
+/// returns 20 MB for each while the volume grew by nothing. ZFS names the same
+/// distinction explicitly: this is `referenced`, not `used`.
+///
+/// **Never sum this across snapshots and call the total reclaimable.** Doing so
+/// counts every shared block once per sharer. On a real pool that over-reported
+/// 35 snapshots as 1.4 GB when the entire pool held 767 MB.
+///
+/// It is the right number for "how big is this tree", which is what `du`
+/// answers and what a single commit's `snapshot_size_bytes` records. It is the
+/// wrong number for "how much would I get back".
 #[cfg(unix)]
 pub fn directory_physical_size_bytes(dir: &Path) -> Result<u64, RepoError> {
     use std::os::unix::fs::MetadataExt;
@@ -684,6 +698,26 @@ pub fn write_files_object(repo_path: &Path, entries: &[FileEntry]) -> Result<Str
 }
 
 /// Read the file entries list from the object store by its content hash.
+/// Decode a file-list object from raw bytes.
+///
+/// Asserts the whole buffer was consumed. `decode_from_slice` stops at the end
+/// of the value and reports how far it got; ignoring that lets a blob which
+/// merely *begins* with something bincode-shaped decode successfully, which
+/// matters when the caller is trying to identify an unknown file rather than
+/// read one it already trusts.
+pub fn decode_file_entries(bytes: &[u8]) -> Result<Vec<FileEntry>, RepoError> {
+    let (entries, read): (Vec<FileEntry>, usize) =
+        bincode::serde::decode_from_slice(bytes, files_bincode_config())
+            .map_err(|e| RepoError::InvalidConfig(e.to_string()))?;
+    if read != bytes.len() {
+        return Err(RepoError::InvalidConfig(format!(
+            "trailing bytes after the file list ({read} of {} consumed)",
+            bytes.len()
+        )));
+    }
+    Ok(entries)
+}
+
 pub fn get_file_entries_by_ref(
     repo_path: &Path,
     files_ref: &str,
@@ -1444,14 +1478,22 @@ fn collect_branch_refs(dir: &Path, prefix: &str) -> Result<Vec<(String, String)>
 
 /// List every branch in `refs/heads/` as `(branch_name, tip_commit_hash)` pairs.
 ///
-/// Returns an empty vec when the heads directory is absent (fresh repo with no
-/// committed branch refs yet) rather than erroring.
+/// Returns an empty vec when the heads directory is **absent** (fresh repo with
+/// no committed branch refs yet) rather than erroring.
+///
+/// Absent, specifically, and not merely unreachable. `Path::exists` is also
+/// false when a *parent* directory cannot be opened, and collapsing the two here
+/// is unusually expensive: branch tips are the roots of every reachability walk
+/// in GFS, so "no branches" and "could not read the branches" differ by the
+/// entire repository. An unreadable `refs/` made `gfs fsck` see zero roots and
+/// therefore consider every object in the repository collectable.
 pub fn list_branches(repo_path: &Path) -> Result<Vec<(String, String)>, RepoError> {
     let refs_dir = repo_path.join(GFS_DIR).join(REFS_DIR).join(HEADS_DIR);
-    if !refs_dir.exists() {
-        return Ok(Vec::new());
+    match fs::metadata(&refs_dir) {
+        Ok(_) => collect_branch_refs(&refs_dir, ""),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(RepoError::from(e)),
     }
-    collect_branch_refs(&refs_dir, "")
 }
 
 /// Returns the list of ref names pointing to the given commit hash.
@@ -1615,6 +1657,44 @@ fn is_engine_owned(path: &str, patterns: &[&str]) -> bool {
     })
 }
 
+/// Whether a `workspace_changes` comparison could consult mtime for every file
+/// it found in both places.
+///
+/// `workspace_changes` falls back to comparing size alone when either side lacks
+/// `mtime_ns` -- `FileAttrs.mtime_ns` is `Option` behind `#[serde(default)]` so
+/// commits written before the field existed still decode. An empty change list
+/// from a size-only comparison means "no file changed length", which for a
+/// database is nearly worthless: PostgreSQL pages and SQLite pages are
+/// fixed-width, so an in-place update changes content without changing size.
+///
+/// A caller that only reports differences can ignore this. A caller that acts on
+/// the absence of differences -- deleting something because it "matches" -- must
+/// not, which is why this is a separate query rather than a stricter comparison:
+/// making `workspace_changes` itself report every file changed would turn every
+/// pre-`mtime_ns` commit into a false positive for `gfs status`.
+pub fn workspace_changes_are_conclusive(
+    workspace: &Path,
+    baseline: &[FileEntry],
+) -> Result<bool, RepoError> {
+    if !workspace.exists() {
+        return Ok(true);
+    }
+    let current = collect_file_entries(workspace, "")?;
+    let by_path: std::collections::HashMap<&str, &FileEntry> = baseline
+        .iter()
+        .map(|e| (e.relative_path.as_str(), e))
+        .collect();
+    Ok(current
+        .iter()
+        .filter(|entry| !is_ignorable_sidecar(&entry.relative_path, entry.file_size))
+        .filter_map(|entry| {
+            by_path
+                .get(entry.relative_path.as_str())
+                .map(|b| (b, entry))
+        })
+        .all(|(base, entry)| mtime_ns(base).is_some() && mtime_ns(entry).is_some()))
+}
+
 pub fn workspace_changes(
     workspace: &Path,
     baseline: &[FileEntry],
@@ -1648,6 +1728,11 @@ pub fn workspace_changes(
                     }
                     match (mtime_ns(base), mtime_ns(entry)) {
                         (Some(a), Some(b)) => a != b,
+                        // Size matched and mtime could not be consulted, so this
+                        // file is "unchanged as far as we can tell" -- which is not
+                        // the same as unchanged. `workspace_changes_are_conclusive`
+                        // reports whether that happened, for callers that need the
+                        // difference.
                         _ => false,
                     }
                 }

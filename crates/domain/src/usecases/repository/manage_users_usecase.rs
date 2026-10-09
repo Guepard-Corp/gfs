@@ -503,6 +503,11 @@ fn require_password(password: &str) -> Result<(), ManageUsersError> {
 /// destroys the customer's primary login; rotating a password or privileges
 /// out-of-band desyncs the deploy's stored credential/connection string. Fail
 /// fast with a clear message instead.
+///
+/// **Half the reserved set, not all of it.** [`is_reserved_role`] also checks
+/// [`PRESET_GROUP_ROLES`], so seven names are reserved in total, not four. Read
+/// this array on its own and you will undercount — check against that function,
+/// which is the only authority on whether a name is reserved.
 const RESERVED_ROLES: [&str; 4] = ["gfs_super", "postgres", "owner", "developers"];
 
 /// The management superusers, whose passwords the platform never rotates through
@@ -523,8 +528,19 @@ fn reject_superuser_role(username: &str) -> Result<(), ManageUsersError> {
     }
 }
 
-/// Whether `username` is a reserved platform role (`owner`/`developers` + the
-/// management superusers + the preset group roles). Public so the reconcile
+/// Whether `username` is a reserved platform role. **This is the authority**:
+/// the reserved set is the union of [`RESERVED_ROLES`] and
+/// [`PRESET_GROUP_ROLES`] — seven names, spread over two arrays, so neither one
+/// answers the question alone.
+///
+/// The union is `gfs_super`, `postgres`, `owner`, `developers`, `gfs_readonly`,
+/// `gfs_readwrite`, `gfs_admin`. Note the bootstrap superuser is spelled
+/// `gfs_super` here; nothing in these crates is named `guepard-admin`.
+///
+/// Narrower than this is [`SUPERUSER_ROLES`], the two roles whose passwords are
+/// never rotated — `owner` and `developers` are reserved but *are* rotatable,
+/// which is what the clone fresh-reset path depends on.
+/// Public so the reconcile
 /// re-key can skip them — a reserved role must not be re-keyed as a normal
 /// managed user. The preset group roles (`gfs_readonly`/`gfs_readwrite`/
 /// `gfs_admin`) carry the platform-managed privilege level; a client must never

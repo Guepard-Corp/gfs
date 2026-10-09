@@ -80,22 +80,43 @@ pub fn bold(s: impl AsRef<str>) -> String {
     format!("{}", s.if_supports_color(Stream::Stdout, |t| t.bold()))
 }
 
-/// Like `println!` but returns `io::Result<()>` and silently exits on broken pipe.
+/// Set once stdout is gone, so later writes are skipped instead of retried.
+///
+/// A reader that closed early (`| head`, `| grep -q`, a quit pager) is not an
+/// error, but it is also not a verdict. This used to `exit(0)` on the first
+/// `BrokenPipe`, which replaced whatever the command had concluded with
+/// success: `gfs fsck --json | head -1` reported 0 on a corrupt repository,
+/// indistinguishable from a clean one. The command now runs to completion and
+/// returns its own status; the output simply stops going anywhere.
+pub static STDOUT_CLOSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether stdout has already refused a write.
+pub fn stdout_is_closed() -> bool {
+    STDOUT_CLOSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Like `println!` but returns `io::Result<()>` and tolerates a closed reader.
 ///
 /// When `gfs log` is piped to `head` or `less`, the pipe closes early and the
-/// next write returns `BrokenPipe`. We treat that as a clean exit so the user
-/// doesn't see a spurious error message.
+/// next write returns `BrokenPipe`. That is swallowed so the user does not see a
+/// spurious error -- but it does NOT decide the exit status, which belongs to
+/// the command.
 #[macro_export]
 macro_rules! println_safe {
     ($($arg:tt)*) => {{
         use std::io::Write;
-        let line = format!($($arg)*);
-        let result = writeln!(std::io::stdout(), "{}", line);
-        match result {
-            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                std::process::exit(0);
+        if $crate::output::stdout_is_closed() {
+            Ok(())
+        } else {
+            let line = format!($($arg)*);
+            match writeln!(std::io::stdout(), "{}", line) {
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                    $crate::output::STDOUT_CLOSED
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    Ok(())
+                }
+                other => other,
             }
-            other => other,
         }
     }};
 }
@@ -220,6 +241,22 @@ pub fn fmt_box_row_colored(
         colored_value,
         " ".repeat(remaining)
     )
+}
+
+/// Bytes for humans, binary units (matches `docker` / `pg_size_pretty` habits).
+pub fn fmt_bytes(b: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = b as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{b} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
 }
 
 #[cfg(test)]

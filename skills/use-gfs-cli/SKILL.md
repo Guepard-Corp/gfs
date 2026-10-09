@@ -79,6 +79,16 @@ gfs --color always log     # Force colors even when piped
 | `gfs schema diff` | 0 | No schema changes |
 | `gfs schema diff` | 1 | Schema changes detected |
 | `gfs schema diff` | 2 | Breaking changes detected |
+| `gfs fsck` | 0 | Repository consistent, nothing unreachable |
+| `gfs fsck` | 1 | Unreachable objects found (collectable) |
+| `gfs fsck` | 2 | Corruption found: something referenced is missing, or an object could not be identified |
+| `gfs fsck` | 3 | The check could NOT be completed — says nothing about the repository. Handle this before 1 or 2: an unreadable object, a `refs/heads` entry that could not be read or is absent, or a Kubernetes backend with no reachable cluster all land here, and on a cluster-backed repository with no cluster it is the ordinary answer |
+| any command | 3 | **A usage error** — an unknown flag, a value that will not parse, a missing subcommand, including bare `gfs config`. The command did not run, so nothing it printed describes your repository. Check your own arguments before investigating: a mistyped flag produces the same `3` as an unreachable cluster |
+| any command | 0 | `--help` and `--version` are requests, not errors |
+
+A ref whose *value* is present but will not parse — empty, or not a hash — is `2`,
+not `3`. A file that could not be read is a hole; a file that reads back as
+nonsense is corruption, and only the second says something about the repository.
 
 Use exit codes for conditional logic:
 ```shell
@@ -410,7 +420,7 @@ Supported formats: SQL, CSV, JSON, custom (database-specific formats)
 GFS stores configuration in `.gfs/config.toml`:
 
 ```shell
-# Read one configuration value. A key is required — bare `gfs config` exits 1.
+# Read one configuration value. A key is required — bare `gfs config` exits 3.
 # Supported keys: user.name, user.email, storage.compression, storage.reflink,
 # telemetry.enabled
 gfs config user.name

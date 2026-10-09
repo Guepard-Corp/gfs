@@ -82,7 +82,24 @@ async fn main() {
             } else {
                 eprintln!("{} {err}", red("error:"));
             }
-            std::process::exit(1);
+            // A usage error exits 3, not 1.
+            //
+            // 1 is a statement that the command RAN and found something: fsck
+            // documents it as "unreachable objects found -- a collector would have
+            // work to do". A mistyped flag used to land on that same code, so
+            // `gfs fsck --typo` was indistinguishable from a repository with
+            // collectable garbage, and a script branching on 1 to run a collector
+            // would be triggered by a typo.
+            //
+            // 3 already means "the command could not be completed, so this says
+            // nothing about the repository", which is exactly what a rejected
+            // argument list is. `--help` and `--version` never reach here: `run()`
+            // returns Ok(0) for DisplayHelp and DisplayVersion before this point.
+            //
+            // Only parse failures move. Every other error keeps 1, so this does not
+            // silently redefine the code for the errors that did run.
+            let usage_error = err.downcast_ref::<clap::Error>().is_some();
+            std::process::exit(if usage_error { 3 } else { 1 });
         }
     }
 }
