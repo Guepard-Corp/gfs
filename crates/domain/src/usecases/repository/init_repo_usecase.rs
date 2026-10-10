@@ -508,7 +508,6 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         }
 
         let id = compute.provision(&definition).await?;
-        compute.start(&id, StartOptions::default()).await?;
         let runtime = compute
             .describe_runtime()
             .await
@@ -539,6 +538,14 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         self.repository
             .update_runtime_config(repo_path, runtime)
             .await?;
+
+        // Started only once the repository names the instance. Provisioning has
+        // already created it (on Kubernetes, a StatefulSet and its PVC), so a start
+        // that fails before the runtime config is written leaves an instance no
+        // record points at: a destroy then refuses with "no runtime config" and
+        // nothing reclaims it. Seen live when a Kubernetes API timeout failed a
+        // first start.
+        compute.start(&id, StartOptions::default()).await?;
 
         self.refuse_a_workspace_the_container_cannot_see(
             repo_path,
@@ -748,6 +755,8 @@ mod tests {
         /// What an `exec` probe of the container's data dir prints. `None` models a
         /// runtime without `exec`, which is the trait default.
         exec_stdout: Option<String>,
+        /// Whether `start` fails, as a Kubernetes API timeout fails it.
+        start_fails: bool,
     }
 
     #[async_trait]
@@ -764,6 +773,9 @@ mod tests {
             id: &InstanceId,
             _: StartOptions,
         ) -> crate::ports::compute::Result<InstanceStatus> {
+            if self.start_fails {
+                return Err(ComputeError::Internal("k8s pod list failed".into()));
+            }
             Ok(InstanceStatus {
                 id: id.clone(),
                 state: InstanceState::Running,
@@ -1265,6 +1277,44 @@ mod tests {
             )
             .await;
         assert!(result.is_ok());
+    }
+
+    /// A start that fails after provisioning created the instance still leaves
+    /// the repository naming it, so a destroy can find and remove it.
+    #[tokio::test]
+    async fn a_failed_start_leaves_the_instance_recorded() {
+        let repository = Arc::new(MockRepository::default());
+        let usecase = InitRepositoryUseCase::new(
+            repository.clone(),
+            Some(Arc::new(MockCompute {
+                start_fails: true,
+                ..Default::default()
+            })),
+            Arc::new(MockRegistry),
+        );
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = usecase
+            .run(
+                dir.path().to_path_buf(),
+                None,
+                Some("postgres".into()),
+                Some("17".into()),
+                None,
+                DatabaseCredentials::default(),
+                None,
+                None,
+                ProvisionSpec::default(),
+            )
+            .await;
+
+        assert!(result.is_err(), "the failed start is still an error");
+        let recorded = repository.runtime.lock().unwrap().clone();
+        assert_eq!(
+            recorded.map(|runtime| runtime.container_name),
+            Some("mock".to_string()),
+            "the provisioned instance is not recorded"
+        );
     }
 
     #[tokio::test]
