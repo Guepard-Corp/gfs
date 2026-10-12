@@ -371,102 +371,38 @@ enum TopLevel {
         database_name: Option<String>,
     },
 
-    /// Lazily clone a read-only remote database (copy-on-read; data fetched on first read)
+    /// Renamed to `gfs lazy clone`; kept for one release.
+    #[command(hide = true)]
     Clone {
-        /// Remote source URL, e.g. postgres://user:password@host:5432/dbname
         #[arg(long = "from")]
         from: String,
-
-        /// Path where to initialize the clone (default: current directory)
         path: Option<PathBuf>,
-
-        /// Version for the local database container (e.g. 17). Omit to match the remote's version.
-        #[arg(long)]
-        database_version: Option<String>,
-
-        /// Override the local container image (e.g. pgvector/pgvector:pg16). Use
-        /// when the source relies on an extension the default image lacks; pins
-        /// its own version (overrides --database-version).
-        #[arg(long)]
-        image: Option<String>,
-
-        /// Platform for the local container (e.g. linux/amd64). Use to run an
-        /// image that lacks a manifest for your architecture (via emulation).
-        #[arg(long)]
-        platform: Option<String>,
-
-        /// Host port to bind for the local database container
-        #[arg(long)]
-        port: Option<u16>,
-
-        /// Freeze right after cloning: copy EVERY table from one source instant
-        /// and detach (a true point-in-time snapshot; pays the full copy -- see
-        /// --max-bytes)
+        #[command(flatten)]
+        options: LazyCloneOptions,
         #[arg(long)]
         snapshot: bool,
-
-        /// Copy budget in bytes for --snapshot (default 1073741824 = 1 GiB);
-        /// the snapshot is refused above it and the clone stays lazy
-        #[arg(long = "max-bytes")]
-        max_bytes: Option<u64>,
-
-        /// Take the --snapshot copy regardless of its estimated size
-        #[arg(long)]
-        force: bool,
     },
 
-    /// Show what has changed on a clone's source (read-only; never modifies the clone)
-    Fetch {
-        /// Path to the GFS repository root (default: current directory)
-        #[arg(long)]
-        path: Option<PathBuf>,
+    /// Renamed to `gfs lazy status`; kept for one release.
+    #[command(hide = true)]
+    Fetch(LazyStatusArgs),
 
-        /// Probe the source now instead of using the last cached verdict
-        #[arg(long)]
-        check: bool,
-    },
+    /// Renamed to `gfs lazy pull`; kept for one release.
+    #[command(hide = true)]
+    Pull(LazyPullArgs),
 
-    /// Put tables the source has changed back on the lazy path so reads are local again
-    Pull {
-        /// Path to the GFS repository root (default: current directory)
-        #[arg(long)]
-        path: Option<PathBuf>,
+    /// Renamed to `gfs lazy source`; kept for one release.
+    #[command(hide = true)]
+    Remote(LazySourceArgs),
 
-        /// Also reset tables you have written to, discarding those local changes
-        #[arg(long)]
-        force: bool,
+    /// Renamed to `gfs lazy freeze`; kept for one release.
+    #[command(hide = true)]
+    Freeze(LazyFreezeArgs),
 
-        /// Turn automatic pulling on or off instead of pulling now (on|off)
-        #[arg(long)]
-        auto: Option<String>,
-
-        /// Turn automatic SCHEMA repair on or off instead of pulling now (on|off)
-        #[arg(long = "auto-schema")]
-        auto_schema: Option<String>,
-    },
-
-    /// Show the source a lazy clone reads from (fetch-only: the source is never written to)
-    Remote {
-        /// Path to the GFS repository root (default: current directory)
-        #[arg(long)]
-        path: Option<PathBuf>,
-    },
-
-    /// Freeze a lazy clone into a point-in-time snapshot: re-copy every table
-    /// from ONE source instant, keep your local writes, then detach for good
-    Freeze {
-        /// Path to the GFS repository root (default: current directory)
-        #[arg(long)]
-        path: Option<PathBuf>,
-
-        /// Copy budget in bytes (default 1073741824 = 1 GiB); the freeze is
-        /// refused above it, because freezing copies EVERYTHING
-        #[arg(long = "max-bytes")]
-        max_bytes: Option<u64>,
-
-        /// Freeze regardless of the estimated copy size
-        #[arg(long)]
-        force: bool,
+    /// Lazy clones: copy-on-read copies of an external database (clone, status, pull, source, freeze)
+    Lazy {
+        #[command(subcommand)]
+        action: LazyAction,
     },
 
     /// Record a commit of the current repository state
@@ -743,6 +679,124 @@ enum TopLevel {
 // Storage subcommands
 // ---------------------------------------------------------------------------
 
+/// Options a lazy clone takes whichever spelling started it.
+#[derive(clap::Args)]
+struct LazyCloneOptions {
+    /// Version for the local database container (e.g. 17). Omit to match the remote's version.
+    #[arg(long)]
+    database_version: Option<String>,
+
+    /// Override the local container image (e.g. pgvector/pgvector:pg16). Use
+    /// when the source relies on an extension the default image lacks; pins
+    /// its own version (overrides --database-version).
+    #[arg(long)]
+    image: Option<String>,
+
+    /// Platform for the local container (e.g. linux/amd64). Use to run an
+    /// image that lacks a manifest for your architecture (via emulation).
+    #[arg(long)]
+    platform: Option<String>,
+
+    /// Host port to bind for the local database container
+    #[arg(long)]
+    port: Option<u16>,
+
+    /// Copy budget in bytes for the freeze copy (default 1073741824 = 1 GiB);
+    /// the freeze is refused above it and the clone stays lazy
+    #[arg(long = "max-bytes")]
+    max_bytes: Option<u64>,
+
+    /// Take the freeze copy regardless of its estimated size
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(clap::Args)]
+struct LazyCloneArgs {
+    /// Source URL, e.g. postgres://user:password@host:5432/dbname
+    url: String,
+
+    /// Path where to initialize the clone (default: current directory)
+    target: Option<PathBuf>,
+
+    #[command(flatten)]
+    options: LazyCloneOptions,
+
+    /// Freeze right after cloning: copy EVERY table from one source instant
+    /// and detach (a true point-in-time snapshot; pays the full copy -- see
+    /// --max-bytes)
+    #[arg(long)]
+    freeze: bool,
+}
+
+#[derive(clap::Args)]
+struct LazyStatusArgs {
+    /// Path to the GFS repository root (default: current directory)
+    #[arg(long)]
+    path: Option<PathBuf>,
+
+    /// Probe the source now instead of using the last cached verdict
+    #[arg(long)]
+    check: bool,
+}
+
+#[derive(clap::Args)]
+struct LazyPullArgs {
+    /// Path to the GFS repository root (default: current directory)
+    #[arg(long)]
+    path: Option<PathBuf>,
+
+    /// Also reset tables you have written to, discarding those local changes
+    #[arg(long)]
+    force: bool,
+
+    /// Turn automatic pulling on or off instead of pulling now (on|off)
+    #[arg(long)]
+    auto: Option<String>,
+
+    /// Turn automatic SCHEMA repair on or off instead of pulling now (on|off)
+    #[arg(long = "auto-schema")]
+    auto_schema: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct LazySourceArgs {
+    /// Path to the GFS repository root (default: current directory)
+    #[arg(long)]
+    path: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
+struct LazyFreezeArgs {
+    /// Path to the GFS repository root (default: current directory)
+    #[arg(long)]
+    path: Option<PathBuf>,
+
+    /// Copy budget in bytes (default 1073741824 = 1 GiB); the freeze is
+    /// refused above it, because freezing copies EVERYTHING
+    #[arg(long = "max-bytes")]
+    max_bytes: Option<u64>,
+
+    /// Freeze regardless of the estimated copy size
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Subcommand)]
+enum LazyAction {
+    /// Lazily clone an external database (copy-on-read; data fetched on first read)
+    Clone(LazyCloneArgs),
+    /// Show what has changed on the source (read-only; never modifies the clone)
+    Status(LazyStatusArgs),
+    /// Put tables the source has changed back on the lazy path so reads are local again
+    Pull(LazyPullArgs),
+    /// Show the source this clone reads from (fetch-only: the source is never written to)
+    Source(LazySourceArgs),
+    /// Freeze into a point-in-time snapshot: re-copy every table from ONE source
+    /// instant, keep your local writes, then detach for good
+    Freeze(LazyFreezeArgs),
+}
+
 #[derive(Subcommand)]
 enum StorageAction {
     /// Mount a volume at the given path
@@ -800,10 +854,17 @@ fn command_name(cmd: &TopLevel) -> &'static str {
     match cmd {
         TopLevel::Init { .. } => "init",
         TopLevel::Clone { .. } => "clone",
-        TopLevel::Fetch { .. } => "fetch",
-        TopLevel::Pull { .. } => "pull",
-        TopLevel::Remote { .. } => "remote",
-        TopLevel::Freeze { .. } => "freeze",
+        TopLevel::Fetch(_) => "fetch",
+        TopLevel::Pull(_) => "pull",
+        TopLevel::Remote(_) => "remote",
+        TopLevel::Freeze(_) => "freeze",
+        TopLevel::Lazy { action } => match action {
+            LazyAction::Clone(_) => "lazy clone",
+            LazyAction::Status(_) => "lazy status",
+            LazyAction::Pull(_) => "lazy pull",
+            LazyAction::Source(_) => "lazy source",
+            LazyAction::Freeze(_) => "lazy freeze",
+        },
         TopLevel::Commit { .. } => "commit",
         TopLevel::Config { .. } => "config",
         TopLevel::Checkout { .. } => "checkout",
@@ -898,55 +959,44 @@ where
             TopLevel::Clone {
                 from,
                 path,
-                database_version,
-                image,
-                platform,
-                port,
+                options,
                 snapshot,
-                max_bytes,
-                force,
             } => {
-                commands::cmd_clone::clone(
-                    from,
-                    path,
-                    database_version,
-                    image,
-                    platform,
-                    port,
-                    snapshot,
-                    max_bytes,
-                    force,
-                    json_output,
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-                Ok(0)
+                warn_renamed("clone --from", "lazy clone");
+                lazy_clone(from, path, options, snapshot, json_output).await
             }
-            TopLevel::Fetch { path, check } => {
-                commands::cmd_source::fetch(path, check, json_output).await?;
-                Ok(0)
+            TopLevel::Fetch(args) => {
+                warn_renamed("fetch", "lazy status");
+                lazy_status(args, json_output).await
             }
-            TopLevel::Pull {
-                path,
-                force,
-                auto,
-                auto_schema,
-            } => {
-                commands::cmd_source::pull(path, force, auto, auto_schema, json_output).await?;
-                Ok(0)
+            TopLevel::Pull(args) => {
+                warn_renamed("pull", "lazy pull");
+                lazy_pull(args, json_output).await
             }
-            TopLevel::Remote { path } => {
-                commands::cmd_source::remote(path, json_output).await?;
-                Ok(0)
+            TopLevel::Remote(args) => {
+                warn_renamed("remote", "lazy source");
+                lazy_source(args, json_output).await
             }
-            TopLevel::Freeze {
-                path,
-                max_bytes,
-                force,
-            } => {
-                commands::cmd_freeze::freeze(path, max_bytes, force, json_output).await?;
-                Ok(0)
+            TopLevel::Freeze(args) => {
+                warn_renamed("freeze", "lazy freeze");
+                lazy_freeze(args, json_output).await
             }
+            TopLevel::Lazy { action } => match action {
+                LazyAction::Clone(args) => {
+                    lazy_clone(
+                        args.url,
+                        args.target,
+                        args.options,
+                        args.freeze,
+                        json_output,
+                    )
+                    .await
+                }
+                LazyAction::Status(args) => lazy_status(args, json_output).await,
+                LazyAction::Pull(args) => lazy_pull(args, json_output).await,
+                LazyAction::Source(args) => lazy_source(args, json_output).await,
+                LazyAction::Freeze(args) => lazy_freeze(args, json_output).await,
+            },
             TopLevel::Commit {
                 message,
                 path,
@@ -1261,6 +1311,66 @@ where
 // ---------------------------------------------------------------------------
 // Storage dispatch
 // ---------------------------------------------------------------------------
+
+/// An old spelling still works for one release, and says where it went. Stderr
+/// only, so `--json` output on stdout is unchanged.
+fn warn_renamed(old: &str, new: &str) {
+    eprintln!(
+        "{} `gfs {old}` is renamed to `gfs {new}`; the old name will be removed in a future release",
+        output::yellow("warning:")
+    );
+}
+
+async fn lazy_clone(
+    url: String,
+    target: Option<PathBuf>,
+    options: LazyCloneOptions,
+    freeze: bool,
+    json_output: bool,
+) -> Result<i32> {
+    commands::cmd_clone::clone(
+        url,
+        target,
+        options.database_version,
+        options.image,
+        options.platform,
+        options.port,
+        freeze,
+        options.max_bytes,
+        options.force,
+        json_output,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
+    Ok(0)
+}
+
+async fn lazy_status(args: LazyStatusArgs, json_output: bool) -> Result<i32> {
+    commands::cmd_source::fetch(args.path, args.check, json_output).await?;
+    Ok(0)
+}
+
+async fn lazy_pull(args: LazyPullArgs, json_output: bool) -> Result<i32> {
+    commands::cmd_source::pull(
+        args.path,
+        args.force,
+        args.auto,
+        args.auto_schema,
+        json_output,
+    )
+    .await?;
+    Ok(0)
+}
+
+async fn lazy_source(args: LazySourceArgs, json_output: bool) -> Result<i32> {
+    commands::cmd_source::remote(args.path, json_output).await?;
+    Ok(0)
+}
+
+async fn lazy_freeze(args: LazyFreezeArgs, json_output: bool) -> Result<i32> {
+    commands::cmd_freeze::freeze(args.path, args.max_bytes, args.force, json_output).await?;
+    Ok(0)
+}
 
 async fn run_storage(action: StorageAction, json_output: bool) -> Result<()> {
     #[cfg(target_os = "macos")]
