@@ -12,6 +12,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::model::config::{GfsConfig, RepoCredentials};
+use crate::ports::compute::VolumeSeed;
 use crate::ports::database_provider::DatabaseProviderRegistry;
 use crate::ports::repository::{Repository, RepositoryError};
 use crate::repo_utils::repo_layout;
@@ -123,13 +124,26 @@ impl<R: DatabaseProviderRegistry> CloneFromSnapshotUseCase<R> {
         }
         let commit = repo_layout::get_commit_from_hash(source, &commit_hash)
             .map_err(|_| CloneFromSnapshotError::SnapshotNotFound(revision.clone()))?;
-        let snapshot_dir = repo_layout::snapshot_path(source, &commit.snapshot_hash);
-        if !snapshot_dir.is_dir() {
-            return Err(CloneFromSnapshotError::SnapshotDataMissing {
-                snapshot: short(&commit_hash),
-                path: display(&snapshot_dir),
-            });
-        }
+        // Where the data comes from. On Kubernetes the snapshot is a volume
+        // snapshot of the source instance, not a directory, and the new
+        // instance's volume is created from it; elsewhere it is a directory under
+        // .gfs/snapshots, copied into the new workspace.
+        let seed = match kubernetes_instance(source) {
+            Some(source_instance) => Seed::Volume(VolumeSeed {
+                source_instance,
+                snapshot_hash: commit.snapshot_hash.clone(),
+            }),
+            None => {
+                let dir = repo_layout::snapshot_path(source, &commit.snapshot_hash);
+                if !dir.is_dir() {
+                    return Err(CloneFromSnapshotError::SnapshotDataMissing {
+                        snapshot: short(&commit_hash),
+                        path: display(&dir),
+                    });
+                }
+                Seed::Directory(dir)
+            }
+        };
 
         let credentials = request.credentials.clone().unwrap_or_else(|| {
             let saved = RepoCredentials::load(source);
@@ -150,21 +164,41 @@ impl<R: DatabaseProviderRegistry> CloneFromSnapshotUseCase<R> {
             )
             .await?;
         copy_compute_params(source, target);
-        self.repository
-            .seed_head_workspace(target, &snapshot_dir)
-            .await?;
-        self.init
-            .start_database(
-                target,
-                environment.database_provider.clone(),
-                Some(environment.database_version.clone()),
-                request.database_port,
-                credentials,
-                environment.display_name.clone(),
-                request.image.clone(),
-                request.provision.clone(),
-            )
-            .await?;
+        let provider = environment.database_provider.clone();
+        let version = Some(environment.database_version.clone());
+        let display_name = environment.display_name.clone();
+        match &seed {
+            Seed::Directory(dir) => {
+                self.repository.seed_head_workspace(target, dir).await?;
+                self.init
+                    .start_database(
+                        target,
+                        provider,
+                        version,
+                        request.database_port,
+                        credentials,
+                        display_name,
+                        request.image.clone(),
+                        request.provision.clone(),
+                    )
+                    .await?;
+            }
+            Seed::Volume(volume) => {
+                self.init
+                    .start_database_seeded(
+                        target,
+                        provider,
+                        version,
+                        request.database_port,
+                        credentials,
+                        display_name,
+                        request.image.clone(),
+                        request.provision.clone(),
+                        volume,
+                    )
+                    .await?;
+            }
+        }
 
         Ok(ClonedDatabase {
             source_commit: commit_hash,
@@ -186,6 +220,25 @@ fn copy_compute_params(source: &Path, target: &Path) {
         config.compute.get_or_insert_with(Default::default).params = params;
         let _ = config.save(target);
     }
+}
+
+enum Seed {
+    Directory(PathBuf),
+    Volume(VolumeSeed),
+}
+
+/// The source's instance name when it runs on Kubernetes.
+fn kubernetes_instance(source: &Path) -> Option<String> {
+    repo_layout::get_runtime_config(source)
+        .ok()
+        .flatten()
+        .filter(|runtime| {
+            runtime
+                .runtime_provider
+                .trim()
+                .eq_ignore_ascii_case("kubernetes")
+        })
+        .map(|runtime| runtime.container_name)
 }
 
 fn display(path: &Path) -> String {

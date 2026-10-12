@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use gfs_compute_docker::DockerCompute;
+use gfs_compute_kubernetes::KubernetesCompute;
 use gfs_db_providers as containers;
 use gfs_domain::adapters::gfs_repository::GfsRepository;
 use gfs_domain::model::config::GfsConfig;
@@ -36,11 +37,6 @@ pub struct CloneFromSnapshotArgs {
 }
 
 pub async fn clone_from_snapshot(mut args: CloneFromSnapshotArgs, json_output: bool) -> Result<()> {
-    if is_kubernetes_runtime() {
-        return Err(anyhow!(
-            "cloning from a snapshot is not available on the Kubernetes runtime yet"
-        ));
-    }
     // Absolute paths, so what the new repository records about its workspace
     // and connection holds wherever it is later used from, not only from the
     // directory this command ran in.
@@ -61,14 +57,31 @@ pub async fn clone_from_snapshot(mut args: CloneFromSnapshotArgs, json_output: b
         .flatten()
         .and_then(|env| registry.get(&env.database_provider))
         .is_some_and(|provider| provider.requires_compute());
-    let compute: Option<Arc<dyn Compute>> = if needs_container {
-        Some(Arc::new(
+    let kubernetes = is_kubernetes_runtime();
+    if needs_container && kubernetes != source_runs_on_kubernetes(&args.source) {
+        // The copy must be made where the source's snapshots are: a volume
+        // snapshot on Kubernetes, a directory elsewhere. Crossing over would start
+        // the copy on an empty volume.
+        return Err(anyhow!(
+            "'{}' runs on {}, but this command would create the copy on {}; set \
+             GFS_RUNTIME_PROVIDER to match the source",
+            args.source.display(),
+            runtime_name(!kubernetes),
+            runtime_name(kubernetes)
+        ));
+    }
+    let compute: Option<Arc<dyn Compute>> = match (needs_container, kubernetes) {
+        (false, _) => None,
+        (true, true) => Some(Arc::new(
+            KubernetesCompute::new(None)
+                .await
+                .map_err(|e| anyhow!("{e}"))?,
+        )),
+        (true, false) => Some(Arc::new(
             DockerCompute::new()
                 .map_err(|e| anyhow!("{e}"))?
                 .with_platform(args.platform.clone()),
-        ))
-    } else {
-        None
+        )),
     };
 
     let init = InitRepositoryUseCase::new(repository.clone(), compute.clone(), registry.clone());
@@ -84,6 +97,18 @@ pub async fn clone_from_snapshot(mut args: CloneFromSnapshotArgs, json_output: b
         })
         .await
         .map_err(|e| anyhow!("{e}"))?;
+
+    // As `gfs init` does on Kubernetes: commits snapshot the data volume, so
+    // the repository must name it.
+    if kubernetes
+        && let Ok(mut config) = GfsConfig::load(&args.target)
+        && let Some(runtime) = config.runtime.as_ref()
+    {
+        config.mount_point = Some(format!("{}-data", runtime.container_name.trim()));
+        config
+            .save(&args.target)
+            .map_err(|e| anyhow!("recording the copy's data volume: {e}"))?;
+    }
 
     let source_short = short(&cloned.source_commit);
     let message = format!("cloned from {} @ {source_short}", args.source.display());
@@ -148,6 +173,22 @@ fn is_kubernetes_runtime() -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn source_runs_on_kubernetes(source: &Path) -> bool {
+    repo_layout::get_runtime_config(source)
+        .ok()
+        .flatten()
+        .is_some_and(|runtime| {
+            runtime
+                .runtime_provider
+                .trim()
+                .eq_ignore_ascii_case("kubernetes")
+        })
+}
+
+fn runtime_name(kubernetes: bool) -> &'static str {
+    if kubernetes { "Kubernetes" } else { "Docker" }
 }
 
 /// A lazy clone is labelled `gfs.role=clone` when it is created.
