@@ -243,39 +243,16 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         image: Option<String>,
         provision: ProvisionSpec,
     ) -> std::result::Result<(), InitRepoError> {
-        // Validate the provider and version HERE, not only in the caller.
-        //
-        // The CLI checks both before it builds a compute client, so a typo
-        // reports the typo rather than a Docker failure — that is a better
-        // error, not a different guarantee. This is the guarantee: every caller
-        // of this use case reaches the write through here, and the MCP server
-        // reached it without either check, accepting `sqlite 4` and writing it
-        // to config.toml permanently while the CLI refused the same input.
-        if let Some(name) = database_provider.as_deref() {
-            let resolved = self
-                .registry
-                .list()
-                .into_iter()
-                .find(|n| n.eq_ignore_ascii_case(name))
-                .and_then(|n| self.registry.get(&n))
-                .ok_or_else(|| InitRepoError::UnknownDatabaseProvider(name.to_string()))?;
-
-            if let Some(version) = database_version.as_deref() {
-                let supported = resolved.supported_versions();
-                if !supported.is_empty() && !supported.iter().any(|v| v == version) {
-                    return Err(InitRepoError::UnsupportedDatabaseVersion {
-                        provider: resolved.name().to_string(),
-                        version: version.to_string(),
-                        supported: supported.join(", "),
-                    });
-                }
-            }
-        }
-
-        self.repository.init(&path, mount_point).await?;
+        self.create_repository(
+            &path,
+            mount_point,
+            database_provider.as_deref(),
+            database_version.as_deref(),
+        )
+        .await?;
 
         if let Some(provider) = database_provider {
-            self.deploy_database(
+            self.start_database(
                 &path,
                 provider,
                 database_version,
@@ -291,8 +268,60 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         Ok(())
     }
 
+    /// Validate the provider and version and lay out an empty repository at
+    /// `path`, without starting anything.
+    ///
+    /// The first half of [`Self::run`]. A caller that needs the workspace filled
+    /// before the database first starts -- a clone seeded from a snapshot --
+    /// calls this, writes the workspace, then [`Self::start_database`].
+    pub async fn create_repository(
+        &self,
+        path: &std::path::Path,
+        mount_point: Option<String>,
+        database_provider: Option<&str>,
+        database_version: Option<&str>,
+    ) -> std::result::Result<(), InitRepoError> {
+        // Validate the provider and version HERE, not only in the caller.
+        //
+        // The CLI checks both before it builds a compute client, so a typo
+        // reports the typo rather than a Docker failure — that is a better
+        // error, not a different guarantee. This is the guarantee: every caller
+        // of this use case reaches the write through here, and the MCP server
+        // reached it without either check, accepting `sqlite 4` and writing it
+        // to config.toml permanently while the CLI refused the same input.
+        if let Some(name) = database_provider {
+            let resolved = self
+                .registry
+                .list()
+                .into_iter()
+                .find(|n| n.eq_ignore_ascii_case(name))
+                .and_then(|n| self.registry.get(&n))
+                .ok_or_else(|| InitRepoError::UnknownDatabaseProvider(name.to_string()))?;
+
+            if let Some(version) = database_version {
+                let supported = resolved.supported_versions();
+                if !supported.is_empty() && !supported.iter().any(|v| v == version) {
+                    return Err(InitRepoError::UnsupportedDatabaseVersion {
+                        provider: resolved.name().to_string(),
+                        version: version.to_string(),
+                        supported: supported.join(", "),
+                    });
+                }
+            }
+        }
+
+        self.repository.init(path, mount_point).await?;
+        Ok(())
+    }
+
+    /// Record the database for an existing repository and, for a provider that
+    /// runs in a container, provision and start it on the HEAD workspace.
+    ///
+    /// The second half of [`Self::run`]. The workspace is used as it is found:
+    /// empty after [`Self::create_repository`], or already holding data a caller
+    /// placed there.
     #[allow(clippy::too_many_arguments)]
-    async fn deploy_database(
+    pub async fn start_database(
         &self,
         repo_path: &std::path::Path,
         provider_name: String,
