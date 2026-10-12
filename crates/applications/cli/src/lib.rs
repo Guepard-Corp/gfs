@@ -371,16 +371,47 @@ enum TopLevel {
         database_name: Option<String>,
     },
 
-    /// Renamed to `gfs lazy clone`; kept for one release.
-    #[command(hide = true)]
+    /// Copy a database from one of its snapshots into a new, independent database
     Clone {
-        #[arg(long = "from")]
-        from: String,
-        path: Option<PathBuf>,
-        #[command(flatten)]
-        options: LazyCloneOptions,
+        /// The database to copy (path to its repository)
+        source: Option<PathBuf>,
+
+        /// Where to create the copy
+        target: Option<PathBuf>,
+
+        /// Snapshot to copy: an id from `gfs log`, full or short. Default: the latest
+        #[arg(long, num_args = 0..=1, default_missing_value = "", conflicts_with = "branch")]
+        snapshot: Option<String>,
+
+        /// Copy the latest snapshot on this branch instead
         #[arg(long)]
-        snapshot: bool,
+        branch: Option<String>,
+
+        /// Host port to bind for the new database
+        #[arg(long)]
+        port: Option<u16>,
+
+        /// Container image for the copy; needed only when the source was started
+        /// from a custom image (gfs does not record which)
+        #[arg(long)]
+        image: Option<String>,
+
+        /// Platform for the container (e.g. linux/amd64)
+        #[arg(long)]
+        platform: Option<String>,
+
+        /// Renamed to `gfs lazy clone <url>`; kept for one release.
+        #[arg(long = "from", hide = true)]
+        from: Option<String>,
+
+        #[arg(long, hide = true)]
+        database_version: Option<String>,
+
+        #[arg(long = "max-bytes", hide = true)]
+        max_bytes: Option<u64>,
+
+        #[arg(long, hide = true)]
+        force: bool,
     },
 
     /// Renamed to `gfs lazy status`; kept for one release.
@@ -957,13 +988,46 @@ where
                 Ok(0)
             }
             TopLevel::Clone {
-                from,
-                path,
-                options,
+                source,
+                target,
                 snapshot,
+                branch,
+                port,
+                image,
+                platform,
+                from,
+                database_version,
+                max_bytes,
+                force,
             } => {
-                warn_renamed("clone --from", "lazy clone");
-                lazy_clone(from, path, options, snapshot, json_output).await
+                if let Some(url) = from {
+                    // The old spelling: `gfs clone --from <url> [PATH] [--snapshot]`,
+                    // where PATH arrives as the first positional and a bare
+                    // --snapshot meant "freeze".
+                    warn_renamed("clone --from", "lazy clone");
+                    let options = LazyCloneOptions {
+                        database_version,
+                        image,
+                        platform,
+                        port,
+                        max_bytes,
+                        force,
+                    };
+                    lazy_clone(url, source, options, snapshot.is_some(), json_output).await
+                } else {
+                    clone_from_snapshot(
+                        source,
+                        target,
+                        snapshot,
+                        branch,
+                        port,
+                        image,
+                        platform,
+                        database_version.is_some() || max_bytes.is_some() || force,
+                        json_output,
+                    )
+                    .await
+                }
             }
             TopLevel::Fetch(args) => {
                 warn_renamed("fetch", "lazy status");
@@ -1342,6 +1406,49 @@ async fn lazy_clone(
     )
     .await
     .map_err(|e| anyhow::anyhow!("{}", e))?;
+    Ok(0)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn clone_from_snapshot(
+    source: Option<PathBuf>,
+    target: Option<PathBuf>,
+    snapshot: Option<String>,
+    branch: Option<String>,
+    port: Option<u16>,
+    image: Option<String>,
+    platform: Option<String>,
+    has_lazy_only_flags: bool,
+    json_output: bool,
+) -> Result<i32> {
+    let (Some(source), Some(target)) = (source, target) else {
+        return Err(anyhow::anyhow!(
+            "usage: gfs clone <source> <target> [--snapshot <id> | --branch <name>]"
+        ));
+    };
+    if snapshot.as_deref() == Some("") {
+        return Err(anyhow::anyhow!(
+            "--snapshot needs a snapshot id (`gfs log` lists them)"
+        ));
+    }
+    if has_lazy_only_flags {
+        return Err(anyhow::anyhow!(
+            "--database-version, --max-bytes and --force apply to `gfs lazy clone`; \
+             a copy keeps its source's version"
+        ));
+    }
+    commands::cmd_clone_from_snapshot::clone_from_snapshot(
+        commands::cmd_clone_from_snapshot::CloneFromSnapshotArgs {
+            source,
+            target,
+            revision: snapshot.or(branch),
+            port,
+            image,
+            platform,
+        },
+        json_output,
+    )
+    .await?;
     Ok(0)
 }
 
