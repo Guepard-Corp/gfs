@@ -3290,6 +3290,9 @@ mod runtime_exists_tests {
         code: u16,
         body: String,
     ) -> (KubernetesCompute, Arc<Mutex<Vec<String>>>) {
+        // A workspace build enables both rustls backends, and rustls then refuses
+        // to pick one; the CLI's main installs aws-lc-rs for the same reason.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
