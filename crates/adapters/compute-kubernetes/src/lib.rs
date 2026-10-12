@@ -3259,3 +3259,102 @@ mod tests {
         ));
     }
 }
+
+/// `runtime_exists` against a stand-in API server: a plain-HTTP listener that
+/// answers the one StatefulSet read, so the real `kube` client, its request path
+/// and its 404 handling are exercised without a cluster.
+#[cfg(test)]
+mod runtime_exists_tests {
+    use std::sync::{Arc, Mutex};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    const STATEFULSET_PATH: &str = "/apis/apps/v1/namespaces/gfs/statefulsets/db-1";
+
+    /// A StatefulSet as a pause leaves it: kept, scaled to zero.
+    const SCALED_TO_ZERO: &str = r#"{"apiVersion":"apps/v1","kind":"StatefulSet",
+        "metadata":{"name":"db-1","namespace":"gfs"},
+        "spec":{"replicas":0,"serviceName":"db-1-svc","selector":{},"template":{}}}"#;
+
+    fn status(code: u16, reason: &str) -> String {
+        format!(
+            r#"{{"kind":"Status","apiVersion":"v1","status":"Failure","message":"{reason}","reason":"{reason}","code":{code}}}"#
+        )
+    }
+
+    /// Serves `(code, body)` to every request and records each request line.
+    async fn compute_answering(
+        code: u16,
+        body: String,
+    ) -> (KubernetesCompute, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && socket.read(&mut byte).await.unwrap_or(0) == 1
+                {
+                    head.push(byte[0]);
+                }
+                let request_line = String::from_utf8_lossy(&head)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                seen.lock().unwrap().push(request_line);
+                let response = format!(
+                    "HTTP/1.1 {code} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        let config = kube::Config::new(format!("http://{address}").parse().unwrap());
+        let compute = KubernetesCompute {
+            client: Client::try_from(config).unwrap(),
+            namespace: DEFAULT_NAMESPACE.to_string(),
+        };
+        (compute, requests)
+    }
+
+    fn instance() -> InstanceId {
+        InstanceId("db-1".to_string())
+    }
+
+    #[tokio::test]
+    async fn a_statefulset_scaled_to_zero_still_exists() {
+        let (compute, requests) = compute_answering(200, SCALED_TO_ZERO.to_string()).await;
+
+        assert!(compute.runtime_exists(&instance()).await.unwrap());
+        let requests = requests.lock().unwrap();
+        assert!(
+            requests[0].starts_with(&format!("GET {STATEFULSET_PATH}")),
+            "read the wrong object: {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_statefulset_does_not_exist() {
+        let (compute, _) = compute_answering(404, status(404, "NotFound")).await;
+
+        assert!(!compute.runtime_exists(&instance()).await.unwrap());
+    }
+
+    /// A refused read answers neither way: it must not be taken for "absent".
+    #[tokio::test]
+    async fn a_failed_read_is_an_error_not_an_absence() {
+        let (compute, _) = compute_answering(403, status(403, "Forbidden")).await;
+
+        let error = compute.runtime_exists(&instance()).await.unwrap_err();
+        assert!(
+            matches!(error, ComputeError::Internal(ref message) if message.contains("statefulset get failed")),
+            "unexpected error: {error:?}"
+        );
+    }
+}
