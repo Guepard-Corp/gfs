@@ -575,18 +575,34 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
         // because the shutdown's own writes to pg_control read as uncommitted
         // work, commit because the database is down -- leaving --force, which
         // discards work, as the only way out.
-        let instance_is_running = match runtime_config {
-            Some(runtime) => matches!(
-                self
-                    .compute
-                    .status(&InstanceId(runtime.container_name.clone()))
-                    .await,
-                Ok(status) if status.state == InstanceState::Running
-            ),
-            None => false,
+        //
+        // Only a positive "stopped" skips it. A status that cannot be read, or
+        // reads as anything else (Unknown, Paused, Starting...), may hide a
+        // running writer, and an unquiesced copy of a running database can be
+        // silently lossy; such a state goes through the quiesce, which refuses
+        // the commit if the instance cannot be prepared.
+        let needs_quiesce = match (runtime_config, environment) {
+            (Some(runtime), Some(_)) => match self
+                .compute
+                .status(&InstanceId(runtime.container_name.clone()))
+                .await
+            {
+                Ok(status) => status.state != InstanceState::Stopped,
+                Err(e) => {
+                    return Err(CommitRepoError::Repository(RepositoryError::Internal(
+                        format!(
+                            "{e}. Refusing to commit: the database's state could not be \
+                             read, so it cannot be told whether it must be quiesced before \
+                             the snapshot, and a running database snapshotted without that \
+                             can be silently lossy"
+                        ),
+                    )));
+                }
+            },
+            _ => false,
         };
         if let (Some(runtime), Some(env)) = (runtime_config, environment)
-            && instance_is_running
+            && needs_quiesce
         {
             let instance_id = InstanceId(runtime.container_name.clone());
 
@@ -1282,6 +1298,8 @@ mod tests {
         /// What an `exec` probe of the container's data dir prints. `None` models a
         /// runtime where `exec` is unavailable, which is the trait default.
         exec_stdout: Option<String>,
+        /// When set, `status()` fails with this message.
+        status_fails_with: Option<String>,
     }
 
     impl Default for MockCompute {
@@ -1296,6 +1314,7 @@ mod tests {
                 pause_fails_with: None,
                 db_live_during_snapshot: false,
                 exec_stdout: None,
+                status_fails_with: None,
             }
         }
     }
@@ -1356,6 +1375,11 @@ mod tests {
         }
 
         async fn status(&self, id: &InstanceId) -> crate::ports::compute::Result<InstanceStatus> {
+            if let Some(message) = &self.status_fails_with {
+                return Err(crate::ports::compute::ComputeError::Internal(
+                    message.clone(),
+                ));
+            }
             Ok(InstanceStatus {
                 id: id.clone(),
                 state: self.state.clone(),
@@ -1780,6 +1804,104 @@ mod tests {
         let compute_arc = uc.compute.clone();
         // We can't downcast Arc<dyn Compute>, so we just check the result is correct.
         let _ = compute_arc;
+    }
+
+    /// A repo with a container-backed database named `container`.
+    fn repo_with_database(container: &str) -> MockRepository {
+        MockRepository {
+            commit_hash: "q1".into(),
+            current_commit: "previous-hash".into(),
+            mount_point: Some("/vol/main".into()),
+            runtime_config: Some(RuntimeConfig {
+                runtime_provider: "docker".into(),
+                runtime_version: "24".into(),
+                container_name: container.into(),
+            }),
+            environment: Some(EnvironmentConfig {
+                database_provider: "mock-db".into(),
+                database_version: "16".into(),
+                database_port: None,
+                display_name: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_commit_whose_database_state_cannot_be_read_is_refused_not_taken_unquiesced() {
+        let compute = Arc::new(MockCompute {
+            status_fails_with: Some("runtime API unreachable".into()),
+            ..Default::default()
+        });
+        let storage = Arc::new(MockStorage::new("snap-q1"));
+        let uc = CommitRepoUseCase::new(
+            Arc::new(repo_with_database("q-pg")),
+            compute.clone(),
+            storage.clone(),
+            Arc::new(MockRegistry),
+        );
+
+        let err = uc
+            .run(existing_repo_path(), "w".into(), None, None, None, None)
+            .await
+            .expect_err("a commit that cannot tell whether to quiesce must not proceed");
+
+        assert!(err.to_string().contains("Refusing to commit"), "{err}");
+        assert!(
+            storage.last_volume.lock().unwrap().is_none(),
+            "no snapshot taken"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_database_in_an_unknown_state_is_quiesced_before_its_snapshot() {
+        let compute = Arc::new(MockCompute {
+            state: InstanceState::Unknown,
+            ..Default::default()
+        });
+        let uc = CommitRepoUseCase::new(
+            Arc::new(repo_with_database("q-pg")),
+            compute.clone(),
+            Arc::new(MockStorage::new("snap-q2")),
+            Arc::new(MockRegistry),
+        );
+
+        uc.run(existing_repo_path(), "w".into(), None, None, None, None)
+            .await
+            .expect("commit");
+
+        assert!(
+            *compute.prepared.lock().unwrap(),
+            "Unknown is not a positive stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stopped_database_is_committed_without_quiescing() {
+        let compute = Arc::new(MockCompute {
+            state: InstanceState::Stopped,
+            ..Default::default()
+        });
+        let storage = Arc::new(MockStorage::new("snap-q3"));
+        let uc = CommitRepoUseCase::new(
+            Arc::new(repo_with_database("q-pg")),
+            compute.clone(),
+            storage.clone(),
+            Arc::new(MockRegistry),
+        );
+
+        uc.run(existing_repo_path(), "w".into(), None, None, None, None)
+            .await
+            .expect("a stopped database is committed");
+
+        assert!(
+            !*compute.prepared.lock().unwrap(),
+            "no CHECKPOINT on a stopped database"
+        );
+        assert_eq!(
+            storage.last_volume.lock().unwrap().as_deref(),
+            Some("/vol/main")
+        );
     }
 
     #[tokio::test]
