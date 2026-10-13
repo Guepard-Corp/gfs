@@ -1212,8 +1212,9 @@ impl KubernetesCompute {
         // Fast-fail if the instance is stopped (StatefulSet scaled to zero): no pod
         // exists and none is coming, so don't burn the full deadline hanging and
         // then return a misleading "not Ready" error. Tell the caller to resume it.
-        if let Ok(ss) = self.api_statefulsets().get(instance).await
-            && ss.spec.as_ref().and_then(|s| s.replicas) == Some(0)
+        if self
+            .is_scaled_to_zero(&InstanceId(instance.to_string()))
+            .await
         {
             // NotAvailable has a bare `{0}` Display: this is an expected state, not an
             // internal fault, so avoid the misleading "internal error:" prefix while
@@ -1535,6 +1536,17 @@ impl KubernetesCompute {
         Ok(InstanceId(instance))
     }
 
+    /// Whether the instance's StatefulSet exists and is scaled to zero: a pause.
+    /// A read failure answers "not known to be", so callers keep treating the
+    /// instance as unknown rather than stopped.
+    async fn is_scaled_to_zero(&self, id: &InstanceId) -> bool {
+        matches!(
+            self.api_statefulsets().get_opt(&id.0).await,
+            Ok(Some(statefulset))
+                if statefulset.spec.as_ref().and_then(|spec| spec.replicas) == Some(0)
+        )
+    }
+
     /// Whether the instance's StatefulSet exists, whatever its replica count.
     ///
     /// [`Compute::status`] reads the instance's pod, so a database scaled to zero
@@ -1744,7 +1756,19 @@ impl Compute for KubernetesCompute {
     }
 
     async fn status(&self, id: &InstanceId) -> Result<InstanceStatus> {
-        Ok(Self::instance_status_from_pod(id, self.get_pod(id).await?))
+        let pod = self.get_pod(id).await?;
+        // No pod is what a pause leaves, and what a StatefulSet that is gone or
+        // still scaling up looks like; only the first is a stopped database.
+        if pod.is_none() && self.is_scaled_to_zero(id).await {
+            return Ok(InstanceStatus {
+                id: id.clone(),
+                state: InstanceState::Stopped,
+                pid: None,
+                started_at: None,
+                exit_code: None,
+            });
+        }
+        Ok(Self::instance_status_from_pod(id, pod))
     }
 
     async fn watch_status(
@@ -3290,6 +3314,13 @@ mod runtime_exists_tests {
         code: u16,
         body: String,
     ) -> (KubernetesCompute, Arc<Mutex<Vec<String>>>) {
+        compute_routing(vec![("/", code, body)]).await
+    }
+
+    /// Serves the first route whose path prefix the request path starts with.
+    async fn compute_routing(
+        routes: Vec<(&'static str, u16, String)>,
+    ) -> (KubernetesCompute, Arc<Mutex<Vec<String>>>) {
         // A workspace build enables both rustls backends, and rustls then refuses
         // to pick one; the CLI's main installs aws-lc-rs for the same reason.
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -3310,7 +3341,13 @@ mod runtime_exists_tests {
                     .next()
                     .unwrap_or("")
                     .to_string();
+                let path = request_line.split(' ').nth(1).unwrap_or("").to_string();
                 seen.lock().unwrap().push(request_line);
+                let (code, body) = routes
+                    .iter()
+                    .find(|(prefix, _, _)| path.starts_with(prefix))
+                    .map(|(_, code, body)| (*code, body.clone()))
+                    .unwrap_or((404, String::new()));
                 let response = format!(
                     "HTTP/1.1 {code} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
@@ -3340,6 +3377,35 @@ mod runtime_exists_tests {
             requests[0].starts_with(&format!("GET {STATEFULSET_PATH}")),
             "read the wrong object: {requests:?}"
         );
+    }
+
+    const PODS_PATH: &str = "/api/v1/namespaces/gfs/pods";
+    const NO_PODS: &str = r#"{"apiVersion":"v1","kind":"PodList","metadata":{},"items":[]}"#;
+
+    /// A paused database (StatefulSet kept, scaled to zero, no pod) reads Stopped.
+    #[tokio::test]
+    async fn a_database_scaled_to_zero_reads_stopped() {
+        let (compute, _) = compute_routing(vec![
+            (PODS_PATH, 200, NO_PODS.to_string()),
+            (STATEFULSET_PATH, 200, SCALED_TO_ZERO.to_string()),
+        ])
+        .await;
+
+        let state = compute.status(&instance()).await.unwrap().state;
+        assert_eq!(state, InstanceState::Stopped);
+    }
+
+    /// No pod and no StatefulSet is not a pause: it stays Unknown.
+    #[tokio::test]
+    async fn no_pod_and_no_statefulset_reads_unknown() {
+        let (compute, _) = compute_routing(vec![
+            (PODS_PATH, 200, NO_PODS.to_string()),
+            (STATEFULSET_PATH, 404, status(404, "NotFound")),
+        ])
+        .await;
+
+        let state = compute.status(&instance()).await.unwrap().state;
+        assert_eq!(state, InstanceState::Unknown);
     }
 
     #[tokio::test]
