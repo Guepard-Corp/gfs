@@ -332,6 +332,21 @@ impl StoragePort for KubernetesStorage {
         Ok(())
     }
 
+    async fn discard_snapshot(&self, snapshot_hash: &str) -> Result<()> {
+        let name = volumesnapshot_name_for_hash(snapshot_hash);
+        match self
+            .api_volume_snapshots()
+            .delete(&name, &DeleteParams::default())
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(err)) if err.code == 404 => Ok(()),
+            Err(e) => Err(StorageError::Internal(format!(
+                "delete volumesnapshot '{name}' failed: {e}"
+            ))),
+        }
+    }
+
     async fn snapshot(&self, id: &VolumeId, options: SnapshotOptions) -> Result<Snapshot> {
         let pvc_name = id.0.trim();
         if pvc_name.is_empty() {

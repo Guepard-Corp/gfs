@@ -401,10 +401,8 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
             // `join!` (not `try_join!`): a failed schema arm must NOT cancel the
             // in-flight snapshot midway. A `.gfs/objects` orphan left by a schema
             // arm that finished while the snapshot failed is harmless — no ref
-            // points to it. shortcut: a snapshot that finished while the schema
-            // arm failed is left unreferenced (no commit points to it) until a
-            // collector reclaims it; capturing the schema first would cost the
-            // overlap's latency on every commit.
+            // points to it. A snapshot that finished while the schema arm failed
+            // is discarded: no commit will ever reference it.
             let (schema_res, snapshot_res) = tokio::join!(
                 self.commit_schema(&path, &runtime_config, &environment, is_stopped),
                 self.take_snapshot(
@@ -417,7 +415,20 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                 ),
             );
             let snapshot_hash = snapshot_res?;
-            (schema_res?, snapshot_hash)
+            let schema_hash = match schema_res {
+                Ok(schema_hash) => schema_hash,
+                Err(e) => {
+                    if let Err(discard) = self.storage.discard_snapshot(&snapshot_hash).await {
+                        tracing::warn!(
+                            snapshot = %snapshot_hash,
+                            error = %discard,
+                            "could not discard the snapshot of a failed commit; it stays unreferenced"
+                        );
+                    }
+                    return Err(e);
+                }
+            };
+            (schema_hash, snapshot_hash)
         } else {
             // Sequential: schema extraction must complete before the snapshot
             // pauses (and thus freezes) the database.
@@ -3009,6 +3020,7 @@ mod tests {
             snapshot_step: AtomicUsize,
             latch: Option<Arc<Latch>>,
             fail: bool,
+            discarded: std::sync::Mutex<Vec<String>>,
         }
 
         impl OverlapStorage {
@@ -3018,6 +3030,7 @@ mod tests {
                     snapshot_step: AtomicUsize::new(0),
                     latch: None,
                     fail: false,
+                    discarded: std::sync::Mutex::new(Vec::new()),
                 }
             }
             fn with_latch(mut self, latch: Arc<Latch>) -> Self {
@@ -3103,6 +3116,10 @@ mod tests {
                 &self,
                 _: &std::path::Path,
             ) -> crate::ports::storage::Result<()> {
+                Ok(())
+            }
+            async fn discard_snapshot(&self, hash: &str) -> crate::ports::storage::Result<()> {
+                self.discarded.lock().unwrap().push(hash.to_string());
                 Ok(())
             }
         }
@@ -3428,7 +3445,7 @@ mod tests {
             let uc = CommitRepoUseCase::new(
                 repo_arc.clone(),
                 compute,
-                storage,
+                storage.clone(),
                 Arc::new(OverlapRegistry),
             );
             let err = uc
@@ -3440,6 +3457,13 @@ mod tests {
                 repo_arc.committed.lock().unwrap().is_none(),
                 "no schema-less commit is recorded"
             );
+            // The snapshot taken alongside (the arms overlap) is referenced by no
+            // commit, so it is discarded rather than left for a collector.
+            assert!(
+                storage.snapshot_step.load(Ordering::SeqCst) > 0,
+                "fixture sanity: the snapshot arm ran"
+            );
+            assert_eq!(storage.discarded.lock().unwrap().len(), 1);
         }
 
         /// Error asymmetry (b): snapshot fails, schema succeeds → the commit
