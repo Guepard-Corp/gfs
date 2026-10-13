@@ -1755,6 +1755,22 @@ impl Compute for KubernetesCompute {
         self.start(id, StartOptions::default()).await
     }
 
+    /// The StatefulSet's uid and generation. Starting and stopping patch its
+    /// replicas, a spec change that bumps the generation; a rebuilt StatefulSet
+    /// gets a new uid, so a generation that restarted at 1 never reads as equal.
+    async fn instance_epoch(&self, id: &InstanceId) -> Result<Option<String>> {
+        let statefulset = self
+            .api_statefulsets()
+            .get_opt(&id.0)
+            .await
+            .map_err(|e| ComputeError::Internal(format!("k8s statefulset get failed: {e}")))?;
+        Ok(statefulset.and_then(|statefulset| {
+            let uid = statefulset.metadata.uid?;
+            let generation = statefulset.metadata.generation?;
+            Some(format!("{uid}:{generation}"))
+        }))
+    }
+
     async fn status(&self, id: &InstanceId) -> Result<InstanceStatus> {
         let pod = self.get_pod(id).await?;
         // No pod is what a pause leaves, and what a StatefulSet that is gone or
@@ -3300,7 +3316,7 @@ mod runtime_exists_tests {
 
     /// A StatefulSet as a pause leaves it: kept, scaled to zero.
     const SCALED_TO_ZERO: &str = r#"{"apiVersion":"apps/v1","kind":"StatefulSet",
-        "metadata":{"name":"db-1","namespace":"gfs"},
+        "metadata":{"name":"db-1","namespace":"gfs","uid":"u-1","generation":4},
         "spec":{"replicas":0,"serviceName":"db-1-svc","selector":{},"template":{}}}"#;
 
     fn status(code: u16, reason: &str) -> String {
@@ -3406,6 +3422,19 @@ mod runtime_exists_tests {
 
         let state = compute.status(&instance()).await.unwrap().state;
         assert_eq!(state, InstanceState::Unknown);
+    }
+
+    #[tokio::test]
+    async fn the_epoch_is_the_statefulsets_uid_and_generation() {
+        let (compute, _) = compute_answering(200, SCALED_TO_ZERO.to_string()).await;
+        let epoch = compute.instance_epoch(&instance()).await.unwrap();
+        assert_eq!(epoch.as_deref(), Some("u-1:4"));
+    }
+
+    #[tokio::test]
+    async fn a_missing_statefulset_has_no_epoch() {
+        let (compute, _) = compute_answering(404, status(404, "NotFound")).await;
+        assert_eq!(compute.instance_epoch(&instance()).await.unwrap(), None);
     }
 
     #[tokio::test]
