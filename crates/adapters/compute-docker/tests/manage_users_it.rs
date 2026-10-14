@@ -626,6 +626,9 @@ async fn a_password_sent_as_a_verifier_still_logs_in() {
     }
 
     let pg = Postgres::start();
+    // Log every statement, so the server log shows whether a plaintext was sent.
+    pg.psql("ALTER SYSTEM SET log_statement = 'all'");
+    pg.psql("SELECT pg_reload_conf()");
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path();
     write_repo(repo, pg.name());
@@ -654,7 +657,28 @@ async fn a_password_sent_as_a_verifier_still_logs_in() {
         .expect("rotate app_pw");
     let logs_in_second = login(pg.name(), "app_pw", "second pw 2");
     let old_refused = !login(pg.name(), "app_pw", "first pw $HOME 1");
+    let logs = Command::new("docker")
+        .args(["logs", pg.name()])
+        .output()
+        .expect("docker logs");
+    let server_log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&logs.stdout),
+        String::from_utf8_lossy(&logs.stderr)
+    );
 
+    // Postgres hashes a plaintext on arrival too, so `stored` alone cannot tell the
+    // two apart; only the logged statements show what was actually sent.
+    assert!(
+        server_log.contains(r#"CREATE ROLE "app_pw""#),
+        "statement logging must capture the CREATE ROLE"
+    );
+    for plaintext in ["first pw $HOME 1", "second pw 2"] {
+        assert!(
+            !server_log.contains(plaintext),
+            "plaintext {plaintext:?} reached the server log"
+        );
+    }
     assert!(
         stored.starts_with("SCRAM-SHA-256$4096:"),
         "stored: {stored}"
