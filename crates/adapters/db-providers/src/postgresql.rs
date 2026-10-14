@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use gfs_domain::model::db_user::{
     DeployEnvSpec, GrantSpec, GrantableObject, PRESET_GROUP_ROLES, Privilege, RevokeSpec,
-    RolePreset, RoleSpec,
+    RolePreset, RoleSpec, is_scram_verifier,
 };
 use gfs_domain::ports::compute::{ComputeDefinition, EnvVar, PortMapping};
 use gfs_domain::ports::database_provider::{
@@ -471,7 +471,7 @@ impl DatabaseProvider for PostgresqlProvider {
         // v2 escalation). Password via a quoted literal — never bare (v2 gap #3).
         let mut sql = format!(
             "CREATE ROLE {ident} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '{}';",
-            sql_lit(&spec.password)
+            sql_lit(&password_verifier(&spec.password))
         );
         if let Some(preset) = spec.preset {
             // Quote the deploy owner (if any) so the preset's default privileges
@@ -507,7 +507,10 @@ impl DatabaseProvider for PostgresqlProvider {
     ) -> std::result::Result<String, ProviderError> {
         let ident = pg_quote_ident(username)?;
         Ok(Self::pin_mgmt_search_path(self.query_in_instance_command(
-            &format!("ALTER ROLE {ident} WITH PASSWORD '{}';", sql_lit(password)),
+            &format!(
+                "ALTER ROLE {ident} WITH PASSWORD '{}';",
+                sql_lit(&password_verifier(password))
+            ),
             None,
         )?))
     }
@@ -559,7 +562,7 @@ impl DatabaseProvider for PostgresqlProvider {
         Ok(Self::pin_mgmt_search_path(self.query_in_instance_command(
             &format!(
                 "BEGIN;\nALTER ROLE {ident} NOLOGIN;\nALTER ROLE {ident} WITH PASSWORD '{}';\nCOMMIT;",
-                sql_lit(new_password)
+                sql_lit(&password_verifier(new_password))
             ),
             None,
         )?))
@@ -679,7 +682,7 @@ impl DatabaseProvider for PostgresqlProvider {
              ALTER DEFAULT PRIVILEGES FOR ROLE {owner} IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {group};\n\
              ALTER DEFAULT PRIVILEGES FOR ROLE {owner} IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO {group};\n\
              COMMIT;",
-            pw = sql_lit(&spec.owner_password),
+            pw = sql_lit(&password_verifier(&spec.owner_password)),
         );
         let bootstrap = Self::pin_mgmt_search_path(self.query_in_instance_command(&sql, None)?);
         // Confine the management superuser (`${POSTGRES_USER}`) to the container's
@@ -1224,6 +1227,18 @@ pub fn register(registry: &impl DatabaseProviderRegistry) -> Result<()> {
 /// highlighting / linting). `__PLACEHOLDER__` sentinels are substituted by
 /// `build_clone_bootstrap_sql`.
 const CLONE_BOOTSTRAP_TMPL: &str = include_str!("clone_bootstrap.sql");
+
+/// The SCRAM-SHA-256 verifier for a role password (RFC 5802 / RFC 7677, via
+/// `postgres_protocol`), which Postgres stores as given. The plaintext then never
+/// appears in the SQL, and so never in psql's argv or a logged statement. An input
+/// that already is a verifier (re-keying from durability) passes through unchanged.
+fn password_verifier(password: &str) -> String {
+    if is_scram_verifier(password) {
+        password.to_string()
+    } else {
+        postgres_protocol::password::scram_sha_256(password.as_bytes())
+    }
+}
 
 /// Escape a value for use inside a single-quoted SQL string literal.
 fn sql_lit(s: &str) -> String {
@@ -1775,6 +1790,33 @@ mod tests {
         assert_eq!(spec.input_filename, "import.dump");
     }
 
+    /// The role password reaches the SQL only as a SCRAM verifier, never as text.
+    fn assert_password_hashed(cmd: &str, before: &str, plaintext: &str) {
+        let verifier = format!("{before}SCRAM-SHA-256$4096:");
+        assert!(cmd.contains(&verifier), "expected `{verifier}` in {cmd}");
+        assert!(!cmd.contains(plaintext), "plaintext password in {cmd}");
+        assert!(
+            !cmd.contains(&plaintext.replace('\'', "''")),
+            "plaintext password in {cmd}"
+        );
+    }
+
+    #[test]
+    fn a_verifier_passes_through_and_a_plaintext_is_hashed_freshly() {
+        let stored = password_verifier("hunter2");
+        assert!(is_scram_verifier(&stored));
+        assert_eq!(
+            password_verifier(&stored),
+            stored,
+            "re-key must not re-hash"
+        );
+        assert_ne!(
+            password_verifier("hunter2"),
+            stored,
+            "each hash gets a new salt"
+        );
+    }
+
     #[test]
     fn query_in_instance_command_uses_loopback_and_heredoc() {
         let provider = PostgresqlProvider::new();
@@ -1866,10 +1908,7 @@ mod tests {
         assert!(
             cmd.contains(r#"CREATE ROLE "app_rw" WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE"#)
         );
-        assert!(
-            cmd.contains("PASSWORD 'p''wd'"),
-            "password literal must double the quote"
-        );
+        assert_password_hashed(&cmd, "PASSWORD '", "p'wd");
         assert!(
             cmd.contains("BEGIN;"),
             "create+grants must be transactional"
@@ -2039,7 +2078,7 @@ mod tests {
         );
         assert!(provider.drop_role_command("bad name", None).is_err());
         let alter = provider.alter_password_command("app_ro", "new'pw").unwrap();
-        assert!(alter.contains(r#"ALTER ROLE "app_ro" WITH PASSWORD 'new''pw';"#));
+        assert_password_hashed(&alter, r#"ALTER ROLE "app_ro" WITH PASSWORD '"#, "new'pw");
     }
 
     #[test]
@@ -2052,9 +2091,11 @@ mod tests {
             cmd.contains(r#"ALTER ROLE "app_stale" NOLOGIN;"#),
             "quarantine must disable login (the airtight, cluster-wide access denial)"
         );
-        assert!(
-            cmd.contains(r#"ALTER ROLE "app_stale" WITH PASSWORD 'thrown''away';"#),
-            "quarantine must overwrite the resurrected snapshot password (literal escaped)"
+        // quarantine must overwrite the resurrected snapshot password
+        assert_password_hashed(
+            &cmd,
+            r#"ALTER ROLE "app_stale" WITH PASSWORD '"#,
+            "thrown'away",
         );
         // NOLOGIN before the password rotation, both inside one transaction, so a
         // half-applied neutralization can never leave the role able to log in.
@@ -2084,9 +2125,11 @@ mod tests {
         let cmd = provider.bootstrap_deploy_env_command(&spec).unwrap();
         // group NOLOGIN + least-privileged owner; identifiers quoted, password escaped.
         assert!(cmd.contains(r#"CREATE ROLE "developers" NOLOGIN;"#));
-        assert!(cmd.contains(
-            r#"CREATE ROLE "app_owner" WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD 's3cret''pw';"#
-        ));
+        assert_password_hashed(
+            &cmd,
+            r#"CREATE ROLE "app_owner" WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '"#,
+            "s3cret'pw",
+        );
         // owner keeps `public` (explicit CONNECT + USAGE,CREATE).
         assert!(cmd.contains(r#"GRANT CONNECT ON DATABASE "appdb" TO "app_owner";"#));
         assert!(cmd.contains(r#"GRANT USAGE, CREATE ON SCHEMA public TO "app_owner";"#));
