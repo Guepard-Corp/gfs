@@ -1209,19 +1209,28 @@ impl KubernetesCompute {
     /// not-ready pod fails the WebSocket upgrade with `400 Bad Request`.
     async fn wait_ready_pod_name(&self, instance: &str) -> Result<String> {
         use std::time::Duration;
-        // Fast-fail if the instance is stopped (StatefulSet scaled to zero): no pod
-        // exists and none is coming, so don't burn the full deadline hanging and
-        // then return a misleading "not Ready" error. Tell the caller to resume it.
-        if let Ok(ss) = self.api_statefulsets().get(instance).await
-            && ss.spec.as_ref().and_then(|s| s.replicas) == Some(0)
-        {
-            // NotAvailable has a bare `{0}` Display: this is an expected state, not an
-            // internal fault, so avoid the misleading "internal error:" prefix while
-            // keeping the actionable "resume it" guidance intact.
-            return Err(ComputeError::NotAvailable(format!(
-                "instance '{instance}' is stopped (scaled to zero); resume it \
-                 (e.g. `gfs compute start`) before running this operation"
-            )));
+        // Fast-fail when no pod is coming, so the caller does not burn the full
+        // deadline hanging and then get a misleading "not Ready" error: the
+        // instance is stopped (StatefulSet scaled to zero), or its StatefulSet is
+        // gone (removed, and never rebuilt). Only a StatefulSet that exists with
+        // replicas, or one that cannot be read, is waited for. NotAvailable has a
+        // bare `{0}` Display: these are expected states, not internal faults.
+        match self.api_statefulsets().get_opt(instance).await {
+            Ok(Some(statefulset))
+                if statefulset.spec.as_ref().and_then(|spec| spec.replicas) == Some(0) =>
+            {
+                return Err(ComputeError::NotAvailable(format!(
+                    "instance '{instance}' is stopped (scaled to zero); resume it \
+                     (e.g. `gfs compute start`) before running this operation"
+                )));
+            }
+            Ok(None) => {
+                return Err(ComputeError::NotAvailable(format!(
+                    "instance '{instance}' has no StatefulSet: it was removed and must be \
+                     deployed again before running this operation"
+                )));
+            }
+            Ok(Some(_)) | Err(_) => {}
         }
         use kube::runtime::watcher;
         use tokio_stream::StreamExt;
@@ -3342,6 +3351,48 @@ mod runtime_exists_tests {
         );
     }
 
+    /// An exec into an instance whose StatefulSet is gone fails at once: no pod
+    /// is coming, so it must not wait out the readiness deadline (120 s) for one.
+    #[tokio::test]
+    async fn an_exec_into_an_instance_whose_statefulset_is_gone_fails_at_once() {
+        let (compute, requests) = compute_answering(404, status(404, "NotFound")).await;
+
+        let began = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            compute.exec(&instance(), "true", None),
+        )
+        .await
+        .expect("the exec returns instead of waiting for a pod");
+        assert!(began.elapsed() < std::time::Duration::from_secs(5));
+        assert!(
+            matches!(&result, Err(ComputeError::NotAvailable(m)) if m.contains("no StatefulSet")),
+            "{result:?}"
+        );
+        let requests = requests.lock().unwrap();
+        assert!(
+            !requests.iter().any(|r| r.contains("/pods")),
+            "watched for pods: {requests:?}"
+        );
+    }
+
+    /// The same for a stopped instance (StatefulSet kept, scaled to zero).
+    #[tokio::test]
+    async fn an_exec_into_a_stopped_instance_fails_at_once() {
+        let (compute, requests) = compute_answering(200, SCALED_TO_ZERO.to_string()).await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            compute.exec(&instance(), "true", None),
+        )
+        .await
+        .expect("the exec returns instead of waiting for a pod");
+        assert!(
+            matches!(&result, Err(ComputeError::NotAvailable(m)) if m.contains("scaled to zero")),
+            "{result:?}"
+        );
+        assert!(!requests.lock().unwrap().iter().any(|r| r.contains("/pods")));
+    }
     #[tokio::test]
     async fn a_missing_statefulset_does_not_exist() {
         let (compute, _) = compute_answering(404, status(404, "NotFound")).await;
