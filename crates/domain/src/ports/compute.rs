@@ -405,6 +405,15 @@ pub trait Compute: Send + Sync {
     /// Return the current runtime status of the instance.
     async fn status(&self, id: &InstanceId) -> Result<InstanceStatus>;
 
+    /// An opaque marker that changes whenever the instance is started, stopped
+    /// or rebuilt, whoever does it. Two equal readings mean the instance stayed
+    /// in the same run (or the same stop) in between. `None` when the runtime
+    /// cannot tell, which callers must read as "may have changed".
+    async fn instance_epoch(&self, id: &InstanceId) -> Result<Option<String>> {
+        let _ = id;
+        Ok(None)
+    }
+
     /// Watch for instance state changes, delivering `(InstanceId, InstanceState)`
     /// the moment a runtime transition is observed (e.g. a pod becoming ready)
     /// rather than on the next poll tick.
