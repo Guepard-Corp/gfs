@@ -1,3 +1,4 @@
+use crate::println_safe;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -64,7 +65,7 @@ async fn storage_for_repo(repo_path: &std::path::Path) -> Arc<dyn StoragePort> {
         && cfg
             .runtime
             .as_ref()
-            .map(|r| r.runtime_provider.trim().eq_ignore_ascii_case("kubernetes"))
+            .map(|r| gfs_domain::model::config::is_kubernetes_provider(&r.runtime_provider))
             .unwrap_or(false)
     {
         let s = gfs_storage_kubernetes::KubernetesStorage::new(None)
@@ -115,23 +116,23 @@ async fn run(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if json_output {
-        println!(
+        println_safe!(
             "{}",
             json!({
                 "hash": commit_hash,
                 "branch": branch,
                 "message": message,
             })
-        );
+        )?;
     } else {
         let short = &commit_hash[..7.min(commit_hash.len())];
-        println!(
+        println_safe!(
             "{} [{}] {}  {}",
             green("✓"),
             cyan(&branch),
             dimmed(short),
             message
-        );
+        )?;
     }
     Ok(())
 }

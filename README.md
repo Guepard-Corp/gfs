@@ -530,6 +530,61 @@ gfs status
 gfs status --output json
 ```
 
+### `gfs fsck`
+
+Check repository integrity. Walks from every branch and HEAD and reports what
+is not reachable, what is referenced but missing, and any entry in the object
+store it cannot identify. It removes nothing.
+
+```bash
+gfs fsck
+gfs fsck --json
+gfs fsck --plan            # also record the marked set under .gfs/gc/<id>/
+gfs fsck --grace 7200      # seconds an entry must have existed to count as garbage
+```
+
+Exit status is meaningful:
+
+| code | meaning |
+| ---- | ------- |
+| `0` | consistent, nothing to collect |
+| `1` | unreachable objects found — a collector would have work to do |
+| `2` | corruption found: something referenced is missing, or an entry could not be identified |
+| `3` | **the check could not be completed**, so the report says nothing about the repository |
+
+A usage error — a flag that does not exist, a value that will not parse, an argument
+that is not valid UTF-8, an unknown subcommand — also exits `3`, for every `gfs`
+command and not just this one. It is the same statement: the command did not run, so
+nothing here describes your repository. `--help` and `--version` exit `0`; they are
+requests, not errors.
+
+`3` is the one to handle first. It is not a statement about the repository — an
+unreadable object, a `refs/heads` entry that could not be read or is absent, a
+Kubernetes backend whose cluster cannot be reached, and a usage error all produce
+it, and on a cluster-backed repository with no reachable cluster it is the
+ordinary answer. Treating it as `1` would read a check that never ran as a check
+that found some garbage.
+
+A ref whose *value* is present but will not parse — empty, or not a hash — is
+`2`, not `3`. The distinction is deliberate: a file that could not be read is a
+hole, while a file that reads back as nonsense is corruption, and only the second
+is a statement about the repository.
+
+Reported sizes are what `du` would show for those trees, not space already free —
+on a copy-on-write filesystem a snapshot shares blocks with the tree it was
+cloned from.
+
+`--grace` defaults to 86400 (24 hours): a commit writes its snapshot before the
+object that references it, so anything newer may belong to an operation still in
+flight. Values below the one-hour floor need `--disable-grace-period-check`,
+which is named for what it disables — without the window, an in-flight commit's
+snapshot can be reported as garbage, and `--plan` will persist that judgement.
+
+`--plan` is refused when a plan would be untrustworthy: on an inconsistent
+repository, when the snapshots could not be verified, and when the walk did not
+complete. In each case the refusal carries the repository's own exit code, and
+under `--json` it is reported as an `error` object rather than an empty stdout.
+
 ### `gfs commit`
 
 Commit the current database state.

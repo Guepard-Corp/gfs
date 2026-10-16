@@ -21,6 +21,10 @@ pub const SNAPSHOTS_DIR: &str = "snapshots";
 pub const WORKSPACES_DIR: &str = "workspaces";
 pub const WORKSPACE_DATA_DIR: &str = "data";
 pub const OPERATIONS_DIR: &str = "operations";
+/// Holds one directory per `gfs fsck --plan` run: the marked set a later
+/// `gfs gc` sweeps. Written before anything is ever removed, so the plan a
+/// human inspected is provably the plan that gets acted on.
+pub const GC_DIR: &str = "gc";
 
 /// Length of commit hash used in workspace directory paths on disk (e.g. `workspaces/detached/<short>/data`).
 /// Full hash remains in refs and HEAD; only the path segment is shortened to keep paths readable.

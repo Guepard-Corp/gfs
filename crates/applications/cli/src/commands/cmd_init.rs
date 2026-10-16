@@ -1,3 +1,4 @@
+use crate::println_safe;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -138,7 +139,7 @@ pub async fn init(
     // Kubernetes runtime: ensure mount_point is set to PVC name so commits snapshot PVCs
     // instead of trying to snapshot a host filesystem path.
     if has_provider
-        && matches!(runtime_provider.as_str(), "kubernetes" | "k8s" | "k3s")
+        && gfs_domain::model::config::is_kubernetes_provider(&runtime_provider)
         && let Ok(mut cfg) = GfsConfig::load(&target_path)
         && cfg.mount_point.as_deref().unwrap_or("").trim().is_empty()
         && let Some(rt) = cfg.runtime.as_ref()
@@ -167,7 +168,7 @@ pub async fn init(
     }
 
     if json_output {
-        println!(
+        println_safe!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "path": target_path.display().to_string(),
@@ -176,21 +177,21 @@ pub async fn init(
                 "provider": provider_display,
                 "connection_string": connection_string,
             }))?
-        );
+        )?;
     } else {
-        println!(
+        println_safe!(
             "  {} Initialized GFS repository at {}",
             green("✓"),
             cyan(target_path.display().to_string())
-        );
-        println!();
-        println!("    {:<16} {}", dimmed("Branch"), cyan("main"));
-        println!("    {:<16} .gfs/config.toml", dimmed("Config"));
+        )?;
+        println_safe!()?;
+        println_safe!("    {:<16} {}", dimmed("Branch"), cyan("main"))?;
+        println_safe!("    {:<16} .gfs/config.toml", dimmed("Config"))?;
         if let Some(ref provider) = provider_display {
-            println!("    {:<16} {}", dimmed("Provider"), cyan(provider));
+            println_safe!("    {:<16} {}", dimmed("Provider"), cyan(provider))?;
         }
         if let Some(ref c) = connection_string {
-            println!("    {:<16} {}", dimmed("Connection"), cyan(c));
+            println_safe!("    {:<16} {}", dimmed("Connection"), cyan(c))?;
         }
     }
 
