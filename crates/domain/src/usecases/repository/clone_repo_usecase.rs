@@ -163,7 +163,7 @@ impl<R: DatabaseProviderRegistry> CloneRepoUseCase<R> {
             return Err(CloneRepoError::Config(format!(
                 "remote version probe failed (exit {}): {}",
                 out.exit_code,
-                out.stderr.trim()
+                failure_detail(&out)
             )));
         }
         let num: u32 = out.stdout.trim().parse().map_err(|_| {
@@ -382,8 +382,54 @@ impl<R: DatabaseProviderRegistry> CloneRepoUseCase<R> {
     }
 }
 
+/// What a failed task said about why it failed. A Kubernetes task pod has a
+/// single log stream, which `run_task` returns as stdout with an empty stderr,
+/// so a reason read from stderr alone was always blank there.
+fn failure_detail(out: &crate::ports::compute::ExecOutput) -> &str {
+    let stderr = out.stderr.trim();
+    if stderr.is_empty() {
+        out.stdout.trim()
+    } else {
+        stderr
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    fn output(stdout: &str, stderr: &str) -> crate::ports::compute::ExecOutput {
+        crate::ports::compute::ExecOutput {
+            exit_code: 2,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        }
+    }
+
+    /// The Kubernetes shape: the probe's error arrives on stdout, stderr empty.
+    #[test]
+    fn a_failure_reported_only_on_stdout_is_not_lost() {
+        let out = output(
+            "psql: error: connection to server at \"192.0.2.5\", port 5432 failed: Connection refused\n",
+            "",
+        );
+        assert_eq!(
+            super::failure_detail(&out),
+            "psql: error: connection to server at \"192.0.2.5\", port 5432 failed: Connection refused"
+        );
+    }
+
+    /// Where stderr is separate (Docker), it is still the reason.
+    #[test]
+    fn stderr_is_the_reason_when_there_is_one() {
+        let out = output(
+            "partial output",
+            "psql: error: password authentication failed",
+        );
+        assert_eq!(
+            super::failure_detail(&out),
+            "psql: error: password authentication failed"
+        );
+    }
+
     /// The launcher and poll are built inline in `run`, so this pins their shape
     /// from the one place that is testable without a live pod: the strings
     /// themselves. Behaviour is covered end-to-end on a cluster.

@@ -58,7 +58,7 @@ Built with **cargo-pgrx** (excluded from the parent Cargo workspace):
 cd crates/extensions/gfs
 cargo build --no-default-features --features pg16            # typecheck / compile
 cargo pgrx install --pg-config "$(which pg_config)"          # build + install into a local PG
-docker build -t gfs-postgres:16 .                            # package into an image (slow, multi-stage)
+docker build --build-arg PG_MAJOR=16 -t gfs-postgres:16 .                            # package into an image (slow, multi-stage)
 ```
 
 The hook-only library loads via `session_preload_libraries='gfs'` (set on the clone

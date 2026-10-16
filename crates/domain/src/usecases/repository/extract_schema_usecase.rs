@@ -37,6 +37,10 @@ pub enum ExtractSchemaError {
     #[error("schema extraction failed: {0}")]
     ExtractionFailed(String),
 
+    /// The provider has no schema extraction: its commits carry no schema by design.
+    #[error("{0}")]
+    Unsupported(String),
+
     #[error("config error: {0}")]
     Config(String),
 
@@ -176,6 +180,19 @@ impl<R: DatabaseProviderRegistry> ExtractSchemaUseCase<R> {
         })
     }
 
+    /// Extract the schema like [`Self::run`] and store it as a schema object in the
+    /// repo, returning its hash: the value a commit records as its `schema_hash`.
+    ///
+    /// # Errors
+    /// Every [`Self::run`] error, and [`ExtractSchemaError::ExtractionFailed`] when
+    /// the schema object cannot be written.
+    pub async fn run_and_store(&self, path: &Path) -> Result<String, ExtractSchemaError> {
+        let schema = self.run(path).await?;
+        repo_layout::write_schema_object(path, &schema.metadata, &schema.schema_sql).map_err(|e| {
+            ExtractSchemaError::ExtractionFailed(format!("storing the schema object: {e}"))
+        })
+    }
+
     /// Run the provider's extraction command inside its running database
     /// container, returning the command's stdout.
     async fn extract_via_container(
@@ -218,7 +235,7 @@ impl<R: DatabaseProviderRegistry> ExtractSchemaUseCase<R> {
             .schema_extraction_spec(&params)
             .map_err(|e| ExtractSchemaError::ExtractionFailed(e.to_string()))?
             .ok_or_else(|| {
-                ExtractSchemaError::ExtractionFailed(format!(
+                ExtractSchemaError::Unsupported(format!(
                     "provider '{provider_name}' does not support schema extraction"
                 ))
             })?;

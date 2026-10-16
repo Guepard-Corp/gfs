@@ -14,7 +14,7 @@
 //! macOS-only (consistent with the other e2e suites); Docker/Podman required;
 //! relies on Docker Desktop's `host.docker.internal`. Tests SKIP (no failure) when
 //! the `gfs-postgres:16` image is absent — build it with
-//! `docker build -t gfs-postgres:16 crates/extensions/gfs`.
+//! `docker build --build-arg PG_MAJOR=16 -t gfs-postgres:16 crates/extensions/gfs`.
 
 #![cfg(target_os = "macos")]
 
@@ -176,16 +176,50 @@ const SCHEMA: &str = "\
     GRANT SELECT ON ALL TABLES IN SCHEMA public TO gfs_reader;";
 
 /// True if the gfs extension image is present; otherwise print a SKIP note.
+/// The PostgreSQL major `GFS_IMAGE` is tagged for.
+fn expected_pg_major() -> &'static str {
+    GFS_IMAGE.rsplit(':').next().unwrap_or("17")
+}
+
 fn gfs_image_present() -> bool {
+    let build_hint = format!(
+        "docker build --build-arg PG_MAJOR={} -t {GFS_IMAGE} crates/extensions/gfs",
+        expected_pg_major()
+    );
     let ok = runtime_command()
         .args(["image", "inspect", GFS_IMAGE])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
     if !ok {
+        eprintln!("SKIP: image {GFS_IMAGE} absent — build: {build_hint}");
+        return false;
+    }
+
+    // The tag is a string and PG_MAJOR defaults to 17, so an image built without
+    // the build argument holds a 17 extension whatever it is called. That image
+    // starts, serves, and fails later somewhere unrelated, so check it here
+    // where the cause is still visible. Images built before the label existed
+    // report nothing and are let through rather than failing the suite.
+    let label = runtime_command()
+        .args([
+            "image",
+            "inspect",
+            GFS_IMAGE,
+            "--format",
+            "{{index .Config.Labels \"run.guepard.gfs.pg_major\"}}",
+        ])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let want = expected_pg_major();
+    if !label.is_empty() && label != "<no value>" && label != want {
         eprintln!(
-            "SKIP: image {GFS_IMAGE} absent — build: docker build -t {GFS_IMAGE} crates/extensions/gfs"
+            "SKIP: image {GFS_IMAGE} holds PostgreSQL {label}, not {want} — it was built \
+             without --build-arg PG_MAJOR={want}. Rebuild: {build_hint}"
         );
+        return false;
     }
     ok
 }
