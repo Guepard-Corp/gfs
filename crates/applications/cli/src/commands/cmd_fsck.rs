@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use gfs_domain::model::fsck::FsckReport;
 use gfs_domain::model::fsck::SnapshotFacts;
 use gfs_domain::model::layout::{GC_DIR, GFS_DIR, SNAPSHOTS_DIR};
+use gfs_domain::repo_utils::durable_write::write_durable;
 use gfs_domain::repo_utils::fsck::{self, DEFAULT_GRACE, MIN_GRACE, SnapshotSource};
 use serde_json::json;
 use std::collections::HashMap;
@@ -393,7 +394,8 @@ fn write_plan(repo_path: &std::path::Path, report: &FsckReport) -> Result<String
         "report": report,
     });
     let path = dir.join("plan.json");
-    std::fs::write(&path, serde_json::to_string_pretty(&plan)?)
+    // Durable and atomic: a crash or a full disk leaves no plan, never a torn one.
+    write_durable(&path, serde_json::to_string_pretty(&plan)?.as_bytes(), None)
         .with_context(|| format!("failed to write the plan at {}", path.display()))?;
     Ok(mark_id)
 }
