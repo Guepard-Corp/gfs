@@ -19,6 +19,7 @@
 //! and the CLI is only one of the ways in.
 
 use crate::model::errors::RepoError;
+use crate::model::layout::DETACHED_WORKSPACE_SEGMENT;
 
 /// Characters git refuses in a ref name, and so do we.
 ///
@@ -68,6 +69,40 @@ pub fn validate_branch_name(name: &str) -> Result<(), RepoError> {
     if name.ends_with(".lock") {
         return invalid("it ends with '.lock', which is reserved");
     }
+    // `detached` names the layout segment that holds every detached working copy,
+    // and a branch's workspace is `workspaces/<branch>` -- so a branch of this
+    // name owns the namespace root rather than a directory inside it. Deleting
+    // such a branch removed `workspaces/detached` entirely, taking every detached
+    // working copy and any uncommitted work in them, silently, at exit 0.
+    //
+    // Refused at creation rather than only guarded at deletion, because the
+    // collision is what makes the deletion dangerous. The guard exists too, for a
+    // repository that already carries such a branch.
+    // Compared case-INSENSITIVELY, and against the first segment rather than the
+    // whole name.
+    //
+    // Case, because macOS and Windows resolve `workspaces/Detached` and
+    // `workspaces/detached` to one directory -- an exact `==` let `Detached`
+    // through and it landed on the same namespace, so a capital letter reopened
+    // the whole defect. ASCII-only comparison is deliberate: this is one known
+    // ASCII word, and Unicode case folding would bring its own surprises for no
+    // gain.
+    //
+    // First segment, because `detached/foo` puts the branch's workspace INSIDE the
+    // namespace at `workspaces/detached/foo`, where it can collide with a
+    // commit-prefix directory and be removed with it. Before this it failed with a
+    // bare `io error: File exists (os error 17)`, which is the collision surfacing
+    // as an errno rather than being refused.
+    if name
+        .split('/')
+        .next()
+        .is_some_and(|first| first.eq_ignore_ascii_case(DETACHED_WORKSPACE_SEGMENT))
+    {
+        return invalid(
+            "'detached' is reserved: it names the directory holding detached working copies, \
+             so a branch starting with that segment would land inside or on that namespace",
+        );
+    }
     // The escape. Each segment is a directory name under refs/heads, so a `..`
     // segment walks out of the repository.
     for segment in name.split('/') {
@@ -79,6 +114,80 @@ pub fn validate_branch_name(name: &str) -> Result<(), RepoError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod reserved_name_tests {
+    /// Both validators must refuse the reserved name, and this test exists because
+    /// one of them did not.
+    ///
+    /// There are two: `branch_name::validate_branch_name`, which `gfs branch`
+    /// reaches, and `repo_layout::validate_branch_name`, which a filesystem
+    /// `gfs checkout -b` reaches instead. Adding the rule to the first left
+    /// `checkout -b detached` creating the branch anyway -- the fix looked complete
+    /// and the defect was still reachable by one of its two doors. Asserting
+    /// against both is what makes the pair impossible to half-fix again.
+    #[test]
+    fn a_reserved_name_is_refused_by_both_validators() {
+        let reserved = crate::model::layout::DETACHED_WORKSPACE_SEGMENT;
+
+        assert!(
+            super::validate_branch_name(reserved).is_err(),
+            "branch_name:: must refuse '{reserved}'"
+        );
+        assert!(
+            crate::repo_utils::repo_layout::validate_branch_name(reserved).is_err(),
+            "repo_layout:: must refuse '{reserved}' -- this is the validator a \
+             filesystem `checkout -b` reaches, and it is the one that was missed"
+        );
+
+        // The variants that reopened it after the first fix. `Detached` resolves to
+        // the same directory on a case-insensitive filesystem -- macOS and Windows
+        // both -- so an exact comparison let a capital letter walk past. And
+        // `detached/foo` lands INSIDE the namespace rather than on it, where it can
+        // collide with a commit-prefix directory; before this it surfaced as a bare
+        // `io error: File exists (os error 17)`.
+        for variant in [
+            "Detached",
+            "DETACHED",
+            "dEtAcHeD",
+            "detached/foo",
+            "Detached/foo",
+            "detached/0",
+        ] {
+            assert!(
+                super::validate_branch_name(variant).is_err(),
+                "branch_name:: must refuse '{variant}'"
+            );
+            assert!(
+                crate::repo_utils::repo_layout::validate_branch_name(variant).is_err(),
+                "repo_layout:: must refuse '{variant}'"
+            );
+        }
+
+        // Controls, and they are chosen to pin the comparison's SHAPE. A
+        // `starts_with` implementation would wrongly refuse `detached-work`; a
+        // `contains` one would wrongly refuse `my-detached` and `undetached`; only
+        // a first-segment comparison accepts all of these while refusing the list
+        // above. Without them, a validator that refused everything would pass.
+        for ok in [
+            "main",
+            "feature/detached-thing",
+            "detached-work",
+            "my-detached",
+            "undetached",
+            "feature/detached",
+        ] {
+            assert!(
+                super::validate_branch_name(ok).is_ok(),
+                "branch_name:: must still accept '{ok}'"
+            );
+            assert!(
+                crate::repo_utils::repo_layout::validate_branch_name(ok).is_ok(),
+                "repo_layout:: must still accept '{ok}'"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

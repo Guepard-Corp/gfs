@@ -2,9 +2,10 @@ use crate::model::commit::{Commit, FileEntry};
 use crate::model::config::{EnvironmentConfig, GfsConfig, RuntimeConfig, UserConfig};
 use crate::model::errors::RepoError;
 use crate::model::layout::{
-    BRANCH_WORKSPACE_SEGMENT, CONFIG_FILE, DEFAULT_SHORT_HASH_LEN, DELETED_REFS_DIR, GFS_DIR,
-    HEAD_FILE, HEADS_DIR, MAIN_BRANCH, MIN_SHORT_HASH_LEN, OBJECTS_DIR, REFS_DIR,
-    SHORT_COMMIT_ID_LEN, SNAPSHOTS_DIR, WORKSPACE_DATA_DIR, WORKSPACE_FILE, WORKSPACES_DIR,
+    BRANCH_WORKSPACE_SEGMENT, CONFIG_FILE, DEFAULT_SHORT_HASH_LEN, DELETED_REFS_DIR,
+    DETACHED_WORKSPACE_SEGMENT, GFS_DIR, HEAD_FILE, HEADS_DIR, MAIN_BRANCH, MIN_SHORT_HASH_LEN,
+    OBJECTS_DIR, REFS_DIR, SHORT_COMMIT_ID_LEN, SNAPSHOTS_DIR, WORKSPACE_DATA_DIR, WORKSPACE_FILE,
+    WORKSPACES_DIR,
 };
 use anyhow::Result;
 use std::collections::HashSet;
@@ -985,6 +986,30 @@ pub fn validate_branch_name(name: &str) -> Result<(), RepoError> {
     if name.contains('\\') {
         return Err(RepoError::invalid_layout(format!(
             "branch name '{name}' must not contain a backslash"
+        )));
+    }
+    // `detached` names the directory holding every detached working copy, and a
+    // branch's workspace is `workspaces/<branch>` -- so a branch of that name owns
+    // the namespace root rather than a directory inside it.
+    //
+    // Checked HERE as well as in `branch_name::validate_branch_name` because there
+    // are two validators and the paths split between them: `gfs branch` reaches
+    // the other one, while `gfs checkout -b` on a filesystem repository reaches
+    // only this. Adding the rule to one left the other accepting it, which is how
+    // the collision survived its first fix. `a_reserved_name_is_refused_by_both`
+    // pins the pair together.
+    // Case-insensitive and first-segment, matching `branch_name::` -- see the long
+    // note there. `Detached` resolves to the same directory on a case-insensitive
+    // filesystem, and `detached/foo` lands inside the namespace.
+    if name
+        .split('/')
+        .next()
+        .is_some_and(|first| first.eq_ignore_ascii_case(DETACHED_WORKSPACE_SEGMENT))
+    {
+        return Err(RepoError::invalid_layout(format!(
+            "branch name '{name}' is reserved: it names the directory holding detached \
+             working copies, so a branch starting with that segment would land inside or \
+             on that namespace"
         )));
     }
     Ok(())
