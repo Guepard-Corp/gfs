@@ -510,6 +510,15 @@ pub trait Compute: Send + Sync {
     /// Stop the instance if running, then remove it. Used when recreating a container with a new data bind.
     async fn remove_instance(&self, id: &InstanceId) -> Result<()>;
 
+    /// The instances provisioned for the repository at `repo`, found by the
+    /// `gfs.repo` mark every provision leaves on them. This is how a caller
+    /// finds an instance whose id was never recorded: a provisioning cut off
+    /// between creating the instance and writing the runtime config leaves one.
+    /// A runtime that cannot search its instances reports none.
+    async fn instances_for_repo(&self, _repo: &Path) -> Result<Vec<InstanceId>> {
+        Ok(Vec::new())
+    }
+
     /// Stream the contents of `container_path` from inside the running instance
     /// and unpack them into `dest` on the host.
     ///

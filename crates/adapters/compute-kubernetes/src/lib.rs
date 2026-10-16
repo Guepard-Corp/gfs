@@ -483,6 +483,23 @@ fn is_valid_metadata_key(key: &str) -> bool {
 /// naive merge would take down every provision on this adapter. An entry whose
 /// *key* is invalid is dropped: annotation keys obey the same syntax, so there
 /// is nowhere valid to put it.
+/// The StatefulSets among `sets` that were provisioned for the repository at
+/// `repo`: a path is not a valid label value, so it travels as the `gfs.repo`
+/// annotation (see [`split_labels_and_annotations`]).
+fn instances_provisioned_for(sets: Vec<StatefulSet>, repo: &str) -> Vec<InstanceId> {
+    sets.into_iter()
+        .filter(|set| {
+            set.metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get("gfs.repo"))
+                .is_some_and(|annotated| annotated == repo)
+        })
+        .filter_map(|set| set.metadata.name)
+        .map(InstanceId)
+        .collect()
+}
+
 fn split_labels_and_annotations(
     definition_labels: &BTreeMap<String, String>,
 ) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
@@ -1655,6 +1672,22 @@ impl KubernetesCompute {
 
 #[async_trait]
 impl Compute for KubernetesCompute {
+    async fn instances_for_repo(&self, repo: &Path) -> Result<Vec<InstanceId>> {
+        // The same form provision recorded: canonical when the path exists.
+        let repo = repo
+            .canonicalize()
+            .unwrap_or_else(|_| repo.to_path_buf())
+            .display()
+            .to_string();
+        let managed = ListParams::default().labels("gfs.managed=true");
+        let sets = self
+            .api_statefulsets()
+            .list(&managed)
+            .await
+            .map_err(|e| ComputeError::Internal(format!("list statefulsets: {e}")))?;
+        Ok(instances_provisioned_for(sets.items, &repo))
+    }
+
     async fn node_allocation(&self) -> Result<Option<NodeAllocation>> {
         // Only meaningful for the node this adapter actually schedules onto.
         // Without a pinned node there is no single answer, and guessing one
@@ -2991,6 +3024,31 @@ mod tests {
 
         assert_eq!(selector, labels_for("gfs-pg-1"));
         assert!(!selector.contains_key("gfs.role"));
+    }
+
+    #[test]
+    fn an_instance_is_found_by_the_repository_it_was_provisioned_for() {
+        let named = |name: &str, repo: Option<&str>| {
+            let mut set = match repo {
+                Some(repo) => manifest_with_labels(&[("gfs.repo", repo), ("gfs.role", "source")]),
+                None => manifest_with_labels(&[("gfs.role", "source")]),
+            };
+            set.metadata.name = Some(name.to_string());
+            set
+        };
+        let sets = vec![
+            named("gfs-pg-1", Some("/var/lib/guepard/repositories/o/p/db-a")),
+            named("gfs-pg-2", Some("/var/lib/guepard/repositories/o/p/db-b")),
+            named("gfs-pg-3", None),
+            named("gfs-pg-4", Some("/var/lib/guepard/repositories/o/p/db-a")),
+        ];
+
+        let found = instances_provisioned_for(sets, "/var/lib/guepard/repositories/o/p/db-a");
+
+        assert_eq!(
+            found,
+            vec![InstanceId("gfs-pg-1".into()), InstanceId("gfs-pg-4".into())]
+        );
     }
 
     #[test]
