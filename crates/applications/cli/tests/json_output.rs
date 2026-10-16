@@ -269,6 +269,52 @@ fn fsck_reports_an_unidentifiable_object_and_exits_two() {
     assert_eq!(v["fsck"]["unrecognised"].as_array().unwrap().len(), 1);
 }
 
+/// A crash while `--plan` writes must leave no plan rather than a torn one: a
+/// collector reading a truncated `plan.json` gets a partial list of what to
+/// delete. `ulimit -f` makes the crash real: the write past the limit raises
+/// SIGXFSZ, which kills the process in the middle of the plan.
+#[cfg(unix)]
+#[test]
+fn fsck_plan_interrupted_mid_write_leaves_no_torn_plan() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let tmp = TempDir::new().unwrap();
+    run_gfs(tmp.path(), &["init", "."]);
+    for i in 0..10 {
+        let (code, _, _) = run_gfs(tmp.path(), &["commit", "-m", &format!("c{i}")]);
+        assert_eq!(code, 0, "commit should succeed");
+    }
+    // Orphan the commits so the plan lists them and outgrows the limit (1 or 2 KiB: `sh` units differ).
+    std::fs::write(tmp.path().join(".gfs/refs/heads/main"), "0").unwrap();
+
+    let status = Command::new("sh")
+        .current_dir(tmp.path())
+        .args(["-c", "ulimit -f 2 && exec \"$0\" \"$@\"", gfs_bin()])
+        .args([
+            "fsck",
+            "--plan",
+            "--grace",
+            "0",
+            "--disable-grace-period-check",
+        ])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("failed to run gfs")
+        .status;
+    assert!(
+        status.signal().is_some(),
+        "the size limit never fired, so nothing was interrupted: {status:?}"
+    );
+
+    for plan_dir in std::fs::read_dir(tmp.path().join(".gfs/gc")).unwrap() {
+        let plan = plan_dir.unwrap().path().join("plan.json");
+        if let Ok(body) = std::fs::read_to_string(&plan) {
+            serde_json::from_str::<Value>(&body)
+                .unwrap_or_else(|e| panic!("torn plan at {}: {e}", plan.display()));
+        }
+    }
+}
+
 /// `--json` means every outcome is machine-readable, including a failure. This
 /// path printed to stderr and left stdout empty, so a caller parsing the output
 /// got an empty string rather than an error it could act on.
