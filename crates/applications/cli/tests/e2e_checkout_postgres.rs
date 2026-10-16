@@ -544,16 +544,14 @@ fn postgres_test_03_checkout_previous_no_pgbench() {
     let hash1 = get_first_commit_hash(repo_path);
 
     let start = Instant::now();
-    let (ok, stdout, stderr) = cli_runner::gfs_checkout(repo_path, &hash1);
+    let (ok, stdout, stderr) = cli_runner::gfs_checkout_subprocess(repo_path, &hash1);
     let elapsed = start.elapsed();
     eprintln!("checkout to first commit took {:?}", elapsed);
     assert!(ok, "gfs checkout <hash1> should succeed; stderr: {stderr}");
-    if !stdout.is_empty() {
-        assert!(
-            stdout.contains("Switched to"),
-            "checkout stdout should show switched; got: {stdout}"
-        );
-    }
+    assert!(
+        stdout.contains("Switched to"),
+        "checkout stdout should show switched; got: {stdout}"
+    );
 
     // Validate compute is still running (we never stop it).
     let (status_ok, status_stdout, status_stderr) = cli_runner::gfs_compute_status(repo_path);
@@ -585,16 +583,14 @@ fn postgres_test_04_checkout_head_has_pgbench() {
     let repo_path = shared_repo_path();
 
     let start = Instant::now();
-    let (ok, stdout, stderr) = cli_runner::gfs_checkout(repo_path, "main");
+    let (ok, stdout, stderr) = cli_runner::gfs_checkout_subprocess(repo_path, "main");
     let elapsed = start.elapsed();
     eprintln!("checkout to main took {:?}", elapsed);
     assert!(ok, "gfs checkout main should succeed; stderr: {stderr}");
-    if !stdout.is_empty() {
-        assert!(
-            stdout.contains("Switched to"),
-            "checkout stdout should show switched; got: {stdout}"
-        );
-    }
+    assert!(
+        stdout.contains("Switched to"),
+        "checkout stdout should show switched; got: {stdout}"
+    );
 
     // Checkout main must point at the branch's persistent workspace (main/0), not a new commit-hash folder.
     let workspace_path = read_workspace_path(repo_path);
@@ -636,17 +632,16 @@ fn postgres_test_04_checkout_head_has_pgbench() {
 fn postgres_test_05_checkout_b_new_branch_has_pgbench() {
     let repo_path = shared_repo_path();
     // We are on main at tip (with pgbench). Create a new branch from current HEAD.
-    let (ok, stdout, stderr) = cli_runner::gfs_checkout_b(repo_path, "pgbench-branch", None);
+    let (ok, stdout, stderr) =
+        cli_runner::gfs_checkout_b_subprocess(repo_path, "pgbench-branch", None);
     assert!(
         ok,
         "gfs checkout -b pgbench-branch should succeed; stderr: {stderr}"
     );
-    if !stdout.is_empty() {
-        assert!(
-            stdout.contains("Switched to new branch") && stdout.contains("pgbench-branch"),
-            "checkout -b stdout should show new branch; got: {stdout}"
-        );
-    }
+    assert!(
+        stdout.contains("Switched to new branch") && stdout.contains("pgbench-branch"),
+        "checkout -b stdout should show new branch; got: {stdout}"
+    );
 
     // Validate that HEAD switched to the new branch.
     let head = read_head(repo_path);
@@ -689,14 +684,12 @@ fn postgres_test_05_checkout_b_new_branch_has_pgbench() {
 fn postgres_test_06_checkout_back_to_main() {
     let repo_path = shared_repo_path();
 
-    let (ok, stdout, stderr) = cli_runner::gfs_checkout(repo_path, "main");
+    let (ok, stdout, stderr) = cli_runner::gfs_checkout_subprocess(repo_path, "main");
     assert!(ok, "gfs checkout main should succeed; stderr: {stderr}");
-    if !stdout.is_empty() {
-        assert!(
-            stdout.contains("Switched to"),
-            "checkout main stdout should show switched; got: {stdout}"
-        );
-    }
+    assert!(
+        stdout.contains("Switched to"),
+        "checkout main stdout should show switched; got: {stdout}"
+    );
 
     let head = read_head(repo_path);
     assert!(
