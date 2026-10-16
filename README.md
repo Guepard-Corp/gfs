@@ -705,7 +705,7 @@ source database and a real clone container rather than a unit test.
 
 ```bash
 cargo build --release                                    # the suites run the real binary
-docker build -t gfs-postgres:16 crates/extensions/gfs    # and the real image
+docker build --build-arg PG_MAJOR=16 -t gfs-postgres:16 crates/extensions/gfs    # and the real image
 
 tests/paths/run-all.sh          # one test per documented clone behaviour
 tests/paths/run-all.sh B        # one family

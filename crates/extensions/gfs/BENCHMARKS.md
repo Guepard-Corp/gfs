@@ -53,7 +53,7 @@ regression guard. Scale up with `SF=10` (~16 GB) / `SF=50` (~100 GB).
 - **DuckDB** on `PATH` (`duckdb`) — generates TPC-H, no `dbgen` build
 - **pnpm** (the explorer is a small Node app)
 - the **gfs CLI** at `target/debug/gfs` — `cargo build -p gfs-cli`
-- the **`gfs-postgres:16`** image — `docker build -t gfs-postgres:16 crates/extensions/gfs`
+- the **`gfs-postgres:16`** image — `docker build --build-arg PG_MAJOR=16 -t gfs-postgres:16 crates/extensions/gfs`
   (slow, multi-stage; only after extension changes). `scripts/run.sh` /
   `scripts/bench.sh` build it on first run if absent.
 
