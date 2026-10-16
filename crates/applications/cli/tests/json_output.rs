@@ -921,6 +921,9 @@ fn a_closed_reader_keeps_the_verdict_of_every_command() {
         (vec!["branch", "--json"], 0),
         (vec!["providers"], 0),
         (vec!["version"], 0),
+        // Printed by clap before any command runs, so not via println_safe!.
+        (vec!["--help"], 0),
+        (vec!["--version"], 0),
         // A non-zero verdict, so a closed reader cannot pass by exiting 0.
         (vec!["schema", "diff", "HEAD~1", "HEAD"], 2),
     ] {
