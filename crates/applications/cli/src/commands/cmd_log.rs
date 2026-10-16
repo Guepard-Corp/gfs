@@ -87,10 +87,15 @@ async fn run_linear(
             .iter()
             .map(|cwr| json_commit(cwr, full_hash))
             .collect();
-        println!(
+        // `println_safe!`, not `println!`: a bare one panics when the reader has
+        // gone -- `gfs log --json | head -1` exited 101, which is outside every
+        // exit code this CLI documents and indistinguishable from a crash. The
+        // graph path below never had this problem because `render_graph` returns
+        // io::Result and propagates the error.
+        println_safe!(
             "{}",
             serde_json::to_string_pretty(&json!({ "commits": out }))?
-        );
+        )?;
         return Ok(());
     }
 
@@ -413,10 +418,15 @@ fn run_graph(
                 json_commit(&cwr, full_hash)
             })
             .collect();
-        println!(
+        // `println_safe!`, not `println!`: a bare one panics when the reader has
+        // gone -- `gfs log --json | head -1` exited 101, which is outside every
+        // exit code this CLI documents and indistinguishable from a crash. The
+        // graph path below never had this problem because `render_graph` returns
+        // io::Result and propagates the error.
+        println_safe!(
             "{}",
             serde_json::to_string_pretty(&json!({ "commits": out }))?
-        );
+        )?;
         return Ok(());
     }
 

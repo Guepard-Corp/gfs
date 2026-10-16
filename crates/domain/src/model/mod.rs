@@ -4,6 +4,7 @@ pub mod config;
 pub mod datasource;
 pub mod db_user;
 pub mod errors;
+pub mod fsck;
 pub mod layout;
 pub mod ref_info;
 pub mod status;
