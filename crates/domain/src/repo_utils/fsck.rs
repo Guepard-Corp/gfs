@@ -36,6 +36,7 @@ use crate::model::layout::{
     BRANCH_WORKSPACE_SEGMENT, DELETED_REFS_DIR, GFS_DIR, HEAD_FILE, HEADS_DIR, OBJECTS_DIR,
     REFS_DIR, SNAPSHOTS_DIR, WORKSPACE_DATA_DIR, WORKSPACE_FILE, WORKSPACES_DIR,
 };
+use crate::repo_utils::durable_write::is_temp_name;
 use crate::repo_utils::repo_layout;
 
 /// The sentinel a ref or parent carries when there is no commit yet.
@@ -206,7 +207,9 @@ fn two_level(
             let Some(rest) = entry.file_name().to_str().map(str::to_string) else {
                 continue;
             };
-            if is_incidental(&rest) {
+            // A dotted leaf is `write_durable`'s temp: an object write in flight or
+            // the leftover of a crashed one. Not an object yet, so not a finding.
+            if is_incidental(&rest) || is_temp_name(&rest) {
                 continue;
             }
             if !is_object_leaf(&rest) {
@@ -587,6 +590,12 @@ fn soft_deleted_roots(
                     continue;
                 }
             };
+            // A dotted entry is a temp from an interrupted write, not a recovery
+            // record: `list_deleted_branch_refs` skips it, so `branch --restore`
+            // cannot give it back and it protects nothing.
+            if is_temp_name(&entry.file_name().to_string_lossy()) {
+                continue;
+            }
             let path = entry.path();
             let Ok(meta) = std::fs::symlink_metadata(&path) else {
                 blind.at(repo_path, &path, "could not be stat'd");
@@ -2859,6 +2868,48 @@ mod tests {
             check(d.path(), Duration::ZERO).unwrap().is_clean(),
             "a nested deleted ref is still a root"
         );
+    }
+
+    /// `write_durable` writes an object through `.<62 hex>.tmp.<pid>.<n>` beside
+    /// it, and a crash leaves that behind. It is not an object, and calling it
+    /// corruption made a crash-interrupted commit fail fsck with exit 2.
+    #[test]
+    fn a_leftover_object_temp_is_not_corruption() {
+        let d = repo();
+        let h = write_commit(d.path(), "aa", "live", None, true);
+        set_branch(d.path(), "main", &h);
+        let shard = d.path().join(GFS_DIR).join(OBJECTS_DIR).join("27");
+        fs::create_dir_all(&shard).unwrap();
+        fs::write(
+            shard.join(format!(".{}.tmp.4242.1", "b".repeat(62))),
+            b"{\"partial",
+        )
+        .unwrap();
+
+        let r = check(d.path(), Duration::ZERO).unwrap();
+        assert!(r.unrecognised.is_empty(), "{:?}", r.unrecognised);
+        assert_eq!(r.exit_code(), 0);
+    }
+
+    /// The same temp under `refs/deleted`, empty because the crash came before
+    /// the write: not a tombstone, so not a dangling root.
+    #[test]
+    fn a_leftover_deleted_ref_temp_is_not_a_root() {
+        let d = repo();
+        let h = write_commit(d.path(), "aa", "live", None, true);
+        set_branch(d.path(), "main", &h);
+        let stamp = d
+            .path()
+            .join(GFS_DIR)
+            .join(REFS_DIR)
+            .join(DELETED_REFS_DIR)
+            .join("1788452232388");
+        fs::create_dir_all(&stamp).unwrap();
+        fs::write(stamp.join(".feature.tmp.4242.1"), b"").unwrap();
+
+        let r = check(d.path(), Duration::ZERO).unwrap();
+        assert!(r.dangling.is_empty(), "{:?}", r.dangling);
+        assert_eq!(r.exit_code(), 0);
     }
 
     /// The race the double read exists for, made deterministic.
