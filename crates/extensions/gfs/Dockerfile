@@ -58,6 +58,12 @@ COPY --from=build /usr/lib/postgresql/${PG_MAJOR}/lib/gfs.so /usr/lib/postgresql
 RUN test -f /usr/share/postgresql/${PG_MAJOR}/extension/gfs.control \
  && test -f /usr/lib/postgresql/${PG_MAJOR}/lib/gfs.so
 
+# Say which PostgreSQL this holds, so a consumer can check it against the tag it
+# was given. PG_MAJOR defaults to 17, and the tag is just a string: building
+# with `-t gfs-postgres:16` and no `--build-arg` produces a 17 extension called
+# 16, and nothing downstream notices until a test fails somewhere unrelated.
+LABEL run.guepard.gfs.pg_major="${PG_MAJOR}"
+
 # TLS offered on every start (self-signed unless a cert is mounted); see the script.
 COPY gfs-tls-entrypoint.sh /usr/local/bin/gfs-tls-entrypoint.sh
 ENTRYPOINT ["gfs-tls-entrypoint.sh"]

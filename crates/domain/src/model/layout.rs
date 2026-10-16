@@ -35,3 +35,14 @@ pub const DEFAULT_SHORT_HASH_LEN: usize = 7;
 /// Directory segment for a branch's single persistent workspace (e.g. `workspaces/main/0/data`).
 /// One workspace per branch so the database state in that directory is preserved across checkouts.
 pub const BRANCH_WORKSPACE_SEGMENT: &str = "0";
+
+/// Directory segment holding every detached working copy, keyed by commit hash
+/// prefix (`workspaces/detached/<prefix>/data`).
+///
+/// Named, because it shares a namespace with branch names and that collision has
+/// already cost data: a branch's workspace is `workspaces/<branch>`, so a branch
+/// called `detached` owned this directory rather than one inside it, and deleting
+/// it removed every detached working copy. `validate_branch_name` refuses the name
+/// for that reason, and this constant is what it refuses against — a bare string
+/// repeated at each site is how the two drifted into agreeing by accident.
+pub const DETACHED_WORKSPACE_SEGMENT: &str = "detached";
