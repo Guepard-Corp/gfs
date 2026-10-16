@@ -405,6 +405,15 @@ pub trait Compute: Send + Sync {
     /// Return the current runtime status of the instance.
     async fn status(&self, id: &InstanceId) -> Result<InstanceStatus>;
 
+    /// An opaque marker that changes whenever the instance is started, stopped
+    /// or rebuilt, whoever does it. Two equal readings mean the instance stayed
+    /// in the same run (or the same stop) in between. `None` when the runtime
+    /// cannot tell, which callers must read as "may have changed".
+    async fn instance_epoch(&self, id: &InstanceId) -> Result<Option<String>> {
+        let _ = id;
+        Ok(None)
+    }
+
     /// Watch for instance state changes, delivering `(InstanceId, InstanceState)`
     /// the moment a runtime transition is observed (e.g. a pod becoming ready)
     /// rather than on the next poll tick.
@@ -500,6 +509,15 @@ pub trait Compute: Send + Sync {
 
     /// Stop the instance if running, then remove it. Used when recreating a container with a new data bind.
     async fn remove_instance(&self, id: &InstanceId) -> Result<()>;
+
+    /// The instances provisioned for the repository at `repo`, found by the
+    /// `gfs.repo` mark every provision leaves on them. This is how a caller
+    /// finds an instance whose id was never recorded: a provisioning cut off
+    /// between creating the instance and writing the runtime config leaves one.
+    /// A runtime that cannot search its instances reports none.
+    async fn instances_for_repo(&self, _repo: &Path) -> Result<Vec<InstanceId>> {
+        Ok(Vec::new())
+    }
 
     /// Stream the contents of `container_path` from inside the running instance
     /// and unpack them into `dest` on the host.

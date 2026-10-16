@@ -183,6 +183,16 @@ pub trait StoragePort: Send + Sync {
     async fn captured_any_data(&self, _dest: &Path) -> Result<Option<bool>> {
         Ok(None)
     }
+
+    /// Drop the snapshot taken for `snapshot_hash` when the commit it was taken
+    /// for failed, so no commit will ever reference it.
+    ///
+    /// Default no-op: a snapshot that lives under the repository's own
+    /// `.gfs/snapshots` costs nothing outside it. An adapter whose snapshots are
+    /// separate objects (a Kubernetes `VolumeSnapshot`) removes them here.
+    async fn discard_snapshot(&self, _snapshot_hash: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
