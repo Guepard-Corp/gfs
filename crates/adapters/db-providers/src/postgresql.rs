@@ -270,9 +270,10 @@ impl PostgresqlProvider {
         &self,
         sql: &str,
     ) -> std::result::Result<String, ProviderError> {
-        let escaped = sql.replace('\\', "\\\\").replace('"', "\\\"");
+        // Single-quoted, so the shell expands nothing in the SQL ($(…), `…`, ${…}).
         Ok(format!(
-            r#"PGPASSWORD="${{POSTGRES_PASSWORD:-postgres}}" psql -h 127.0.0.1 -U "${{POSTGRES_USER:-postgres}}" -d "${{POSTGRES_DB:-postgres}}" -v ON_ERROR_STOP=1 -c "{escaped}""#
+            r#"PGPASSWORD="${{POSTGRES_PASSWORD:-postgres}}" psql -h 127.0.0.1 -U "${{POSTGRES_USER:-postgres}}" -d "${{POSTGRES_DB:-postgres}}" -v ON_ERROR_STOP=1 -c {}"#,
+            shell_single_quote(sql)
         ))
     }
 
@@ -1773,6 +1774,29 @@ mod tests {
         assert!(spec.command.contains("pg_restore"));
         assert!(spec.command.contains("/data/import.dump"));
         assert_eq!(spec.input_filename, "import.dump");
+    }
+
+    #[test]
+    fn inline_psql_command_hands_sql_to_psql_unexpanded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("pwned");
+        let sql = format!(
+            "SELECT 'a$(touch {m})b`touch {m}`c${{HOME}}d\"e''f'\nSELECT 2",
+            m = marker.display()
+        );
+        let cmd = PostgresqlProvider::new()
+            .psql_inline_instance_command(&sql)
+            .expect("inline command");
+        // A `psql` function prints its last argument instead of connecting.
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                r#"psql() {{ for a; do last="$a"; done; printf %s "$last"; }}; {cmd}"#
+            ))
+            .output()
+            .expect("sh");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), sql);
+        assert!(!marker.exists(), "the shell ran a command from the SQL");
     }
 
     #[test]
