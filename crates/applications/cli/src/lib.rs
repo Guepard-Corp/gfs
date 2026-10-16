@@ -844,8 +844,14 @@ where
     let cli = match Cli::try_parse_from(args_os) {
         Ok(c) => c,
         Err(e) if e.kind() == ErrorKind::DisplayVersion || e.kind() == ErrorKind::DisplayHelp => {
-            e.print().expect("writing version/help to stdout/stderr");
-            return Ok(0);
+            // A closed reader (`gfs --help | head -1`) is not a failure, as in
+            // `println_safe!`; any other write error still is.
+            match e.print() {
+                Err(err) if err.kind() != std::io::ErrorKind::BrokenPipe => {
+                    return Err(err.into());
+                }
+                _ => return Ok(0),
+            }
         }
         Err(e) => return Err(e.into()),
     };
