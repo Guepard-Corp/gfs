@@ -17,6 +17,7 @@ pub mod cmd_query;
 pub mod cmd_schema;
 pub mod cmd_source;
 pub mod cmd_status;
+pub mod cmd_storage_reclaim;
 pub mod cmd_user;
 pub mod cmd_version;
 mod compute_support;
