@@ -8,6 +8,7 @@ repository.workspace   = true
 rust-version.workspace = true
 
 [dependencies]
+postgres-protocol = "0.6"
 gfs-domain = { workspace = true }
 rusqlite   = { workspace = true }
 tracing    = { workspace = true }
