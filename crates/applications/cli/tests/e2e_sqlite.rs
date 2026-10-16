@@ -24,6 +24,7 @@ mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use common::cli_runner;
 use tempfile::tempdir;
@@ -32,13 +33,50 @@ use tempfile::tempdir;
 ///
 /// Any command that still tries to reach Docker fails loudly instead of
 /// silently succeeding against a daemon the developer happens to be running.
+/// Serialises every test in this binary, and is why the `set_var` below is sound.
+///
+/// The previous note claimed these tests "run single-threaded with respect to this
+/// variable". They do not: the default harness runs test functions on as many threads
+/// as there are CPUs, every test calls `init_sqlite`, and `run_gfs` executes the CLI
+/// IN-PROCESS — where production code reads the variable
+/// (`gfs_repository.rs`: `std::env::var("DOCKER_HOST")`, and bollard's
+/// `connect_with_local_defaults`). A write racing those reads is exactly the data race
+/// `set_var` became `unsafe` for in Rust 1.80, and the claim was not something CI
+/// honoured: it runs `cargo test` with no `--test-threads=1`.
+///
+/// Rather than restate the invariant, this enforces it. Every test holds this lock for
+/// its whole body, so no two run at once and nothing can read the variable while it is
+/// being written. Soundness no longer depends on how the suite is invoked.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+/// Take the binary-wide lock. The first line of every test.
+///
+/// Recovers from a poisoned lock on purpose: one failing test must not turn every later
+/// test into a panic that hides it.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn forbid_container_runtime() {
-    // SAFETY: integration tests in this binary run single-threaded with respect
-    // to this variable — it is set once, before any command runs, and never read
-    // concurrently with a write.
-    unsafe {
+    // The invariant, enforced rather than trusted. Every test reaches here through
+    // `init_sqlite`, so a test that forgot `serial()` is caught at its first call
+    // instead of silently reintroducing the race. `try_lock` fails whenever the lock is
+    // held by anyone, including this thread; it succeeding means nobody holds it.
+    assert!(
+        SERIAL.try_lock().is_err(),
+        "every test in this binary must begin with `let _serial = serial();` -- without \
+         it the DOCKER_HOST write below races the reads in gfs_repository and bollard"
+    );
+
+    // SAFETY: the caller holds `serial()`, so this is the only test running in this
+    // process and no other thread can be reading the environment. Written once, guarded
+    // by `DOCKER_HOST_SET`, so repeated calls do not write again.
+    static DOCKER_HOST_SET: std::sync::Once = std::sync::Once::new();
+    DOCKER_HOST_SET.call_once(|| unsafe {
         std::env::set_var("DOCKER_HOST", "unix:///nonexistent/gfs-test-docker.sock");
-    }
+    });
 }
 
 fn workspace_data_dir(repo_path: &Path) -> PathBuf {
@@ -108,6 +146,7 @@ fn exec_sql_at(db: &Path, sql: &str) {
 
 #[test]
 fn init_writes_environment_config_and_no_runtime_section() {
+    let _serial = serial();
     let tmp = tempdir().expect("temp dir");
     let repo = tmp.path();
     init_sqlite(repo);
@@ -127,6 +166,7 @@ fn init_writes_environment_config_and_no_runtime_section() {
 
 #[test]
 fn query_runs_against_the_workspace_database() {
+    let _serial = serial();
     let tmp = tempdir().expect("temp dir");
     let repo = tmp.path();
     init_sqlite(repo);
@@ -144,6 +184,7 @@ fn query_runs_against_the_workspace_database() {
 
 #[test]
 fn commit_captures_schema_from_the_linked_engine() {
+    let _serial = serial();
     let tmp = tempdir().expect("temp dir");
     let repo = tmp.path();
     init_sqlite(repo);
@@ -191,6 +232,7 @@ fn commit_captures_schema_from_the_linked_engine() {
 
 #[test]
 fn commit_before_any_write_succeeds() {
+    let _serial = serial();
     let tmp = tempdir().expect("temp dir");
     let repo = tmp.path();
     init_sqlite(repo);
@@ -206,6 +248,7 @@ fn commit_before_any_write_succeeds() {
 
 #[test]
 fn branches_isolate_writes_and_checkout_restores_them() {
+    let _serial = serial();
     let tmp = tempdir().expect("temp dir");
     let repo = tmp.path();
     init_sqlite(repo);
@@ -258,6 +301,7 @@ fn branches_isolate_writes_and_checkout_restores_them() {
 
 #[test]
 fn snapshot_is_consistent_and_matches_the_committed_state() {
+    let _serial = serial();
     let tmp = tempdir().expect("temp dir");
     let repo = tmp.path();
     init_sqlite(repo);
@@ -314,6 +358,7 @@ fn snapshot_is_consistent_and_matches_the_committed_state() {
 
 #[test]
 fn a_container_backed_provider_still_reports_the_runtime_failure() {
+    let _serial = serial();
     let tmp = tempdir().expect("temp dir");
     let repo = tmp.path();
     forbid_container_runtime();
@@ -346,6 +391,7 @@ fn a_container_backed_provider_still_reports_the_runtime_failure() {
 /// a state the repo cannot support.
 #[test]
 fn user_and_compute_explain_themselves_instead_of_advising_each_other() {
+    let _serial = serial();
     let tmp = tempdir().expect("temp dir");
     let repo = tmp.path();
     init_sqlite(repo);
@@ -396,6 +442,7 @@ fn user_and_compute_explain_themselves_instead_of_advising_each_other() {
 /// list of daemon troubleshooting steps for a database that needs no daemon.
 #[test]
 fn a_mistyped_provider_name_names_the_provider_not_the_daemon() {
+    let _serial = serial();
     let tmp = tempdir().expect("temp dir");
     forbid_container_runtime();
 
@@ -427,6 +474,7 @@ fn a_mistyped_provider_name_names_the_provider_not_the_daemon() {
 /// report of the real version.
 #[test]
 fn an_unsupported_version_is_refused_rather_than_recorded() {
+    let _serial = serial();
     let tmp = tempdir().expect("temp dir");
     forbid_container_runtime();
 
@@ -460,6 +508,7 @@ fn an_unsupported_version_is_refused_rather_than_recorded() {
 /// context Display prints only the context string.
 #[test]
 fn an_ambiguous_workspace_is_explained_by_every_command_that_hits_it() {
+    let _serial = serial();
     let tmp = tempdir().expect("temp dir");
     let repo = tmp.path();
     init_sqlite(repo);
@@ -525,6 +574,7 @@ fn repo_with_alice(repo: &Path) {
 /// the emptiness as a legitimate breaking change.
 #[test]
 fn a_checkout_whose_snapshot_is_missing_fails_instead_of_emptying_the_database() {
+    let _serial = serial();
     let tmp = tempdir().expect("temp dir");
     let repo = tmp.path();
     repo_with_alice(repo);
@@ -615,6 +665,7 @@ fn a_checkout_whose_snapshot_is_missing_fails_instead_of_emptying_the_database()
 // See the doc comment above, and sqlite-snapshot-torture.py for the proof.
 #[test]
 fn commits_under_a_concurrent_writer_capture_only_whole_transactions() {
+    let _serial = serial();
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -811,6 +862,7 @@ fn commits_under_a_concurrent_writer_capture_only_whole_transactions() {
 /// `StatusResponse`, so neither can drift.
 #[test]
 fn status_reports_the_head_commit_like_the_mcp_tool_does() {
+    let _serial = serial();
     let tmp = tempdir().expect("temp dir");
     let repo = tmp.path();
     init_sqlite(repo);

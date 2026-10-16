@@ -483,6 +483,23 @@ fn is_valid_metadata_key(key: &str) -> bool {
 /// naive merge would take down every provision on this adapter. An entry whose
 /// *key* is invalid is dropped: annotation keys obey the same syntax, so there
 /// is nowhere valid to put it.
+/// The StatefulSets among `sets` that were provisioned for the repository at
+/// `repo`: a path is not a valid label value, so it travels as the `gfs.repo`
+/// annotation (see [`split_labels_and_annotations`]).
+fn instances_provisioned_for(sets: Vec<StatefulSet>, repo: &str) -> Vec<InstanceId> {
+    sets.into_iter()
+        .filter(|set| {
+            set.metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get("gfs.repo"))
+                .is_some_and(|annotated| annotated == repo)
+        })
+        .filter_map(|set| set.metadata.name)
+        .map(InstanceId)
+        .collect()
+}
+
 fn split_labels_and_annotations(
     definition_labels: &BTreeMap<String, String>,
 ) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
@@ -1212,8 +1229,9 @@ impl KubernetesCompute {
         // Fast-fail if the instance is stopped (StatefulSet scaled to zero): no pod
         // exists and none is coming, so don't burn the full deadline hanging and
         // then return a misleading "not Ready" error. Tell the caller to resume it.
-        if let Ok(ss) = self.api_statefulsets().get(instance).await
-            && ss.spec.as_ref().and_then(|s| s.replicas) == Some(0)
+        if self
+            .is_scaled_to_zero(&InstanceId(instance.to_string()))
+            .await
         {
             // NotAvailable has a bare `{0}` Display: this is an expected state, not an
             // internal fault, so avoid the misleading "internal error:" prefix while
@@ -1535,6 +1553,37 @@ impl KubernetesCompute {
         Ok(InstanceId(instance))
     }
 
+    /// Whether the instance's StatefulSet exists and is scaled to zero: a pause.
+    /// A read failure answers "not known to be", so callers keep treating the
+    /// instance as unknown rather than stopped.
+    async fn is_scaled_to_zero(&self, id: &InstanceId) -> bool {
+        matches!(
+            self.api_statefulsets().get_opt(&id.0).await,
+            Ok(Some(statefulset))
+                if statefulset.spec.as_ref().and_then(|spec| spec.replicas) == Some(0)
+        )
+    }
+
+    /// Whether the instance's StatefulSet exists, whatever its replica count.
+    ///
+    /// [`Compute::status`] reads the instance's pod, so a database scaled to zero
+    /// (StatefulSet kept, no pod: what a pause leaves) and one whose StatefulSet is
+    /// gone (a checkout that tore it down and never rebuilt it) both read
+    /// [`InstanceState::Unknown`]. Only the first can be started again with
+    /// [`Compute::start`], which patches the StatefulSet's replicas; the second
+    /// answers `statefulsets.apps ... not found`. This tells them apart.
+    ///
+    /// # Errors
+    /// [`ComputeError::Internal`] when the StatefulSet cannot be read. That is not
+    /// an answer either way, and callers must not read it as "absent".
+    pub async fn runtime_exists(&self, id: &InstanceId) -> Result<bool> {
+        self.api_statefulsets()
+            .get_opt(&id.0)
+            .await
+            .map(|statefulset| statefulset.is_some())
+            .map_err(|e| ComputeError::Internal(format!("k8s statefulset get failed: {e}")))
+    }
+
     /// PVC names for an instance: the stable `{id}-data` plus any de-duplicated
     /// non-empty extras.
     fn pvc_names(id: &InstanceId, extra_pvcs: &[String]) -> Vec<String> {
@@ -1615,6 +1664,22 @@ impl KubernetesCompute {
 
 #[async_trait]
 impl Compute for KubernetesCompute {
+    async fn instances_for_repo(&self, repo: &Path) -> Result<Vec<InstanceId>> {
+        // The same form provision recorded: canonical when the path exists.
+        let repo = repo
+            .canonicalize()
+            .unwrap_or_else(|_| repo.to_path_buf())
+            .display()
+            .to_string();
+        let managed = ListParams::default().labels("gfs.managed=true");
+        let sets = self
+            .api_statefulsets()
+            .list(&managed)
+            .await
+            .map_err(|e| ComputeError::Internal(format!("list statefulsets: {e}")))?;
+        Ok(instances_provisioned_for(sets.items, &repo))
+    }
+
     async fn node_allocation(&self) -> Result<Option<NodeAllocation>> {
         // Only meaningful for the node this adapter actually schedules onto.
         // Without a pinned node there is no single answer, and guessing one
@@ -1723,8 +1788,36 @@ impl Compute for KubernetesCompute {
         self.start(id, StartOptions::default()).await
     }
 
+    /// The StatefulSet's uid and generation. Starting and stopping patch its
+    /// replicas, a spec change that bumps the generation; a rebuilt StatefulSet
+    /// gets a new uid, so a generation that restarted at 1 never reads as equal.
+    async fn instance_epoch(&self, id: &InstanceId) -> Result<Option<String>> {
+        let statefulset = self
+            .api_statefulsets()
+            .get_opt(&id.0)
+            .await
+            .map_err(|e| ComputeError::Internal(format!("k8s statefulset get failed: {e}")))?;
+        Ok(statefulset.and_then(|statefulset| {
+            let uid = statefulset.metadata.uid?;
+            let generation = statefulset.metadata.generation?;
+            Some(format!("{uid}:{generation}"))
+        }))
+    }
+
     async fn status(&self, id: &InstanceId) -> Result<InstanceStatus> {
-        Ok(Self::instance_status_from_pod(id, self.get_pod(id).await?))
+        let pod = self.get_pod(id).await?;
+        // No pod is what a pause leaves, and what a StatefulSet that is gone or
+        // still scaling up looks like; only the first is a stopped database.
+        if pod.is_none() && self.is_scaled_to_zero(id).await {
+            return Ok(InstanceStatus {
+                id: id.clone(),
+                state: InstanceState::Stopped,
+                pid: None,
+                started_at: None,
+                exit_code: None,
+            });
+        }
+        Ok(Self::instance_status_from_pod(id, pod))
     }
 
     async fn watch_status(
@@ -2926,6 +3019,31 @@ mod tests {
     }
 
     #[test]
+    fn an_instance_is_found_by_the_repository_it_was_provisioned_for() {
+        let named = |name: &str, repo: Option<&str>| {
+            let mut set = match repo {
+                Some(repo) => manifest_with_labels(&[("gfs.repo", repo), ("gfs.role", "source")]),
+                None => manifest_with_labels(&[("gfs.role", "source")]),
+            };
+            set.metadata.name = Some(name.to_string());
+            set
+        };
+        let sets = vec![
+            named("gfs-pg-1", Some("/var/lib/guepard/repositories/o/p/db-a")),
+            named("gfs-pg-2", Some("/var/lib/guepard/repositories/o/p/db-b")),
+            named("gfs-pg-3", None),
+            named("gfs-pg-4", Some("/var/lib/guepard/repositories/o/p/db-a")),
+        ];
+
+        let found = instances_provisioned_for(sets, "/var/lib/guepard/repositories/o/p/db-a");
+
+        assert_eq!(
+            found,
+            vec![InstanceId("gfs-pg-1".into()), InstanceId("gfs-pg-4".into())]
+        );
+    }
+
+    #[test]
     fn a_value_kubernetes_would_reject_becomes_an_annotation() {
         // `gfs.repo` holds a filesystem path. One invalid label value makes the
         // API server reject the whole manifest, so this is what stands between
@@ -3237,5 +3355,162 @@ mod tests {
             KubernetesCompute::instance_status_from_pod(&id, Some(pod)).state,
             InstanceState::Stopping
         ));
+    }
+}
+
+/// `runtime_exists` against a stand-in API server: a plain-HTTP listener that
+/// answers the one StatefulSet read, so the real `kube` client, its request path
+/// and its 404 handling are exercised without a cluster.
+#[cfg(test)]
+mod runtime_exists_tests {
+    use std::sync::{Arc, Mutex};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    const STATEFULSET_PATH: &str = "/apis/apps/v1/namespaces/gfs/statefulsets/db-1";
+
+    /// A StatefulSet as a pause leaves it: kept, scaled to zero.
+    const SCALED_TO_ZERO: &str = r#"{"apiVersion":"apps/v1","kind":"StatefulSet",
+        "metadata":{"name":"db-1","namespace":"gfs","uid":"u-1","generation":4},
+        "spec":{"replicas":0,"serviceName":"db-1-svc","selector":{},"template":{}}}"#;
+
+    fn status(code: u16, reason: &str) -> String {
+        format!(
+            r#"{{"kind":"Status","apiVersion":"v1","status":"Failure","message":"{reason}","reason":"{reason}","code":{code}}}"#
+        )
+    }
+
+    /// Serves `(code, body)` to every request and records each request line.
+    async fn compute_answering(
+        code: u16,
+        body: String,
+    ) -> (KubernetesCompute, Arc<Mutex<Vec<String>>>) {
+        compute_routing(vec![("/", code, body)]).await
+    }
+
+    /// Serves the first route whose path prefix the request path starts with.
+    async fn compute_routing(
+        routes: Vec<(&'static str, u16, String)>,
+    ) -> (KubernetesCompute, Arc<Mutex<Vec<String>>>) {
+        // A workspace build enables both rustls backends, and rustls then refuses
+        // to pick one; the CLI's main installs aws-lc-rs for the same reason.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && socket.read(&mut byte).await.unwrap_or(0) == 1
+                {
+                    head.push(byte[0]);
+                }
+                let request_line = String::from_utf8_lossy(&head)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let path = request_line.split(' ').nth(1).unwrap_or("").to_string();
+                seen.lock().unwrap().push(request_line);
+                let (code, body) = routes
+                    .iter()
+                    .find(|(prefix, _, _)| path.starts_with(prefix))
+                    .map(|(_, code, body)| (*code, body.clone()))
+                    .unwrap_or((404, String::new()));
+                let response = format!(
+                    "HTTP/1.1 {code} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        let config = kube::Config::new(format!("http://{address}").parse().unwrap());
+        let compute = KubernetesCompute {
+            client: Client::try_from(config).unwrap(),
+            namespace: DEFAULT_NAMESPACE.to_string(),
+        };
+        (compute, requests)
+    }
+
+    fn instance() -> InstanceId {
+        InstanceId("db-1".to_string())
+    }
+
+    #[tokio::test]
+    async fn a_statefulset_scaled_to_zero_still_exists() {
+        let (compute, requests) = compute_answering(200, SCALED_TO_ZERO.to_string()).await;
+
+        assert!(compute.runtime_exists(&instance()).await.unwrap());
+        let requests = requests.lock().unwrap();
+        assert!(
+            requests[0].starts_with(&format!("GET {STATEFULSET_PATH}")),
+            "read the wrong object: {requests:?}"
+        );
+    }
+
+    const PODS_PATH: &str = "/api/v1/namespaces/gfs/pods";
+    const NO_PODS: &str = r#"{"apiVersion":"v1","kind":"PodList","metadata":{},"items":[]}"#;
+
+    /// A paused database (StatefulSet kept, scaled to zero, no pod) reads Stopped.
+    #[tokio::test]
+    async fn a_database_scaled_to_zero_reads_stopped() {
+        let (compute, _) = compute_routing(vec![
+            (PODS_PATH, 200, NO_PODS.to_string()),
+            (STATEFULSET_PATH, 200, SCALED_TO_ZERO.to_string()),
+        ])
+        .await;
+
+        let state = compute.status(&instance()).await.unwrap().state;
+        assert_eq!(state, InstanceState::Stopped);
+    }
+
+    /// No pod and no StatefulSet is not a pause: it stays Unknown.
+    #[tokio::test]
+    async fn no_pod_and_no_statefulset_reads_unknown() {
+        let (compute, _) = compute_routing(vec![
+            (PODS_PATH, 200, NO_PODS.to_string()),
+            (STATEFULSET_PATH, 404, status(404, "NotFound")),
+        ])
+        .await;
+
+        let state = compute.status(&instance()).await.unwrap().state;
+        assert_eq!(state, InstanceState::Unknown);
+    }
+
+    #[tokio::test]
+    async fn the_epoch_is_the_statefulsets_uid_and_generation() {
+        let (compute, _) = compute_answering(200, SCALED_TO_ZERO.to_string()).await;
+        let epoch = compute.instance_epoch(&instance()).await.unwrap();
+        assert_eq!(epoch.as_deref(), Some("u-1:4"));
+    }
+
+    #[tokio::test]
+    async fn a_missing_statefulset_has_no_epoch() {
+        let (compute, _) = compute_answering(404, status(404, "NotFound")).await;
+        assert_eq!(compute.instance_epoch(&instance()).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_missing_statefulset_does_not_exist() {
+        let (compute, _) = compute_answering(404, status(404, "NotFound")).await;
+
+        assert!(!compute.runtime_exists(&instance()).await.unwrap());
+    }
+
+    /// A refused read answers neither way: it must not be taken for "absent".
+    #[tokio::test]
+    async fn a_failed_read_is_an_error_not_an_absence() {
+        let (compute, _) = compute_answering(403, status(403, "Forbidden")).await;
+
+        let error = compute.runtime_exists(&instance()).await.unwrap_err();
+        assert!(
+            matches!(error, ComputeError::Internal(ref message) if message.contains("statefulset get failed")),
+            "unexpected error: {error:?}"
+        );
     }
 }

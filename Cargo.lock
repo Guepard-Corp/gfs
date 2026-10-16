@@ -1448,6 +1448,7 @@ dependencies = [
  "gfs-storage-kubernetes",
  "k8s-openapi",
  "kube",
+ "rustls 0.23.40",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

@@ -15,7 +15,9 @@ use crate::ports::repository::{Repository, RepositoryError};
 use crate::ports::storage::{SnapshotOptions, StorageError, StoragePort, VolumeId};
 use crate::repo_utils::repo_layout;
 use crate::repo_utils::repo_lock::{LockError, RepoLock};
-use crate::usecases::repository::extract_schema_usecase::ExtractSchemaUseCase;
+use crate::usecases::repository::extract_schema_usecase::{
+    ExtractSchemaError, ExtractSchemaUseCase,
+};
 use crate::utils::hash::hash_snapshot;
 
 // ---------------------------------------------------------------------------
@@ -38,6 +40,19 @@ pub enum CommitRepoError {
 
     #[error("commit message must not be empty")]
     EmptyMessage,
+
+    /// The database is stopped, so its schema cannot be read now, and the caller
+    /// supplied none (see [`CommitRepoUseCase::with_schema_when_stopped`]).
+    #[error(
+        "the database is stopped and no schema was captured for it, so the commit would \
+         record no schema; start the database and commit again"
+    )]
+    StoppedWithoutSchema,
+
+    /// Reading the running database's schema failed. A commit without its schema
+    /// would break `gfs schema show` / `schema diff` for it, so none is recorded.
+    #[error("refusing to commit: capturing the database's schema failed: {0}")]
+    SchemaCapture(String),
 }
 
 /// True when host-side snapshot copy failed because the host could not read a file
@@ -49,6 +64,15 @@ fn storage_error_looks_like_permission_denied(err: &StorageError) -> bool {
         StorageError::Io(io) => io.kind() == ErrorKind::PermissionDenied,
         _ => false,
     }
+}
+
+/// Whether `schema_hash` names a schema object stored in the repo.
+fn schema_object_exists(repo_path: &Path, schema_hash: &str) -> bool {
+    // `get_schema_by_hash` splits the hash at byte 2; anything shorter or not
+    // plain hex is not a hash a commit can record.
+    schema_hash.len() > 2
+        && schema_hash.bytes().all(|b| b.is_ascii_hexdigit())
+        && repo_layout::get_schema_by_hash(repo_path, schema_hash).is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +227,7 @@ pub struct CommitRepoUseCase<R: DatabaseProviderRegistry> {
     compute: Arc<dyn Compute>,
     storage: Arc<dyn StoragePort>,
     registry: Arc<R>,
+    schema_when_stopped: Option<String>,
 }
 
 impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
@@ -217,7 +242,18 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
             compute,
             storage,
             registry,
+            schema_when_stopped: None,
         }
+    }
+
+    /// The schema object (its hash, as [`ExtractSchemaUseCase::run_and_store`]
+    /// returns it) to record if the database turns out to be stopped. A stopped
+    /// database cannot change, so a schema captured when it stopped is exactly
+    /// its schema now. Ignored when the database is running: its live schema is
+    /// read instead.
+    pub fn with_schema_when_stopped(mut self, schema_hash: String) -> Self {
+        self.schema_when_stopped = Some(schema_hash);
+        self
     }
 
     /// Commit the current state of the repository at `path` with the given `message`.
@@ -314,6 +350,10 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
             })
             .or_else(|| git_config.email.clone());
 
+        let is_stopped = self
+            .instance_is_stopped(&runtime_config, &environment)
+            .await?;
+
         // 2. Decide whether schema extraction may overlap the snapshot.
         //    On runtimes where `pause()` does not freeze the database
         //    (`db_live_during_snapshot`, e.g. Kubernetes), the read-only schema
@@ -357,29 +397,44 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
         };
 
         let (schema_hash, snapshot_hash) = if db_live_during_snapshot {
-            // Overlap: run both arms to completion, then apply the asymmetry.
-            // `join!` (not `try_join!`) is required because schema extraction is
-            // best-effort while the snapshot is fatal: a failed schema arm must
-            // NOT cancel the in-flight snapshot. A `.gfs/objects` orphan left by
-            // a schema arm that finished while the snapshot failed is harmless —
-            // no ref points to it.
+            // Overlap: run both arms to completion, then fail on either.
+            // `join!` (not `try_join!`): a failed schema arm must NOT cancel the
+            // in-flight snapshot midway. A `.gfs/objects` orphan left by a schema
+            // arm that finished while the snapshot failed is harmless — no ref
+            // points to it. A snapshot that finished while the schema arm failed
+            // is discarded: no commit will ever reference it.
             let (schema_res, snapshot_res) = tokio::join!(
-                self.maybe_extract_schema(&path, &runtime_config, &environment),
+                self.commit_schema(&path, &runtime_config, &environment, is_stopped),
                 self.take_snapshot(
                     &path,
                     &runtime_config,
                     &environment,
                     mount_point,
                     db_live_during_snapshot,
+                    !is_stopped,
                 ),
             );
-            (schema_res, snapshot_res?)
+            let snapshot_hash = snapshot_res?;
+            let schema_hash = match schema_res {
+                Ok(schema_hash) => schema_hash,
+                Err(e) => {
+                    if let Err(discard) = self.storage.discard_snapshot(&snapshot_hash).await {
+                        tracing::warn!(
+                            snapshot = %snapshot_hash,
+                            error = %discard,
+                            "could not discard the snapshot of a failed commit; it stays unreferenced"
+                        );
+                    }
+                    return Err(e);
+                }
+            };
+            (schema_hash, snapshot_hash)
         } else {
             // Sequential: schema extraction must complete before the snapshot
             // pauses (and thus freezes) the database.
-            let schema_res = self
-                .maybe_extract_schema(&path, &runtime_config, &environment)
-                .await;
+            let schema_hash = self
+                .commit_schema(&path, &runtime_config, &environment, is_stopped)
+                .await?;
             let snapshot_hash = self
                 .take_snapshot(
                     &path,
@@ -387,9 +442,10 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                     &environment,
                     mount_point,
                     db_live_during_snapshot,
+                    !is_stopped,
                 )
                 .await?;
-            (schema_res, snapshot_hash)
+            (schema_hash, snapshot_hash)
         };
 
         // 5. Build the new commit.
@@ -418,20 +474,93 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
         Ok(commit_hash)
     }
 
-    /// Best-effort schema extraction: extract and store the schema while the
-    /// database is still serving reads, returning the schema hash on success.
+    /// Whether the database is known to be stopped. Only a positive "stopped"
+    /// counts: a status that reads as anything else (Unknown, Paused,
+    /// Starting...) may hide a running writer and goes through the quiesce,
+    /// which refuses the commit if the instance cannot be prepared.
     ///
-    /// Returns `None` when no database is configured or when extraction fails —
-    /// schema capture is never allowed to abort a commit. This is the `A` arm of
-    /// the overlap path; on the sequential path it is awaited before the
-    /// snapshot.
-    async fn maybe_extract_schema(
+    /// # Errors
+    /// Refuses the commit when the status cannot be read: it cannot then be told
+    /// whether the database must be quiesced, and a running database snapshotted
+    /// without that can be silently lossy.
+    async fn instance_is_stopped(
+        &self,
+        runtime_config: &Option<RuntimeConfig>,
+        environment: &Option<EnvironmentConfig>,
+    ) -> Result<bool, CommitRepoError> {
+        let (Some(runtime), Some(_)) = (runtime_config, environment) else {
+            return Ok(false);
+        };
+        match self
+            .compute
+            .status(&InstanceId(runtime.container_name.clone()))
+            .await
+        {
+            Ok(status) => Ok(status.state == InstanceState::Stopped),
+            Err(e) => Err(CommitRepoError::Repository(RepositoryError::Internal(
+                format!(
+                    "{e}. Refusing to commit: the database's state could not be read, so \
+                     it cannot be told whether it must be quiesced before the snapshot, \
+                     and a running database snapshotted without that can be silently lossy"
+                ),
+            ))),
+        }
+    }
+
+    /// Whether the provider can read a database's schema at all. Its commits
+    /// carry no schema otherwise, whatever the database's state. A spec that
+    /// fails to build counts as supported, so extraction reports the real error.
+    fn provider_extracts_schema(&self, environment: &EnvironmentConfig) -> bool {
+        let Some(provider) = self.registry.get(&environment.database_provider) else {
+            return false;
+        };
+        if provider.local_engine().is_some() {
+            return true;
+        }
+        let Ok(container) = provider.require_container() else {
+            return false;
+        };
+        let params = ConnectionParams {
+            host: "127.0.0.1".into(),
+            port: container.default_port(),
+            env: Vec::new(),
+        };
+        !matches!(container.schema_extraction_spec(&params), Ok(None))
+    }
+
+    /// The schema the commit records, returning its hash.
+    ///
+    /// A running database (or an embedded one) is read now. A stopped one cannot
+    /// be read; it gets the schema supplied with
+    /// [`Self::with_schema_when_stopped`], which is exact because a stopped
+    /// database cannot change. A provider without schema extraction records
+    /// none. This is the `A` arm of the overlap path; on the sequential path it is
+    /// awaited before the snapshot.
+    ///
+    /// # Errors
+    /// [`CommitRepoError::StoppedWithoutSchema`] for a stopped database with no
+    /// supplied schema, or one whose supplied schema object is not in the repo;
+    /// [`CommitRepoError::SchemaCapture`] when reading a running database's schema
+    /// fails. Neither records a commit without its schema.
+    async fn commit_schema(
         &self,
         path: &Path,
         runtime_config: &Option<RuntimeConfig>,
         environment: &Option<EnvironmentConfig>,
-    ) -> Option<String> {
-        let environment = environment.as_ref()?;
+        is_stopped: bool,
+    ) -> Result<Option<String>, CommitRepoError> {
+        let Some(environment) = environment.as_ref() else {
+            return Ok(None);
+        };
+        if !self.provider_extracts_schema(environment) {
+            return Ok(None);
+        }
+        if is_stopped {
+            return match &self.schema_when_stopped {
+                Some(hash) if schema_object_exists(path, hash) => Ok(Some(hash.clone())),
+                _ => Err(CommitRepoError::StoppedWithoutSchema),
+            };
+        }
 
         // A container-backed provider needs its instance running to be queried.
         // An embedded provider has no instance and no `RuntimeConfig`, so
@@ -442,11 +571,19 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                 .registry
                 .get(&environment.database_provider)
                 .is_some_and(|p| !p.requires_compute());
-
-        if extractable {
-            self.extract_and_store_schema(path).await.ok()
-        } else {
-            None
+        if !extractable {
+            return Ok(None);
+        }
+        match ExtractSchemaUseCase::new(self.compute.clone(), self.registry.clone())
+            .run_and_store(path)
+            .await
+        {
+            Ok(hash) => {
+                tracing::info!("Schema stored with hash: {}", hash);
+                Ok(Some(hash))
+            }
+            Err(ExtractSchemaError::Unsupported(_)) => Ok(None),
+            Err(e) => Err(CommitRepoError::SchemaCapture(e.to_string())),
         }
     }
 
@@ -562,6 +699,7 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
         environment: &Option<EnvironmentConfig>,
         mount_point: Option<String>,
         db_live_during_snapshot: bool,
+        needs_quiesce: bool,
     ) -> Result<String, CommitRepoError> {
         // 3. Prepare the database container for snapshotting (if present).
         let mut unpause_guard: Option<UnpauseGuard> = None;
@@ -575,18 +713,9 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
         // because the shutdown's own writes to pg_control read as uncommitted
         // work, commit because the database is down -- leaving --force, which
         // discards work, as the only way out.
-        let instance_is_running = match runtime_config {
-            Some(runtime) => matches!(
-                self
-                    .compute
-                    .status(&InstanceId(runtime.container_name.clone()))
-                    .await,
-                Ok(status) if status.state == InstanceState::Running
-            ),
-            None => false,
-        };
+        // Only a positive "stopped" skips it (see `instance_is_stopped`).
         if let (Some(runtime), Some(env)) = (runtime_config, environment)
-            && instance_is_running
+            && needs_quiesce
         {
             let instance_id = InstanceId(runtime.container_name.clone());
 
@@ -823,12 +952,12 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                     let canonical_ws = self.repository.get_active_workspace_data_dir(path).await;
                     if let Ok(ws) = canonical_ws {
                         if let Some(m) = repo_layout::repair_marker_path(&ws) {
-                            let _ = std::fs::write(&m, b"");
+                            let _ = crate::repo_utils::durable_write::write_durable(&m, b"", None);
                         }
                     } else if let Some(m) = repo_layout::repair_marker_path(
                         std::path::Path::new(volume_id.0.as_str()),
                     ) {
-                        let _ = std::fs::write(&m, b"");
+                        let _ = crate::repo_utils::durable_write::write_durable(&m, b"", None);
                     }
 
                     Ok(())
@@ -1002,52 +1131,6 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                  /private/tmp."
             ),
         )))
-    }
-
-    /// Extract and store schema for the current database state.
-    /// Returns the schema hash on success, or None if extraction fails.
-    /// This is best-effort - failures are logged but don't fail the commit.
-    ///
-    /// Both the schema metadata and the schema-only DDL are captured from a
-    /// SINGLE extraction sidecar's stdout. Stdout is the only channel that
-    /// survives runtimes where the sidecar runs on a different host than the
-    /// repository (e.g. Kubernetes, where the task pod and `.gfs` live on
-    /// separate nodes): a mounted output file the sidecar writes is never
-    /// readable by the gfs process. Routing the DDL through stdout — instead of
-    /// a second `pg_dump -f <file>` sidecar whose file the host then reads —
-    /// fixes schema history on Kubernetes and halves the per-commit sidecar
-    /// cost (one cold start instead of two).
-    async fn extract_and_store_schema(
-        &self,
-        repo_path: &std::path::Path,
-    ) -> Result<String, Box<dyn std::error::Error>> {
-        tracing::debug!("Extracting schema for commit");
-
-        // Extract schema metadata + DDL via a single ExtractSchemaUseCase run.
-        let extract_use_case =
-            ExtractSchemaUseCase::new(self.compute.clone(), self.registry.clone());
-        let schema_output = extract_use_case.run(repo_path).await.map_err(|e| {
-            tracing::warn!("Schema extraction failed: {}", e);
-            e
-        })?;
-
-        // Store schema object in repo. The hash is derived from the metadata
-        // (schema.json); the DDL (schema.sql) is stored alongside for `gfs
-        // schema show --ddl`. An empty DDL is acceptable — `schema show`
-        // (metadata) and `schema diff` operate on the metadata and remain
-        // fully functional.
-        let schema_hash = repo_layout::write_schema_object(
-            repo_path,
-            &schema_output.metadata,
-            &schema_output.schema_sql,
-        )
-        .map_err(|e| {
-            tracing::warn!("Failed to write schema object: {}", e);
-            e
-        })?;
-
-        tracing::info!("Schema stored with hash: {}", schema_hash);
-        Ok(schema_hash)
     }
 }
 
@@ -1282,6 +1365,8 @@ mod tests {
         /// What an `exec` probe of the container's data dir prints. `None` models a
         /// runtime where `exec` is unavailable, which is the trait default.
         exec_stdout: Option<String>,
+        /// When set, `status()` fails with this message.
+        status_fails_with: Option<String>,
     }
 
     impl Default for MockCompute {
@@ -1296,6 +1381,7 @@ mod tests {
                 pause_fails_with: None,
                 db_live_during_snapshot: false,
                 exec_stdout: None,
+                status_fails_with: None,
             }
         }
     }
@@ -1356,6 +1442,11 @@ mod tests {
         }
 
         async fn status(&self, id: &InstanceId) -> crate::ports::compute::Result<InstanceStatus> {
+            if let Some(message) = &self.status_fails_with {
+                return Err(crate::ports::compute::ComputeError::Internal(
+                    message.clone(),
+                ));
+            }
             Ok(InstanceStatus {
                 id: id.clone(),
                 state: self.state.clone(),
@@ -1780,6 +1871,104 @@ mod tests {
         let compute_arc = uc.compute.clone();
         // We can't downcast Arc<dyn Compute>, so we just check the result is correct.
         let _ = compute_arc;
+    }
+
+    /// A repo with a container-backed database named `container`.
+    fn repo_with_database(container: &str) -> MockRepository {
+        MockRepository {
+            commit_hash: "q1".into(),
+            current_commit: "previous-hash".into(),
+            mount_point: Some("/vol/main".into()),
+            runtime_config: Some(RuntimeConfig {
+                runtime_provider: "docker".into(),
+                runtime_version: "24".into(),
+                container_name: container.into(),
+            }),
+            environment: Some(EnvironmentConfig {
+                database_provider: "mock-db".into(),
+                database_version: "16".into(),
+                database_port: None,
+                display_name: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_commit_whose_database_state_cannot_be_read_is_refused_not_taken_unquiesced() {
+        let compute = Arc::new(MockCompute {
+            status_fails_with: Some("runtime API unreachable".into()),
+            ..Default::default()
+        });
+        let storage = Arc::new(MockStorage::new("snap-q1"));
+        let uc = CommitRepoUseCase::new(
+            Arc::new(repo_with_database("q-pg")),
+            compute.clone(),
+            storage.clone(),
+            Arc::new(MockRegistry),
+        );
+
+        let err = uc
+            .run(existing_repo_path(), "w".into(), None, None, None, None)
+            .await
+            .expect_err("a commit that cannot tell whether to quiesce must not proceed");
+
+        assert!(err.to_string().contains("Refusing to commit"), "{err}");
+        assert!(
+            storage.last_volume.lock().unwrap().is_none(),
+            "no snapshot taken"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_database_in_an_unknown_state_is_quiesced_before_its_snapshot() {
+        let compute = Arc::new(MockCompute {
+            state: InstanceState::Unknown,
+            ..Default::default()
+        });
+        let uc = CommitRepoUseCase::new(
+            Arc::new(repo_with_database("q-pg")),
+            compute.clone(),
+            Arc::new(MockStorage::new("snap-q2")),
+            Arc::new(MockRegistry),
+        );
+
+        uc.run(existing_repo_path(), "w".into(), None, None, None, None)
+            .await
+            .expect("commit");
+
+        assert!(
+            *compute.prepared.lock().unwrap(),
+            "Unknown is not a positive stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stopped_database_is_committed_without_quiescing() {
+        let compute = Arc::new(MockCompute {
+            state: InstanceState::Stopped,
+            ..Default::default()
+        });
+        let storage = Arc::new(MockStorage::new("snap-q3"));
+        let uc = CommitRepoUseCase::new(
+            Arc::new(repo_with_database("q-pg")),
+            compute.clone(),
+            storage.clone(),
+            Arc::new(MockRegistry),
+        );
+
+        uc.run(existing_repo_path(), "w".into(), None, None, None, None)
+            .await
+            .expect("a stopped database is committed");
+
+        assert!(
+            !*compute.prepared.lock().unwrap(),
+            "no CHECKPOINT on a stopped database"
+        );
+        assert_eq!(
+            storage.last_volume.lock().unwrap().as_deref(),
+            Some("/vol/main")
+        );
     }
 
     #[tokio::test]
@@ -2621,8 +2810,8 @@ mod tests {
 
         // ---------------------------------------------------------------
         // Compute mock: capability flag + latching/step-counting `exec`.
-        // `status -> Stopped` so the snapshot arm never pauses — snapshot
-        // entry is gated ONLY by the storage rendezvous, never by env flags.
+        // Snapshot entry is gated ONLY by the storage rendezvous, never by env
+        // flags.
         // ---------------------------------------------------------------
         struct OverlapCompute {
             db_live_during_snapshot: bool,
@@ -2632,6 +2821,8 @@ mod tests {
             exec_step: AtomicUsize,
             /// Optional rendezvous latch (overlap test only).
             latch: Option<Arc<Latch>>,
+            /// Report the database as stopped (scaled to zero).
+            is_stopped: bool,
         }
 
         impl OverlapCompute {
@@ -2641,7 +2832,13 @@ mod tests {
                     step,
                     exec_step: AtomicUsize::new(0),
                     latch: None,
+                    is_stopped: false,
                 }
+            }
+
+            fn stopped(mut self) -> Self {
+                self.is_stopped = true;
+                self
             }
 
             fn with_latch(mut self, latch: Arc<Latch>) -> Self {
@@ -2678,8 +2875,13 @@ mod tests {
                 &self,
                 id: &InstanceId,
             ) -> crate::ports::compute::Result<InstanceStatus> {
-                // Stopped → the snapshot arm skips pause/unpause entirely.
-                Ok(stopped(id))
+                // Running unless told otherwise: the schema arm reads it through
+                // `exec`, which a stopped database cannot answer.
+                Ok(if self.is_stopped {
+                    stopped(id)
+                } else {
+                    running(id)
+                })
             }
             async fn prepare_for_snapshot(
                 &self,
@@ -2818,6 +3020,7 @@ mod tests {
             snapshot_step: AtomicUsize,
             latch: Option<Arc<Latch>>,
             fail: bool,
+            discarded: std::sync::Mutex<Vec<String>>,
         }
 
         impl OverlapStorage {
@@ -2827,6 +3030,7 @@ mod tests {
                     snapshot_step: AtomicUsize::new(0),
                     latch: None,
                     fail: false,
+                    discarded: std::sync::Mutex::new(Vec::new()),
                 }
             }
             fn with_latch(mut self, latch: Arc<Latch>) -> Self {
@@ -2912,6 +3116,10 @@ mod tests {
                 &self,
                 _: &std::path::Path,
             ) -> crate::ports::storage::Result<()> {
+                Ok(())
+            }
+            async fn discard_snapshot(&self, hash: &str) -> crate::ports::storage::Result<()> {
+                self.discarded.lock().unwrap().push(hash.to_string());
                 Ok(())
             }
         }
@@ -3119,11 +3327,96 @@ mod tests {
             assert_eq!(hash, "overlap-commit");
         }
 
-        /// Error asymmetry (a): schema extraction fails, snapshot succeeds → the
-        /// commit still SUCCEEDS with `schema_hash == None`. Schema capture is
-        /// best-effort and never aborts a commit.
+        /// The schema object a running database stores, as captured at pause time.
+        async fn schema_captured_while_running(path: &std::path::Path) -> String {
+            let compute = Arc::new(OverlapCompute::new(false, Arc::new(AtomicUsize::new(0))));
+            super::super::ExtractSchemaUseCase::new(compute, Arc::new(OverlapRegistry))
+                .run_and_store(path)
+                .await
+                .expect("schema captured while running")
+        }
+
         #[tokio::test]
-        async fn schema_failure_does_not_abort_commit() {
+        async fn a_stopped_database_records_the_schema_captured_when_it_stopped() {
+            let (path, repo) = configured_repo();
+            let captured = schema_captured_while_running(&path).await;
+            let step = Arc::new(AtomicUsize::new(0));
+            let compute = Arc::new(OverlapCompute::new(false, step.clone()).stopped());
+            let repo = Arc::new(repo);
+            let uc = CommitRepoUseCase::new(
+                repo.clone(),
+                compute.clone(),
+                Arc::new(OverlapStorage::new(step)),
+                Arc::new(OverlapRegistry),
+            )
+            .with_schema_when_stopped(captured.clone());
+
+            uc.run(path, "while stopped".into(), None, None, None, None)
+                .await
+                .expect("a stopped database with its captured schema commits");
+
+            let committed = repo.committed.lock().unwrap();
+            let commit = committed.as_ref().expect("a commit was recorded");
+            assert_eq!(commit.schema_hash.as_deref(), Some(captured.as_str()));
+            assert_eq!(
+                compute.exec_step.load(Ordering::SeqCst),
+                0,
+                "nothing is read from a stopped database"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_stopped_database_without_a_captured_schema_is_refused() {
+            let (path, repo) = configured_repo();
+            let step = Arc::new(AtomicUsize::new(0));
+            let repo = Arc::new(repo);
+            let uc = CommitRepoUseCase::new(
+                repo.clone(),
+                Arc::new(OverlapCompute::new(false, step.clone()).stopped()),
+                Arc::new(OverlapStorage::new(step)),
+                Arc::new(OverlapRegistry),
+            );
+
+            let err = uc
+                .run(path, "while stopped".into(), None, None, None, None)
+                .await
+                .expect_err("no schema-less commit");
+            assert!(
+                matches!(err, CommitRepoError::StoppedWithoutSchema),
+                "{err}"
+            );
+            assert!(repo.committed.lock().unwrap().is_none());
+        }
+
+        #[tokio::test]
+        async fn a_captured_schema_missing_from_the_repo_is_refused() {
+            let (path, repo) = configured_repo();
+            let step = Arc::new(AtomicUsize::new(0));
+            let repo = Arc::new(repo);
+            let uc = CommitRepoUseCase::new(
+                repo.clone(),
+                Arc::new(OverlapCompute::new(false, step.clone()).stopped()),
+                Arc::new(OverlapStorage::new(step)),
+                Arc::new(OverlapRegistry),
+            )
+            .with_schema_when_stopped("ab".repeat(32));
+
+            let err = uc
+                .run(path, "while stopped".into(), None, None, None, None)
+                .await
+                .expect_err("a dangling schema hash is not recorded");
+            assert!(
+                matches!(err, CommitRepoError::StoppedWithoutSchema),
+                "{err}"
+            );
+            assert!(repo.committed.lock().unwrap().is_none());
+        }
+
+        /// Schema extraction fails, snapshot succeeds → the commit FAILS and
+        /// nothing is recorded: a commit without its schema would break `gfs
+        /// schema show` / `schema diff` for it.
+        #[tokio::test]
+        async fn a_failed_schema_capture_fails_the_commit() {
             let path = existing_repo_path();
             // No `.gfs/config.toml` on disk → the schema arm fails at config load,
             // but the snapshot arm still runs from the MockRepository getters.
@@ -3152,21 +3445,25 @@ mod tests {
             let uc = CommitRepoUseCase::new(
                 repo_arc.clone(),
                 compute,
-                storage,
+                storage.clone(),
                 Arc::new(OverlapRegistry),
             );
-            let hash = uc
+            let err = uc
                 .run(path, "schema-failed".into(), None, None, None, None)
                 .await
-                .expect("commit should succeed despite schema failure");
-            assert_eq!(hash, "schema-failed");
-
-            let committed = repo_arc.committed.lock().unwrap();
-            let new_commit = committed.as_ref().expect("a commit was recorded");
+                .expect_err("a commit whose schema cannot be read must not be recorded");
+            assert!(matches!(err, CommitRepoError::SchemaCapture(_)), "{err}");
             assert!(
-                new_commit.schema_hash.is_none(),
-                "failed schema extraction must yield schema_hash == None"
+                repo_arc.committed.lock().unwrap().is_none(),
+                "no schema-less commit is recorded"
             );
+            // The snapshot taken alongside (the arms overlap) is referenced by no
+            // commit, so it is discarded rather than left for a collector.
+            assert!(
+                storage.snapshot_step.load(Ordering::SeqCst) > 0,
+                "fixture sanity: the snapshot arm ran"
+            );
+            assert_eq!(storage.discarded.lock().unwrap().len(), 1);
         }
 
         /// Error asymmetry (b): snapshot fails, schema succeeds → the commit

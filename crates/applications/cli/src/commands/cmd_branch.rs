@@ -11,7 +11,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use gfs_domain::adapters::gfs_repository::GfsRepository;
 use gfs_domain::model::config::{DEFAULT_DELETED_RETENTION_DAYS, GfsConfig};
-use gfs_domain::model::layout::{GFS_DIR, HEADS_DIR, REFS_DIR};
+use gfs_domain::model::layout::{DETACHED_WORKSPACE_SEGMENT, GFS_DIR, HEADS_DIR, REFS_DIR};
 use gfs_domain::ports::repository::Repository;
 use gfs_domain::repo_utils::repo_layout;
 use serde_json::json;
@@ -269,7 +269,21 @@ fn delete_branch(repo_path: &std::path::Path, name: &str, json_output: bool) -> 
     // workspace. Reported rather than ignored: a workspace that silently failed
     // to go is exactly the state this is meant to prevent.
     let workspace = repo_layout::branch_workspace_dir(repo_path, name);
-    if workspace.exists() {
+    // For one name this path is not a branch's workspace but a namespace root. A
+    // branch's workspace is `workspaces/<branch>`, and `detached` is also the
+    // segment holding every detached working copy, so deleting a branch of that
+    // name removed all of them -- silently, at exit 0, including uncommitted work.
+    // `validate_branch_name` refuses the name now, so no new branch reaches here;
+    // a repository that already carries one still can, which is why this guard
+    // exists as well as the refusal.
+    if workspace.exists() && name == DETACHED_WORKSPACE_SEGMENT {
+        println!(
+            "  its workspace path is {}, which is the directory holding every detached \
+             working copy — left in place rather than removed.\n  Move anything you need \
+             out of it; `gfs destroy` reclaims it with the repository",
+            workspace.display()
+        );
+    } else if workspace.exists() {
         #[cfg(unix)]
         let _ = std::process::Command::new("chmod")
             .args(["-R", "u+w"])
