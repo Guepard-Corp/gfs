@@ -64,3 +64,7 @@ RUN test -f /usr/share/postgresql/${PG_MAJOR}/extension/gfs.control \
 # 16, and nothing downstream notices until a test fails somewhere unrelated.
 LABEL run.guepard.gfs.pg_major="${PG_MAJOR}"
 
+# TLS offered on every start (self-signed unless a cert is mounted); see the script.
+COPY gfs-tls-entrypoint.sh /usr/local/bin/gfs-tls-entrypoint.sh
+ENTRYPOINT ["gfs-tls-entrypoint.sh"]
+CMD ["postgres"]
