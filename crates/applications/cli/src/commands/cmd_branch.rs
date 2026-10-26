@@ -278,12 +278,12 @@ fn delete_branch(repo_path: &std::path::Path, name: &str, json_output: bool) -> 
     // a repository that already carries one still can, which is why this guard
     // exists as well as the refusal.
     if workspace.exists() && name == DETACHED_WORKSPACE_SEGMENT {
-        println!(
+        println_safe!(
             "  its workspace path is {}, which is the directory holding every detached \
              working copy — left in place rather than removed.\n  Move anything you need \
              out of it; `gfs destroy` reclaims it with the repository",
             workspace.display()
-        );
+        )?;
     } else if workspace.exists() {
         #[cfg(unix)]
         let _ = std::process::Command::new("chmod")
