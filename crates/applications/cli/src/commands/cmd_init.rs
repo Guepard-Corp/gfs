@@ -138,7 +138,7 @@ pub async fn init(
     // Kubernetes runtime: ensure mount_point is set to PVC name so commits snapshot PVCs
     // instead of trying to snapshot a host filesystem path.
     if has_provider
-        && matches!(runtime_provider.as_str(), "kubernetes" | "k8s" | "k3s")
+        && gfs_domain::model::config::is_kubernetes_provider(&runtime_provider)
         && let Ok(mut cfg) = GfsConfig::load(&target_path)
         && cfg.mount_point.as_deref().unwrap_or("").trim().is_empty()
         && let Some(rt) = cfg.runtime.as_ref()

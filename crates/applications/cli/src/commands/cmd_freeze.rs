@@ -21,26 +21,10 @@ use serde_json::json;
 
 use crate::cli_utils::get_repo_dir;
 use crate::commands::cmd_source::{frozen_info, rows, run_sql};
-use crate::output::{bold, cyan, dimmed, green, red, yellow};
+use crate::output::{bold, cyan, dimmed, fmt_bytes, green, red, yellow};
 
 /// Default copy budget for the full copy a freeze requires: 1 GiB.
 pub(crate) const DEFAULT_MAX_BYTES: u64 = 1_073_741_824;
-
-/// Bytes for humans, binary units (matches `docker`/`pg_size_pretty` habits).
-fn fmt_bytes(b: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut v = b as f64;
-    let mut u = 0;
-    while v >= 1024.0 && u < UNITS.len() - 1 {
-        v /= 1024.0;
-        u += 1;
-    }
-    if u == 0 {
-        format!("{b} B")
-    } else {
-        format!("{v:.1} {}", UNITS[u])
-    }
-}
 
 /// `gfs freeze` -- see the module docs. Also runs as the `--snapshot` step of
 /// `gfs clone`, so every message must make sense in both settings.
