@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use chrono::Utc;
 use gfs_domain::ports::compute::{
-    Compute, ComputeCapabilities, ComputeDefinition, ComputeError, ExecOutput,
+    Compute, ComputeCapabilities, ComputeDefinition, ComputeError, ComputeResources, ExecOutput,
     InstanceConnectionInfo, InstanceId, InstanceState, InstanceStatus, LogEntry, LogStream,
     LogsOptions, NodeAllocation, PortMapping, Result, RuntimeDescriptor, StartOptions,
 };
@@ -406,8 +406,8 @@ fn labels_for(instance: &str) -> BTreeMap<String, String> {
 /// `ComputeResources::try_new` refuses a zero but is explicitly not a boundary —
 /// `Deserialize` builds the struct field by field and never calls it — so the
 /// decision about what a zero means belongs here, where the pod spec is built.
-fn resource_requirements_for(def: &ComputeDefinition) -> Option<ResourceRequirements> {
-    let declared = def.resources?;
+fn resource_requirements_for(resources: Option<ComputeResources>) -> Option<ResourceRequirements> {
+    let declared = resources?;
     if declared.cpu_millicores == 0 || declared.memory_mb == 0 {
         return None;
     }
@@ -427,6 +427,25 @@ fn resource_requirements_for(def: &ComputeDefinition) -> Option<ResourceRequirem
         limits: Some(BTreeMap::from([("memory".to_string(), memory)])),
         ..Default::default()
     })
+}
+
+/// The StatefulSet patch [`Compute::start`] sends: one replica, plus the `db`
+/// container's resources when the start declares them.
+///
+/// Sent as a strategic merge, which matches containers by name. A JSON merge
+/// patch would replace the whole container list with this one partial entry.
+/// Patching the template of a StatefulSet at zero replicas restarts nothing:
+/// the pod it scales up to is the first to carry the change.
+fn start_patch(resources: Option<ComputeResources>) -> serde_json::Value {
+    let mut patch = json!({ "spec": { "replicas": 1 } });
+    if let Some(requirements) = resource_requirements_for(resources) {
+        patch["spec"]["template"] = json!({
+            "spec": { "containers": [
+                { "name": DB_CONTAINER_NAME, "resources": requirements }
+            ] }
+        });
+    }
+    patch
 }
 
 /// Whether Kubernetes will accept `value` as a label value.
@@ -1012,7 +1031,7 @@ impl KubernetesCompute {
             volume_mounts: Some(mounts),
             args: if args.is_empty() { None } else { Some(args) },
             readiness_probe,
-            resources: resource_requirements_for(def),
+            resources: resource_requirements_for(def.resources),
             ..Default::default()
         };
 
@@ -1762,12 +1781,12 @@ impl Compute for KubernetesCompute {
         self.provision_with_instance(definition, &instance).await
     }
 
-    async fn start(&self, id: &InstanceId, _options: StartOptions) -> Result<InstanceStatus> {
+    async fn start(&self, id: &InstanceId, options: StartOptions) -> Result<InstanceStatus> {
         // StatefulSet is always desired replicas=1; ensure it exists.
         // If it was scaled to 0 by stop(), scale back to 1.
         let api = self.api_statefulsets();
-        let patch = json!({ "spec": { "replicas": 1 } });
-        api.patch(&id.0, &PatchParams::default(), &Patch::Merge(&patch))
+        let patch = start_patch(options.resources);
+        api.patch(&id.0, &PatchParams::default(), &Patch::Strategic(&patch))
             .await
             .map_err(|e| ComputeError::Internal(format!("k8s scale up failed: {e}")))?;
         // Wait (best-effort, bounded) for the pod to become Ready so we report the
@@ -2929,6 +2948,40 @@ mod tests {
             container_of(&definition_with_resources(None))
                 .resources
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn a_start_that_declares_resources_puts_them_on_the_db_container() {
+        let patch = start_patch(Some(ComputeResources {
+            cpu_millicores: 285,
+            memory_mb: 1024,
+        }));
+
+        assert_eq!(patch["spec"]["replicas"], 1);
+        let containers = patch["spec"]["template"]["spec"]["containers"]
+            .as_array()
+            .expect("no container entry");
+        assert_eq!(containers.len(), 1);
+        // The name is the strategic-merge key: any other name adds a container.
+        assert_eq!(containers[0]["name"], DB_CONTAINER_NAME);
+        let resources = &containers[0]["resources"];
+        assert_eq!(resources["requests"]["cpu"], "285m");
+        assert_eq!(resources["requests"]["memory"], "1024Mi");
+        assert_eq!(resources["limits"]["memory"], "1024Mi");
+        assert!(resources["limits"].get("cpu").is_none());
+    }
+
+    #[test]
+    fn a_start_without_resources_only_scales_up() {
+        // Every start before this change sent exactly this, and must still.
+        assert_eq!(start_patch(None), json!({ "spec": { "replicas": 1 } }));
+        assert_eq!(
+            start_patch(Some(ComputeResources {
+                cpu_millicores: 0,
+                memory_mb: 1024,
+            })),
+            json!({ "spec": { "replicas": 1 } })
         );
     }
 
