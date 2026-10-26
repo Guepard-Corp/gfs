@@ -10,6 +10,7 @@
 //! reclaims the PVCs and per-commit VolumeSnapshots — so only the on-disk `.gfs`
 //! metadata is removed.
 
+use crate::println_safe;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -66,7 +67,9 @@ pub async fn destroy(path: Option<PathBuf>, yes: bool) -> Result<()> {
             let id = InstanceId(name.to_string());
             let _ = compute.stop(&id).await;
             match compute.remove_instance(&id).await {
-                Ok(()) => println!("  {} removed compute instance {}", green("✓"), cyan(name)),
+                Ok(()) => {
+                    println_safe!("  {} removed compute instance {}", green("✓"), cyan(name))?
+                }
                 Err(e) => {
                     eprintln!(
                         "  {} could not remove instance {name}: {e} (continuing)",
@@ -104,11 +107,11 @@ pub async fn destroy(path: Option<PathBuf>, yes: bool) -> Result<()> {
             gfs_dir.display()
         );
     }
-    println!(
+    println_safe!(
         "  {} destroyed GFS repository at {}",
         green("✓"),
         cyan(repo_path.display().to_string())
-    );
+    )?;
     Ok(())
 }
 
