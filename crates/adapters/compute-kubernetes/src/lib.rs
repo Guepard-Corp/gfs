@@ -1795,12 +1795,30 @@ impl Compute for KubernetesCompute {
         )
         .await
         .map_err(|e| ComputeError::Internal(format!("data volume from snapshot: {e}")))?;
-        self.adopt_credentials_secret(&seed.source_instance, &instance)
-            .await?;
 
-        let mut seeded = definition.clone();
-        seeded.host_data_dir = Some(PathBuf::from(format!("pvc:{data_pvc}")));
-        self.provision_with_instance(&seeded, &instance).await
+        let provisioned = async {
+            self.adopt_credentials_secret(&seed.source_instance, &instance)
+                .await?;
+            let mut seeded = definition.clone();
+            seeded.host_data_dir = Some(PathBuf::from(format!("pvc:{data_pvc}")));
+            self.provision_with_instance(&seeded, &instance).await
+        }
+        .await;
+        if provisioned.is_err() {
+            // Nothing records this instance until provisioning returns, so no later
+            // teardown can find what was made here: remove it now. The snapshot the
+            // volume came from belongs to the source and is kept.
+            let id = InstanceId(instance.clone());
+            let _ = self.teardown_instance_keep_snapshots(&id, &[]).await;
+            let _ = self
+                .api_secrets()
+                .delete(
+                    &credentials_secret_name(&instance),
+                    &DeleteParams::default(),
+                )
+                .await;
+        }
+        provisioned
     }
 
     async fn start(&self, id: &InstanceId, _options: StartOptions) -> Result<InstanceStatus> {
