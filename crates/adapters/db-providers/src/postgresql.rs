@@ -1,6 +1,6 @@
 //! PostgreSQL provider: compute definition, connection string, and related behaviour.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gfs_domain::model::db_user::{
@@ -323,6 +323,13 @@ impl DatabaseProvider for PostgresqlProvider {
             // `base/5/16384`, where it is caught.
             "pg_wal/",
         ]
+    }
+
+    /// A relation file whose only differences are hint bits PostgreSQL set while
+    /// reading it; see [`crate::pg_page`].
+    fn holds_same_data(&self, relative_path: &str, committed: &Path, current: &Path) -> bool {
+        crate::pg_page::is_main_fork(relative_path)
+            && crate::pg_page::same_data(committed, current).unwrap_or(false)
     }
 
     fn name(&self) -> &str {
