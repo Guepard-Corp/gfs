@@ -116,7 +116,8 @@ fn snapshot_hash_from_label(label: Option<&str>) -> Option<String> {
     }
 }
 
-fn volumesnapshot_name_for_hash(hash: &str) -> String {
+/// The VolumeSnapshot a commit's snapshot hash is stored as.
+pub fn volumesnapshot_name_for_hash(hash: &str) -> String {
     // DNS label <= 63. Keep stable + deterministic.
     // Use first 32 chars to keep name short but collision-resistant.
     format!("gfs-snap-{}", &hash[..32.min(hash.len())])

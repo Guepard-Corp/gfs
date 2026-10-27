@@ -17,8 +17,9 @@ use chrono::Utc;
 use gfs_domain::ports::compute::{
     Compute, ComputeCapabilities, ComputeDefinition, ComputeError, ExecOutput,
     InstanceConnectionInfo, InstanceId, InstanceState, InstanceStatus, LogEntry, LogStream,
-    LogsOptions, NodeAllocation, PortMapping, Result, RuntimeDescriptor, StartOptions,
+    LogsOptions, NodeAllocation, PortMapping, Result, RuntimeDescriptor, StartOptions, VolumeSeed,
 };
+use gfs_domain::ports::storage::{CloneOptions, SnapshotId, StoragePort, VolumeId};
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::{
     Container, EnvVarSource, PersistentVolumeClaim, PersistentVolumeClaimSpec, Pod,
@@ -1760,6 +1761,64 @@ impl Compute for KubernetesCompute {
         // password while the engine bakes it into the data volume on init.
         self.apply_credentials_secret(&instance, definition).await?;
         self.provision_with_instance(definition, &instance).await
+    }
+
+    /// A new instance whose data volume is created from another instance's
+    /// VolumeSnapshot before its first start: no blank database boots, nothing
+    /// is torn down or swapped. The instance name is fixed first so the data
+    /// volume can carry the name checkout later expects (`{instance}-data`), and
+    /// the source's credentials Secret is copied because the data was
+    /// initialised with that password.
+    async fn provision_seeded(
+        &self,
+        definition: &ComputeDefinition,
+        seed: &VolumeSeed,
+    ) -> Result<InstanceId> {
+        let instance = ensure_dns_label(&instance_name_from_definition(definition));
+        let data_pvc = crate::checkout::stable_data_pvc(&instance);
+        let snapshot = gfs_storage_kubernetes::volumesnapshot_name_for_hash(&seed.snapshot_hash);
+
+        let storage = gfs_storage_kubernetes::KubernetesStorage::new(Some(self.namespace.clone()))
+            .await
+            .map_err(|e| ComputeError::Internal(format!("kubernetes storage: {e}")))?;
+        storage
+            .wait_snapshot_ready(&snapshot)
+            .await
+            .map_err(|e| ComputeError::Internal(format!("snapshot {snapshot} not ready: {e}")))?;
+        StoragePort::clone(
+            &storage,
+            &VolumeId("unused".into()),
+            VolumeId(data_pvc.clone()),
+            CloneOptions {
+                from_snapshot: Some(SnapshotId(snapshot)),
+            },
+        )
+        .await
+        .map_err(|e| ComputeError::Internal(format!("data volume from snapshot: {e}")))?;
+
+        let provisioned = async {
+            self.adopt_credentials_secret(&seed.source_instance, &instance)
+                .await?;
+            let mut seeded = definition.clone();
+            seeded.host_data_dir = Some(PathBuf::from(format!("pvc:{data_pvc}")));
+            self.provision_with_instance(&seeded, &instance).await
+        }
+        .await;
+        if provisioned.is_err() {
+            // Nothing records this instance until provisioning returns, so no later
+            // teardown can find what was made here: remove it now. The snapshot the
+            // volume came from belongs to the source and is kept.
+            let id = InstanceId(instance.clone());
+            let _ = self.teardown_instance_keep_snapshots(&id, &[]).await;
+            let _ = self
+                .api_secrets()
+                .delete(
+                    &credentials_secret_name(&instance),
+                    &DeleteParams::default(),
+                )
+                .await;
+        }
+        provisioned
     }
 
     async fn start(&self, id: &InstanceId, _options: StartOptions) -> Result<InstanceStatus> {
