@@ -64,7 +64,7 @@ async fn storage_for_repo(repo_path: &std::path::Path) -> Arc<dyn StoragePort> {
         && cfg
             .runtime
             .as_ref()
-            .map(|r| r.runtime_provider.trim().eq_ignore_ascii_case("kubernetes"))
+            .map(|r| gfs_domain::model::config::is_kubernetes_provider(&r.runtime_provider))
             .unwrap_or(false)
     {
         let s = gfs_storage_kubernetes::KubernetesStorage::new(None)

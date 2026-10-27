@@ -78,10 +78,7 @@ pub async fn run(
     let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
     let compute = compute_for_repo(&repository, &repo_path).await?;
 
-    let is_k8s = runtime
-        .runtime_provider
-        .trim()
-        .eq_ignore_ascii_case("kubernetes");
+    let is_k8s = gfs_domain::model::config::is_kubernetes_provider(&runtime.runtime_provider);
 
     if is_k8s {
         let sql = query.as_deref().context(

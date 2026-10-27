@@ -7,6 +7,7 @@ pub mod cmd_config;
 pub mod cmd_destroy;
 pub mod cmd_export;
 pub mod cmd_freeze;
+pub mod cmd_fsck;
 pub mod cmd_import;
 pub mod cmd_init;
 pub mod cmd_log;

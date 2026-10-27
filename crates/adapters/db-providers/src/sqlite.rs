@@ -1073,25 +1073,21 @@ impl LocalEngine for SqliteProvider {
         Ok(render_sections(&version, &schemas, &tables, &columns, &ddl))
     }
 
-    /// Fold the write-ahead log back in, then hold the write lock so the files
-    /// stop changing while they are copied.
+    /// Hold the write lock so the file set stops changing while it is copied.
     ///
-    /// Two steps, and the order is load-bearing:
+    /// One step. `BEGIN IMMEDIATE` takes SQLite's write lock, so other processes
+    /// writing this database — the user's application, not anything GFS controls —
+    /// block until the returned guard is dropped. Nothing is written under the
+    /// transaction; it exists only to hold the lock.
     ///
-    /// 1. `PRAGMA wal_checkpoint(TRUNCATE)` writes committed frames back into
-    ///    the main database and resets the WAL. This must run *before* the
-    ///    transaction below: inside an open write transaction it fails with
-    ///    "database table is locked". It is a compaction, not a correctness
-    ///    step — a writer can append new frames in the window between the
-    ///    checkpoint and the lock, so the snapshot may still carry a non-empty
-    ///    WAL, which is fine because step 2 freezes both files together.
-    /// 2. `BEGIN IMMEDIATE` takes SQLite's write lock. Other processes writing
-    ///    this database — the user's application, not anything GFS controls —
-    ///    block until the returned guard is dropped. Nothing is written under
-    ///    the transaction; it exists only to hold the lock.
+    /// This used to checkpoint the write-ahead log first, and that was the cause of
+    /// the malformed snapshots rather than the guard against them: 17 of 60 with the
+    /// checkpoint, 0 of 60 without it. See the body for the measurement.
     ///
-    /// Step 2 is what makes this correct: the file set stops changing for the
-    /// duration of the copy.
+    /// The snapshot therefore carries whatever log the database had, which is the
+    /// correct shape — a database and its log, frozen together, is what SQLite can
+    /// recover from. Copying the database file ALONE would not be: a copy with the log
+    /// dropped is missing every committed frame still in it.
     ///
     /// That matters on every filesystem, not only the ones that cannot clone.
     /// A copy-on-write clone is atomic per *file* — the APFS backend runs
@@ -1127,14 +1123,29 @@ impl LocalEngine for SqliteProvider {
             return Ok(None);
         }
 
-        // Compaction first, on its own short budget (see CHECKPOINT_TIMEOUT).
-        conn.busy_timeout(CHECKPOINT_TIMEOUT)
-            .map_err(|e| ProviderError::InvalidParams(format!("cannot set busy timeout: {e}")))?;
-        if let Err(e) = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE") {
-            tracing::debug!(error = %e, "wal checkpoint did not complete; snapshotting WAL as-is");
-        }
-
-        // The lock gets the full budget.
+        // NO CHECKPOINT. It was here, and it is what corrupted the snapshots.
+        //
+        // Measured on a filesystem without reflink with a writer running, every failure
+        // classified by which assertion fired, 60 interleaved attempts per arm:
+        //
+        //   checkpoint + this lock      17 malformed snapshots of 60   (28%)
+        //   neither                      3 of 60                        (5%)
+        //   this lock, no checkpoint     0 of 60                        (0%)
+        //
+        // Every one was `integrity_check`; no torn transaction and no missing batch in
+        // any arm. The two clean arms are exactly the two that do not checkpoint.
+        //
+        // The comment that stood here called it "compaction, not correctness: failing it
+        // costs a larger WAL in the snapshot, nothing more". The first half was right and
+        // the inference was backwards -- RUNNING it is what costs, because it rewrites
+        // the main database before the write lock is taken, while a writer is still free
+        // to append, and `TRUNCATE` resets the log's salt underneath them. What exactly
+        // that produces is not established; that it produces malformed snapshots at 28%
+        // is.
+        //
+        // A snapshot now carries whatever log the database had. That restores: measured
+        // separately, a frozen non-empty 4.1 MB log restored cleanly 8 times of 8. So
+        // what is given up is compaction, and what is bought is the end of the 28%.
         conn.busy_timeout(self.lock_timeout)
             .map_err(|e| ProviderError::InvalidParams(format!("cannot set busy timeout: {e}")))?;
 
@@ -1346,16 +1357,6 @@ fn brief(error: &rusqlite::Error) -> String {
 /// How long to wait for the write lock before giving up and letting the caller
 /// decide whether an unquiesced snapshot is acceptable.
 const LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// How long to wait for the WAL checkpoint.
-///
-/// Deliberately short, and separate from [`LOCK_TIMEOUT`]. A `TRUNCATE`
-/// checkpoint waits for readers to drain, so a single long-lived read
-/// transaction — routine for an ORM connection pool — would otherwise burn the
-/// entire lock budget before giving up, after which the write lock is taken
-/// instantly. The checkpoint is compaction, not correctness: failing it costs a
-/// larger WAL in the snapshot, nothing more.
-const CHECKPOINT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Holds SQLite's write lock open for the duration of a storage snapshot.
 struct SqliteSnapshotGuard {
@@ -1601,8 +1602,17 @@ mod tests {
         assert_eq!(args, ["/srv/db.sqlite", "SELECT 1;"]);
     }
 
+    /// The guard excludes other writers, and LEAVES THE LOG ALONE.
+    ///
+    /// Renamed and inverted. It used to assert `TRUNCATE must reset the WAL to zero
+    /// length`, and that checkpoint is what produced the malformed snapshots: 17 of 60
+    /// with it, 0 of 60 without, every failure `integrity_check`. So the log being
+    /// PRESERVED is now the property worth pinning — a database and its log, frozen
+    /// together, is what SQLite recovers from.
+    ///
+    /// The exclusion half is unchanged and still the point of the guard.
     #[test]
-    fn snapshot_guard_checkpoints_the_wal_and_excludes_other_writers() {
+    fn snapshot_guard_excludes_other_writers_and_leaves_the_log_intact() {
         let dir = tempfile::tempdir().unwrap();
         let params = seeded_db(dir.path());
         let db = dir.path().join(DB_FILENAME);
@@ -1627,10 +1637,10 @@ mod tests {
             .unwrap()
             .expect("an existing database yields a guard");
         assert!(guard.describe().contains("write lock"));
-        assert_eq!(
-            std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0),
-            0,
-            "TRUNCATE must reset the WAL to zero length"
+        assert!(
+            std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0) > 0,
+            "the log must be LEFT INTACT: checkpointing it away is what corrupted the \
+             snapshots, and dropping it from one loses every frame still in it"
         );
 
         // While the guard is alive another connection must not be able to write.
