@@ -39,6 +39,8 @@ PASS=0; FAIL=0
 src() { PGPASSWORD=pw "$PSQL" "postgresql://app:pw@localhost:${SRC_PORT}/tpch" -tAqc "$1" 2>/dev/null; }
 cln() { PGPASSWORD=postgres "$PSQL" "postgresql://postgres:postgres@localhost:${CLONE_PORT}/postgres" -tAqc "$1" 2>/dev/null; }
 ck()  { echo "SELECT COALESCE(md5(string_agg(t::text,'|' ORDER BY t::text)),'NONE') FROM ($1) t"; }
+# rows_fetched leaves out the background worker's copies, so pulled()
+# under-reports whenever a query federates and the worker copies afterwards.
 counters() { cln "SELECT COALESCE(sum(rows_fetched),0)||' '||COALESCE(sum(federate_calls),0) FROM gfs.clones"; }
 pulled()   { cln "SELECT COALESCE(sum(rows_fetched),0) FROM gfs.clones"; }
 

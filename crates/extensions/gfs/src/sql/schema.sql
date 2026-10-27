@@ -1600,6 +1600,9 @@ COMMENT ON FUNCTION gfs.note_tombstone() IS 'AFTER DELETE trigger: record the de
 CREATE TABLE gfs.clone_stats (
     relid          regclass PRIMARY KEY REFERENCES gfs.clone_source(relid) ON DELETE CASCADE,
     fetch_calls    bigint NOT NULL DEFAULT 0,
+    -- Rows a backend copies for its own query, plus rows gfs.warm copies. The
+    -- background worker's copies (temporal windows, whole-table and predicate
+    -- copies) are not counted: it skips this table (DEFER_BOOKKEEPING in hydrate.rs).
     rows_fetched   bigint NOT NULL DEFAULT 0,
     federate_calls bigint NOT NULL DEFAULT 0,  -- times this table was pushed to the source
     last_fetch     timestamptz
