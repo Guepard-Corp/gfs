@@ -2,6 +2,8 @@
 //!
 //! Thin wrapper around the library. See `gfs_cli::run()` for programmatic use.
 
+use std::ffi::OsString;
+
 use gfs_cli::output::red;
 use serde_json::json;
 
@@ -19,6 +21,34 @@ fn wants_json(args: &[String]) -> bool {
         }
     }
     false
+}
+
+/// The arguments as UTF-8, or the position of the first one that is not.
+///
+/// `std::env::args()` panics on such an argument, which exited 101 -- the code
+/// of any crash -- with a message that echoed the undecodable bytes back. The
+/// position is counted from 1 for the first argument after `gfs`.
+///
+/// argv[0] is exempt: it is the path the binary was launched by, not something
+/// the user typed, and clap only uses it for display.
+fn utf8_args(raw: Vec<OsString>) -> Result<Vec<String>, usize> {
+    raw.into_iter()
+        .enumerate()
+        .map(|(position, arg)| match arg.into_string() {
+            Ok(arg) => Ok(arg),
+            Err(arg) if position == 0 => Ok(arg.to_string_lossy().into_owned()),
+            Err(_) => Err(position),
+        })
+        .collect()
+}
+
+/// A usage error, so it takes the same exit code and rendering as a value clap
+/// could not parse. It names the position only: the bytes are not echoed.
+fn non_utf8_argument(position: usize) -> clap::Error {
+    clap::Error::raw(
+        clap::error::ErrorKind::InvalidUtf8,
+        format!("argument {position} is not valid UTF-8\n"),
+    )
 }
 
 #[tokio::main]
@@ -43,10 +73,20 @@ async fn main() {
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .init();
 
-    let args: Vec<String> = std::env::args().collect();
-    let wants_json = wants_json(&args);
+    let raw: Vec<OsString> = std::env::args_os().collect();
+    // Lossy is safe here: a replacement character can never produce "--json".
+    let lossy: Vec<String> = raw
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let wants_json = wants_json(&lossy);
 
-    match gfs_cli::run(args).await {
+    let result = match utf8_args(raw) {
+        Ok(args) => gfs_cli::run(args).await,
+        Err(position) => Err(non_utf8_argument(position).into()),
+    };
+
+    match result {
         Ok(exit_code) => std::process::exit(exit_code),
         Err(err) => {
             if wants_json {
