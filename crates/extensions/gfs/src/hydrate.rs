@@ -28,12 +28,14 @@ pub(crate) static mut DEFER_BOOKKEEPING: bool = false;
 /// a whole/int-range fetch. Shared by the single-statement path and the parallel
 /// backfill. Caller holds an open SPI connection.
 unsafe fn record_whole_or_range(h: &Hydration, n: i64) {
-    let rec = if h.whole {
-        format!("UPDATE gfs.clone_source SET whole_cached = true WHERE relid::oid = {}", u32::from(h.relid))
+    if h.whole {
+        crate::identity::execute_as_extension_owner(&format!(
+            "UPDATE gfs.clone_source SET whole_cached = true WHERE relid::oid = {}",
+            u32::from(h.relid)
+        ));
     } else {
-        format!("SELECT gfs.note_range({}::oid::regclass, {}, {})", u32::from(h.relid), h.lo, h.hi)
-    };
-    pg_sys::SPI_execute(CString::new(rec).unwrap().as_ptr(), false, 0);
+        note_range(h);
+    }
     // #131: stamp the copy event (where the source was when these rows landed).
     // Only the WHOLE branch stamps here -- gfs.note_range stamps range fetches
     // itself, so adding one for them too would probe the source twice. An
@@ -383,43 +385,6 @@ unsafe fn spi_set_repl_role(v: &str) {
     );
 }
 
-struct AsTableOwner {
-    user: pg_sys::Oid,
-    context: i32,
-}
-
-impl AsTableOwner {
-    // The reading role may only SELECT; filling the local table is the table owner's write.
-    unsafe fn enter(relid: pg_sys::Oid) -> Option<Self> {
-        let q = CString::new(format!(
-            "SELECT relowner::oid::int8::text FROM pg_class WHERE oid = {}",
-            u32::from(relid)
-        ))
-        .unwrap();
-        if pg_sys::SPI_execute(q.as_ptr(), true, 1) != pg_sys::SPI_OK_SELECT as i32
-            || pg_sys::SPI_processed != 1
-        {
-            return None;
-        }
-        let tt = pg_sys::SPI_tuptable;
-        let owner = spi_text(pg_sys::SPI_getvalue(*(*tt).vals, (*tt).tupdesc, 1))
-            .and_then(|text| text.trim().parse::<u32>().ok())?;
-        let (mut user, mut context) = (pg_sys::InvalidOid, 0);
-        pg_sys::GetUserIdAndSecContext(&mut user, &mut context);
-        pg_sys::SetUserIdAndSecContext(
-            pg_sys::Oid::from(owner),
-            context | pg_sys::SECURITY_LOCAL_USERID_CHANGE as i32,
-        );
-        Some(Self { user, context })
-    }
-}
-
-impl Drop for AsTableOwner {
-    fn drop(&mut self) {
-        unsafe { pg_sys::SetUserIdAndSecContext(self.user, self.context) };
-    }
-}
-
 /// Fetch a hydration into the local table. Returns true when the slice/table is
 /// COMPLETE (safe to serve local); returns false ONLY for a PARTIAL pull that
 /// overflowed its cap (too many matches -> not selective -> caller must federate,
@@ -433,7 +398,7 @@ pub(crate) unsafe fn do_hydrate(h: &Hydration) -> bool {
         return h.where_sql.is_empty() && !h.time_key;
     }
 
-    let _as_owner = AsTableOwner::enter(h.relid);
+    let _as_owner = crate::identity::as_table_owner(h.relid);
 
     // Copy-on-read replays the SOURCE's already-computed rows, so a replayed INSERT
     // trigger must NOT fire on them again -- it would re-mutate the row (e.g. append or
@@ -541,12 +506,10 @@ pub(crate) unsafe fn do_hydrate(h: &Hydration) -> bool {
         let wm = CString::new(format!("SELECT gfs.note_copy({}::oid::regclass)", u32::from(h.relid))).unwrap();
         pg_sys::SPI_execute(wm.as_ptr(), false, 0);
         if !overflow && !DEFER_BOOKKEEPING {
-            let pr = CString::new(format!(
+            crate::identity::execute_as_extension_owner(&format!(
                 "UPDATE gfs.clone_source SET partial_rows = partial_rows + {} WHERE relid::oid = {}",
                 inserted, u32::from(h.relid)
-            ))
-            .unwrap();
-            pg_sys::SPI_execute(pr.as_ptr(), false, 0);
+            ));
         }
         hydrate_finish(h, inserted);
         spi_set_repl_role(&prior_srr);
@@ -588,8 +551,7 @@ pub(crate) unsafe fn do_hydrate(h: &Hydration) -> bool {
         }
         let overflow = matched > cap;
         if !overflow {
-            let nr = CString::new(format!("SELECT gfs.note_range({}::oid::regclass, {}, {})", u32::from(h.relid), h.lo, h.hi)).unwrap();
-            pg_sys::SPI_execute(nr.as_ptr(), false, 0);
+            note_range(h);
         } else {
             // #131: the overflowed slice still inserted up to cap+1 real rows
             // (kept forever under ON CONFLICT DO NOTHING) -- a copy event, even
@@ -632,6 +594,17 @@ pub(crate) unsafe fn do_hydrate(h: &Hydration) -> bool {
     spi_set_repl_role(&prior_srr);
     pg_sys::SPI_finish();
     true
+}
+
+unsafe fn note_range(h: &Hydration) {
+    crate::identity::execute_as_extension_owner(&format!(
+        "SELECT gfs.claim_range({}::oid::regclass, {}, {})",
+        u32::from(h.relid),
+        h.lo,
+        h.hi
+    ));
+    let copied = CString::new(format!("SELECT gfs.note_copy({}::oid::regclass)", u32::from(h.relid))).unwrap();
+    pg_sys::SPI_execute(copied.as_ptr(), false, 0);
 }
 
 /// Post-fetch: refresh planner stats (so fresh rows use indexes) + bump activity.

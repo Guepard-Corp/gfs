@@ -46,6 +46,7 @@ use pgrx::PgTryBuilder;
 mod catalog;
 mod federate;
 mod hydrate;
+mod identity;
 mod keyrange;
 mod model;
 mod pushdown;

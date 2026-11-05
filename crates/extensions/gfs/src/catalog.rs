@@ -56,7 +56,7 @@ pub(crate) unsafe fn gfs_mark_local_write(relid: pg_sys::Oid) {
     if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
         return;
     }
-    let q = CString::new(format!(
+    crate::identity::execute_as_extension_owner(&format!(
         // session_replication_role = 'replica' means REPLAYED rows, not user
         // writes: gfs.warm() copies under it precisely so its INSERT of the
         // source's own rows is not mistaken for local divergence (#132 -- a
@@ -66,9 +66,7 @@ pub(crate) unsafe fn gfs_mark_local_write(relid: pg_sys::Oid) {
            WHERE relid::oid = {} AND NOT has_local_writes \
              AND current_setting('session_replication_role') <> 'replica'",
         u32::from(relid)
-    ))
-    .unwrap();
-    pg_sys::SPI_execute(q.as_ptr(), false, 0);
+    ));
     pg_sys::SPI_finish();
 }
 
@@ -77,7 +75,9 @@ pub(crate) unsafe fn gfs_lookup_clone(relid: pg_sys::Oid) -> Option<CloneInfo> {
         return None;
     }
     let q = CString::new(format!(
-        "SELECT s.relid::regclass::text, s.source_ref, \
+        "SELECT (SELECT pg_catalog.format('%I.%I', n.nspname, c.relname) FROM pg_catalog.pg_class c \
+                  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = s.relid), \
+                s.source_ref, \
                 COALESCE((SELECT string_agg(quote_ident(attname), ', ' ORDER BY attnum) \
                             FROM pg_attribute WHERE attrelid = s.relid AND attnum > 0 \
                               AND NOT attisdropped AND attgenerated = ''), ''), \
@@ -242,6 +242,7 @@ pub(crate) unsafe fn gfs_verify_source_rows(relid: pg_sys::Oid) -> Option<f64> {
         u32::from(relid)
     ))
     .unwrap();
+    let as_owner = crate::identity::as_extension_owner();
     let mut out = None;
     if pg_sys::SPI_execute(q.as_ptr(), false, 1) == pg_sys::SPI_OK_SELECT as i32
         && pg_sys::SPI_processed == 1
@@ -252,6 +253,7 @@ pub(crate) unsafe fn gfs_verify_source_rows(relid: pg_sys::Oid) -> Option<f64> {
             .and_then(|v| v.trim().parse::<f64>().ok())
             .filter(|v| *v >= 0.0);
     }
+    drop(as_owner);
     pg_sys::SPI_finish();
     out
 }
@@ -261,12 +263,10 @@ pub(crate) unsafe fn bump_access(relid: pg_sys::Oid) {
     if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
         return;
     }
-    let q = CString::new(format!(
+    crate::identity::execute_as_extension_owner(&format!(
         "UPDATE gfs.clone_source SET access_count = access_count + 1 WHERE relid::oid = {}",
         u32::from(relid)
-    ))
-    .unwrap();
-    pg_sys::SPI_execute(q.as_ptr(), false, 0);
+    ));
     pg_sys::SPI_finish();
 }
 
@@ -622,12 +622,10 @@ pub(crate) unsafe fn gfs_set_no_partial(relid: pg_sys::Oid) {
     if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
         return;
     }
-    let q = CString::new(format!(
+    crate::identity::execute_as_extension_owner(&format!(
         "UPDATE gfs.clone_source SET no_partial = true WHERE relid::oid = {}",
         u32::from(relid)
-    ))
-    .unwrap();
-    pg_sys::SPI_execute(q.as_ptr(), false, 0);
+    ));
     pg_sys::SPI_finish();
 }
 
