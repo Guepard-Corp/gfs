@@ -258,6 +258,37 @@ pub async fn reprovision_after_pvc_restore<R: DatabaseProviderRegistry>(
     repo_path: &Path,
     data_pvc: String,
 ) -> Result<(), K8sCheckoutReprovisionError> {
+    reprovision_on_pvc(compute, registry, repository, repo_path, data_pvc, true).await
+}
+
+pub async fn reprovision_unexposed_after_pvc_restore<R: DatabaseProviderRegistry>(
+    compute: &KubernetesCompute,
+    registry: Arc<R>,
+    repository: Arc<dyn Repository>,
+    repo_path: &Path,
+    data_pvc: String,
+) -> Result<(), K8sCheckoutReprovisionError> {
+    reprovision_on_pvc(compute, registry, repository, repo_path, data_pvc, false).await
+}
+
+fn with_exposure(mut def: ComputeDefinition, is_published: bool) -> ComputeDefinition {
+    if !is_published {
+        def.labels.insert(
+            crate::EXPOSURE_LABEL.to_string(),
+            crate::INTERNAL_EXPOSURE.to_string(),
+        );
+    }
+    def
+}
+
+async fn reprovision_on_pvc<R: DatabaseProviderRegistry>(
+    compute: &KubernetesCompute,
+    registry: Arc<R>,
+    repository: Arc<dyn Repository>,
+    repo_path: &Path,
+    data_pvc: String,
+    is_published: bool,
+) -> Result<(), K8sCheckoutReprovisionError> {
     let cfg = GfsConfig::load(repo_path)
         .map_err(|e| K8sCheckoutReprovisionError::Config(e.to_string()))?;
 
@@ -300,7 +331,7 @@ pub async fn reprovision_after_pvc_restore<R: DatabaseProviderRegistry>(
     })?;
 
     let creds = RepoCredentials::load(repo_path);
-    let def = checkout_definition(container, &cfg, &creds);
+    let def = with_exposure(checkout_definition(container, &cfg, &creds), is_published);
 
     let instance_id = InstanceId(stable_instance.clone());
     // SS/svc already torn down in restore_database_volume_from_snapshot; keep cloned PVC.
@@ -336,20 +367,27 @@ pub async fn reprovision_after_pvc_restore<R: DatabaseProviderRegistry>(
         .await
         .map_err(|e| K8sCheckoutReprovisionError::Repository(e.to_string()))?;
 
-    let conn = compute
-        .get_connection_info(&instance_id, container.default_port())
-        .await
-        .map_err(|e| K8sCheckoutReprovisionError::Compute(e.to_string()))?;
+    let published_port = if is_published {
+        Some(
+            compute
+                .get_connection_info(&instance_id, container.default_port())
+                .await
+                .map_err(|e| K8sCheckoutReprovisionError::Compute(e.to_string()))?
+                .port,
+        )
+    } else {
+        None
+    };
 
     if let Ok(mut updated) = GfsConfig::load(repo_path) {
         updated.mount_point = Some(data_pvc);
         if let Some(env) = updated.environment.as_mut() {
-            env.database_port = Some(conn.port);
+            env.database_port = published_port;
         } else {
             updated.environment = Some(EnvironmentConfig {
                 database_provider: provider_name,
                 database_version,
-                database_port: Some(conn.port),
+                database_port: published_port,
                 display_name: None,
             });
         }

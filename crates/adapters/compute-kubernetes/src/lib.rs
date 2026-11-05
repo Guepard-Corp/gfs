@@ -72,14 +72,6 @@ fn k8s_expose_nodeport() -> bool {
     }
 }
 
-fn k8s_service_type() -> &'static str {
-    if k8s_expose_nodeport() {
-        "NodePort"
-    } else {
-        "ClusterIP"
-    }
-}
-
 /// Per-instance NodePort override (via `GFS_INSTANCE_NODE_PORT`).
 fn instance_expose_port() -> Option<i32> {
     std::env::var("GFS_INSTANCE_NODE_PORT")
@@ -128,7 +120,23 @@ fn pin_published_node_port(ports: &mut [PortMapping], node_port: Option<u16>) {
 /// path already did.
 ///
 /// A free function so it is testable without a live `Client`.
-fn service_ports_for(ports: &[PortMapping]) -> Vec<ServicePort> {
+pub const EXPOSURE_LABEL: &str = "gfs.guepard.run/exposure";
+pub const INTERNAL_EXPOSURE: &str = "internal";
+
+fn is_published(def: &ComputeDefinition) -> bool {
+    k8s_expose_nodeport()
+        && def.labels.get(EXPOSURE_LABEL).map(String::as_str) != Some(INTERNAL_EXPOSURE)
+}
+
+fn service_type_for(is_published: bool) -> &'static str {
+    if is_published {
+        "NodePort"
+    } else {
+        "ClusterIP"
+    }
+}
+
+fn service_ports_for(ports: &[PortMapping], is_published: bool) -> Vec<ServicePort> {
     ports
         .iter()
         .enumerate()
@@ -143,7 +151,7 @@ fn service_ports_for(ports: &[PortMapping]) -> Vec<ServicePort> {
                 name: Some(format!("p{}", p.compute_port)),
                 ..Default::default()
             };
-            if k8s_expose_nodeport() {
+            if is_published {
                 sp.node_port = if idx == 0 {
                     service_node_port_from_mapping(p)
                 } else {
@@ -856,7 +864,7 @@ impl KubernetesCompute {
                     name: Some(format!("p{}", p.compute_port)),
                     ..Default::default()
                 };
-                if k8s_expose_nodeport() {
+                if is_published(def) {
                     cp.host_port = host_port_from_mapping(p);
                 }
                 cp
@@ -1093,10 +1101,10 @@ impl KubernetesCompute {
         }
     }
 
-    fn service_manifest(&self, instance: &str, ports: &[PortMapping]) -> Service {
+    fn service_manifest(&self, instance: &str, def: &ComputeDefinition) -> Service {
         let labels = labels_for(instance);
         let svc_name = Self::svc_name(instance);
-        let service_ports = service_ports_for(ports);
+        let service_ports = service_ports_for(&def.ports, is_published(def));
 
         Service {
             metadata: ObjectMeta {
@@ -1106,7 +1114,7 @@ impl KubernetesCompute {
                 ..Default::default()
             },
             spec: Some(ServiceSpec {
-                type_: Some(k8s_service_type().to_string()),
+                type_: Some(service_type_for(is_published(def)).to_string()),
                 selector: Some(labels),
                 ports: Some(service_ports),
                 ..Default::default()
@@ -1165,10 +1173,10 @@ impl KubernetesCompute {
         }
     }
 
-    async fn ensure_service(&self, instance: &str, ports: &[PortMapping]) -> Result<()> {
+    async fn ensure_service(&self, instance: &str, def: &ComputeDefinition) -> Result<()> {
         let api = self.api_services();
         let name = Self::svc_name(instance);
-        let svc = self.service_manifest(instance, ports);
+        let svc = self.service_manifest(instance, def);
         let pp = PatchParams::apply("gfs").force();
         api.patch(&name, &pp, &Patch::Apply(&svc))
             .await
@@ -1556,7 +1564,7 @@ impl KubernetesCompute {
         if !wants_override {
             self.ensure_pvc(&instance).await?;
         }
-        self.ensure_service(&instance, &definition.ports).await?;
+        self.ensure_service(&instance, definition).await?;
         self.ensure_statefulset(&instance, definition).await?;
         Ok(InstanceId(instance))
     }
@@ -2661,16 +2669,19 @@ mod tests {
             std::env::set_var("GFS_INSTANCE_NODE_PORT", "31151");
             std::env::set_var("GFS_K8S_EXPOSE_NODEPORT", "1");
         }
-        let ports = service_ports_for(&[
-            PortMapping {
-                compute_port: 9000,
-                host_port: None,
-            },
-            PortMapping {
-                compute_port: 8123,
-                host_port: None,
-            },
-        ]);
+        let ports = service_ports_for(
+            &[
+                PortMapping {
+                    compute_port: 9000,
+                    host_port: None,
+                },
+                PortMapping {
+                    compute_port: 8123,
+                    host_port: None,
+                },
+            ],
+            true,
+        );
         unsafe {
             std::env::remove_var("GFS_INSTANCE_NODE_PORT");
             std::env::remove_var("GFS_K8S_EXPOSE_NODEPORT");
@@ -2982,6 +2993,39 @@ mod tests {
             ..definition_with_image("postgres:17")
         };
         KubernetesCompute::statefulset_manifest_in("gfs", "gfs-pg-1", &def)
+    }
+
+    #[test]
+    fn an_internal_instance_publishes_no_node_port_and_no_host_port() {
+        // SAFETY: read synchronously below, in a single-threaded test.
+        unsafe { std::env::set_var("GFS_K8S_EXPOSE_NODEPORT", "1") };
+        let ports = vec![PortMapping {
+            compute_port: 5432,
+            host_port: Some(31234),
+        }];
+        let published = ComputeDefinition {
+            ports: ports.clone(),
+            ..definition_with_image("postgres:17")
+        };
+        let internal = ComputeDefinition {
+            labels: [(EXPOSURE_LABEL.to_string(), INTERNAL_EXPOSURE.to_string())].into(),
+            ..published.clone()
+        };
+        let published_port = container_of(&published).ports.unwrap()[0].host_port;
+        let internal_port = container_of(&internal).ports.unwrap()[0].host_port;
+        let (published_is, internal_is) = (is_published(&published), is_published(&internal));
+        unsafe { std::env::remove_var("GFS_K8S_EXPOSE_NODEPORT") };
+
+        assert_eq!(published_port, Some(31234));
+        assert_eq!(internal_port, None, "an internal pod binds no host port");
+        assert!(published_is && !internal_is);
+        assert_eq!(service_type_for(internal_is), "ClusterIP");
+        assert!(
+            service_ports_for(&ports, internal_is)
+                .iter()
+                .all(|port| port.node_port.is_none()),
+            "an internal service pins no NodePort"
+        );
     }
 
     #[test]
