@@ -1583,7 +1583,8 @@ CREATE TABLE gfs.tombstone (
 );
 COMMENT ON TABLE gfs.tombstone IS 'PRIMARY KEYs of locally-deleted rows; hydration excludes them so a local DELETE is never resurrected';
 
-CREATE FUNCTION gfs.note_tombstone() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE FUNCTION gfs.note_tombstone() RETURNS trigger LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
 DECLARE pkcols text[]; pkjson jsonb;
 BEGIN
     SELECT array_agg(a.attname) INTO pkcols
@@ -1609,7 +1610,7 @@ COMMENT ON TABLE gfs.clone_stats IS 'Copy-on-read observability per clone table'
 -- Insert a hydrated key range, then coalesce overlapping/adjacent ranges for the
 -- table into a minimal disjoint set (so coverage checks stay O(1) per query and
 -- elision works across spans). Integer key ranges only.
-CREATE FUNCTION gfs.note_range(R regclass, p_lo bigint, p_hi bigint) RETURNS void
+CREATE FUNCTION gfs.claim_range(R regclass, p_lo bigint, p_hi bigint) RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE los bigint[]; his bigint[];
 BEGIN
@@ -1634,6 +1635,13 @@ BEGIN
     DELETE FROM gfs.cached WHERE relid = R;
     INSERT INTO gfs.cached(relid, lo, hi)
         SELECT R, unnest(los), unnest(his);
+END;
+$$;
+
+CREATE FUNCTION gfs.note_range(R regclass, p_lo bigint, p_hi bigint) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM gfs.claim_range(R, p_lo, p_hi);
     -- #131: every range/time chunk is a copy event; the min..max span over these
     -- stamps is what makes WITHIN-table tearing (E2) reportable at all.
     PERFORM gfs.note_copy(R);
@@ -2075,15 +2083,16 @@ GRANT SELECT ON gfs.clone_source, gfs.cached, gfs.cached_predicate, gfs.copy_que
 -- so withholding DELETE costs nothing and closes that path.
 --
 -- Each verb below is the set actually issued in the invoker's context:
---   clone_source, clone_stats   UPDATE  -- raw SPI in catalog.rs / hydrate.rs
---   cached                      INSERT, DELETE -- gfs.note_range, reached from
---                                          do_hydrate (route.rs runs it in the
---                                          foreground)
+--   clone_stats                 UPDATE  -- raw SPI in hydrate.rs
+--   cached                      DELETE  -- gfs.note_range's coalescing
 --   copy_queue                  INSERT, DELETE -- raw SPI in catalog.rs
 --   cached_predicate            INSERT, UPDATE -- raw SPI in catalog.rs / hydrate.rs
 --   copy_watermark              INSERT, UPDATE -- gfs.note_copy, called by note_range
---   tombstone                   INSERT  -- the gfs.note_tombstone AFTER DELETE
---                                          trigger, firing in the customer's session
+--
+-- Claiming coverage (INSERT on cached), flagging clone_source and recording a
+-- tombstone are never PUBLIC: a reader could otherwise mark a table copied and be
+-- served an empty heap. identity.rs runs those writes as the extension owner and
+-- gfs.note_tombstone is SECURITY DEFINER.
 --
 -- Everything else stays read-only. drift_state, drift_notes, source_baseline and
 -- source_table_baseline are written only by functions reached from the background
@@ -2095,7 +2104,7 @@ GRANT SELECT ON gfs.clone_source, gfs.cached, gfs.cached_predicate, gfs.copy_que
 -- drive it without holding write access -- the pattern RFC 008 documents. Granting
 -- write there would let a clone's own role `DELETE FROM gfs.budget`, which makes
 -- take_token()'s `rate IS NULL` branch return 0 and disables the limit for good.
-GRANT UPDATE         ON gfs.clone_source, gfs.clone_stats TO PUBLIC;
-GRANT INSERT, DELETE ON gfs.cached, gfs.copy_queue TO PUBLIC;
+GRANT UPDATE         ON gfs.clone_stats TO PUBLIC;
+GRANT DELETE         ON gfs.cached TO PUBLIC;
+GRANT INSERT, DELETE ON gfs.copy_queue TO PUBLIC;
 GRANT INSERT, UPDATE ON gfs.cached_predicate, gfs.copy_watermark TO PUBLIC;
-GRANT INSERT         ON gfs.tombstone TO PUBLIC;

@@ -727,7 +727,7 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
             })?;
             let conn_info = self
                 .compute
-                .get_connection_info(&instance_id, container.default_port())
+                .get_task_connection_info(&instance_id, container.default_port())
                 .await?;
             let params = ConnectionParams {
                 host: conn_info.host,
@@ -1367,6 +1367,7 @@ mod tests {
         exec_stdout: Option<String>,
         /// When set, `status()` fails with this message.
         status_fails_with: Option<String>,
+        is_unexposed: bool,
     }
 
     impl Default for MockCompute {
@@ -1382,6 +1383,7 @@ mod tests {
                 db_live_during_snapshot: false,
                 exec_stdout: None,
                 status_fails_with: None,
+                is_unexposed: false,
             }
         }
     }
@@ -1525,6 +1527,11 @@ mod tests {
             _id: &InstanceId,
             compute_port: u16,
         ) -> crate::ports::compute::Result<crate::ports::compute::InstanceConnectionInfo> {
+            if self.is_unexposed {
+                return Err(ComputeError::Internal(
+                    "NodePort not allocated yet for service mock-svc port 5432".into(),
+                ));
+            }
             Ok(crate::ports::compute::InstanceConnectionInfo {
                 host: "127.0.0.1".into(),
                 port: compute_port,
@@ -1969,6 +1976,53 @@ mod tests {
             storage.last_volume.lock().unwrap().as_deref(),
             Some("/vol/main")
         );
+    }
+
+    #[tokio::test]
+    async fn a_running_database_with_no_published_port_is_quiesced_and_committed() {
+        let compute = Arc::new(MockCompute {
+            state: InstanceState::Running,
+            is_unexposed: true,
+            ..Default::default()
+        });
+        let repo = MockRepository {
+            commit_hash: "def456".into(),
+            current_commit: "previous-hash".into(),
+            mount_point: Some("/vol/main".into()),
+            runtime_config: Some(RuntimeConfig {
+                runtime_provider: "kubernetes".into(),
+                runtime_version: "1".into(),
+                container_name: "masked-pg".into(),
+            }),
+            environment: Some(EnvironmentConfig {
+                database_provider: "mock-db".into(),
+                database_version: "16".into(),
+                database_port: None,
+                display_name: None,
+            }),
+            ..Default::default()
+        };
+        let uc = CommitRepoUseCase::new(
+            Arc::new(repo),
+            compute.clone(),
+            Arc::new(MockStorage::new("snap-def")),
+            Arc::new(MockRegistry),
+        );
+
+        let hash = uc
+            .run(
+                existing_repo_path(),
+                "Forked from source@main".into(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("an unexposed database commits through its internal address");
+
+        assert_eq!(hash, "def456");
+        assert!(*compute.prepared.lock().unwrap());
     }
 
     #[tokio::test]
