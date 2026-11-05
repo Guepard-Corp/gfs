@@ -368,8 +368,56 @@ unsafe fn spi_set_repl_role(v: &str) {
         "replica" | "local" | "origin" => v,
         _ => "origin",
     };
-    let q = CString::new(format!("SET session_replication_role = {}", val)).unwrap();
-    pg_sys::SPI_execute(q.as_ptr(), false, 0);
+    let name = CString::new("session_replication_role").unwrap();
+    let value = CString::new(val).unwrap();
+    // A superuser context: the reading role may not SET this parameter itself, and must not be granted it.
+    pg_sys::set_config_option(
+        name.as_ptr(),
+        value.as_ptr(),
+        pg_sys::GucContext::PGC_SUSET,
+        pg_sys::GucSource::PGC_S_SESSION,
+        pg_sys::GucAction::GUC_ACTION_SET,
+        true,
+        pg_sys::PGERROR as i32,
+        false,
+    );
+}
+
+struct AsTableOwner {
+    user: pg_sys::Oid,
+    context: i32,
+}
+
+impl AsTableOwner {
+    // The reading role may only SELECT; filling the local table is the table owner's write.
+    unsafe fn enter(relid: pg_sys::Oid) -> Option<Self> {
+        let q = CString::new(format!(
+            "SELECT relowner::oid::int8::text FROM pg_class WHERE oid = {}",
+            u32::from(relid)
+        ))
+        .unwrap();
+        if pg_sys::SPI_execute(q.as_ptr(), true, 1) != pg_sys::SPI_OK_SELECT as i32
+            || pg_sys::SPI_processed != 1
+        {
+            return None;
+        }
+        let tt = pg_sys::SPI_tuptable;
+        let owner = spi_text(pg_sys::SPI_getvalue(*(*tt).vals, (*tt).tupdesc, 1))
+            .and_then(|text| text.trim().parse::<u32>().ok())?;
+        let (mut user, mut context) = (pg_sys::InvalidOid, 0);
+        pg_sys::GetUserIdAndSecContext(&mut user, &mut context);
+        pg_sys::SetUserIdAndSecContext(
+            pg_sys::Oid::from(owner),
+            context | pg_sys::SECURITY_LOCAL_USERID_CHANGE as i32,
+        );
+        Some(Self { user, context })
+    }
+}
+
+impl Drop for AsTableOwner {
+    fn drop(&mut self) {
+        unsafe { pg_sys::SetUserIdAndSecContext(self.user, self.context) };
+    }
 }
 
 /// Fetch a hydration into the local table. Returns true when the slice/table is
@@ -384,6 +432,8 @@ pub(crate) unsafe fn do_hydrate(h: &Hydration) -> bool {
         // failure -> safe (true).
         return h.where_sql.is_empty() && !h.time_key;
     }
+
+    let _as_owner = AsTableOwner::enter(h.relid);
 
     // Copy-on-read replays the SOURCE's already-computed rows, so a replayed INSERT
     // trigger must NOT fire on them again -- it would re-mutate the row (e.g. append or
