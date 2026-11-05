@@ -186,7 +186,7 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
         }
         let Ok(conn_info) = self
             .compute
-            .get_connection_info(&instance_id, container.default_port())
+            .get_task_connection_info(&instance_id, container.default_port())
             .await
         else {
             return;
