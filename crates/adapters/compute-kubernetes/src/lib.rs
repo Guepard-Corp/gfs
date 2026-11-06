@@ -21,7 +21,7 @@ use gfs_domain::ports::compute::{
 };
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::{
-    Container, EnvVarSource, PersistentVolumeClaim, PersistentVolumeClaimSpec, Pod,
+    Container, EnvVarSource, Event, PersistentVolumeClaim, PersistentVolumeClaimSpec, Pod,
     PodSecurityContext, PodSpec, PodTemplateSpec, Probe, ResourceRequirements, Secret,
     SecretKeySelector, Service, ServicePort, ServiceSpec, TCPSocketAction, Volume, VolumeMount,
 };
@@ -33,6 +33,12 @@ use kube::{Api, Client};
 use serde_json::json;
 
 const DEFAULT_NAMESPACE: &str = "gfs";
+
+// CSI NodePublishVolume answers NotFound when the volume no longer exists on the
+// driver; any other mount failure may still clear on its own.
+fn names_a_missing_volume(message: &str) -> bool {
+    message.contains("code = NotFound")
+}
 const DEFAULT_PVC_SIZE_GI: &str = "1";
 
 fn k8s_storage_class() -> Option<String> {
@@ -1600,6 +1606,34 @@ impl KubernetesCompute {
             .map_err(|e| ComputeError::Internal(format!("k8s statefulset get failed: {e}")))
     }
 
+    pub async fn data_volume_lost(&self, id: &InstanceId) -> Result<bool> {
+        let pod_name = format!("{}-0", id.0);
+        let Some(pod) = self
+            .api_pods()
+            .get_opt(&pod_name)
+            .await
+            .map_err(|e| ComputeError::Internal(format!("k8s pod get failed: {e}")))?
+        else {
+            return Ok(false);
+        };
+        let Some(pod_created) = pod.metadata.creation_timestamp else {
+            return Ok(false);
+        };
+        let failed_mounts = Api::<Event>::namespaced(self.client.clone(), &self.namespace)
+            .list(&ListParams::default().fields(&format!(
+                "involvedObject.kind=Pod,involvedObject.name={pod_name},reason=FailedMount"
+            )))
+            .await
+            .map_err(|e| ComputeError::Internal(format!("k8s event list failed: {e}")))?;
+        Ok(failed_mounts.items.iter().any(|event| {
+            event
+                .last_timestamp
+                .as_ref()
+                .is_some_and(|seen| *seen >= pod_created)
+                && event.message.as_deref().is_some_and(names_a_missing_volume)
+        }))
+    }
+
     /// PVC names for an instance: the stable `{id}-data` plus any de-duplicated
     /// non-empty extras.
     fn pvc_names(id: &InstanceId, extra_pvcs: &[String]) -> Vec<String> {
@@ -2308,6 +2342,18 @@ mod tests {
     use gfs_domain::ports::compute::ComputeResources;
 
     use super::*;
+
+    #[test]
+    fn only_a_mount_the_csi_driver_answers_not_found_names_a_missing_volume() {
+        assert!(names_a_missing_volume(
+            "MountVolume.SetUp failed for volume \"pvc-1\" : rpc error: code = NotFound \
+             desc = volume id 3957f385 does not exist in the volumes list"
+        ));
+        assert!(!names_a_missing_volume(
+            "MountVolume.SetUp failed for volume \"pvc-1\" : rpc error: code = DeadlineExceeded \
+             desc = context deadline exceeded"
+        ));
+    }
     use gfs_domain::ports::compute::EnvVar;
 
     use k8s_openapi::ByteString;
