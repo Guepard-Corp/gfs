@@ -354,15 +354,7 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
             .instance_is_stopped(&runtime_config, &environment)
             .await?;
 
-        // 2. Decide whether schema extraction may overlap the snapshot.
-        //    On runtimes where `pause()` does not freeze the database
-        //    (`db_live_during_snapshot`, e.g. Kubernetes), the read-only schema
-        //    extraction can run concurrently with the snapshot, so commit
-        //    latency is max(schema, snapshot) instead of their sum. On runtimes
-        //    that freeze the database (Docker), the two phases MUST stay
-        //    sequential: schema extraction needs a live connection, so it has to
-        //    finish before the pause. A probe failure falls back to the safe
-        //    sequential path rather than aborting the commit.
+        // A live database keeps taking writes, so its volume is captured before its schema is read.
         let db_live_during_snapshot = self
             .compute
             .capabilities()
@@ -370,12 +362,6 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
             .map(|caps| caps.db_live_during_snapshot)
             .unwrap_or(false);
 
-        // The schema arm and the snapshot arm are independent: schema extraction
-        // is a pure reader writing only `.gfs/objects/...`, while the snapshot
-        // captures the data volume. The snapshot consumes nothing the schema arm
-        // produces (`schema_hash` is attached at commit-build, after the
-        // snapshot). The CHECKPOINT -> snapshot ordering stays inside the
-        // snapshot arm regardless of which path runs.
         // Hold an embedded database still for BOTH phases. Acquiring inside the
         // snapshot alone left schema extraction outside the lock, so anything a
         // writer did between the two ended up in the snapshot but not in the
@@ -397,25 +383,20 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
         };
 
         let (schema_hash, snapshot_hash) = if db_live_during_snapshot {
-            // Overlap: run both arms to completion, then fail on either.
-            // `join!` (not `try_join!`): a failed schema arm must NOT cancel the
-            // in-flight snapshot midway. A `.gfs/objects` orphan left by a schema
-            // arm that finished while the snapshot failed is harmless — no ref
-            // points to it. A snapshot that finished while the schema arm failed
-            // is discarded: no commit will ever reference it.
-            let (schema_res, snapshot_res) = tokio::join!(
-                self.commit_schema(&path, &runtime_config, &environment, is_stopped),
-                self.take_snapshot(
+            let snapshot_hash = self
+                .take_snapshot(
                     &path,
                     &runtime_config,
                     &environment,
                     mount_point,
                     db_live_during_snapshot,
                     !is_stopped,
-                ),
-            );
-            let snapshot_hash = snapshot_res?;
-            let schema_hash = match schema_res {
+                )
+                .await?;
+            let schema_hash = match self
+                .commit_schema(&path, &runtime_config, &environment, is_stopped)
+                .await
+            {
                 Ok(schema_hash) => schema_hash,
                 Err(e) => {
                     if let Err(discard) = self.storage.discard_snapshot(&snapshot_hash).await {
@@ -2822,10 +2803,8 @@ mod tests {
     mod overlap_tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::time::Duration;
 
         use async_trait::async_trait;
-        use tokio::sync::Notify;
 
         use super::{MockRepository, existing_repo_path};
         use crate::model::config::{EnvironmentConfig, GfsConfig, RuntimeConfig};
@@ -2852,18 +2831,8 @@ mod tests {
         /// stdout the schema-extraction `exec` returns so parsing succeeds.
         const SCHEMA_STDOUT: &str = "GFS_SCHEMA_VERSION\nPostgreSQL 16.0\nGFS_SCHEMA_SCHEMAS\n[]\nGFS_SCHEMA_TABLES\n[]\nGFS_SCHEMA_COLUMNS\n[]";
 
-        /// A pair of rendezvous notifies shared by the two arms to prove they run
-        /// concurrently: each arm signals its own entry and awaits the other's.
-        #[derive(Default)]
-        struct Latch {
-            /// Fired by the snapshot arm on entry; awaited by the schema arm.
-            snapshot_entered: Notify,
-            /// Fired by the schema arm on entry; awaited by the snapshot arm.
-            schema_entered: Notify,
-        }
-
         // ---------------------------------------------------------------
-        // Compute mock: capability flag + latching/step-counting `exec`.
+        // Compute mock: capability flag + step-counting `exec`.
         // Snapshot entry is gated ONLY by the storage rendezvous, never by env
         // flags.
         // ---------------------------------------------------------------
@@ -2873,8 +2842,6 @@ mod tests {
             step: Arc<AtomicUsize>,
             /// Step at which `exec` (schema arm) ran. 0 means never.
             exec_step: AtomicUsize,
-            /// Optional rendezvous latch (overlap test only).
-            latch: Option<Arc<Latch>>,
             /// Report the database as stopped (scaled to zero).
             is_stopped: bool,
         }
@@ -2885,18 +2852,12 @@ mod tests {
                     db_live_during_snapshot,
                     step,
                     exec_step: AtomicUsize::new(0),
-                    latch: None,
                     is_stopped: false,
                 }
             }
 
             fn stopped(mut self) -> Self {
                 self.is_stopped = true;
-                self
-            }
-
-            fn with_latch(mut self, latch: Arc<Latch>) -> Self {
-                self.latch = Some(latch);
                 self
             }
         }
@@ -3028,12 +2989,6 @@ mod tests {
                 _: &str,
                 _: Option<&str>,
             ) -> crate::ports::compute::Result<ExecOutput> {
-                // `exec` is unique to the schema arm — the snapshot arm never
-                // calls it — so it is the schema-side rendezvous point.
-                if let Some(latch) = &self.latch {
-                    latch.schema_entered.notify_one();
-                    latch.snapshot_entered.notified().await;
-                }
                 self.exec_step.store(
                     self.step.fetch_add(1, Ordering::SeqCst) + 1,
                     Ordering::SeqCst,
@@ -3066,13 +3021,12 @@ mod tests {
         }
 
         // ---------------------------------------------------------------
-        // Storage mock: latching/step-counting `snapshot` + optional failure.
+        // Storage mock: step-counting `snapshot` + optional failure.
         // ---------------------------------------------------------------
         struct OverlapStorage {
             step: Arc<AtomicUsize>,
             /// Step at which `snapshot` ran. 0 means never.
             snapshot_step: AtomicUsize,
-            latch: Option<Arc<Latch>>,
             fail: bool,
             discarded: std::sync::Mutex<Vec<String>>,
         }
@@ -3082,14 +3036,9 @@ mod tests {
                 Self {
                     step,
                     snapshot_step: AtomicUsize::new(0),
-                    latch: None,
                     fail: false,
                     discarded: std::sync::Mutex::new(Vec::new()),
                 }
-            }
-            fn with_latch(mut self, latch: Arc<Latch>) -> Self {
-                self.latch = Some(latch);
-                self
             }
             fn failing(mut self) -> Self {
                 self.fail = true;
@@ -3114,12 +3063,6 @@ mod tests {
                 id: &VolumeId,
                 options: SnapshotOptions,
             ) -> crate::ports::storage::Result<Snapshot> {
-                // `snapshot` is unique to the snapshot arm, so it is the
-                // snapshot-side rendezvous point.
-                if let Some(latch) = &self.latch {
-                    latch.snapshot_entered.notify_one();
-                    latch.schema_entered.notified().await;
-                }
                 self.snapshot_step.store(
                     self.step.fetch_add(1, Ordering::SeqCst) + 1,
                     Ordering::SeqCst,
@@ -3317,8 +3260,7 @@ mod tests {
         /// Sequential proof: with `db_live_during_snapshot = false`, schema
         /// extraction (`exec`) MUST run strictly before the snapshot. The step
         /// counter records the order; `exec_step` being non-zero also proves the
-        /// fixture drives the schema arm all the way to `exec` (so the overlap
-        /// test's latch can rely on it firing).
+        /// fixture drives the schema arm all the way to `exec`.
         #[tokio::test]
         async fn incapable_runtime_runs_schema_before_snapshot() {
             let (path, repo) = configured_repo();
@@ -3351,34 +3293,32 @@ mod tests {
             );
         }
 
-        /// Overlap proof (load-bearing): with `db_live_during_snapshot = true`,
-        /// the two arms are `join!`ed. The rendezvous latch makes each arm block
-        /// until the OTHER has started: this completes iff both run concurrently.
-        /// If the code were sequential, the first arm would block forever waiting
-        /// for the second to start, and the `timeout` would elapse. We assert NO
-        /// timeout.
         #[tokio::test]
-        async fn capable_runtime_overlaps_schema_and_snapshot() {
+        async fn a_live_database_is_captured_before_its_schema_is_read() {
             let (path, repo) = configured_repo();
             let step = Arc::new(AtomicUsize::new(0));
-            let latch = Arc::new(Latch::default());
-            let compute =
-                Arc::new(OverlapCompute::new(true, step.clone()).with_latch(latch.clone()));
-            let storage = Arc::new(OverlapStorage::new(step.clone()).with_latch(latch.clone()));
+            let compute = Arc::new(OverlapCompute::new(true, step.clone()));
+            let storage = Arc::new(OverlapStorage::new(step.clone()));
 
-            let uc =
-                CommitRepoUseCase::new(Arc::new(repo), compute, storage, Arc::new(OverlapRegistry));
-
-            let outcome = tokio::time::timeout(
-                Duration::from_secs(5),
-                uc.run(path, "overlap".into(), None, None, None, None),
-            )
-            .await;
-
-            let hash = outcome
-                .expect("arms must overlap: a sequential commit would deadlock on the latch")
+            let uc = CommitRepoUseCase::new(
+                Arc::new(repo),
+                compute.clone(),
+                storage.clone(),
+                Arc::new(OverlapRegistry),
+            );
+            let hash = uc
+                .run(path, "capture first".into(), None, None, None, None)
+                .await
                 .expect("commit should succeed");
+
             assert_eq!(hash, "overlap-commit");
+            let snapshot_step = storage.snapshot_step.load(Ordering::SeqCst);
+            let exec_step = compute.exec_step.load(Ordering::SeqCst);
+            assert!(snapshot_step > 0 && exec_step > 0);
+            assert!(
+                snapshot_step < exec_step,
+                "the volume (step {snapshot_step}) is captured before the schema is read (step {exec_step})"
+            );
         }
 
         /// The schema object a running database stores, as captured at pause time.
@@ -3520,11 +3460,9 @@ mod tests {
             assert_eq!(storage.discarded.lock().unwrap().len(), 1);
         }
 
-        /// Error asymmetry (b): snapshot fails, schema succeeds → the commit
-        /// FAILS with the storage error and the partial snapshot tree is removed.
-        /// Because the arms are `join!`ed (not `try_join!`ed), the schema object
-        /// is still written even though the snapshot failed — proving the schema
-        /// arm was not cancelled.
+        /// Error asymmetry (b): the snapshot fails → the commit FAILS with the
+        /// storage error, the partial snapshot tree is removed, and no schema is
+        /// read for a capture that does not exist.
         #[tokio::test]
         async fn snapshot_failure_aborts_commit_and_cleans_up() {
             let (path, mut repo) = configured_repo();
@@ -3557,10 +3495,10 @@ mod tests {
                 matches!(result, Err(CommitRepoError::Storage(_))),
                 "snapshot failure must abort the commit with a storage error: {result:?}"
             );
-            // The schema arm completed (join!, not try_join!): exec ran.
-            assert!(
-                compute.exec_step.load(Ordering::SeqCst) > 0,
-                "schema arm must run to completion even when the snapshot fails"
+            assert_eq!(
+                compute.exec_step.load(Ordering::SeqCst),
+                0,
+                "a failed capture reads no schema"
             );
             // No partial snapshot tree is left behind.
             assert!(

@@ -157,3 +157,16 @@ fallback that makes the unsound rung unnecessary. The opposite framing — live
 backup primary, freeze as fallback — is the same machinery with the rung order
 swapped, and becomes the better default once step 4 has run enough times to
 trust. Nothing here forecloses it.
+
+## Amendment, 6 November 2026: capture first on a live database
+
+On a runtime with `db_live_during_snapshot`, the commit no longer reads the
+schema concurrently with the snapshot. It captures the volume first, right after
+`prepare_for_snapshot`, and only then reads the schema. With the two arms
+overlapping, the CSI snapshot of a Kubernetes commit was cut about two seconds
+after the request, with the schema dump running alongside it, and writes the
+user made after asking for the snapshot ended up in it. The schema is now read from the live database just
+after the capture: a DDL statement run between the capture and that read would
+appear in the schema but not in the data. Removing that window needs the schema
+read from the snapshot itself.
+

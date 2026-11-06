@@ -155,10 +155,10 @@ pub struct ExecOutput {
 pub struct ComputeCapabilities {
     pub supports_stream_snapshot: bool,
     pub supports_exec_as_root: bool,
-    /// `true` when `pause()` does not freeze the database, so a read-only exec
-    /// (e.g. schema extraction) may run concurrently with the snapshot without
-    /// observing or perturbing an in-flight freeze. Defaults to `false`, which
-    /// forces the safe, strictly-sequential commit path.
+    /// `true` when `pause()` does not freeze the database. The database keeps
+    /// taking writes during a commit, so the commit captures the volume first
+    /// and reads the schema after. Defaults to `false`: the schema is read, then
+    /// the database is frozen and captured.
     pub db_live_during_snapshot: bool,
 }
 
