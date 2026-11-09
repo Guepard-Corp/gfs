@@ -27,6 +27,9 @@ const DEFAULT_DB: &str = "default";
 const DEFAULT_USER: &str = "default";
 const DEFAULT_PASSWORD: &str = "clickhouse";
 
+const SERVER_LOG_ON_STDOUT: &str = "printf '<clickhouse><logger><console>1</console></logger></clickhouse>\\n' \
+     > /etc/clickhouse-server/config.d/gfs-console-log.xml && exec /entrypoint.sh";
+
 #[derive(Debug)]
 pub struct ClickhouseProvider;
 
@@ -73,7 +76,11 @@ impl ClickhouseProvider {
             user: None,
             logs_dir: None,
             conf_dir: None,
-            args: vec![],
+            args: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                SERVER_LOG_ON_STDOUT.to_string(),
+            ],
         }
     }
 
@@ -679,6 +686,16 @@ pub fn register(registry: &impl DatabaseProviderRegistry) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_server_also_logs_to_stdout_so_pod_logs_carry_its_log() {
+        let args = ClickhouseProvider::definition_impl().args;
+
+        assert_eq!(&args[..2], ["sh", "-c"]);
+        assert!(args[2].contains("<logger><console>1</console></logger>"));
+        assert!(args[2].contains("/etc/clickhouse-server/config.d/"));
+        assert!(args[2].ends_with("exec /entrypoint.sh"));
+    }
 
     #[test]
     fn connection_string_uses_defaults() {
