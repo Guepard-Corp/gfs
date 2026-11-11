@@ -371,12 +371,37 @@ pub struct PortMapping {
 // Port
 // ---------------------------------------------------------------------------
 
+/// Where a new instance's data volume comes from instead of starting empty: a
+/// snapshot that another instance's commit recorded.
+#[derive(Debug, Clone)]
+pub struct VolumeSeed {
+    /// The instance the snapshot was taken from; the data carries its credentials.
+    pub source_instance: String,
+    /// The snapshot hash the source commit recorded.
+    pub snapshot_hash: String,
+}
+
 /// Port that abstracts lifecycle management of a compute instance (container,
 /// VM, process, …).
 #[async_trait]
 pub trait Compute: Send + Sync {
     /// Create and configure an instance from a definition. Returns the new instance id.
     async fn provision(&self, definition: &ComputeDefinition) -> Result<InstanceId>;
+
+    /// Provision an instance whose data volume is created from `seed` rather
+    /// than empty, so the database never starts blank and nothing is swapped
+    /// underneath it. Runtimes that keep data on the host filesystem seed the
+    /// workspace before provisioning instead, and keep this default, which refuses.
+    async fn provision_seeded(
+        &self,
+        definition: &ComputeDefinition,
+        seed: &VolumeSeed,
+    ) -> Result<InstanceId> {
+        let _ = (definition, seed);
+        Err(ComputeError::NotAvailable(
+            "this runtime cannot provision an instance from a snapshot volume".into(),
+        ))
+    }
 
     /// What the scheduler still has free where this runtime places instances.
     ///

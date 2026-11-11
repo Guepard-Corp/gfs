@@ -308,14 +308,19 @@ Initialize a new GFS repository.
 gfs init --database-provider <provider> --database-version <version>
 ```
 
-### `gfs clone` (experimental)
+### `gfs lazy clone` (experimental)
+
+Everything specific to lazy clones lives under `gfs lazy`: `clone`, `status`, `pull`,
+`source` and `freeze`. They used to be top-level (`gfs clone --from`, `gfs fetch`,
+`gfs pull`, `gfs remote`, `gfs freeze`); those spellings still work for one release
+and print a warning naming the new one.
 
 Lazily clone a remote PostgreSQL database (copy-on-read). Only the schema is
 mirrored up front; reads are served live from the remote until rows are written
 locally, and writes stay local so the clone diverges. The remote is read-only.
 
 ```bash
-gfs clone --from 'postgres://user:password@host:5432/dbname' [PATH]
+gfs lazy clone 'postgres://user:password@host:5432/dbname' [PATH]
 ```
 
 Options: `--database-version` (else matched to the remote), `--image` (e.g.
@@ -409,7 +414,7 @@ changed row set reads from the source. A **new partition** is the quiet one. It 
 reached through a parent the clone already has, so the query still succeeds and
 simply returns fewer rows than the source holds.
 
-`gfs pull` handles all three:
+`gfs lazy pull` handles all three:
 
 | what changed on the source | what `pull` does |
 | --- | --- |
@@ -437,17 +442,17 @@ too, so reads never go quietly short:
 gfs query "UPDATE gfs.sync_policy SET autoschema = true;"
 ```
 
-With `autoschema` off (the default), the gap is reported by `gfs fetch --check`
-but reads of the parent stay short until you run `gfs pull`.
+With `autoschema` off (the default), the gap is reported by `gfs lazy status --check`
+but reads of the parent stay short until you run `gfs lazy pull`.
 
-### `gfs fetch`
+### `gfs lazy status`
 
 Ask whether the source has changed, without changing anything locally. This is the
-read-only half of the source-sync pair: it reports, `gfs pull` acts.
+read-only half of the source-sync pair: it reports, `gfs lazy pull` acts.
 
 ```bash
-gfs fetch                 # use the last cached verdict (no network)
-gfs fetch --check         # probe the source right now
+gfs lazy status                 # use the last cached verdict (no network)
+gfs lazy status --check         # probe the source right now
 ```
 
 `--check` forces a fresh probe. Without it you get the verdict from the last
@@ -461,20 +466,20 @@ What it reports:
 | `N of M tables changed on the source` | which tables drifted, and why |
 | `new table <name>` | a table exists upstream that this clone does not have |
 | `changed, unattributed` | the source moved but nothing accounts for it, so every copied table is suspect |
-| `this clone spans N source moments` | tables were copied at different moments while the source moved; a JOIN across them can return combinations that never existed at the source (run `gfs freeze`) |
+| `this clone spans N source moments` | tables were copied at different moments while the source moved; a JOIN across them can return combinations that never existed at the source (run `gfs lazy freeze`) |
 | `all copied data is from one source moment` | possibly stale, but coherent: everything copied reflects one instant |
 
-### `gfs pull`
+### `gfs lazy pull`
 
 Put tables the source has changed back on the lazy path, so the next read is local
 again. `pull` copies nothing itself: it clears cached state and the normal cost model
 decides again on the next read.
 
 ```bash
-gfs pull                      # reconcile now
-gfs pull --force              # also reset tables YOU wrote to, discarding your changes
-gfs pull --auto on|off        # turn automatic pulling on or off
-gfs pull --auto-schema on|off # turn automatic schema repair on or off
+gfs lazy pull                      # reconcile now
+gfs lazy pull --force              # also reset tables YOU wrote to, discarding your changes
+gfs lazy pull --auto on|off        # turn automatic pulling on or off
+gfs lazy pull --auto-schema on|off # turn automatic schema repair on or off
 ```
 
 Each line of output names an action:
@@ -493,15 +498,15 @@ A table you have written to is **never** reset without `--force`, because that w
 discard your work. It is reported as a conflict, the way git refuses to clobber local
 changes.
 
-### `gfs remote`
+### `gfs lazy source`
 
 Show the source a clone reads from. Like `git remote`, it makes no network round
-trip: it reports what is recorded locally and leaves probing to `gfs fetch --check`.
+trip: it reports what is recorded locally and leaves probing to `gfs lazy status --check`.
 The source password is never printed.
 
 ```bash
-gfs remote           # origin postgres://user@host:5432/db (fetch only)
-gfs remote --json
+gfs lazy source           # origin postgres://user@host:5432/db (fetch only)
+gfs lazy source --json
 ```
 
 ### Why there is no `gfs push`
@@ -513,7 +518,7 @@ written to" is a hard rule of the system** -- enforced end-to-end and asserted o
 every path in the test suite (`assert_source_untouched`), not a missing feature.
 Resolving diverged tables (`merge`/`rebase`) is future work blocked on row-level
 change tracking (see RFC 007). And there is no separate `gfs diff`: GFS has no
-per-row change log on either side, so `gfs fetch` already shows everything a diff
+per-row change log on either side, so `gfs lazy status` already shows everything a diff
 could know (which tables changed, and why).
 
 ### `gfs status`
@@ -871,16 +876,16 @@ perfectly consistent.
 This cannot be *prevented* on a live source — you cannot read the past of a database
 that has already thrown the past away — but it is **detected** (#131): every copy
 event records where the source's WAL was when those rows arrived (`gfs.copy_watermark`),
-so "this clone spans WAL X..Y" is a computable fact rather than a guess. `gfs fetch`
+so "this clone spans WAL X..Y" is a computable fact rather than a guess. `gfs lazy status`
 reports the span, `gfs status` shows a `Moments` row, and the drift warning now
 distinguishes *torn* (mixes moments) from *stale* (a coherent view of one earlier
 moment) — drift and tornness are different facts, and each can occur without the other.
 A chunked table gets a min..max span and a moment count, not per-row provenance: which
 individual row came from which moment is unknowable once ranges coalesce.
 
-The way out is `gfs freeze` ([#132](https://github.com/Guepard-Corp/gfs/issues/132)):
+The way out is `gfs lazy freeze` ([#132](https://github.com/Guepard-Corp/gfs/issues/132)):
 re-copy everything from one instant and detach; a frozen clone reports a single moment
-by construction. `gfs pull` alone does **not** end a tear — it resets changed tables to
+by construction. `gfs lazy pull` alone does **not** end a tear — it resets changed tables to
 be refetched lazily, which narrows the span only if the next reads happen while the
 source holds still.
 
@@ -902,13 +907,13 @@ Tracked as [#139](https://github.com/Guepard-Corp/gfs/issues/139).
 An idle PostgreSQL server still advances its WAL position (checkpoints, autovacuum). If
 that movement cannot be attributed to any table, the safe response is to treat every
 copied table as suspect, which sends reads back to the source. So a clone can drift into
-federating everything shortly after a `gfs pull`, even with no user activity upstream.
+federating everything shortly after a `gfs lazy pull`, even with no user activity upstream.
 Tracked as [#140](https://github.com/Guepard-Corp/gfs/issues/140).
 
 ### With `autoschema` off, a new partition reads short
 
-`gfs fetch --check` reports the new partition, but reads of the parent return fewer rows
-than the source holds until you run `gfs pull`. Every other kind of drift is loud; this
+`gfs lazy status --check` reports the new partition, but reads of the parent return fewer rows
+than the source holds until you run `gfs lazy pull`. Every other kind of drift is loud; this
 one is quiet, because the parent still answers. Turning on `autoschema` closes it.
 
 ## Contributing

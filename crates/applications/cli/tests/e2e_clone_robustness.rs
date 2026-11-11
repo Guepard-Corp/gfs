@@ -257,8 +257,8 @@ fn host_alias_resolves() -> bool {
 fn run_clone(url: &str, repo: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_gfs"))
         .args([
+            "lazy",
             "clone",
-            "--from",
             url,
             repo.to_str().unwrap(),
             "--image",

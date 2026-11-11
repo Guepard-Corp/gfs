@@ -176,4 +176,17 @@ pub trait Repository: Send + Sync {
     /// The two-char prefix subdirectory is created if it does not exist. The
     /// returned path is the destination the storage adapter should copy into.
     async fn ensure_snapshot_path(&self, repo: &Path, hash: &str) -> Result<PathBuf>;
+
+    /// Fill the HEAD workspace of `repo` with a copy of `snapshot_dir` -- a
+    /// snapshot taken in another repository -- before its database first starts.
+    ///
+    /// The copy is prepared the way a checkout prepares a restored workspace, so
+    /// the database starts on it as it would after `checkout`. Implementations
+    /// that cannot copy a snapshot between repositories refuse.
+    async fn seed_head_workspace(&self, repo: &Path, snapshot_dir: &Path) -> Result<()> {
+        let _ = (repo, snapshot_dir);
+        Err(RepositoryError::Internal(
+            "this repository cannot seed a workspace from a snapshot".into(),
+        ))
+    }
 }

@@ -213,12 +213,12 @@ fn e2e_clone_postgres() {
     );
     assert_eq!(psql_remote("SELECT count(*) FROM orders"), "1000");
 
-    // 3. Run the real `gfs clone` binary.
+    // 3. Run the real `gfs lazy clone` binary.
     let url = format!("postgres://gfs_reader:readerpw@host.docker.internal:{host_port}/shop");
     let out = Command::new(env!("CARGO_BIN_EXE_gfs"))
         .args([
+            "lazy",
             "clone",
-            "--from",
             &url,
             repo_path.to_str().unwrap(),
             "--image",

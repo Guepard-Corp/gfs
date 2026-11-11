@@ -385,6 +385,23 @@ fn restore_is_not_filesystem_based(repo: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Copy a snapshot into a workspace and leave it ready for a database to start
+/// on: stale Postgres lock files removed, and the pre-start ownership repair
+/// requested. Checkout restores through this; so does seeding a new repository
+/// from another one's snapshot, so the two cannot drift apart.
+fn restore_workspace_from_snapshot(
+    snapshot_dir: &Path,
+    workspace_path: &Path,
+) -> std::io::Result<()> {
+    populate_workspace_from_snapshot(snapshot_dir, workspace_path)?;
+    let _ = fs::remove_file(workspace_path.join("postmaster.pid"));
+    let _ = fs::remove_file(workspace_path.join("postmaster.opts"));
+    if let Some(marker) = repo_layout::repair_marker_path(workspace_path) {
+        let _ = durable_write::write_durable(&marker, b"", None);
+    }
+    Ok(())
+}
+
 fn set_workspace_dir_permissions(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -456,6 +473,35 @@ impl GfsRepository {
 
 #[async_trait]
 impl Repository for GfsRepository {
+    async fn seed_head_workspace(&self, repo: &Path, snapshot_dir: &Path) -> Result<()> {
+        if !snapshot_dir.is_dir() {
+            return Err(RepositoryError::Internal(format!(
+                "snapshot '{}' does not exist",
+                snapshot_dir.display()
+            )));
+        }
+        let workspace = repo_layout::get_workspace_data_dir_for_head(repo).map_err(map_err)?;
+        // A new repository's HEAD workspace exists and is empty. Anything in it
+        // would be data this copy is about to mix with, so refuse rather than merge.
+        if workspace.exists() {
+            let occupied = fs::read_dir(&workspace)
+                .map_err(RepositoryError::Io)?
+                .next()
+                .is_some();
+            if occupied {
+                return Err(RepositoryError::Internal(format!(
+                    "workspace '{}' is not empty; a repository can only be seeded before it holds data",
+                    workspace.display()
+                )));
+            }
+            // A btrfs snapshot needs its destination absent.
+            fs::remove_dir(&workspace).map_err(RepositoryError::Io)?;
+        }
+        restore_workspace_from_snapshot(snapshot_dir, &workspace).map_err(RepositoryError::Io)?;
+        set_workspace_dir_permissions(&workspace).map_err(RepositoryError::Io)?;
+        Ok(())
+    }
+
     async fn init(&self, path: &Path, mount_point: Option<String>) -> Result<()> {
         repo_layout::init_repo_layout(path, mount_point).map_err(map_err)?;
 
@@ -704,16 +750,9 @@ impl Repository for GfsRepository {
             );
             if snapshot_dir.exists() && snapshot_dir.is_dir() {
                 tracing::info!("Checkout: populating workspace from snapshot...");
-                populate_workspace_from_snapshot(&snapshot_dir, &workspace_path)
+                restore_workspace_from_snapshot(&snapshot_dir, &workspace_path)
                     .map_err(RepositoryError::Io)?;
                 tracing::info!("Checkout: workspace created");
-                // Remove stale Postgres lock files so a new instance can start on this copy.
-                let _ = fs::remove_file(workspace_path.join("postmaster.pid"));
-                let _ = fs::remove_file(workspace_path.join("postmaster.opts"));
-                // Signal that a pre-start ownership repair is required for this workspace.
-                if let Some(marker) = repo_layout::repair_marker_path(&workspace_path) {
-                    let _ = durable_write::write_durable(&marker, b"", None);
-                }
             } else if snapshot_hash.is_empty() || restore_is_not_filesystem_based(&repo) {
                 // Two legitimate cases: a commit that records no snapshot at
                 // all, and the k8s runtime, where the real restore is a PVC

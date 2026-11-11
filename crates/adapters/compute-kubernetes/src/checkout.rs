@@ -109,7 +109,7 @@ pub async fn restore_database_volume_from_snapshot<R: DatabaseProviderRegistry>(
         })?;
 
     let data_pvc = stable_data_pvc(&stable_instance);
-    let vs_name = format!("gfs-snap-{}", &snapshot_hash[..32.min(snapshot_hash.len())]);
+    let vs_name = gfs_storage_kubernetes::volumesnapshot_name_for_hash(snapshot_hash);
 
     let legacy_pvcs: Vec<String> = cfg
         .mount_point

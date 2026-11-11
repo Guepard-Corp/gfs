@@ -9,7 +9,7 @@ use crate::utils::data_dir;
 
 use crate::model::config::{EnvironmentConfig, GfsConfig, RuntimeConfig};
 use crate::ports::compute::{
-    Compute, ComputeError, ComputeResources, RuntimeDescriptor, StartOptions,
+    Compute, ComputeError, ComputeResources, RuntimeDescriptor, StartOptions, VolumeSeed,
 };
 use crate::ports::database_provider::DatabaseProviderRegistry;
 use crate::ports::repository::{Repository, RepositoryError};
@@ -243,39 +243,16 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         image: Option<String>,
         provision: ProvisionSpec,
     ) -> std::result::Result<(), InitRepoError> {
-        // Validate the provider and version HERE, not only in the caller.
-        //
-        // The CLI checks both before it builds a compute client, so a typo
-        // reports the typo rather than a Docker failure — that is a better
-        // error, not a different guarantee. This is the guarantee: every caller
-        // of this use case reaches the write through here, and the MCP server
-        // reached it without either check, accepting `sqlite 4` and writing it
-        // to config.toml permanently while the CLI refused the same input.
-        if let Some(name) = database_provider.as_deref() {
-            let resolved = self
-                .registry
-                .list()
-                .into_iter()
-                .find(|n| n.eq_ignore_ascii_case(name))
-                .and_then(|n| self.registry.get(&n))
-                .ok_or_else(|| InitRepoError::UnknownDatabaseProvider(name.to_string()))?;
-
-            if let Some(version) = database_version.as_deref() {
-                let supported = resolved.supported_versions();
-                if !supported.is_empty() && !supported.iter().any(|v| v == version) {
-                    return Err(InitRepoError::UnsupportedDatabaseVersion {
-                        provider: resolved.name().to_string(),
-                        version: version.to_string(),
-                        supported: supported.join(", "),
-                    });
-                }
-            }
-        }
-
-        self.repository.init(&path, mount_point).await?;
+        self.create_repository(
+            &path,
+            mount_point,
+            database_provider.as_deref(),
+            database_version.as_deref(),
+        )
+        .await?;
 
         if let Some(provider) = database_provider {
-            self.deploy_database(
+            self.start_database(
                 &path,
                 provider,
                 database_version,
@@ -291,8 +268,60 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         Ok(())
     }
 
+    /// Validate the provider and version and lay out an empty repository at
+    /// `path`, without starting anything.
+    ///
+    /// The first half of [`Self::run`]. A caller that needs the workspace filled
+    /// before the database first starts -- a clone seeded from a snapshot --
+    /// calls this, writes the workspace, then [`Self::start_database`].
+    pub async fn create_repository(
+        &self,
+        path: &std::path::Path,
+        mount_point: Option<String>,
+        database_provider: Option<&str>,
+        database_version: Option<&str>,
+    ) -> std::result::Result<(), InitRepoError> {
+        // Validate the provider and version HERE, not only in the caller.
+        //
+        // The CLI checks both before it builds a compute client, so a typo
+        // reports the typo rather than a Docker failure — that is a better
+        // error, not a different guarantee. This is the guarantee: every caller
+        // of this use case reaches the write through here, and the MCP server
+        // reached it without either check, accepting `sqlite 4` and writing it
+        // to config.toml permanently while the CLI refused the same input.
+        if let Some(name) = database_provider {
+            let resolved = self
+                .registry
+                .list()
+                .into_iter()
+                .find(|n| n.eq_ignore_ascii_case(name))
+                .and_then(|n| self.registry.get(&n))
+                .ok_or_else(|| InitRepoError::UnknownDatabaseProvider(name.to_string()))?;
+
+            if let Some(version) = database_version {
+                let supported = resolved.supported_versions();
+                if !supported.is_empty() && !supported.iter().any(|v| v == version) {
+                    return Err(InitRepoError::UnsupportedDatabaseVersion {
+                        provider: resolved.name().to_string(),
+                        version: version.to_string(),
+                        supported: supported.join(", "),
+                    });
+                }
+            }
+        }
+
+        self.repository.init(path, mount_point).await?;
+        Ok(())
+    }
+
+    /// Record the database for an existing repository and, for a provider that
+    /// runs in a container, provision and start it on the HEAD workspace.
+    ///
+    /// The second half of [`Self::run`]. The workspace is used as it is found:
+    /// empty after [`Self::create_repository`], or already holding data a caller
+    /// placed there.
     #[allow(clippy::too_many_arguments)]
-    async fn deploy_database(
+    pub async fn start_database(
         &self,
         repo_path: &std::path::Path,
         provider_name: String,
@@ -302,6 +331,63 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         display_name: Option<String>,
         image: Option<String>,
         provision: ProvisionSpec,
+    ) -> std::result::Result<(), InitRepoError> {
+        self.start(
+            repo_path,
+            provider_name,
+            database_version,
+            database_port,
+            credentials,
+            display_name,
+            image,
+            provision,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::start_database`], with the instance's data volume created from
+    /// `seed` -- a snapshot another repository recorded -- instead of empty. For
+    /// runtimes whose data does not live in the host workspace (Kubernetes).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_database_seeded(
+        &self,
+        repo_path: &std::path::Path,
+        provider_name: String,
+        database_version: Option<String>,
+        database_port: Option<u16>,
+        credentials: DatabaseCredentials,
+        display_name: Option<String>,
+        image: Option<String>,
+        provision: ProvisionSpec,
+        seed: &VolumeSeed,
+    ) -> std::result::Result<(), InitRepoError> {
+        self.start(
+            repo_path,
+            provider_name,
+            database_version,
+            database_port,
+            credentials,
+            display_name,
+            image,
+            provision,
+            Some(seed),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start(
+        &self,
+        repo_path: &std::path::Path,
+        provider_name: String,
+        database_version: Option<String>,
+        database_port: Option<u16>,
+        credentials: DatabaseCredentials,
+        display_name: Option<String>,
+        image: Option<String>,
+        provision: ProvisionSpec,
+        seed: Option<&VolumeSeed>,
     ) -> std::result::Result<(), InitRepoError> {
         let list = self.registry.list();
         let matched_name = list
@@ -507,7 +593,10 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
             }
         }
 
-        let id = compute.provision(&definition).await?;
+        let id = match seed {
+            Some(seed) => compute.provision_seeded(&definition, seed).await?,
+            None => compute.provision(&definition).await?,
+        };
         let runtime = compute
             .describe_runtime()
             .await
@@ -767,6 +856,13 @@ mod tests {
         ) -> crate::ports::compute::Result<InstanceId> {
             *self.provisioned_labels.lock().unwrap() = Some(definition.labels.clone());
             Ok(InstanceId("mock".into()))
+        }
+        async fn provision_seeded(
+            &self,
+            _: &ComputeDefinition,
+            _: &VolumeSeed,
+        ) -> crate::ports::compute::Result<InstanceId> {
+            Ok(InstanceId("mock-seeded".into()))
         }
         async fn start(
             &self,
@@ -1314,6 +1410,51 @@ mod tests {
             recorded.map(|runtime| runtime.container_name),
             Some("mock".to_string()),
             "the provisioned instance is not recorded"
+        );
+    }
+
+    /// The same holds for an instance provisioned from a snapshot volume.
+    #[tokio::test]
+    async fn a_failed_start_leaves_a_seeded_instance_recorded() {
+        let repository = Arc::new(MockRepository::default());
+        let usecase = InitRepositoryUseCase::new(
+            repository.clone(),
+            Some(Arc::new(MockCompute {
+                start_fails: true,
+                ..Default::default()
+            })),
+            Arc::new(MockRegistry),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        usecase
+            .create_repository(dir.path(), None, Some("postgres"), Some("17"))
+            .await
+            .unwrap();
+        let seed = VolumeSeed {
+            source_instance: "source".into(),
+            snapshot_hash: "abc".into(),
+        };
+
+        let result = usecase
+            .start_database_seeded(
+                dir.path(),
+                "postgres".into(),
+                Some("17".into()),
+                None,
+                DatabaseCredentials::default(),
+                None,
+                None,
+                ProvisionSpec::default(),
+                &seed,
+            )
+            .await;
+
+        assert!(result.is_err(), "the failed start is still an error");
+        let recorded = repository.runtime.lock().unwrap().clone();
+        assert_eq!(
+            recorded.map(|runtime| runtime.container_name),
+            Some("mock-seeded".to_string()),
+            "the seeded instance is not recorded"
         );
     }
 

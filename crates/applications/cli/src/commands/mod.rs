@@ -1,6 +1,7 @@
 pub mod cmd_branch;
 pub mod cmd_checkout;
 pub mod cmd_clone;
+pub mod cmd_clone_from_snapshot;
 pub mod cmd_commit;
 pub mod cmd_compute;
 pub mod cmd_config;

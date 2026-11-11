@@ -794,3 +794,76 @@ fn fsck_plan_writes_exactly_one_artefact() {
     assert!(v.get("cutoff").is_some(), "plan must carry its cutoff");
     assert!(v.get("report").is_some(), "plan must carry the marked set");
 }
+
+/// The lazy-only commands live under `gfs lazy`, and the old spellings keep
+/// working for one release. An old spelling must behave exactly like its new
+/// one -- same exit code, same stdout, so `--json` consumers see no change --
+/// and differ only by a rename warning on stderr.
+#[test]
+fn lazy_commands_have_one_home_and_the_old_names_still_work() {
+    let tmp = TempDir::new().unwrap();
+    assert_eq!(run_gfs(tmp.path(), &["init", "."]).0, 0, "init");
+
+    let (_, top_help, _) = run_gfs(tmp.path(), &["--help"]);
+    assert!(top_help.contains("lazy"), "gfs lazy is listed: {top_help}");
+    for hidden in ["fetch", "pull", "remote", "freeze"] {
+        assert!(
+            !top_help
+                .lines()
+                .any(|line| line.trim_start().starts_with(&format!("{hidden} "))),
+            "`{hidden}` is no longer a top-level command in help: {top_help}"
+        );
+    }
+    let (_, lazy_help, _) = run_gfs(tmp.path(), &["lazy", "--help"]);
+    for sub in ["clone", "status", "pull", "source", "freeze"] {
+        assert!(
+            lazy_help
+                .lines()
+                .any(|line| line.trim_start().starts_with(&format!("{sub} "))),
+            "`gfs lazy {sub}` is listed: {lazy_help}"
+        );
+    }
+
+    for (old, new, new_name) in [
+        (vec!["fetch"], vec!["lazy", "status"], "gfs lazy status"),
+        (
+            vec!["--json", "fetch"],
+            vec!["--json", "lazy", "status"],
+            "gfs lazy status",
+        ),
+        (vec!["pull"], vec!["lazy", "pull"], "gfs lazy pull"),
+        (vec!["remote"], vec!["lazy", "source"], "gfs lazy source"),
+        (
+            vec!["--json", "remote"],
+            vec!["--json", "lazy", "source"],
+            "gfs lazy source",
+        ),
+        (vec!["freeze"], vec!["lazy", "freeze"], "gfs lazy freeze"),
+    ] {
+        let (old_code, old_out, old_err) = run_gfs(tmp.path(), &old);
+        let (new_code, new_out, new_err) = run_gfs(tmp.path(), &new);
+        assert_eq!(old_code, new_code, "{old:?} exits like {new:?}");
+        assert_eq!(old_out, new_out, "{old:?} prints what {new:?} prints");
+        assert!(
+            old_err.contains(&format!("is renamed to `{new_name}`")),
+            "{old:?} says where it went: {old_err}"
+        );
+        assert!(
+            !new_err.contains("renamed"),
+            "{new:?} does not warn: {new_err}"
+        );
+    }
+
+    let (old_code, _, old_err) = run_gfs(
+        tmp.path(),
+        &["clone", "--from", "not-a-database-url", "old"],
+    );
+    let (new_code, _, new_err) =
+        run_gfs(tmp.path(), &["lazy", "clone", "not-a-database-url", "new"]);
+    assert_eq!(old_code, new_code, "clone --from fails like lazy clone");
+    assert!(
+        old_err.contains("is renamed to `gfs lazy clone`"),
+        "{old_err}"
+    );
+    assert!(!new_err.contains("renamed"), "{new_err}");
+}
