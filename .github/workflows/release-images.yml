@@ -82,7 +82,7 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        pg: ['16', '17']
+        pg: ['16', '17', '18']
         platform: [amd64, arm64]
         include:
           - platform: amd64
@@ -143,7 +143,7 @@ jobs:
     needs: [plan, build]
     strategy:
       matrix:
-        pg: ['16', '17']
+        pg: ['16', '17', '18']
     runs-on: ubuntu-24.04
     permissions:
       contents: read
