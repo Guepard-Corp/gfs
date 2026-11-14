@@ -177,6 +177,14 @@ pub struct StartOptions {
 
     /// Whether to wait until the instance reaches `Running` before returning.
     pub wait: bool,
+
+    /// CPU and memory to enforce on the instance from this start on. `None`
+    /// leaves whatever it already has.
+    ///
+    /// An instance built before its database declared any keeps running
+    /// unconstrained until something rebuilds it; this lets the next start apply
+    /// the declaration instead of waiting for a rebuild that may never come.
+    pub resources: Option<ComputeResources>,
 }
 
 /// Options controlling how logs are streamed or fetched.
