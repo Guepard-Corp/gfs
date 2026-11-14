@@ -134,17 +134,30 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
         };
         // The provider says which files it maintains for itself; an unknown or
         // absent one yields nothing, which keeps the conservative behaviour.
-        let engine_owned: Vec<&str> = match repo_layout::get_environment_config(path) {
-            Ok(Some(env)) => self
-                .registry
-                .get(&env.database_provider)
-                .map(|provider| provider.engine_owned_paths().to_vec())
-                .unwrap_or_default(),
-            _ => Vec::new(),
+        let provider = match repo_layout::get_environment_config(path) {
+            Ok(Some(env)) => self.registry.get(&env.database_provider),
+            _ => None,
         };
+        let engine_owned: Vec<&str> = provider
+            .as_ref()
+            .map(|provider| provider.engine_owned_paths().to_vec())
+            .unwrap_or_default();
 
-        let changed = repo_layout::workspace_changes(&workspace, &baseline, &engine_owned)
+        let mut changed = repo_layout::workspace_changes(&workspace, &baseline, &engine_owned)
             .map_err(|e| CheckoutRepoError::Repository(RepositoryError::Internal(e.to_string())))?;
+        // A file can differ from its commit with nobody having written to the
+        // database: PostgreSQL marks a row's inserting transaction as committed
+        // the first time it reads the row, and writes that page back later. A
+        // SELECT after a commit was enough to make the next checkout refuse.
+        // The provider compares such a file against the commit's own copy.
+        if let Some(provider) = &provider
+            && commit.snapshot_hash.len() > 2
+        {
+            let snapshot = repo_layout::snapshot_path(path, &commit.snapshot_hash);
+            changed.retain(|file| {
+                !provider.holds_same_data(file, &snapshot.join(file), &workspace.join(file))
+            });
+        }
         if changed.is_empty() {
             return Ok(None);
         }

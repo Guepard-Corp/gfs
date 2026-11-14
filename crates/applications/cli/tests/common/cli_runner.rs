@@ -89,6 +89,25 @@ where
     (ok, stdout, stderr)
 }
 
+/// Run gfs CLI as a subprocess where success means exit status 0.
+/// For commands whose stdout is asserted on: `run_gfs` captures the whole
+/// process's stdout, so libtest's "has been running for over 60 seconds" notice
+/// (or another thread's output) printed meanwhile becomes the command's stdout.
+pub fn run_gfs_subprocess_checked<I, S>(args: I) -> (bool, String, String)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let args: Vec<String> = args.into_iter().map(|s| s.as_ref().to_string()).collect();
+    let output = Command::new(env!("CARGO_BIN_EXE_gfs"))
+        .args(&args[1..]) // skip "gfs" prefix
+        .output()
+        .expect("failed to execute gfs");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    (output.status.success(), stdout, stderr)
+}
+
 /// Convenience: gfs init <path>
 pub fn gfs_init(path: &Path) -> bool {
     let (ok, _, _) = run_gfs(["gfs", "init", path.to_str().unwrap()]);
@@ -179,6 +198,37 @@ pub fn gfs_checkout_b(
         args.push(rev);
     }
     run_gfs(args)
+}
+
+/// [`gfs_checkout`] as a subprocess, for tests that assert on its stdout.
+pub fn gfs_checkout_subprocess(path: &Path, revision: &str) -> (bool, String, String) {
+    run_gfs_subprocess_checked([
+        "gfs",
+        "checkout",
+        "--path",
+        path.to_str().unwrap(),
+        revision,
+    ])
+}
+
+/// [`gfs_checkout_b`] as a subprocess, for tests that assert on its stdout.
+pub fn gfs_checkout_b_subprocess(
+    path: &Path,
+    branch_name: &str,
+    start_revision: Option<&str>,
+) -> (bool, String, String) {
+    let mut args = vec![
+        "gfs",
+        "checkout",
+        "--path",
+        path.to_str().unwrap(),
+        "-b",
+        branch_name,
+    ];
+    if let Some(rev) = start_revision {
+        args.push(rev);
+    }
+    run_gfs_subprocess_checked(args)
 }
 
 /// Convenience: gfs log --path <path> [-n N]
