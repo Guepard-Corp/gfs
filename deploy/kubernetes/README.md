@@ -46,3 +46,18 @@ export GFS_ALLOW_UNFROZEN_SNAPSHOT=1
 export GFS_K8S_STORAGE_CLASS=openebs-zfs-gfs
 ```
 
+
+### TLS certificate for the database
+
+gfs-postgres images serve TLS with a per-container self-signed certificate. To serve your own
+(for `sslmode=verify-full`), create a `kubernetes.io/tls` Secret in the namespace and name it:
+
+```bash
+kubectl -n gfs create secret tls gfs-db-tls --cert=tls.crt --key=tls.key
+export GFS_K8S_TLS_SECRET=gfs-db-tls
+```
+
+Every Postgres pod gfs creates afterwards (init, checkout) mounts it read-only at
+`/etc/gfs-tls` (`tls.crt` 0444, `tls.key` 0400, read by the root entrypoint, which copies them
+for the postgres user). A missing Secret keeps the pod in `ContainerCreating` rather than
+falling back to a self-signed certificate. Unset, nothing is mounted.

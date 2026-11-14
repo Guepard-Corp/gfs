@@ -21,9 +21,10 @@ use gfs_domain::ports::compute::{
 };
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::{
-    Container, EnvVarSource, Event, PersistentVolumeClaim, PersistentVolumeClaimSpec, Pod,
-    PodSecurityContext, PodSpec, PodTemplateSpec, Probe, ResourceRequirements, Secret,
-    SecretKeySelector, Service, ServicePort, ServiceSpec, TCPSocketAction, Volume, VolumeMount,
+    Container, EnvVarSource, Event, KeyToPath, PersistentVolumeClaim, PersistentVolumeClaimSpec,
+    Pod, PodSecurityContext, PodSpec, PodTemplateSpec, Probe, ResourceRequirements, Secret,
+    SecretKeySelector, SecretVolumeSource, Service, ServicePort, ServiceSpec, TCPSocketAction,
+    Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
@@ -66,6 +67,41 @@ fn k8s_schedule_node_name() -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+fn k8s_tls_secret() -> Option<String> {
+    std::env::var("GFS_K8S_TLS_SECRET")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+const TLS_VOLUME: &str = "gfs-tls";
+const TLS_MOUNT_PATH: &str = "/etc/gfs-tls";
+
+fn tls_secret_volume(secret_name: &str) -> (Volume, VolumeMount) {
+    let item = |key: &str, mode: i32| KeyToPath {
+        key: key.to_string(),
+        path: key.to_string(),
+        mode: Some(mode),
+    };
+    let volume = Volume {
+        name: TLS_VOLUME.to_string(),
+        secret: Some(SecretVolumeSource {
+            secret_name: Some(secret_name.to_string()),
+            items: Some(vec![item("tls.crt", 0o444), item("tls.key", 0o400)]),
+            default_mode: Some(0o400),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mount = VolumeMount {
+        name: TLS_VOLUME.to_string(),
+        mount_path: TLS_MOUNT_PATH.to_string(),
+        read_only: Some(true),
+        ..Default::default()
+    };
+    (volume, mount)
 }
 
 /// When true (default), Postgres Services are NodePort so `get_connection_info`
@@ -863,7 +899,7 @@ impl KubernetesCompute {
     }
 
     fn statefulset_manifest(&self, instance: &str, def: &ComputeDefinition) -> StatefulSet {
-        Self::statefulset_manifest_in(&self.namespace, instance, def)
+        Self::statefulset_manifest_in(&self.namespace, instance, def, k8s_tls_secret().as_deref())
     }
 
     /// The manifest builder, free of the client.
@@ -877,6 +913,7 @@ impl KubernetesCompute {
         namespace: &str,
         instance: &str,
         def: &ComputeDefinition,
+        tls_secret: Option<&str>,
     ) -> StatefulSet {
         let labels = labels_for(instance);
         let svc_name = Self::svc_name(instance);
@@ -957,6 +994,11 @@ impl KubernetesCompute {
             });
             args.push("-c".to_string());
             args.push("hba_file=/gfs-hba/pg_hba.conf".to_string());
+            if let Some(secret_name) = tls_secret {
+                let (volume, mount) = tls_secret_volume(secret_name);
+                volumes.push(volume);
+                mounts.push(mount);
+            }
         }
 
         // Readiness probe: prove the engine is actually query-serving, so the
@@ -2999,8 +3041,103 @@ mod tests {
         }
     }
 
+    fn pod_spec_with_tls(image: &str, tls_secret: Option<&str>) -> PodSpec {
+        KubernetesCompute::statefulset_manifest_in(
+            "gfs",
+            "gfs-pg-1",
+            &definition_with_image(image),
+            tls_secret,
+        )
+        .spec
+        .unwrap()
+        .template
+        .spec
+        .unwrap()
+    }
+
+    fn tls_mount_of(container: &Container) -> Option<&VolumeMount> {
+        container
+            .volume_mounts
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find(|m| m.name == TLS_VOLUME)
+    }
+
+    #[test]
+    fn a_tls_secret_is_mounted_read_only_at_the_path_the_gfs_entrypoint_reads() {
+        let pod = pod_spec_with_tls("guepard/gfs-postgres:17", Some("db-tls"));
+
+        let mount = tls_mount_of(&pod.containers[0]).expect("tls mount");
+        assert_eq!(mount.mount_path, "/etc/gfs-tls");
+        assert_eq!(mount.read_only, Some(true));
+
+        let volume = pod
+            .volumes
+            .unwrap()
+            .into_iter()
+            .find(|v| v.name == TLS_VOLUME)
+            .expect("tls volume");
+        let secret = volume.secret.expect("secret volume");
+        assert_eq!(secret.secret_name.as_deref(), Some("db-tls"));
+        assert_eq!(
+            secret.optional, None,
+            "a missing secret must not start the server"
+        );
+        let items: Vec<(String, String, Option<i32>)> = secret
+            .items
+            .unwrap()
+            .into_iter()
+            .map(|i| (i.key, i.path, i.mode))
+            .collect();
+        assert_eq!(
+            items,
+            vec![
+                ("tls.crt".into(), "tls.crt".into(), Some(0o444)),
+                ("tls.key".into(), "tls.key".into(), Some(0o400)),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_tls_secret_reaches_only_the_server_not_the_hba_seal_init_container() {
+        let pod = pod_spec_with_tls("guepard/gfs-postgres:17", Some("db-tls"));
+        for init in pod.init_containers.unwrap_or_default() {
+            assert!(
+                tls_mount_of(&init).is_none(),
+                "{} mounts the key",
+                init.name
+            );
+        }
+    }
+
+    #[test]
+    fn the_key_is_readable_by_the_root_entrypoint_that_copies_it_for_postgres() {
+        let pod = pod_spec_with_tls("guepard/gfs-postgres:17", Some("db-tls"));
+        let run_as = pod.security_context.and_then(|c| c.run_as_user);
+        assert_eq!(run_as, Some(0));
+    }
+
+    #[test]
+    fn without_a_tls_secret_the_pod_mounts_no_certificate() {
+        let pod = pod_spec_with_tls("guepard/gfs-postgres:17", None);
+        assert!(tls_mount_of(&pod.containers[0]).is_none());
+        assert!(
+            pod.volumes
+                .unwrap_or_default()
+                .iter()
+                .all(|v| v.name != TLS_VOLUME)
+        );
+    }
+
+    #[test]
+    fn a_non_postgres_image_ignores_the_tls_secret() {
+        let pod = pod_spec_with_tls("mysql:8", Some("db-tls"));
+        assert!(tls_mount_of(&pod.containers[0]).is_none());
+    }
+
     fn container_of(def: &ComputeDefinition) -> Container {
-        KubernetesCompute::statefulset_manifest_in("gfs", "gfs-pg-1", def)
+        KubernetesCompute::statefulset_manifest_in("gfs", "gfs-pg-1", def, None)
             .spec
             .unwrap()
             .template
@@ -3139,7 +3276,7 @@ mod tests {
                 .collect(),
             ..definition_with_image("postgres:17")
         };
-        KubernetesCompute::statefulset_manifest_in("gfs", "gfs-pg-1", &def)
+        KubernetesCompute::statefulset_manifest_in("gfs", "gfs-pg-1", &def, None)
     }
 
     #[test]
