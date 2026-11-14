@@ -15,7 +15,7 @@ on:
 
 jobs:
   create-release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     outputs:
@@ -176,9 +176,14 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             artifact_name: gfs-linux-x86_64
+            use_cross: false
+            binary_files: "gfs"
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact_name: gfs-linux-aarch64
             use_cross: false
             binary_files: "gfs"
           - os: macos-latest
@@ -257,7 +262,7 @@ jobs:
 
   build-ai-tools:
     needs: create-release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
@@ -274,3 +279,14 @@ jobs:
         with:
           tag_name: v${{ needs.create-release.outputs.version }}
           files: ./gfs-ai-tools-${{ needs.create-release.outputs.version }}.tar.gz
+
+  release-images:
+    needs: create-release
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/release-images.yml
+    with:
+      tag: v${{ needs.create-release.outputs.version }}
