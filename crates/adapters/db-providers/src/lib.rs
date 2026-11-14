@@ -11,6 +11,7 @@
 
 pub mod clickhouse;
 pub mod mysql;
+mod pg_page;
 pub mod postgresql;
 pub mod sqlite;
 

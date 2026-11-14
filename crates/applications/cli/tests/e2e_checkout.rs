@@ -470,3 +470,41 @@ fn the_refusal_guards_the_workspace_being_rebuilt_not_the_one_being_left() {
         "a refused checkout must change nothing"
     );
 }
+
+/// `branch -d detached` must not reach the detached working copies.
+///
+/// A branch's workspace is `workspaces/<name>`, so for `detached` that is the
+/// directory holding every detached working copy. Name validation refuses it,
+/// including for a `detached` branch a gfs from before the name was reserved
+/// created: its ref is the same file that gfs wrote.
+#[test]
+fn deleting_a_branch_named_detached_keeps_the_detached_working_copies() {
+    let tmp = tempdir().expect("create temp dir");
+    let repo_path = tmp.path();
+    assert!(cli_runner::gfs_init(repo_path), "gfs init should succeed");
+    let repo = repo_path.to_str().unwrap();
+
+    let data_dir = workspace_data_dir_main_0(repo_path);
+    fs::write(data_dir.join("seed.txt"), "v1").unwrap();
+    assert!(cli_runner::gfs_commit(repo_path, "c1", None, None).0);
+    let first = read_ref(repo_path, "main");
+    fs::write(data_dir.join("seed.txt"), "v2").unwrap();
+    assert!(cli_runner::gfs_commit(repo_path, "c2", None, None).0);
+
+    assert!(cli_runner::run_gfs(["gfs", "checkout", "--path", repo, &first]).0);
+    let precious = read_workspace_path(repo_path).join("precious.txt");
+    fs::write(&precious, "uncommitted").unwrap();
+    assert!(cli_runner::run_gfs(["gfs", "checkout", "--path", repo, "main", "--force"]).0);
+
+    let tip = read_ref(repo_path, "main");
+    fs::write(repo_path.join(".gfs/refs/heads/detached"), &tip).unwrap();
+
+    let (ok, _, stderr) = cli_runner::run_gfs(["gfs", "branch", "--path", repo, "-d", "detached"]);
+    assert!(!ok, "deleting 'detached' must be refused");
+    assert!(stderr.contains("reserved"), "stderr: {stderr}");
+    assert_eq!(
+        fs::read_to_string(&precious).ok().as_deref(),
+        Some("uncommitted"),
+        "the detached working copy must survive"
+    );
+}

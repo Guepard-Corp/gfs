@@ -361,6 +361,18 @@ pub trait DatabaseProvider: Send + Sync {
         &[]
     }
 
+    /// Whether `current` holds the same data as `committed`, the copy of the same
+    /// file (`relative_path` in the data directory) in a commit's snapshot.
+    ///
+    /// For engines that rewrite a file's bytes on a plain read, so a difference
+    /// alone does not mean anyone wrote to the database. Answer `true` only when
+    /// every difference is of that kind; a file that cannot be read is `false`.
+    ///
+    /// `false` by default: any difference is the user's work.
+    fn holds_same_data(&self, _relative_path: &str, _committed: &Path, _current: &Path) -> bool {
+        false
+    }
+
     fn requires_compute(&self) -> bool {
         self.container().is_some()
     }
