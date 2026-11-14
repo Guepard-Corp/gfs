@@ -1494,6 +1494,7 @@ name = "gfs-db-providers"
 version = "0.4.0"
 dependencies = [
  "gfs-domain",
+ "postgres-protocol",
  "rusqlite",
  "serde_json",
  "tempfile",
