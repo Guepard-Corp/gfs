@@ -614,3 +614,80 @@ fn wait_for_session_count(container: &str, user: &str, want: u64, at_least: bool
         app_session_count(container, user)
     );
 }
+
+/// A role password is set as a client-computed SCRAM verifier, so the plaintext
+/// never reaches psql's argv or a logged statement. The role must still log in
+/// with the original password, before and after a rotation, and refuse others.
+#[tokio::test]
+async fn a_password_sent_as_a_verifier_still_logs_in() {
+    if !docker_ok() {
+        eprintln!("skip: set GFS_DOCKER_IT=1 and ensure docker is running");
+        return;
+    }
+
+    let pg = Postgres::start();
+    // Log every statement, so the server log shows whether a plaintext was sent.
+    pg.psql("ALTER SYSTEM SET log_statement = 'all'");
+    pg.psql("SELECT pg_reload_conf()");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path();
+    write_repo(repo, pg.name());
+    let compute = Arc::new(DockerCompute::new().expect("docker compute"));
+    let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
+    containers::register_all(&*registry).expect("register providers");
+    let uc = ManageUsersUseCase::new(compute, registry);
+
+    uc.create_role(
+        repo,
+        &RoleSpec {
+            username: "app_pw".into(),
+            password: "first pw $HOME 1".into(),
+            preset: None,
+            default_privileges_owner: None,
+        },
+    )
+    .await
+    .expect("create app_pw");
+    let stored = pg.psql("SELECT rolpassword FROM pg_authid WHERE rolname = 'app_pw'");
+    let logs_in_first = login(pg.name(), "app_pw", "first pw $HOME 1");
+    let refuses_wrong = !login(pg.name(), "app_pw", "first pw $HOME 2");
+
+    uc.set_password(repo, "app_pw", "second pw 2")
+        .await
+        .expect("rotate app_pw");
+    let logs_in_second = login(pg.name(), "app_pw", "second pw 2");
+    let old_refused = !login(pg.name(), "app_pw", "first pw $HOME 1");
+    let logs = Command::new("docker")
+        .args(["logs", pg.name()])
+        .output()
+        .expect("docker logs");
+    let server_log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&logs.stdout),
+        String::from_utf8_lossy(&logs.stderr)
+    );
+
+    // Postgres hashes a plaintext on arrival too, so `stored` alone cannot tell the
+    // two apart; only the logged statements show what was actually sent.
+    assert!(
+        server_log.contains(r#"CREATE ROLE "app_pw""#),
+        "statement logging must capture the CREATE ROLE"
+    );
+    for plaintext in ["first pw $HOME 1", "second pw 2"] {
+        assert!(
+            !server_log.contains(plaintext),
+            "plaintext {plaintext:?} reached the server log"
+        );
+    }
+    assert!(
+        stored.starts_with("SCRAM-SHA-256$4096:"),
+        "stored: {stored}"
+    );
+    assert!(logs_in_first, "the original password must log in");
+    assert!(refuses_wrong, "a wrong password must be refused");
+    assert!(logs_in_second, "the rotated password must log in");
+    assert!(
+        old_refused,
+        "the old password must stop working after rotation"
+    );
+}
