@@ -1,0 +1,201 @@
+name: Release images
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build images for (e.g. v0.5.0)'
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-images-${{ inputs.tag || github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      version: ${{ steps.plan.outputs.version }}
+      minor: ${{ steps.plan.outputs.minor }}
+      move_minor: ${{ steps.plan.outputs.move_minor }}
+      image: ${{ steps.plan.outputs.image }}
+    steps:
+      - id: plan
+        env:
+          TAG: ${{ inputs.tag || github.event.release.tag_name }}
+          EVENT_PRERELEASE: ${{ github.event.release.prerelease || false }}
+          OWNER: ${{ github.repository_owner }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          semver='^v([0-9]+)\.([0-9]+)\.([0-9]+)(-[0-9A-Za-z.-]+)?$'
+          if [[ ! "$TAG" =~ $semver ]]; then
+            echo "::error::tag '$TAG' is not vMAJOR.MINOR.PATCH[-PRERELEASE]"
+            exit 1
+          fi
+          minor="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+          prerelease_suffix="${BASH_REMATCH[4]}"
+          gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --silent
+
+          prerelease=false
+          if [[ -n "$prerelease_suffix" || "$EVENT_PRERELEASE" == true ]]; then
+            prerelease=true
+          elif [[ "$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isPrerelease -q .isPrerelease 2>/dev/null)" == true ]]; then
+            prerelease=true
+          fi
+
+          newest_in_minor="$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v$minor." -q '.[].ref' \
+            | sed 's#^refs/tags/##' | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -V | tail -n 1)"
+          move_minor=false
+          if [[ "$prerelease" == false && "$newest_in_minor" == "$TAG" ]]; then
+            move_minor=true
+          fi
+
+          {
+            echo "tag=$TAG"
+            echo "version=${TAG#v}"
+            echo "minor=$minor"
+            echo "move_minor=$move_minor"
+            echo "image=ghcr.io/${OWNER,,}/gfs-postgres"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### gfs-postgres $TAG"
+            echo "- prerelease: $prerelease"
+            echo "- moves the \`<pg>-$minor\` tags: $move_minor"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: plan
+    strategy:
+      fail-fast: true
+      matrix:
+        pg: ['16', '17']
+        platform: [amd64, arm64]
+        include:
+          - platform: amd64
+            runner: ubuntu-24.04
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ${{ needs.plan.outputs.image }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      PG: ${{ matrix.pg }}
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.tag }}
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push by digest
+        run: |
+          docker buildx build \
+            --pull \
+            --platform "linux/$PLATFORM" \
+            --build-arg "PG_MAJOR=$PG" \
+            --label "org.opencontainers.image.title=gfs-postgres" \
+            --label "org.opencontainers.image.description=PostgreSQL $PG with the gfs extension" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" \
+            --sbom=true \
+            --provenance=mode=max \
+            --metadata-file "$RUNNER_TEMP/metadata.json" \
+            --output "type=image,name=$IMAGE,push-by-digest=true,name-canonical=true,push=true" \
+            crates/extensions/gfs
+          digest="$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/metadata.json")"
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.pg }}-${{ matrix.platform }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: [plan, build]
+    strategy:
+      matrix:
+        pg: ['16', '17']
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      IMAGE: ${{ needs.plan.outputs.image }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      MINOR: ${{ needs.plan.outputs.minor }}
+      MOVE_MINOR: ${{ needs.plan.outputs.move_minor }}
+      PG: ${{ matrix.pg }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: digests-${{ matrix.pg }}-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/digests
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - id: merge
+        name: Create the multi-arch manifest
+        run: |
+          tags=(-t "$IMAGE:$PG-$VERSION")
+          if [[ "$MOVE_MINOR" == true ]]; then
+            tags+=(-t "$IMAGE:$PG-$MINOR")
+          fi
+          sources=()
+          for digest_file in "$RUNNER_TEMP"/digests/*; do
+            sources+=("$IMAGE@sha256:$(basename "$digest_file")")
+          done
+          docker buildx imagetools create "${tags[@]}" \
+            --annotation "index:org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --annotation "index:org.opencontainers.image.description=PostgreSQL $PG with the gfs extension" \
+            --annotation "index:org.opencontainers.image.version=$VERSION" \
+            "${sources[@]}"
+          digest="$(docker buildx imagetools inspect "$IMAGE:$PG-$VERSION" --format '{{json .Manifest}}' | jq -r .digest)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "- \`$IMAGE:$PG-$VERSION\` → \`$digest\`" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$MOVE_MINOR" == true ]]; then
+            echo "- \`$IMAGE:$PG-$MINOR\` → \`$digest\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.merge.outputs.digest }}
+          push-to-registry: true
