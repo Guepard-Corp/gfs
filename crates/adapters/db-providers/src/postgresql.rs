@@ -2702,18 +2702,34 @@ mod tests {
 
         // The hook's own writes must be granted...
         for (verbs, table) in [
-            ("UPDATE", "gfs.clone_source"),
             ("UPDATE", "gfs.clone_stats"),
-            ("INSERT, DELETE", "gfs.cached"),
+            ("DELETE", "gfs.cached"),
             ("INSERT, DELETE", "gfs.copy_queue"),
             ("INSERT, UPDATE", "gfs.cached_predicate"),
             ("INSERT, UPDATE", "gfs.copy_watermark"),
-            ("INSERT", "gfs.tombstone"),
         ] {
             assert!(
                 all.lines().any(|l| l.contains(verbs) && l.contains(table)),
                 "missing `GRANT {verbs} ON {table} TO PUBLIC`; without it a \
                  non-superuser read through the planner hook fails.\n{all}"
+            );
+        }
+
+        for (verb, table) in [
+            ("UPDATE", "gfs.clone_source"),
+            ("INSERT", "gfs.cached"),
+            ("INSERT", "gfs.tombstone"),
+        ] {
+            assert!(
+                !all.lines().any(|l| {
+                    let Some((granted, rest)) = l.split_once(" ON ") else {
+                        return false;
+                    };
+                    let tables = rest.trim_end_matches(" TO PUBLIC;");
+                    granted.contains(verb) && tables.split(", ").any(|t| t.trim() == table)
+                }),
+                "`{verb}` on {table} goes through a SECURITY DEFINER function; \
+                 granting it to PUBLIC lets a reader forge coverage.\n{all}"
             );
         }
 
