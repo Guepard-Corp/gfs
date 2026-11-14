@@ -9,10 +9,19 @@ on:
         description: 'Release tag to build images for (e.g. v0.5.0)'
         required: true
         type: string
+      pg_majors:
+        description: 'PostgreSQL majors to build, space separated'
+        required: false
+        default: '16 17 18'
+        type: string
   workflow_call:
     inputs:
       tag:
         required: true
+        type: string
+      pg_majors:
+        required: false
+        default: '16 17 18'
         type: string
 
 permissions:
@@ -33,12 +42,14 @@ jobs:
       minor: ${{ steps.plan.outputs.minor }}
       move_minor: ${{ steps.plan.outputs.move_minor }}
       image: ${{ steps.plan.outputs.image }}
+      pg_majors: ${{ steps.plan.outputs.pg_majors }}
     steps:
       - id: plan
         env:
           TAG: ${{ inputs.tag || github.event.release.tag_name }}
           EVENT_PRERELEASE: ${{ github.event.release.prerelease || false }}
           OWNER: ${{ github.repository_owner }}
+          PG_MAJORS: ${{ inputs.pg_majors || '16 17 18' }}
           GH_TOKEN: ${{ github.token }}
         run: |
           semver='^v([0-9]+)\.([0-9]+)\.([0-9]+)(-[0-9A-Za-z.-]+)?$'
@@ -64,7 +75,17 @@ jobs:
             move_minor=true
           fi
 
+          read -r -a majors <<< "$PG_MAJORS"
+          for major in "${majors[@]}"; do
+            if [[ ! "$major" =~ ^(16|17|18)$ ]]; then
+              echo "::error::unsupported PostgreSQL major '$major'"
+              exit 1
+            fi
+          done
+          pg_majors_json="$(printf '%s\n' "${majors[@]}" | jq -R . | jq -sc .)"
+
           {
+            echo "pg_majors=$pg_majors_json"
             echo "tag=$TAG"
             echo "version=${TAG#v}"
             echo "minor=$minor"
@@ -82,7 +103,7 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        pg: ['16', '17', '18']
+        pg: ${{ fromJSON(needs.plan.outputs.pg_majors) }}
         platform: [amd64, arm64]
         include:
           - platform: amd64
@@ -143,7 +164,7 @@ jobs:
     needs: [plan, build]
     strategy:
       matrix:
-        pg: ['16', '17', '18']
+        pg: ${{ fromJSON(needs.plan.outputs.pg_majors) }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
