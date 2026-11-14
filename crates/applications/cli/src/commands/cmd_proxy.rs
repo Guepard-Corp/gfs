@@ -17,6 +17,7 @@
 //! The binary is located via `GFS_PROXY_BIN`, then next to the `gfs` exe, then
 //! `PATH`. A helpful error points at `cargo build -p guepard-proxy-v2` otherwise.
 
+use crate::println_safe;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -171,11 +172,11 @@ fn spawn_daemon(state: &State, args: &[String]) -> Result<()> {
     } else {
         "single-backend"
     };
-    println!(
+    println_safe!(
         "proxy daemon started (PID {pid}, {mode}). Logs: {}",
         state.log_file.display()
-    );
-    println!("  argv: {}", args.join(" "));
+    )?;
+    println_safe!("  argv: {}", args.join(" "))?;
     Ok(())
 }
 
@@ -183,18 +184,18 @@ fn stop(state: &State) -> Result<()> {
     let pid = match read_pid(&state.pid_file)? {
         Some(p) => p,
         None => {
-            println!("proxy daemon is not running (no PID file)");
+            println_safe!("proxy daemon is not running (no PID file)")?;
             return Ok(());
         }
     };
     if !process_exists(pid) {
         fs::remove_file(&state.pid_file).ok();
-        println!("proxy daemon is not running (stale PID {pid})");
+        println_safe!("proxy daemon is not running (stale PID {pid})")?;
         return Ok(());
     }
     kill_process(pid)?;
     fs::remove_file(&state.pid_file).context("remove ~/.gfs/proxy.pid")?;
-    println!("proxy daemon stopped (PID {pid})");
+    println_safe!("proxy daemon stopped (PID {pid})")?;
     Ok(())
 }
 
@@ -215,23 +216,23 @@ fn status(state: &State) -> Result<()> {
 
     match running_pid {
         Some(pid) => {
-            println!("Daemon: running (PID {pid})");
-            println!("Metrics + /clones: http://{}", metrics_addr);
+            println_safe!("Daemon: running (PID {pid})")?;
+            println_safe!("Metrics + /clones: http://{}", metrics_addr)?;
             if let Some(args) = &saved_args {
-                println!("argv: {}", args.join(" "));
+                println_safe!("argv: {}", args.join(" "))?;
             }
-            print_clones(&metrics_addr);
+            print_clones(&metrics_addr)?;
         }
         None if state.pid_file.exists() => {
-            println!(
+            println_safe!(
                 "Daemon: stopped (stale PID file at {})",
                 state.pid_file.display()
-            );
-            println!("  → `gfs proxy stop` to clean it up, or `gfs proxy start` to restart");
+            )?;
+            println_safe!("  → `gfs proxy stop` to clean it up, or `gfs proxy start` to restart")?;
         }
         None => {
-            println!("Daemon: stopped");
-            println!("  → `gfs proxy start` to launch (auto-discovery by default)");
+            println_safe!("Daemon: stopped")?;
+            println_safe!("  → `gfs proxy start` to launch (auto-discovery by default)")?;
         }
     }
     Ok(())
@@ -245,7 +246,7 @@ fn find_arg_value(args: &[String], name: &str) -> Option<String> {
 /// Pretty-print the live clone→listener map scraped from `GET /clones`. Best-
 /// effort: a fetch/parse failure prints a diagnostic and returns — `status` is
 /// still useful even if the HTTP endpoint hiccups.
-fn print_clones(metrics_addr: &str) {
+fn print_clones(metrics_addr: &str) -> Result<()> {
     let url = format!("http://{metrics_addr}/clones");
     let out = match Command::new("curl")
         .args(["-fsS", "--max-time", "2", &url])
@@ -254,41 +255,42 @@ fn print_clones(metrics_addr: &str) {
     {
         Ok(o) if o.status.success() => o.stdout,
         Ok(o) => {
-            println!(
+            println_safe!(
                 "\nFronted clones: <curl /clones failed: {}>",
                 String::from_utf8_lossy(&o.stderr).trim()
-            );
-            return;
+            )?;
+            return Ok(());
         }
         Err(e) => {
-            println!("\nFronted clones: <could not invoke curl: {e}>");
-            return;
+            println_safe!("\nFronted clones: <could not invoke curl: {e}>")?;
+            return Ok(());
         }
     };
     let body = match serde_json::from_slice::<serde_json::Value>(&out) {
         Ok(v) => v,
         Err(e) => {
-            println!("\nFronted clones: <invalid JSON from /clones: {e}>");
-            return;
+            println_safe!("\nFronted clones: <invalid JSON from /clones: {e}>")?;
+            return Ok(());
         }
     };
     let arr = body.get("clones").and_then(|v| v.as_array());
     match arr {
         Some(a) if a.is_empty() => {
-            println!("\nFronted clones: (none yet — discovery scans Docker periodically)")
+            println_safe!("\nFronted clones: (none yet — discovery scans Docker periodically)")?
         }
         Some(a) => {
-            println!("\nFronted clones ({}):", a.len());
+            println_safe!("\nFronted clones ({}):", a.len())?;
             for c in a {
                 let name = c.get("container").and_then(|v| v.as_str()).unwrap_or("?");
                 let backend = c.get("backend").and_then(|v| v.as_str()).unwrap_or("?");
                 let port = c.get("listen_port").and_then(|v| v.as_u64()).unwrap_or(0);
                 let remote = c.get("remote").and_then(|v| v.as_str()).unwrap_or("?");
-                println!("  - {name}: localhost:{port}  →  {backend}   (remote: {remote})");
+                println_safe!("  - {name}: localhost:{port}  →  {backend}   (remote: {remote})")?;
             }
         }
-        None => println!("\nFronted clones: <unexpected /clones payload>"),
+        None => println_safe!("\nFronted clones: <unexpected /clones payload>")?,
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -297,7 +299,7 @@ fn print_clones(metrics_addr: &str) {
 
 fn logs(state: &State, follow: bool, tail: usize) -> Result<()> {
     if !state.log_file.exists() {
-        println!("no log file yet at {}", state.log_file.display());
+        println_safe!("no log file yet at {}", state.log_file.display())?;
         return Ok(());
     }
     let mut cmd = Command::new("tail");

@@ -103,6 +103,9 @@ pub fn stdout_is_closed() -> bool {
 /// the command.
 #[macro_export]
 macro_rules! println_safe {
+    () => {
+        $crate::println_safe!("")
+    };
     ($($arg:tt)*) => {{
         use std::io::Write;
         if $crate::output::stdout_is_closed() {

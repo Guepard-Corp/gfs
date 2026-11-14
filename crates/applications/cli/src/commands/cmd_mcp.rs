@@ -7,6 +7,7 @@
 //!
 //! PID file: .gfs/mcp.pid, log file: .gfs/mcp.log.
 
+use crate::println_safe;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -117,7 +118,7 @@ async fn run_web_embedded(port: u16) -> Result<()> {
         bind
     );
 
-    println!("Starting MCP server on http://127.0.0.1:{}/mcp", port);
+    println_safe!("Starting MCP server on http://127.0.0.1:{}/mcp", port)?;
     if generated {
         let path = token_file_path().ok_or_else(|| {
             anyhow::anyhow!("no writable location for a generated token; set GFS_MCP_TOKEN")
@@ -128,9 +129,9 @@ async fn run_web_embedded(port: u16) -> Result<()> {
                 path.display()
             )
         })?;
-        println!("Bearer token written to {}", path.display());
+        println_safe!("Bearer token written to {}", path.display())?;
     } else {
-        println!("Bearer token taken from GFS_MCP_TOKEN");
+        println_safe!("Bearer token taken from GFS_MCP_TOKEN")?;
     }
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -225,13 +226,13 @@ async fn spawn_daemon_process(
         fs::write(pid_file, pid.to_string()).context("write PID file")?;
         drop(child);
 
-        println!(
+        println_safe!(
             "MCP daemon started (PID {}, http://127.0.0.1:{}/mcp, repo {}). {}.",
             pid,
             port,
             repo_path.display(),
             token_note
-        );
+        )?;
         Ok(())
     } else {
         anyhow::bail!(
@@ -250,20 +251,20 @@ async fn stop(pid_file: &std::path::Path) -> Result<()> {
     let pid = match read_pid(pid_file)? {
         Some(p) => p,
         None => {
-            println!("MCP daemon is not running (no PID file)");
+            println_safe!("MCP daemon is not running (no PID file)")?;
             return Ok(());
         }
     };
 
     if !process_exists(pid) {
         fs::remove_file(pid_file).ok();
-        println!("MCP daemon is not running (stale PID {})", pid);
+        println_safe!("MCP daemon is not running (stale PID {})", pid)?;
         return Ok(());
     }
 
     kill_process(pid)?;
     fs::remove_file(pid_file).context("remove PID file")?;
-    println!("MCP daemon stopped (PID {})", pid);
+    println_safe!("MCP daemon stopped (PID {})", pid)?;
     Ok(())
 }
 
@@ -272,8 +273,8 @@ async fn stop(pid_file: &std::path::Path) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 async fn status(pid_file: &std::path::Path, default_port: u16) -> Result<()> {
-    println!("MCP Embedded Handler Status");
-    println!();
+    println_safe!("MCP Embedded Handler Status")?;
+    println_safe!()?;
 
     let running = pid_file
         .exists()
@@ -282,21 +283,22 @@ async fn status(pid_file: &std::path::Path, default_port: u16) -> Result<()> {
     let running = running.and_then(|pid| process_exists(pid).then_some(pid));
 
     if let Some(pid) = running {
-        println!(
+        println_safe!(
             "Daemon: running (PID {}, http://127.0.0.1:{}/mcp, bearer token required)",
-            pid, default_port
-        );
+            pid,
+            default_port
+        )?;
     } else if pid_file.exists() {
-        println!("Daemon: stopped (use 'gfs mcp stop' to remove stale PID file)");
+        println_safe!("Daemon: stopped (use 'gfs mcp stop' to remove stale PID file)")?;
     } else {
-        println!("Daemon: stopped");
+        println_safe!("Daemon: stopped")?;
     }
 
-    println!();
-    println!("Embedded MCP modes:");
-    println!("  - Stdio (default): gfs mcp");
-    println!("  - HTTP (foreground): gfs mcp web --port 3000");
-    println!("  - HTTP (daemon): gfs mcp start");
+    println_safe!()?;
+    println_safe!("Embedded MCP modes:")?;
+    println_safe!("  - Stdio (default): gfs mcp")?;
+    println_safe!("  - HTTP (foreground): gfs mcp web --port 3000")?;
+    println_safe!("  - HTTP (daemon): gfs mcp start")?;
     Ok(())
 }
 
@@ -306,7 +308,7 @@ async fn status(pid_file: &std::path::Path, default_port: u16) -> Result<()> {
 
 fn show_version() -> Result<()> {
     const VERSION: &str = env!("CARGO_PKG_VERSION");
-    println!("gfs-mcp version: {}", VERSION);
+    println_safe!("gfs-mcp version: {}", VERSION)?;
     Ok(())
 }
 

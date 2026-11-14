@@ -10,6 +10,7 @@
 //!
 //! Note there is deliberately no `push`: the source is never written to.
 
+use crate::println_safe;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -180,38 +181,38 @@ pub async fn fetch(path: Option<PathBuf>, check: bool, json_output: bool) -> Res
             .map(|m| m.diverged_stale)
             .unwrap_or(0);
         if json_output {
-            println!(
+            println_safe!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
                     "detached": true, "state": "frozen", "torn": false,
                     "frozen_at": at, "frozen_lsn": lsn, "kept": kept,
                     "diverged_stale": stale
                 }))?
-            );
+            )?;
             return Ok(());
         }
-        println!();
-        println!(
+        println_safe!()?;
+        println_safe!(
             "  {} detached snapshot {} — no source to sync",
             green("\u{2713}"),
             dimmed(format!("(frozen {at}, source LSN {lsn})"))
-        );
+        )?;
         if stale > 0 {
-            println!(
+            println_safe!(
                 "    {}",
                 dimmed(format!(
                     "{stale} kept table(s) hold source rows that predate the freeze (they are your branch)"
                 ))
-            );
+            )?;
         } else if kept > 0 {
-            println!(
+            println_safe!(
                 "    {}",
                 dimmed(format!(
                     "{kept} table(s) kept your local writes; their source-derived rows date from earlier moments"
                 ))
-            );
+            )?;
         }
-        println!();
+        println_safe!()?;
         return Ok(());
     }
 
@@ -268,53 +269,53 @@ pub async fn fetch(path: Option<PathBuf>, check: bool, json_output: bool) -> Res
             out["wal_span"] = json!([m.span_min, m.span_max]);
             out["torn"] = json!(m.torn);
         }
-        println!("{}", serde_json::to_string_pretty(&out)?);
+        println_safe!("{}", serde_json::to_string_pretty(&out)?)?;
         return Ok(());
     }
 
-    println!();
+    println_safe!()?;
     if all.is_empty() {
-        println!("  {} no tables tracked yet", dimmed("·"));
+        println_safe!("  {} no tables tracked yet", dimmed("·"))?;
         return Ok(());
     }
 
     if changed.is_empty() && notes.is_empty() {
-        println!(
+        println_safe!(
             "  {} source unchanged {}",
             green("✓"),
             dimmed(format!("({} tables tracked)", all.len()))
-        );
+        )?;
     } else {
-        println!(
+        println_safe!(
             "  {} {} of {} tables changed on the source",
             yellow("!"),
             bold(changed.len().to_string()),
             all.len()
-        );
-        println!();
+        )?;
+        println_safe!()?;
         for r in &changed {
             if r[3] == "true" {
-                println!("    {} {}", red("conflict"), cyan(&r[0]));
-                println!(
+                println_safe!("    {} {}", red("conflict"), cyan(&r[0]))?;
+                println_safe!(
                     "      {}",
                     dimmed("you have local writes AND the source changed")
-                );
+                )?;
             } else {
-                println!("    {} {}", yellow("changed "), cyan(&r[0]));
+                println_safe!("    {} {}", yellow("changed "), cyan(&r[0]))?;
                 if !r[2].is_empty() {
-                    println!("      {}", dimmed(&r[2]));
+                    println_safe!("      {}", dimmed(&r[2]))?;
                 }
             }
         }
-        println!();
-        println!(
+        println_safe!()?;
+        println_safe!(
             "  {}",
             dimmed("reads of these tables go to the source, so they are")
-        );
-        println!(
+        )?;
+        println_safe!(
             "  {}",
             dimmed("correct but slower. run `gfs pull` to make them local again.")
-        );
+        )?;
     }
 
     for n in &notes {
@@ -323,9 +324,9 @@ pub async fn fetch(path: Option<PathBuf>, check: bool, json_output: bool) -> Res
             "unattributed" => "unattributed",
             _ => "unaccounted",
         };
-        println!("    {} {}", yellow(label), cyan(&n[1]));
+        println_safe!("    {} {}", yellow(label), cyan(&n[1]))?;
         if !n[2].is_empty() {
-            println!("      {}", dimmed(&n[2]));
+            println_safe!("      {}", dimmed(&n[2]))?;
         }
     }
 
@@ -334,64 +335,64 @@ pub async fn fetch(path: Option<PathBuf>, check: bool, json_output: bool) -> Res
     // baseline), and stale-but-coherent while it is loud. Say which.
     if let Some(m) = &moments {
         if m.torn {
-            println!();
-            println!(
+            println_safe!()?;
+            println_safe!(
                 "  {} this clone spans {} source moments {}",
                 yellow("!"),
                 bold(m.moment_count.to_string()),
                 dimmed(format!("(WAL {} \u{2192} {})", m.span_min, m.span_max))
-            );
-            println!(
+            )?;
+            println_safe!(
                 "    {}",
                 dimmed("tables were copied while the source kept moving, so a JOIN across")
-            );
-            println!(
+            )?;
+            println_safe!(
                 "    {}",
                 dimmed("them can return combinations that never existed on the source at")
-            );
-            println!(
+            )?;
+            println_safe!(
                 "    {}",
                 dimmed("any instant. `gfs freeze` re-copies everything from one instant")
-            );
-            println!(
+            )?;
+            println_safe!(
                 "    {}",
                 dimmed("(tables you have written to keep your changes); `gfs pull` re-syncs")
-            );
-            println!(
+            )?;
+            println_safe!(
                 "    {}",
                 dimmed("changed tables but stays lazy, so it narrows the span only if the")
-            );
-            println!(
+            )?;
+            println_safe!(
                 "    {}",
                 dimmed("next reads happen while the source is quiet.")
-            );
+            )?;
         } else if m.copied >= 2 && m.unmarked == 0 {
-            println!();
-            println!(
+            println_safe!()?;
+            println_safe!(
                 "  {} all copied data is from one source moment",
                 green("\u{2713}")
-            );
+            )?;
         }
         if m.unmarked > 0 {
-            println!(
+            println_safe!(
                 "    {}",
                 dimmed(format!(
                     "({} copied table(s) carry no copy watermark; their moment is unknown)",
                     m.unmarked
                 ))
-            );
+            )?;
         }
     }
 
     if !check && !last_checked.is_empty() {
-        println!();
-        println!(
+        println_safe!()?;
+        println_safe!(
             "  {} {}",
             dimmed(format!("as of {last_checked}")),
             dimmed("(use --check to probe the source now)")
-        );
+        )?;
     }
-    println!();
+    println_safe!()?;
     Ok(())
 }
 
@@ -415,25 +416,25 @@ pub async fn pull(
     // machinery the frozen guards keep off anyway).
     if let Some((true, at, _lsn)) = frozen_info(&repo).await {
         if json_output {
-            println!(
+            println_safe!(
                 "{}",
                 serde_json::to_string_pretty(&json!({ "detached": true, "frozen_at": at }))?
-            );
+            )?;
             return Ok(());
         }
-        println!();
-        println!(
+        println_safe!()?;
+        println_safe!(
             "  {} this clone is detached {} — pull does nothing",
             green("\u{2713}"),
             dimmed(format!("(frozen {at})"))
-        );
+        )?;
         if auto.is_some() || auto_schema.is_some() {
-            println!(
+            println_safe!(
                 "    {}",
                 dimmed("auto-pull settings have no effect on a frozen clone")
-            );
+            )?;
         }
-        println!();
+        println_safe!()?;
         return Ok(());
     }
 
@@ -456,32 +457,32 @@ pub async fn pull(
         )
         .await?;
         if json_output {
-            println!(
+            println_safe!(
                 "{}",
                 serde_json::to_string_pretty(&json!({ "autoschema": on }))?
-            );
+            )?;
         } else {
-            println!();
-            println!(
+            println_safe!()?;
+            println_safe!(
                 "  {} auto schema repair {}",
                 green("✓"),
                 bold(if on { "on" } else { "off" })
-            );
-            println!(
+            )?;
+            println_safe!(
                 "    {}",
                 dimmed(if on {
                     "a source shape change is re-imported automatically (additive changes only)"
                 } else {
                     "a source shape change fails with a clear message until you run `gfs pull`"
                 })
-            );
-            println!(
+            )?;
+            println_safe!(
                 "    {}",
                 dimmed(
                     "a column dropped on the source is never applied automatically: that could destroy local data"
                 )
-            );
-            println!();
+            )?;
+            println_safe!()?;
         }
         return Ok(());
     }
@@ -495,26 +496,26 @@ pub async fn pull(
         )
         .await?;
         if json_output {
-            println!(
+            println_safe!(
                 "{}",
                 serde_json::to_string_pretty(&json!({ "autopull": on }))?
-            );
+            )?;
         } else {
-            println!();
-            println!(
+            println_safe!()?;
+            println_safe!(
                 "  {} auto-pull {}",
                 green("✓"),
                 bold(if on { "on" } else { "off" })
-            );
-            println!(
+            )?;
+            println_safe!(
                 "    {}",
                 dimmed(if on {
                     "a changed table costs one query from the source, then it is re-copied"
                 } else {
                     "changed tables are read from the source until you run `gfs pull`"
                 })
-            );
-            println!();
+            )?;
+            println_safe!()?;
         }
         return Ok(());
     }
@@ -531,7 +532,7 @@ pub async fn pull(
     let conflicts: Vec<&Vec<String>> = actions.iter().filter(|r| r[0] == "conflict").collect();
 
     if json_output {
-        println!(
+        println_safe!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "reset": reset,
@@ -540,66 +541,66 @@ pub async fn pull(
                     "action": r[0], "table": r[1], "detail": r[2]
                 })).collect::<Vec<_>>(),
             }))?
-        );
+        )?;
         return Ok(());
     }
 
-    println!();
+    println_safe!()?;
     for r in actions
         .iter()
         .filter(|r| r[0] == "schema" || r[0] == "sequence" || r[0] == "enum")
     {
-        println!("  {} {} {}", green("✓"), cyan(&r[1]), dimmed(&r[2]));
+        println_safe!("  {} {} {}", green("✓"), cyan(&r[1]), dimmed(&r[2]))?;
     }
     if actions.is_empty() {
-        println!("  {} already up to date", green("✓"));
-        println!();
+        println_safe!("  {} already up to date", green("✓"))?;
+        println_safe!()?;
         return Ok(());
     }
 
     if seqs > 0 && reset == 0 {
-        println!(
+        println_safe!(
             "    {}",
             dimmed("local inserts would otherwise have collided with rows fetched from the source")
-        );
+        )?;
     }
     if reset > 0 {
-        println!(
+        println_safe!(
             "  {} {} table(s) back on the lazy path",
             green("✓"),
             bold(reset.to_string())
-        );
+        )?;
         for r in actions.iter().filter(|r| r[0] == "reset") {
-            println!("    {} {}", dimmed("reset"), cyan(&r[1]));
+            println_safe!("    {} {}", dimmed("reset"), cyan(&r[1]))?;
         }
-        println!(
+        println_safe!(
             "    {}",
             dimmed("the next read of each fetches from the source")
-        );
+        )?;
     }
 
     if !conflicts.is_empty() {
-        println!();
-        println!(
+        println_safe!()?;
+        println_safe!(
             "  {} {} table(s) NOT touched",
             red("!"),
             bold(conflicts.len().to_string())
-        );
+        )?;
         // Print each conflict's OWN reason: a local-write conflict and a schema
         // conflict are different situations, and a single hardcoded line claimed
         // the user had local writes even when the clash was purely structural.
         for r in &conflicts {
-            println!("    {} {}", red("conflict"), cyan(&r[1]));
-            println!("      {}", dimmed(r[2].trim_start_matches("conflict: ")));
+            println_safe!("    {} {}", red("conflict"), cyan(&r[1]))?;
+            println_safe!("      {}", dimmed(r[2].trim_start_matches("conflict: ")))?;
         }
         if conflicts.iter().any(|r| r[2].contains("local writes")) {
-            println!(
+            println_safe!(
                 "    {}",
                 dimmed("use `gfs pull --force` to discard yours and take the source's")
-            );
+            )?;
         }
     }
-    println!();
+    println_safe!()?;
     Ok(())
 }
 
@@ -636,17 +637,17 @@ pub async fn remote(path: Option<PathBuf>, json_output: bool) -> Result<()> {
     // cannot trip; an empty result is how a non-clone repository answers
     let Some(r) = rows(&raw).into_iter().next().filter(|r| r.len() >= 4) else {
         if json_output {
-            println!(
+            println_safe!(
                 "{}",
                 serde_json::to_string_pretty(&json!({ "url": null, "push": false }))?
-            );
+            )?;
         } else {
-            println!();
-            println!(
+            println_safe!()?;
+            println_safe!(
                 "  {} this repository has no source (not a clone)",
                 dimmed("\u{b7}")
-            );
-            println!();
+            )?;
+            println_safe!()?;
         }
         return Ok(());
     };
@@ -660,28 +661,28 @@ pub async fn remote(path: Option<PathBuf>, json_output: bool) -> Result<()> {
     let url = format!("postgres://{auth}{host}:{port}/{dbname}");
 
     if json_output {
-        println!(
+        println_safe!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "url": url, "host": host, "port": port, "dbname": dbname,
                 "user": user, "push": false,
             }))?
-        );
+        )?;
         return Ok(());
     }
 
-    println!();
-    println!(
+    println_safe!()?;
+    println_safe!(
         "  {} {}  {}",
         bold("origin"),
         cyan(&url),
         dimmed("(fetch only)")
-    );
-    println!(
+    )?;
+    println_safe!(
         "  {}",
         dimmed("GFS never writes to the source; there is no `gfs push`.")
-    );
-    println!();
+    )?;
+    println_safe!()?;
     Ok(())
 }
 
@@ -714,11 +715,11 @@ pub(crate) async fn materialize_clone(repo_path: &Path, quiet: bool) -> Result<i
         {
             let partial: i64 = out.trim().parse().unwrap_or(0);
             if partial > 0 {
-                println!(
+                println_safe!(
                     "  {} frozen clone: {} table(s) kept with your local writes export as they stand",
                     dimmed("\u{b7}"),
                     partial
-                );
+                )?;
             }
         }
         return Ok(0);
@@ -740,11 +741,11 @@ pub(crate) async fn materialize_clone(repo_path: &Path, quiet: bool) -> Result<i
     }
 
     if !quiet {
-        println!(
+        println_safe!(
             "  {} fetching {} table(s) not yet copied, so the export is complete",
             dimmed("·"),
             pending
-        );
+        )?;
     }
     run_sql(
         repo_path,

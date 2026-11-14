@@ -1,3 +1,4 @@
+use crate::println_safe;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -121,21 +122,21 @@ fn handle_config(path: Option<PathBuf>, key: &str, value: &str, json_output: boo
             }
             config.save(&repo_path).context("failed to save config")?;
             if json_output {
-                println!(
+                println_safe!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
                         "action": "config_set",
                         "key": "db.port",
                         "value": port,
                     }))?
-                );
+                )?;
                 return Ok(());
             }
-            println!(
+            println_safe!(
                 "{} database_port updated to {}. Run 'gfs compute restart' to apply.",
                 green("✓"),
                 port
-            );
+            )?;
             Ok(())
         }
         _ => anyhow::bail!("unknown config key '{}'; supported keys: db.port", key),
@@ -166,7 +167,7 @@ async fn dispatch_dyn(
             if json_output {
                 print_status_json(&status, data_dir, path.as_ref(), None)?;
             } else {
-                print_status(&status, data_dir, path.as_ref());
+                print_status(&status, data_dir, path.as_ref())?;
             }
         }
 
@@ -177,8 +178,8 @@ async fn dispatch_dyn(
             if json_output {
                 print_status_json(&status, data_dir, path.as_ref(), Some("start"))?;
             } else {
-                println!("{} Compute started", green("✓"));
-                print_status(&status, data_dir, path.as_ref());
+                println_safe!("{} Compute started", green("✓"))?;
+                print_status(&status, data_dir, path.as_ref())?;
             }
         }
 
@@ -190,8 +191,8 @@ async fn dispatch_dyn(
             if json_output {
                 print_status_json(&status, None, path.as_ref(), Some("stop"))?;
             } else {
-                println!("{} Compute stopped", green("✓"));
-                print_status(&status, None, path.as_ref());
+                println_safe!("{} Compute stopped", green("✓"))?;
+                print_status(&status, None, path.as_ref())?;
             }
         }
 
@@ -201,8 +202,8 @@ async fn dispatch_dyn(
             if json_output {
                 print_status_json(&status, data_dir, path.as_ref(), Some("restart"))?;
             } else {
-                println!("{} Compute restarted", green("✓"));
-                print_status(&status, data_dir, path.as_ref());
+                println_safe!("{} Compute restarted", green("✓"))?;
+                print_status(&status, data_dir, path.as_ref())?;
             }
         }
 
@@ -214,8 +215,8 @@ async fn dispatch_dyn(
             if json_output {
                 print_status_json(&status, None, path.as_ref(), Some("pause"))?;
             } else {
-                println!("{} Compute paused", green("✓"));
-                print_status(&status, None, path.as_ref());
+                println_safe!("{} Compute paused", green("✓"))?;
+                print_status(&status, None, path.as_ref())?;
             }
         }
 
@@ -227,8 +228,8 @@ async fn dispatch_dyn(
             if json_output {
                 print_status_json(&status, None, path.as_ref(), Some("unpause"))?;
             } else {
-                println!("{} Compute unpaused", green("✓"));
-                print_status(&status, None, path.as_ref());
+                println_safe!("{} Compute unpaused", green("✓"))?;
+                print_status(&status, None, path.as_ref())?;
             }
         }
 
@@ -276,19 +277,19 @@ async fn dispatch_dyn(
                         })
                     })
                     .collect();
-                println!(
+                println_safe!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
                         "action": "logs",
                         "id": instance_id.0,
                         "entries": out,
                     }))?
-                );
+                )?;
                 return Ok(());
             }
 
             for entry in &entries {
-                println!(
+                println_safe!(
                     "[{}] [{}] {}",
                     entry.timestamp.format("%Y-%m-%dT%H:%M:%SZ"),
                     match entry.stream {
@@ -296,7 +297,7 @@ async fn dispatch_dyn(
                         gfs_domain::ports::compute::LogStream::Stderr => "stderr",
                     },
                     entry.message.trim_end()
-                );
+                )?;
             }
         }
     }
@@ -320,7 +321,7 @@ fn print_status_json(
     let repo_path = path.cloned().unwrap_or_else(get_repo_dir);
     let rel_data_dir = data_dir.map(|d| relativize_to_repo(&repo_path, d));
 
-    println!(
+    println_safe!(
         "{}",
         serde_json::to_string_pretty(&json!({
             "action": action,
@@ -333,17 +334,17 @@ fn print_status_json(
                 "data_dir": rel_data_dir,
             }
         }))?
-    );
+    )?;
     Ok(())
 }
 
-fn print_status(s: &InstanceStatus, data_dir: Option<&str>, path: Option<&PathBuf>) {
-    println!("{}", box_top(&bold("Compute"), BOX_W));
+fn print_status(s: &InstanceStatus, data_dir: Option<&str>, path: Option<&PathBuf>) -> Result<()> {
+    println_safe!("{}", box_top(&bold("Compute"), BOX_W))?;
 
     // ID
     let truncated_id = truncate_id(&s.id.0);
     let row = fmt_box_row_colored("id", &dimmed(&truncated_id), &truncated_id, LABEL_W, BOX_W);
-    println!("{}", box_row(&row, BOX_W));
+    println_safe!("{}", box_row(&row, BOX_W))?;
 
     // State with dot indicator
     let state_str = format_state(&s.state);
@@ -351,27 +352,27 @@ fn print_status(s: &InstanceStatus, data_dir: Option<&str>, path: Option<&PathBu
     let colored_state = format!("{} {}", dot, format_state_colored_text(&s.state));
     let raw_state = format!("{} {}", status_indicator_raw(&s.state), state_str);
     let row = fmt_box_row_colored("state", &colored_state, &raw_state, LABEL_W, BOX_W);
-    println!("{}", box_row(&row, BOX_W));
+    println_safe!("{}", box_row(&row, BOX_W))?;
 
     // PID
     if let Some(pid) = s.pid {
         let pid_str = pid.to_string();
         let row = fmt_box_row("pid", &pid_str, LABEL_W, BOX_W);
-        println!("{}", box_row(&row, BOX_W));
+        println_safe!("{}", box_row(&row, BOX_W))?;
     }
 
     // Started at
     if let Some(started_at) = s.started_at {
         let ts = started_at.format("%Y-%m-%dT%H:%M:%SZ").to_string();
         let row = fmt_box_row("started_at", &ts, LABEL_W, BOX_W);
-        println!("{}", box_row(&row, BOX_W));
+        println_safe!("{}", box_row(&row, BOX_W))?;
     }
 
     // Exit code
     if let Some(code) = s.exit_code {
         let code_str = code.to_string();
         let row = fmt_box_row("exit_code", &code_str, LABEL_W, BOX_W);
-        println!("{}", box_row(&row, BOX_W));
+        println_safe!("{}", box_row(&row, BOX_W))?;
     }
 
     // Container data dir
@@ -379,10 +380,11 @@ fn print_status(s: &InstanceStatus, data_dir: Option<&str>, path: Option<&PathBu
         let repo_path = path.cloned().unwrap_or_else(get_repo_dir);
         let rel = relativize_to_repo(&repo_path, dir);
         let row = fmt_box_row("data dir", &rel, LABEL_W, BOX_W);
-        println!("{}", box_row(&row, BOX_W));
+        println_safe!("{}", box_row(&row, BOX_W))?;
     }
 
-    println!("{}", box_bottom(BOX_W));
+    println_safe!("{}", box_bottom(BOX_W))?;
+    Ok(())
 }
 
 fn format_state(state: &InstanceState) -> &'static str {

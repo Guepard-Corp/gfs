@@ -13,6 +13,7 @@
 //! raises it or `--force` bypasses it. For big sources the better answer is
 //! cloning from an already-frozen endpoint (snapshot, backup, paused replica).
 
+use crate::println_safe;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -40,20 +41,20 @@ pub async fn freeze(
     // satisfied, not an error.
     if let Some((true, at, _lsn)) = frozen_info(&repo).await {
         if json_output {
-            println!(
+            println_safe!(
                 "{}",
                 serde_json::to_string_pretty(
                     &json!({ "frozen": true, "already": true, "frozen_at": at })
                 )?
-            );
+            )?;
         } else {
-            println!();
-            println!(
+            println_safe!()?;
+            println_safe!(
                 "  {} already frozen {}",
                 green("✓"),
                 dimmed(format!("(at {at})"))
-            );
-            println!();
+            )?;
+            println_safe!()?;
         }
         return Ok(());
     }
@@ -95,34 +96,34 @@ pub async fn freeze(
     let cap = max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
     if est_bytes > cap && !force {
         if !json_output {
-            println!();
-            println!(
+            println_safe!()?;
+            println_safe!(
                 "  {} freezing copies everything: ~{} from the source ({} table(s))",
                 yellow("!"),
                 bold(fmt_bytes(est_bytes)),
                 n_copy
-            );
-            println!(
+            )?;
+            println_safe!(
                 "    {}",
                 dimmed(format!(
                     "that exceeds the {} budget, so nothing was copied",
                     fmt_bytes(cap)
                 ))
-            );
-            println!(
+            )?;
+            println_safe!(
                 "    {}",
                 dimmed(format!(
                     "raise it with `gfs freeze --max-bytes {est_bytes}` or bypass with --force"
                 ))
-            );
-            println!(
+            )?;
+            println_safe!(
                 "    {}",
                 dimmed(
                     "for a large source, prefer cloning from an already-frozen endpoint \
-                     (storage snapshot, backup, paused replica): lazy AND a point in time"
+                 (storage snapshot, backup, paused replica): lazy AND a point in time"
                 )
-            );
-            println!();
+            )?;
+            println_safe!()?;
         }
         bail!(
             "estimated copy of {} exceeds the {} budget (nothing was copied)",
@@ -132,13 +133,13 @@ pub async fn freeze(
     }
 
     if !json_output {
-        println!();
-        println!(
+        println_safe!()?;
+        println_safe!(
             "  {} freezing: copying ~{} from one source instant ({} table(s))...",
             dimmed("\u{b7}"),
             fmt_bytes(est_bytes),
             n_copy
-        );
+        )?;
     }
 
     // Phase B: ONE statement = ONE transaction = atomic. Everything -- the
@@ -170,7 +171,7 @@ pub async fn freeze(
     let frozen_line = actions.iter().find(|a| a[0] == "frozen");
 
     if json_output {
-        println!(
+        println_safe!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "frozen": true,
@@ -182,21 +183,21 @@ pub async fn freeze(
                     "action": a[0], "table": a[1], "detail": a[2]
                 })).collect::<Vec<_>>(),
             }))?
-        );
+        )?;
         return Ok(());
     }
 
-    println!();
+    println_safe!()?;
     if already {
-        println!("  {} already frozen", green("\u{2713}"));
-        println!();
+        println_safe!("  {} already frozen", green("\u{2713}"))?;
+        println_safe!()?;
         return Ok(());
     }
 
     let lsn = frozen_line
         .and_then(|a| a[2].split("source LSN ").nth(1).map(str::to_string))
         .unwrap_or_default();
-    println!(
+    println_safe!(
         "  {} clone is now a snapshot: {} table(s) copied from one instant{}",
         green("\u{2713}"),
         bold(copied.to_string()),
@@ -205,36 +206,36 @@ pub async fn freeze(
         } else {
             format!(" {}", dimmed(format!("(source LSN {lsn})")))
         }
-    );
+    )?;
     if matviews > 0 || seqs > 0 {
-        println!(
+        println_safe!(
             "  {} {} matview(s) recomputed, {} sequence(s) advanced",
             green("\u{2713}"),
             matviews,
             seqs
-        );
+        )?;
     }
     if !kept.is_empty() {
-        println!();
-        println!(
+        println_safe!()?;
+        println_safe!(
             "  {} {} table(s) kept your local writes",
             yellow("!"),
             bold(kept.len().to_string())
-        );
+        )?;
         for k in &kept {
-            println!("    {} {}", red("kept"), cyan(&k[1]));
+            println_safe!("    {} {}", red("kept"), cyan(&k[1]))?;
         }
-        println!(
+        println_safe!(
             "    {}",
             dimmed("kept tables are your branch; their source-derived rows may predate the freeze")
-        );
+        )?;
     }
-    println!();
-    println!(
+    println_safe!()?;
+    println_safe!(
         "  {} detached from source {}",
         green("\u{2713}"),
         dimmed("(fetch/pull are disabled; the source can go away and this clone still answers)")
-    );
-    println!();
+    )?;
+    println_safe!()?;
     Ok(())
 }

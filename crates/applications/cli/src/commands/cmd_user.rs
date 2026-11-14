@@ -1,5 +1,6 @@
 //! `gfs user` — manage database users/roles (create, list, drop, set-password).
 
+use crate::println_safe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -44,21 +45,27 @@ fn generate_password() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
-fn print_credential(username: &str, password: &str, generated: bool, json_output: bool) {
+fn print_credential(
+    username: &str,
+    password: &str,
+    generated: bool,
+    json_output: bool,
+) -> Result<()> {
     if json_output {
         // Machine output keeps a stable shape; the caller opts into it and owns
         // redaction of a password they themselves supplied.
-        println!(
+        println_safe!(
             "{}",
             serde_json::json!({ "username": username, "password": password })
-        );
+        )?;
     } else if generated {
         // Only the server-generated secret is the "shown once" copy worth echoing.
-        println!("user '{username}' — password (shown once): {password}");
+        println_safe!("user '{username}' — password (shown once): {password}")?;
     } else {
         // A caller-supplied password is not re-echoed to the terminal/logs.
-        println!("user '{username}' — password set");
+        println_safe!("user '{username}' — password set")?;
     }
+    Ok(())
 }
 
 pub async fn run_create(
@@ -94,7 +101,7 @@ pub async fn run_create(
         )
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    print_credential(&username, &password, generated, json_output);
+    print_credential(&username, &password, generated, json_output)?;
     Ok(())
 }
 
@@ -106,15 +113,17 @@ pub async fn run_list(path: Option<PathBuf>, json_output: bool) -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     if json_output {
-        println!("{}", serde_json::to_string(&roles)?);
+        println_safe!("{}", serde_json::to_string(&roles)?)?;
     } else if roles.is_empty() {
-        println!("no database users");
+        println_safe!("no database users")?;
     } else {
         for role in &roles {
-            println!(
+            println_safe!(
                 "{:<32} login={} superuser={}",
-                role.username, role.can_login, role.is_superuser
-            );
+                role.username,
+                role.can_login,
+                role.is_superuser
+            )?;
         }
     }
     Ok(())
@@ -128,12 +137,12 @@ pub async fn run_drop(path: Option<PathBuf>, username: String, json_output: bool
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     if json_output {
-        println!(
+        println_safe!(
             "{}",
             serde_json::json!({ "username": username, "dropped": true })
-        );
+        )?;
     } else {
-        println!("dropped user '{username}'");
+        println_safe!("dropped user '{username}'")?;
     }
     Ok(())
 }
@@ -152,7 +161,7 @@ pub async fn run_set_password(
         .set_password(&repo_path, &username, &password)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    print_credential(&username, &password, generated, json_output);
+    print_credential(&username, &password, generated, json_output)?;
     Ok(())
 }
 
@@ -179,12 +188,12 @@ pub async fn run_apply_preset(
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     if json_output {
-        println!(
+        println_safe!(
             "{}",
             serde_json::json!({ "username": username, "preset_applied": true })
-        );
+        )?;
     } else {
-        println!("user '{username}' — preset applied");
+        println_safe!("user '{username}' — preset applied")?;
     }
     Ok(())
 }
@@ -291,12 +300,12 @@ pub async fn run_grant(
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     if json_output {
-        println!(
+        println_safe!(
             "{}",
             serde_json::json!({ "username": username, "granted": true })
-        );
+        )?;
     } else {
-        println!("granted privileges to '{username}'");
+        println_safe!("granted privileges to '{username}'")?;
     }
     Ok(())
 }
@@ -326,12 +335,12 @@ pub async fn run_revoke(
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     if json_output {
-        println!(
+        println_safe!(
             "{}",
             serde_json::json!({ "username": username, "revoked": true })
-        );
+        )?;
     } else {
-        println!("revoked privileges from '{username}'");
+        println_safe!("revoked privileges from '{username}'")?;
     }
     Ok(())
 }
@@ -348,15 +357,18 @@ pub async fn run_list_privs(
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     if json_output {
-        println!("{}", serde_json::to_string(&privileges)?);
+        println_safe!("{}", serde_json::to_string(&privileges)?)?;
     } else if privileges.is_empty() {
-        println!("no privileges for '{username}'");
+        println_safe!("no privileges for '{username}'")?;
     } else {
         for p in &privileges {
-            println!(
+            println_safe!(
                 "{:<10} {:<40} {:<12} grantable={}",
-                p.object_type, p.object_name, p.privilege, p.grantable
-            );
+                p.object_type,
+                p.object_name,
+                p.privilege,
+                p.grantable
+            )?;
         }
     }
     Ok(())

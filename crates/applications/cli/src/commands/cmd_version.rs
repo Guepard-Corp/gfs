@@ -1,9 +1,11 @@
 //! `gfs version` — print the CLI version with retro arcade-style ASCII art.
 
 use crate::output::{bold, dimmed, gold};
+use crate::println_safe;
+use anyhow::Result;
 
 /// Print the current gfs CLI version inside a retro branded box.
-pub fn run() {
+pub fn run() -> Result<()> {
     let version = env!("CARGO_PKG_VERSION");
     let target = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
 
@@ -39,59 +41,60 @@ pub fn run() {
         .max(art_w);
 
     // Top border
-    println!("  {}{}{}", tl, h.repeat(w + 2), tr);
+    println_safe!("  {}{}{}", tl, h.repeat(w + 2), tr)?;
 
     // Empty line
-    println!("  {} {} {}", v, " ".repeat(w), v);
+    println_safe!("  {} {} {}", v, " ".repeat(w), v)?;
 
     // ASCII art lines (gold-colored block letters)
     for line in &art {
         let plain_len = indent.len() + line.chars().count();
         let remaining = w.saturating_sub(plain_len);
-        println!(
+        println_safe!(
             "  {} {}{}{} {}",
             v,
             indent,
             gold(line),
             " ".repeat(remaining),
             v
-        );
+        )?;
     }
 
     // Empty line
-    println!("  {} {} {}", v, " ".repeat(w), v);
+    println_safe!("  {} {} {}", v, " ".repeat(w), v)?;
 
     // Tagline (bold)
     {
         let plain_len = indent.len() + tagline.chars().count();
         let remaining = w.saturating_sub(plain_len);
-        println!(
+        println_safe!(
             "  {} {}{}{} {}",
             v,
             indent,
             bold(tagline),
             " ".repeat(remaining),
             v
-        );
+        )?;
     }
 
     // Version + platform (dimmed)
     {
         let plain_len = indent.len() + meta.chars().count();
         let remaining = w.saturating_sub(plain_len);
-        println!(
+        println_safe!(
             "  {} {}{}{} {}",
             v,
             indent,
             dimmed(&meta),
             " ".repeat(remaining),
             v
-        );
+        )?;
     }
 
     // Empty line
-    println!("  {} {} {}", v, " ".repeat(w), v);
+    println_safe!("  {} {} {}", v, " ".repeat(w), v)?;
 
     // Bottom border
-    println!("  {}{}{}", bl, h.repeat(w + 2), br);
+    println_safe!("  {}{}{}", bl, h.repeat(w + 2), br)?;
+    Ok(())
 }
