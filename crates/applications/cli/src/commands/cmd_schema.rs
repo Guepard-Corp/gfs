@@ -1,5 +1,6 @@
 //! `gfs schema` — database schema operations (extract, show, diff).
 
+use crate::println_safe;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -69,13 +70,13 @@ pub async fn run_extract(
     if let Some(output_path) = output {
         std::fs::write(&output_path, &json)
             .with_context(|| format!("failed to write schema to {}", output_path.display()))?;
-        println!(
+        println_safe!(
             "{} Schema extracted to {}",
             green("✓"),
             cyan(output_path.display().to_string())
-        );
+        )?;
     } else {
-        println!("{}", json);
+        println_safe!("{}", json)?;
     }
 
     Ok(())
@@ -115,30 +116,30 @@ pub async fn run_show(
 
     // Output based on flags (do not color ddl_only or metadata_only - raw output)
     if ddl_only {
-        println!("{}", ddl);
+        println_safe!("{}", ddl)?;
     } else if metadata_only {
         let json = serde_json::to_string_pretty(&metadata)
             .context("failed to serialize schema metadata")?;
-        println!("{}", json);
+        println_safe!("{}", json)?;
     } else {
         // Show both metadata and DDL with colors
-        println!("  {} {}", dimmed("Schema Hash:"), cyan(schema_hash));
-        println!(
+        println_safe!("  {} {}", dimmed("Schema Hash:"), cyan(schema_hash))?;
+        println_safe!(
             "  {} {} {}",
             dimmed("Driver:"),
             metadata.driver,
             metadata.version
-        );
-        println!();
-        println!("  {}", header("Metadata (JSON)"));
-        println!();
+        )?;
+        println_safe!()?;
+        println_safe!("  {}", header("Metadata (JSON)"))?;
+        println_safe!()?;
         let json = serde_json::to_string_pretty(&metadata)
             .context("failed to serialize schema metadata")?;
-        println!("{}", json);
-        println!();
-        println!("  {}", header("DDL (SQL)"));
-        println!();
-        println!("{}", ddl);
+        println_safe!("{}", json)?;
+        println_safe!()?;
+        println_safe!("  {}", header("DDL (SQL)"))?;
+        println_safe!()?;
+        println_safe!("{}", ddl)?;
     }
 
     Ok(())
@@ -197,7 +198,7 @@ pub async fn run_diff(
         AgenticFormatter::format(&diff)
     };
 
-    println!("{}", output);
+    println_safe!("{}", output)?;
 
     Ok(diff.exit_code())
 }

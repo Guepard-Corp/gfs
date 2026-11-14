@@ -1,5 +1,6 @@
 //! `gfs import` — import data into the running database instance.
 
+use crate::println_safe;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -46,18 +47,18 @@ pub async fn run(
     let output = use_case.run(&repo_path, file, format_str).await?;
 
     if json_output {
-        println!(
+        println_safe!(
             "{}",
             json!({
                 "imported_from": output.imported_from.display().to_string(),
             })
-        );
+        )?;
     } else {
-        println!(
+        println_safe!(
             "{} Imported from {}",
             green("✓"),
             cyan(output.imported_from.display().to_string())
-        );
+        )?;
     }
     if !output.stderr.is_empty() {
         eprintln!("{}", output.stderr.trim_end());

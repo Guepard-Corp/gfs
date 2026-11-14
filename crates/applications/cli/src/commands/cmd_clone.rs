@@ -1,3 +1,4 @@
+use crate::println_safe;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -64,7 +65,7 @@ pub async fn clone(
             None => match use_case.detect_remote_version(&remote).await {
                 Ok(v) => {
                     if !json_output {
-                        println!("  {} Detected remote version {}", green("✓"), cyan(&v));
+                        println_safe!("  {} Detected remote version {}", green("✓"), cyan(&v))?;
                     }
                     Some(v)
                 }
@@ -110,25 +111,25 @@ pub async fn clone(
     let output = use_case.run(&target_path, remote).await?;
 
     if json_output && !snapshot {
-        println!(
+        println_safe!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "path": target_path.display().to_string(),
                 "remote": output.remote,
                 "mode": "lazy-clone",
             }))?
-        );
+        )?;
     } else if !json_output {
-        println!();
-        println!(
+        println_safe!()?;
+        println_safe!(
             "  {} Lazy clone ready from {}",
             green("✓"),
             cyan(output.remote)
-        );
-        println!(
+        )?;
+        println_safe!(
             "    {:<16} copy-on-read (data fetched on first read)",
             dimmed("Mode")
-        );
+        )?;
     }
     if !output.stderr.is_empty() {
         eprintln!("{}", output.stderr.trim_end());
@@ -140,8 +141,8 @@ pub async fn clone(
     // clone, and the error says so instead of pretending the clone broke.
     if snapshot {
         if !json_output {
-            println!();
-            println!("  {} taking the snapshot (gfs freeze)...", dimmed("\u{b7}"));
+            println_safe!()?;
+            println_safe!("  {} taking the snapshot (gfs freeze)...", dimmed("\u{b7}"))?;
         }
         if let Err(e) = crate::commands::cmd_freeze::freeze(
             Some(target_path.clone()),
@@ -158,11 +159,11 @@ pub async fn clone(
             .into());
         }
         if !json_output {
-            println!(
+            println_safe!(
                 "  {} Snapshot clone ready {}",
                 green("\u{2713}"),
                 dimmed("(a point in time, detached from its source)")
-            );
+            )?;
         }
     }
 

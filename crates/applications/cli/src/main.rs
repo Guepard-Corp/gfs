@@ -90,7 +90,10 @@ async fn main() {
         Ok(exit_code) => std::process::exit(exit_code),
         Err(err) => {
             if wants_json {
-                println!(
+                // Discarded on purpose: the process exits with this error's own
+                // code just below, and a failed write has nowhere else to go. A
+                // bare println! here panicked into 101 on a closed reader.
+                let _ = gfs_cli::println_safe!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
                         "error": {
