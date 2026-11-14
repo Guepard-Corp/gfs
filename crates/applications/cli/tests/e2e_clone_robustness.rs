@@ -439,25 +439,61 @@ fn clone_range_and_temporal_hydration_elide() {
     );
     psql(&clone, "postgres", "TRUNCATE orders"); // fresh local state for the window
 
+    // A temporal window is answered by federating to the source, while the
+    // background worker copies it; the worker's copy skips clone_stats, so
+    // rows_fetched does not move here and federate_calls is what to watch.
     let tq = "SELECT id FROM orders WHERE placed_at BETWEEN date '2024-02-01' AND date '2024-02-15' ORDER BY id";
-    let t0 = sum_fetched(&clone);
-    psql(&clone, "postgres", tq);
-    let t1 = sum_fetched(&clone);
-    assert!(t1 > t0, "temporal window hydrated (t0={t0} t1={t1})");
-    psql(&clone, "postgres", tq);
-    assert_eq!(
-        sum_fetched(&clone),
-        t1,
-        "temporal window elided — no new source fetch"
-    );
-    assert_eq!(
+    let expected = psql(remote, "shop", tq);
+    assert!(!expected.is_empty(), "the fixture has rows in the window");
+    let federated = || -> i64 {
         psql(
             &clone,
             "postgres",
-            &format!("SELECT count(*) FROM ({tq}) t")
-        ),
-        psql(remote, "shop", &format!("SELECT count(*) FROM ({tq}) t")),
+            "SELECT federate_calls FROM gfs.clones WHERE clone = 'orders'",
+        )
+        .parse()
+        .unwrap_or(-1)
+    };
+    let t0 = federated();
+    assert_eq!(
+        psql(&clone, "postgres", tq),
+        expected,
         "temporal result matches source"
+    );
+    let t1 = federated();
+    assert_eq!(
+        t1,
+        t0 + 1,
+        "an uncovered temporal window is federated (t0={t0} t1={t1})"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let copied = || {
+        psql(
+            &clone,
+            "postgres",
+            "SELECT NOT EXISTS (SELECT 1 FROM gfs.copy_queue WHERE relid = 'orders'::regclass) \
+             AND EXISTS (SELECT 1 FROM gfs.clones WHERE clone = 'orders' \
+                         AND (whole_cached OR cached_ranges > 0))",
+        ) == "t"
+    };
+    while !copied() {
+        assert!(
+            Instant::now() < deadline,
+            "the background copy of the window never landed"
+        );
+        thread::sleep(Duration::from_millis(500));
+    }
+
+    assert_eq!(
+        psql(&clone, "postgres", tq),
+        expected,
+        "copied window matches source"
+    );
+    assert_eq!(
+        federated(),
+        t1,
+        "temporal window served locally once copied"
     );
     drop(cl);
 }
