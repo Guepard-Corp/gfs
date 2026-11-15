@@ -69,6 +69,37 @@ fn k8s_schedule_node_name() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+fn k8s_schedule_node_labels() -> Option<BTreeMap<String, String>> {
+    std::env::var("GFS_K8S_NODE_SELECTOR")
+        .ok()
+        .and_then(|raw| parse_node_selector(&raw))
+}
+
+fn parse_node_selector(raw: &str) -> Option<BTreeMap<String, String>> {
+    let labels: BTreeMap<String, String> = raw
+        .split(',')
+        .filter_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            let key = key.trim();
+            (!key.is_empty()).then(|| (key.to_string(), value.trim().to_string()))
+        })
+        .collect();
+    (!labels.is_empty()).then_some(labels)
+}
+
+fn k8s_schedule_node_selector() -> Option<BTreeMap<String, String>> {
+    schedule_node_selector(k8s_schedule_node_name(), k8s_schedule_node_labels())
+}
+
+fn schedule_node_selector(
+    node_name: Option<String>,
+    node_labels: Option<BTreeMap<String, String>>,
+) -> Option<BTreeMap<String, String>> {
+    node_name
+        .map(|name| BTreeMap::from([("kubernetes.io/hostname".to_string(), name)]))
+        .or(node_labels)
+}
+
 fn k8s_tls_secret() -> Option<String> {
     std::env::var("GFS_K8S_TLS_SECRET")
         .ok()
@@ -1150,19 +1181,15 @@ impl KubernetesCompute {
                         },
                         containers: vec![container],
                         volumes: Some(volumes),
-                        node_selector: k8s_schedule_node_name()
-                            .map(|name| {
-                                BTreeMap::from([("kubernetes.io/hostname".to_string(), name)])
+                        node_selector: k8s_schedule_node_selector().or_else(|| {
+                            // Legacy local-path: pin to control-plane when no ZFS SC.
+                            k8s_storage_class().is_none().then(|| {
+                                BTreeMap::from([(
+                                    "node-role.kubernetes.io/control-plane".to_string(),
+                                    "true".to_string(),
+                                )])
                             })
-                            .or_else(|| {
-                                // Legacy local-path: pin to control-plane when no ZFS SC.
-                                k8s_storage_class().is_none().then(|| {
-                                    BTreeMap::from([(
-                                        "node-role.kubernetes.io/control-plane".to_string(),
-                                        "true".to_string(),
-                                    )])
-                                })
-                            }),
+                        }),
                         ..Default::default()
                     }),
                 },
@@ -2353,8 +2380,7 @@ impl KubernetesCompute {
                     ]),
                     ..Default::default()
                 }],
-                node_selector: k8s_schedule_node_name()
-                    .map(|name| BTreeMap::from([("kubernetes.io/hostname".to_string(), name)])),
+                node_selector: k8s_schedule_node_selector(),
                 ..Default::default()
             }),
             ..Default::default()
@@ -2451,6 +2477,40 @@ mod tests {
     use gfs_domain::ports::compute::ComputeResources;
 
     use super::*;
+
+    #[test]
+    fn a_node_selector_reads_comma_separated_key_value_pairs() {
+        assert_eq!(
+            parse_node_selector(" guepard.io/database-host=true , zone=a "),
+            Some(BTreeMap::from([
+                ("guepard.io/database-host".to_string(), "true".to_string()),
+                ("zone".to_string(), "a".to_string()),
+            ]))
+        );
+    }
+
+    #[test]
+    fn a_node_selector_without_any_key_selects_no_node_label() {
+        assert_eq!(parse_node_selector(""), None);
+        assert_eq!(parse_node_selector(" , =x, novalue"), None);
+    }
+
+    #[test]
+    fn a_pinned_node_wins_over_the_node_selector_which_wins_over_any_node() {
+        let labels = BTreeMap::from([("guepard.io/database-host".to_string(), "true".to_string())]);
+        assert_eq!(
+            schedule_node_selector(Some("dp-2".to_string()), Some(labels.clone())),
+            Some(BTreeMap::from([(
+                "kubernetes.io/hostname".to_string(),
+                "dp-2".to_string()
+            )]))
+        );
+        assert_eq!(
+            schedule_node_selector(None, Some(labels.clone())),
+            Some(labels)
+        );
+        assert_eq!(schedule_node_selector(None, None), None);
+    }
 
     #[test]
     fn only_a_mount_the_csi_driver_answers_not_found_names_a_missing_volume() {
