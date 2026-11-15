@@ -7,7 +7,9 @@ use thiserror::Error;
 
 use crate::model::config::GfsConfig;
 use crate::ports::compute::{Compute, ExecOutput, InstanceId};
-use crate::ports::database_provider::DatabaseProviderRegistry;
+use crate::ports::database_provider::{
+    ContainerProvider, DatabaseProviderRegistry, ProviderError, RoleLogin,
+};
 
 #[derive(Debug, Error)]
 pub enum ExecuteQueryError {
@@ -45,12 +47,43 @@ impl<R: DatabaseProviderRegistry> ExecuteQueryUseCase<R> {
         Self { compute, registry }
     }
 
-    /// Run `sql` inside the database container/pod for the repo at `path`.
+    /// Run `sql` inside the database container/pod for the repo at `path`, as
+    /// the instance's administrative user. This is standalone gfs's behaviour.
     pub async fn run(
         &self,
         path: &Path,
         sql: &str,
         database: Option<&str>,
+    ) -> Result<ExecuteQueryOutput, ExecuteQueryError> {
+        self.execute(path, sql, |container| {
+            container.query_in_instance_command(sql, database)
+        })
+        .await
+    }
+
+    /// Like [`Self::run`], but logged in as `login` instead of the
+    /// administrative user, for a host that gives people a least-privilege
+    /// role: objects the SQL creates belong to that role, and it runs with
+    /// only that role's privileges. A provider that cannot do this refuses; it
+    /// never falls back to the administrative user.
+    pub async fn run_as(
+        &self,
+        path: &Path,
+        sql: &str,
+        database: Option<&str>,
+        login: &RoleLogin<'_>,
+    ) -> Result<ExecuteQueryOutput, ExecuteQueryError> {
+        self.execute(path, sql, |container| {
+            container.query_in_instance_command_as(sql, database, login)
+        })
+        .await
+    }
+
+    async fn execute(
+        &self,
+        path: &Path,
+        sql: &str,
+        build_command: impl FnOnce(&dyn ContainerProvider) -> Result<String, ProviderError>,
     ) -> Result<ExecuteQueryOutput, ExecuteQueryError> {
         if sql.trim().is_empty() {
             return Err(ExecuteQueryError::Unsupported(
@@ -93,9 +126,8 @@ impl<R: DatabaseProviderRegistry> ExecuteQueryUseCase<R> {
             .require_container()
             .map_err(|e| ExecuteQueryError::Unsupported(e.to_string()))?;
 
-        let command = container
-            .query_in_instance_command(sql, database)
-            .map_err(|e| ExecuteQueryError::Unsupported(e.to_string()))?;
+        let command =
+            build_command(container).map_err(|e| ExecuteQueryError::Unsupported(e.to_string()))?;
 
         let instance_id = InstanceId(container_name);
         let output = self
@@ -299,7 +331,11 @@ mod tests {
         }
     }
 
-    struct MockQueryProvider;
+    /// `supports_roles` decides whether it can run a query as a role, the way
+    /// Postgres can and MySQL cannot.
+    struct MockQueryProvider {
+        supports_roles: bool,
+    }
 
     impl DatabaseProvider for MockQueryProvider {
         fn name(&self) -> &str {
@@ -371,6 +407,19 @@ mod tests {
                 None => Ok(format!("mock-exec-query: {sql}")),
             }
         }
+        fn query_in_instance_command_as(
+            &self,
+            sql: &str,
+            _: Option<&str>,
+            login: &RoleLogin<'_>,
+        ) -> std::result::Result<String, ProviderError> {
+            if !self.supports_roles {
+                return Err(ProviderError::UnsupportedFormat(
+                    "query_in_instance as a role".into(),
+                ));
+            }
+            Ok(format!("mock-exec-query-as[{}]: {sql}", login.username))
+        }
     }
 
     fn repo_with_config(provider: &str, container: &str) -> (TempDir, PathBuf) {
@@ -406,7 +455,11 @@ mod tests {
         let (_temp, repo_path) = repo_with_config("mock-query", "pg-test-1");
 
         let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
-        registry.register(Arc::new(MockQueryProvider)).unwrap();
+        registry
+            .register(Arc::new(MockQueryProvider {
+                supports_roles: true,
+            }))
+            .unwrap();
 
         let compute = Arc::new(QueryMockCompute {
             stdout: " ?column? \n----------\n        1\n(1 row)\n".into(),
@@ -423,12 +476,65 @@ mod tests {
         assert!(!cmd.contains("Command::new"));
     }
 
+    const OWNER: RoleLogin<'static> = RoleLogin {
+        username: "owner",
+        password: "s3cret",
+    };
+
+    #[tokio::test]
+    async fn run_as_runs_the_role_scoped_command_in_compute() {
+        let (_temp, repo_path) = repo_with_config("mock-query", "pg-test-3");
+        let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
+        registry
+            .register(Arc::new(MockQueryProvider {
+                supports_roles: true,
+            }))
+            .unwrap();
+        let compute = Arc::new(QueryMockCompute::default());
+
+        let uc = ExecuteQueryUseCase::new(compute.clone(), registry);
+        uc.run_as(&repo_path, "SELECT 1", None, &OWNER)
+            .await
+            .unwrap();
+
+        let cmd = compute.last_command.lock().unwrap().clone().unwrap();
+        assert_eq!(cmd, "mock-exec-query-as[owner]: SELECT 1");
+    }
+
+    #[tokio::test]
+    async fn run_as_refuses_and_runs_nothing_when_the_provider_cannot() {
+        let (_temp, repo_path) = repo_with_config("mock-query", "pg-test-4");
+        let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
+        registry
+            .register(Arc::new(MockQueryProvider {
+                supports_roles: false,
+            }))
+            .unwrap();
+        let compute = Arc::new(QueryMockCompute::default());
+
+        let uc = ExecuteQueryUseCase::new(compute.clone(), registry);
+        let err = uc
+            .run_as(&repo_path, "SELECT 1", None, &OWNER)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ExecuteQueryError::Unsupported(_)), "{err}");
+        assert!(
+            compute.last_command.lock().unwrap().is_none(),
+            "nothing may run, in particular not as the administrative user"
+        );
+    }
+
     #[tokio::test]
     async fn execute_query_surfaces_stderr_on_failure() {
         let (_temp, repo_path) = repo_with_config("mock-query", "pg-test-2");
 
         let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
-        registry.register(Arc::new(MockQueryProvider)).unwrap();
+        registry
+            .register(Arc::new(MockQueryProvider {
+                supports_roles: true,
+            }))
+            .unwrap();
 
         let compute = Arc::new(QueryMockCompute {
             exit_code: 1,
