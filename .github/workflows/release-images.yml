@@ -33,7 +33,7 @@ concurrency:
 
 jobs:
   plan:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(vars.RUNNER_AMD64 || '"ubuntu-24.04"') }}
     permissions:
       contents: read
     outputs:
@@ -110,7 +110,7 @@ jobs:
             runner: ubuntu-24.04
           - platform: arm64
             runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner == 'ubuntu-24.04-arm' && fromJSON(vars.RUNNER_ARM64 || '"ubuntu-24.04-arm"') || fromJSON(vars.RUNNER_AMD64 || '"ubuntu-24.04"') }}
     permissions:
       contents: read
       packages: write
@@ -165,7 +165,7 @@ jobs:
     strategy:
       matrix:
         pg: ${{ fromJSON(needs.plan.outputs.pg_majors) }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(vars.RUNNER_AMD64 || '"ubuntu-24.04"') }}
     permissions:
       contents: read
       packages: write
@@ -224,7 +224,7 @@ jobs:
   mirror-gcp:
     needs: [plan, merge]
     if: vars.GCP_RELEASE_MIRROR == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(vars.RUNNER_AMD64 || '"ubuntu-24.04"') }}
     permissions:
       contents: read
       packages: read

@@ -19,7 +19,10 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+        exclude:
+          - os: ${{ vars.HOSTED_RUNNERS_AVAILABLE == 'false' && 'windows-latest' || 'none' }}
+          - os: ${{ vars.HOSTED_RUNNERS_AVAILABLE == 'false' && 'macos-latest' || 'none' }}
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && fromJSON(vars.RUNNER_AMD64 || '"ubuntu-latest"') || matrix.os }}
     steps:
       - uses: actions/checkout@v6
 

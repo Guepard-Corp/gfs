@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_AMD64 || '"ubuntu-latest"') }}
     env:
       # Embedded at compile time by option_env!() in gfs-telemetry.
       # Store as a repository secret (Settings → Secrets) so it is masked in logs.
