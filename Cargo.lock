@@ -1386,7 +1386,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-cli"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1421,7 +1421,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-compute-docker"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "async-trait",
  "bollard",
@@ -1439,7 +1439,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-compute-kubernetes"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1459,7 +1459,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-config"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "serde",
@@ -1469,7 +1469,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-console"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -1491,7 +1491,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-db-providers"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "gfs-domain",
  "postgres-protocol",
@@ -1503,7 +1503,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-domain"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1522,7 +1522,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-mcp"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "atty",
@@ -1551,7 +1551,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-storage-apfs"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1564,7 +1564,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-storage-btrfs"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1576,7 +1576,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-storage-file"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1589,7 +1589,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-storage-kubernetes"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1605,7 +1605,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-telemetry"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "gfs-domain",
@@ -1618,7 +1618,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-website"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "console_error_panic_hook",
  "leptos",
